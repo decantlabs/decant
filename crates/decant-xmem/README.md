@@ -1,6 +1,6 @@
 # Physical page tracking
 
-The engine separates its address space state from GPU dirty tracking. The dirty mutex owns the tracker, a writable address index and the pool view metadata needed to query commitment. `take_dirty` and tracked write faults use this mutex without acquiring the address space mutex. The exception handler tries a tracked write before the general commitment path.
+The engine separates its address space state from GPU dirty tracking. The dirty mutex owns the tracker, a writable address index and the pool view metadata needed to query commitment. `take_dirty` and tracked write faults use this mutex without acquiring the address space mutex. The exception handler tries a tracked write before the general commitment path, and retries the tracked write path after commitment when another thread commits and protects the page in between.
 
 Mapping changes acquire the address space mutex before the dirty mutex. They keep both through Windows mapping calls, alias updates and protection changes. Dirty tracking never acquires the address space mutex while holding its mutex. Address space inspection, including the full commitment walk in `footprint`, does not acquire the dirty mutex.
 
