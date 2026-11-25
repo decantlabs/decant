@@ -56,7 +56,7 @@ struct Args {
     #[arg(long)]
     cache: PathBuf,
     /// Worker threads translating and compiling pipelines at once.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = default_threads())]
     threads: usize,
     /// Warm only the top N pipelines (by bind order when a bind order file exists, else manifest order).
     #[arg(long)]
@@ -76,6 +76,9 @@ struct Args {
     /// Print every per stage translation line from the layer adapter.
     #[arg(long)]
     verbose: bool,
+    /// Print structured machine readable progress lines to stdout during warming.
+    #[arg(long)]
+    progress: bool,
 }
 
 /// Wraps `decant_dxc::Dxc` as a `compile_service::Compiler`.
@@ -562,13 +565,31 @@ fn parse_hash_list(text: &str) -> HashSet<u64> {
     text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect()
 }
 
+const MAX_THREADS: usize = 32;
+
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map(usize::from).unwrap_or(4).clamp(4, 16)
+}
+
 fn effective_threads(requested: usize) -> usize {
     let threads = requested.max(1);
-    if threads > 4 {
-        log(&format!("decant_shader_warm: capping threads from {threads} to 4 (maximum worker count)"));
-        return 4;
+    if threads > MAX_THREADS {
+        log(&format!("decant_shader_warm: capping threads from {threads} to {MAX_THREADS} (maximum worker count)"));
+        return MAX_THREADS;
     }
     threads
+}
+
+fn format_progress_line(done: usize, total: usize, ready: u64, compiled: u64, cache_hits: u64, failed: u64) -> String {
+    format!("PROGRESS {done}/{total} ready={ready} compiled={compiled} cache_hits={cache_hits} failed={failed}")
+}
+
+fn emit_progress(done: usize, total: usize, ready: u64, compiled: u64, cache_hits: u64, failed: u64) {
+    use std::io::Write as _;
+    let line = format_progress_line(done, total, ready, compiled, cache_hits, failed);
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
 }
 
 fn main() -> std::process::ExitCode {
@@ -681,13 +702,20 @@ fn main() -> std::process::ExitCode {
     let containers = Arc::new(containers);
 
     let started = Instant::now();
+    let progress_enabled = args.progress;
+    let progress_step = (total / 50).clamp(1, 25);
+    let last_progress_ms = Arc::new(AtomicU64::new(0));
+    if progress_enabled {
+        emit_progress(0, total, 0, 0, 0, 0);
+    }
     let workers: Vec<_> = (0..threads)
         .map(|_| {
-            let (cursor, completed, pipeline_hits, pending_timeout, pipelines, manifest, containers, service) = (
+            let (cursor, completed, pipeline_hits, pending_timeout, last_progress_ms, pipelines, manifest, containers, service) = (
                 cursor.clone(),
                 completed.clone(),
                 pipeline_hits.clone(),
                 pending_timeout.clone(),
+                last_progress_ms.clone(),
                 pipelines.clone(),
                 manifest.clone(),
                 containers.clone(),
@@ -726,6 +754,25 @@ fn main() -> std::process::ExitCode {
                         }
                     }
                     let done = completed.fetch_add(1, Ordering::AcqRel) + 1;
+                    if progress_enabled && done < total {
+                        let now_ms = started.elapsed().as_millis() as u64;
+                        let prev_ms = last_progress_ms.load(Ordering::Relaxed);
+                        let time_due = now_ms.saturating_sub(prev_ms) >= 250
+                            && last_progress_ms.compare_exchange(prev_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+                        if done.is_multiple_of(progress_step) || time_due {
+                            let c = service.counters();
+                            let refused_map = c.refused();
+                            let fail_now = count_failures(pending_timeout.load(Ordering::Relaxed), &refused_map);
+                            emit_progress(
+                                done,
+                                total,
+                                c.ready.load(Ordering::Relaxed),
+                                c.compiled.load(Ordering::Relaxed),
+                                c.cache_hits.load(Ordering::Relaxed),
+                                fail_now,
+                            );
+                        }
+                    }
                     if done.is_multiple_of(100) {
                         let c = service.counters();
                         let refused_map = c.refused();
@@ -750,6 +797,19 @@ fn main() -> std::process::ExitCode {
         let _ = w.join();
     }
     let elapsed = started.elapsed().as_secs_f64();
+    if progress_enabled {
+        let c = service.counters();
+        let refused_map = c.refused();
+        let fail_now = count_failures(pending_timeout.load(Ordering::Relaxed), &refused_map);
+        emit_progress(
+            total,
+            total,
+            c.ready.load(Ordering::Relaxed),
+            c.compiled.load(Ordering::Relaxed),
+            c.cache_hits.load(Ordering::Relaxed),
+            fail_now,
+        );
+    }
 
     let cache_bytes = std::fs::read_dir(&cache_dir)
         .map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
@@ -876,7 +936,17 @@ mod tests {
     }
 
     #[test]
-    fn thread_count_is_capped_at_four_without_a_game_lock() {
-        assert_eq!(effective_threads(64), 4);
+    fn thread_count_defaults_and_clamps_sensibly() {
+        assert!(default_threads() >= 4);
+        assert_eq!(effective_threads(0), 1);
+        assert_eq!(effective_threads(64), MAX_THREADS);
+    }
+
+    #[test]
+    fn progress_line_formats_structured_fields() {
+        assert_eq!(
+            format_progress_line(12, 40, 10, 4, 8, 2),
+            "PROGRESS 12/40 ready=10 compiled=4 cache_hits=8 failed=2"
+        );
     }
 }

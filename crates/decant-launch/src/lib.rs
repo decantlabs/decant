@@ -7,6 +7,7 @@ pub mod cpu_emu;
 pub mod drive;
 pub mod gentle;
 pub mod pls_drive;
+pub mod precompile;
 pub mod relaunch;
 pub mod run;
 pub mod runtime;
