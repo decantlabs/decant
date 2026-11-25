@@ -35,6 +35,9 @@
 //! Scalars parked in vector lanes: when a program runs out of scalar registers it puts one into
 //! a lane of a vector register with `v_writelane_b32` and takes it back with `v_readlane_b32`.
 //! Such a place is followed like a register, so a parked mask comes back as a mask.
+//! A lane write into vector data can also read a whole mask word. The compute lifter collects
+//! its bits with a ballot when the graph has one block. Literal zero has the same mask role
+//! as inline zero. Literal all ones has that role for a 32 bit mask word.
 //!
 //! The lifter asks through [`Masks::is_mask`] for the instruction it is at. `lift::wave` moves
 //! that position with [`Masks::enter`] before any rule runs.
@@ -455,7 +458,8 @@ impl Collector<'_> {
                 MaskOp::Logic(_) | MaskOp::Select => {
                     // A constant other than "no lane" and "all lanes" is a number.
                     let constant = insn.src.iter().any(|s| {
-                        matches!(s, Operand::Lit(_) | Operand::Float(_))
+                        matches!(s, Operand::Lit(v) if *v != 0 && !(w == 32 && *v == u32::MAX))
+                            || matches!(s, Operand::Float(_))
                             || matches!(s, Operand::Int(v) if *v != 0 && *v != -1)
                     });
                     if names(insn, Reg::ExecLo) {
@@ -555,7 +559,9 @@ impl Collector<'_> {
             match insn.src[0] {
                 op if exec(op).is_some() => self.at(slot, exec(op).unwrap_or(0), Role::Mask, true),
                 // "No lane" and "all lanes" are constants of both kinds.
-                Operand::Int(0 | -1) => self.at(slot, 0, Role::Same, true),
+                Operand::Int(0 | -1) | Operand::Lit(0 | u32::MAX) => {
+                    self.at(slot, 0, Role::Same, true)
+                }
                 Operand::Int(_) | Operand::Lit(_) | Operand::Float(_) => {
                     self.at(slot, 0, Role::Data, true)
                 }
@@ -575,6 +581,11 @@ impl Collector<'_> {
 
     /// Vector instructions: the table says which slots are lane masks.
     fn vector(&mut self, insn: &Insn) {
+        if insn.op == Op::v_writelane_b32_e64 {
+            self.uses(insn.src[0], 1, Role::Number);
+            self.uses(insn.src[1], 1, Role::Data);
+            return;
+        }
         if matches!(insn.op, Op::v_mbcnt_lo_u32_b32 | Op::v_mbcnt_hi_u32_b32_e64) {
             // The count of the bits below the lane takes one word of a mask, or a number.
             self.uses(insn.src[0], 1, Role::Number);
@@ -873,6 +884,8 @@ pub enum Parked {
 struct Site {
     /// The registers that hold a mask where the instruction reads them.
     reads: Set,
+    /// Reads of the high word of a mask.
+    high_reads: Set,
     /// The registers the instruction writes a mask to.
     writes: Set,
     /// Why the instruction cannot be translated one lane at a time.
@@ -887,12 +900,22 @@ struct Site {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Masks {
     lanes: u8,
+    /// Whole mask words can only be collected where all invocations stay together.
+    converged: bool,
     sites: BTreeMap<u32, Site>,
     /// The instruction the lifter is at.
     at: Cell<Site>,
 }
 
 impl Masks {
+    pub fn converged(&self) -> bool {
+        self.converged
+    }
+
+    pub fn reads_high_mask(&self, first: u8) -> bool {
+        usize::from(first) < REGS && self.at.get().high_reads & bit(first) != 0
+    }
+
     /// The lanes of a wave of this program: 32 or 64.
     pub fn lanes(&self) -> u8 {
         if self.lanes == 32 { 32 } else { 64 }
@@ -1804,6 +1827,9 @@ impl Typing<'_> {
                 site.parked = kind;
             } else if kind & (LOW | HIGH) != 0 {
                 site.reads |= bit(t.loc as u8);
+                if kind == HIGH {
+                    site.high_reads |= bit(t.loc as u8);
+                }
             }
         }
         for t in self.own(span).iter().filter(|t| t.def) {
@@ -1931,6 +1957,7 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
     let later = typing.later_readers(&typing.backward());
     let mut masks = Masks {
         lanes,
+        converged: cfg.blocks.len() == 1,
         ..Masks::default()
     };
     let mut refused = 0;

@@ -47,6 +47,9 @@
 //! program the two words of a mask are parked one by one: the low word carries the bit, the
 //! high word is nothing. `crate::exec` tells such a parking place from a real reach into
 //! another lane. Compute programs use HLSL wave intrinsics for those reads and writes.
+//! A mask written into vector data uses a ballot to reconstruct its low word in a converged
+//! compute block. Direct EXEC and VCC reads can also collect the high word. A scalar high
+//! word without its original mask identity remains refused.
 //!
 //! A wave of one lane. Some instructions take a whole mask as a number: they count its lanes
 //! (`s_bcnt1`), search the first or the last one (`s_ff1`, `s_flbit`), test one (`s_bitcmp`),
@@ -164,6 +167,7 @@ fn reads_mask(cx: &Lifter, op: Operand) -> bool {
     match op {
         Operand::Reg(Reg::ExecLo) => true,
         Operand::Reg(Reg::VccLo) => cx.masks.reads_mask(VCC),
+        Operand::Reg(Reg::VccHi) => cx.masks.reads_mask(VCC + 1),
         Operand::Reg(Reg::S(n)) => cx.masks.reads_mask(n),
         _ => false,
     }
@@ -197,8 +201,9 @@ fn constant_lane_bit(lanes: u8, op: Operand) -> Option<Expr> {
 /// This lane's bit of a mask operand that is read.
 fn source(cx: &Lifter, insn: &Insn, op: Operand) -> Result<Expr, Refusal> {
     Ok(match op {
-        Operand::Int(0) => Expr::Bool(false),
+        Operand::Int(0) | Operand::Lit(0) => Expr::Bool(false),
         Operand::Int(-1) => Expr::Bool(true),
+        Operand::Lit(u32::MAX) if cx.masks.lanes() == 32 => Expr::Bool(true),
         Operand::Reg(Reg::ExecLo) => Expr::Var(Var::Exec),
         Operand::Reg(Reg::VccLo) if cx.masks.reads_mask(VCC) => Expr::Var(Var::Vcc),
         Operand::Reg(Reg::S(n)) if cx.masks.reads_mask(n) => Expr::Var(Var::Mask(n)),
@@ -447,7 +452,11 @@ fn park(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
             cx.set(dst, Expr::Var(place));
         }
         (Parked::Mask, true) => {
-            let bit = source(cx, insn, insn.src[0])?;
+            let bit = if insn.src[0] == Operand::Lit(u32::MAX) {
+                Expr::Bool(true)
+            } else {
+                source(cx, insn, insn.src[0])?
+            };
             cx.set(place, Expr::un(Un::BoolToU32, bit));
         }
         (Parked::Mask, false) => {
@@ -458,6 +467,13 @@ fn park(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
     Ok(true)
 }
 
+static MASK_WORD: Helper = Helper {
+    name: "decant_mask_word",
+    result: Ty::U32,
+    text: "uint decant_mask_word(bool value, uint word) { return WaveActiveBallot(value)[word]; }",
+    needs: &[],
+};
+
 fn compute_lane(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
     let dst = var(insn, insn.dst)?;
     let lane = Expr::bin(
@@ -465,7 +481,26 @@ fn compute_lane(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
         bits(insn, 1)?,
         Expr::U32(u32::from(cx.masks.lanes()) - 1),
     );
-    let value = bits(insn, 0)?;
+    let value = if insn.op == Op::v_writelane_b32_e64
+        && (reads_mask(cx, insn.src[0]) || matches!(insn.src[0], Operand::Reg(Reg::ExecHi)))
+    {
+        if !cx.masks.converged() {
+            return Err(refuse(insn, "mask-as-data"));
+        }
+        let (value, high) = match insn.src[0] {
+            Operand::Reg(Reg::ExecLo) => (Expr::Var(Var::Exec), false),
+            Operand::Reg(Reg::ExecHi) => (Expr::Var(Var::Exec), true),
+            Operand::Reg(Reg::S(n)) if cx.masks.reads_high_mask(n) => {
+                // A separately restored high word need not be next to its low word.
+                return Err(refuse(insn, "mask-as-data"));
+            }
+            Operand::Reg(Reg::VccHi) => (Expr::Var(Var::Vcc), true),
+            op => (source(cx, insn, op)?, false),
+        };
+        Expr::Call(&MASK_WORD, vec![value, Expr::U32(u32::from(high))])
+    } else {
+        bits(insn, 0)?
+    };
     let call = if insn.op == Op::v_readlane_b32_e64 {
         Expr::Call(&READ_LANE, vec![value, lane])
     } else {
@@ -711,14 +746,29 @@ fn swizzle(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
     Ok(true)
 }
 
-/// Native lane reads require the lanes to reach the instruction together. The scalar
-/// EXEC model also substitutes per-invocation answers for instructions that inspect a mask
-/// as a whole. Keep native DPP out of programs that can use those substitutions.
+/// Native lane reads permit scalar control flow when its condition is uniform.
+/// Mask tests and scalar wave substitutions can make that condition differ by invocation.
+/// Refuse those combinations before structuring the control flow.
 pub(crate) fn check_dpp_context(
     graph: &crate::cfg::Cfg,
     masks: &crate::exec::Masks,
 ) -> Result<(), Refusal> {
-    if graph.blocks.len() != 1 {
+    let reads_mask_operand = |masks: &crate::exec::Masks, op| match op {
+        Operand::Reg(Reg::ExecLo | Reg::ExecHi) => true,
+        Operand::Reg(Reg::VccLo) => masks.reads_mask(VCC),
+        Operand::Reg(Reg::VccHi) => masks.reads_mask(VCC + 1),
+        Operand::Reg(Reg::S(n)) => masks.reads_mask(n),
+        _ => false,
+    };
+    if graph.blocks.iter().any(|block| {
+        matches!(
+            block.term,
+            crate::cfg::Term::Branch {
+                cond: crate::cfg::Cond::ExecZero(_) | crate::cfg::Cond::VccZero(_),
+                ..
+            }
+        )
+    }) {
         return Err(Refusal::new(
             RefusalKind::Exec("dpp-control-flow"),
             "native DPP requires converged compute control flow",
@@ -727,8 +777,8 @@ pub(crate) fn check_dpp_context(
     for insn in graph.insns() {
         masks.enter(insn.pc);
         if masks.reduction().is_some()
-            || mask_number(insn.op).is_some()
-            || zero_test(insn).is_some()
+            || (mask_number(insn.op).is_some() && reads_mask_operand(masks, insn.src[0]))
+            || zero_test(insn).is_some_and(|(at, ..)| reads_mask_operand(masks, insn.src[at]))
             || matches!(
                 mask_op(insn.op),
                 Some((MaskOp::SaveExec(_) | MaskOp::WrExec(_) | MaskOp::Wqm
