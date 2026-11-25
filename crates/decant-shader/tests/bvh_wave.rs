@@ -18,6 +18,27 @@ fn program(insn: Insn) -> StageProgram {
     }
 }
 
+/// `insn` after a load of its descriptor into s8 to s11 from slot 1 of the table in s4, with
+/// the first result word written to group shared memory so the intersection stays live.
+fn bvh_program(insn: Insn) -> StageProgram {
+    let none = decant_shader::decode::Operand::None;
+    let mut asm = Asm::new();
+    asm.push(sop1(Op::s_mov_b32, s(5), int(0)))
+        .push(smem(Op::s_load_dwordx4, s(8), s(4), 0x20))
+        .push(insn)
+        .push(ds(Op::ds_write_b32, none, v(1), v(20), none, 0, 0))
+        .push(sopp(Op::s_endpgm, 0));
+    StageProgram {
+        threads: [64, 1, 1],
+        lds_bytes: 256,
+        user_data: vec![UserDataSlot {
+            sgpr: 4,
+            kind: UserDataKind::Table,
+        }],
+        ..StageProgram::new(Stage::Compute, asm.finish())
+    }
+}
+
 #[test]
 fn bvh_forms_preserve_descriptor_address_width_and_all_result_words() {
     for op in [Op::image_bvh_intersect_ray, Op::image_bvh64_intersect_ray] {
@@ -34,7 +55,7 @@ fn bvh_forms_preserve_descriptor_address_width_and_all_result_words() {
                 if let Ext::Mimg(m) = &mut insn.ext {
                     m.a16 = a16;
                 }
-                let p = program(insn);
+                let p = bvh_program(insn);
                 let func = lift_program(&p).unwrap();
                 let mut words = Vec::new();
                 func.for_each_stmt(&mut |stmt| {
@@ -57,14 +78,20 @@ fn bvh_forms_preserve_descriptor_address_width_and_all_result_words() {
                     }
                 });
                 assert_eq!(words, [0, 1, 2, 3]);
-                let refusal = translate(
+                // The descriptor becomes the node memory buffer and the intersection lowers to
+                // one call of the HLSL helper. `tests/bvh_hlsl.rs` covers the text and DXC.
+                let translated = translate(
                     &[p],
                     &RootSignature::default(),
                     &Options::default(),
                     &CountingHost::default(),
                 )
-                .unwrap_err();
-                assert_eq!(refusal.key(), "resource:bvh-node-backend");
+                .unwrap_or_else(|r| panic!("refused: {r}"));
+                let text = &translated.stages[0].hlsl;
+                assert!(
+                    text.contains("= decant_bvh_intersect(heap_t_s4_1, "),
+                    "{text}"
+                );
             }
         }
     }

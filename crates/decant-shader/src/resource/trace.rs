@@ -22,6 +22,9 @@
 //! * Four constants are a sampler the program builds itself.
 //! * A scalar load whose base is (user data `K`, user data `K + 1`) reads the buffer behind a
 //!   root descriptor directly.
+//! * The four descriptor registers of a node intersection (`image_bvh_intersect_ray`,
+//!   `image_bvh64_intersect_ray`) come from any of the places above. They become one buffer
+//!   resource read as words, the node memory, see [`node_memory`].
 //!
 //! Anything else is refused by name: a load at an address the program computed
 //! (`raw-address`), descriptor words used as numbers (`descriptor-as-data`), a descriptor that
@@ -36,8 +39,8 @@ use super::flow::Flow;
 use crate::api::{HEAP_PAGE_SHIFT, StageProgram, UserDataKind};
 use crate::hlsl::{HEAP_MAP_LOAD, VIEW_SHADOW_LOAD, VIEW_SHADOW_LOAD2};
 use crate::ir::{
-    Bin, Desc, Expr, Function, Helper, ImageKind, Load, Origin, ResId, Resource, ResourceUse, Stmt,
-    Ty, Un, Var,
+    Bin, BvhIntersect, Desc, Expr, Function, Helper, ImageKind, Load, Origin, ResId, Resource,
+    ResourceUse, Stmt, Ty, Un, Var,
 };
 use crate::refusal::{Refusal, RefusalKind};
 
@@ -930,6 +933,14 @@ impl Tracer<'_> {
                 value: Expr::Load(load),
                 ..
             } if load.buffer => note(self, &Desc::Regs(load.base), 4, false),
+            Stmt::Set {
+                value: Expr::BvhWord(op, _),
+                ..
+            } => {
+                if let Some(first) = descriptor_registers(op) {
+                    note(self, &Desc::Regs(first), 4, false);
+                }
+            }
             Stmt::Image(op, _) => {
                 if let Desc::Regs(first) = op.image {
                     let writable =
@@ -1358,6 +1369,33 @@ impl Tracer<'_> {
         Ok(())
     }
 
+    /// Replaces the four descriptor registers of a node intersection by the buffer resource
+    /// they describe, see [`node_memory`].
+    fn bind_node_memory(&mut self, state: &State, op: &mut BvhIntersect) -> Result<(), Refusal> {
+        if node_memory(op).is_some() {
+            return Ok(());
+        }
+        let first = descriptor_registers(op).ok_or_else(|| {
+            refuse(
+                "bvh-descriptor",
+                op.pc,
+                "descriptor words outside four consecutive scalar registers",
+            )
+        })?;
+        let res = self.resource(
+            state,
+            first,
+            4,
+            ResourceUse::Words { written: false },
+            op.pc,
+        )?;
+        op.descriptor = vec![Expr::BufferWord {
+            res,
+            offset: Box::new(Expr::U32(0)),
+        }];
+        Ok(())
+    }
+
     /// Whether an expression reads a register that holds a descriptor word.
     fn reads_word(state: &State, e: &Expr) -> bool {
         let mut found = false;
@@ -1408,6 +1446,9 @@ impl Tracer<'_> {
                         Expr::Var(Var::V(*base)),
                         (**offset).clone(),
                     )));
+                }
+                if let Expr::BvhWord(op, _) = value {
+                    self.bind_node_memory(state, op)?;
                 }
                 let sym = if let Expr::Load(load) = value {
                     let (load, pc) = (load.clone(), load.pc);
@@ -1546,6 +1587,34 @@ impl Tracer<'_> {
             | Stmt::Comment(_) => {}
         }
         Ok(())
+    }
+}
+
+/// The first of the four consecutive scalar registers a node intersection takes its
+/// descriptor from, before the pass binds it.
+fn descriptor_registers(op: &BvhIntersect) -> Option<u8> {
+    let Some(Expr::Var(Var::S(first))) = op.descriptor.first() else {
+        return None;
+    };
+    let consecutive = op.descriptor.len() == 4
+        && op.descriptor.iter().enumerate().all(|(k, word)| {
+            u8::try_from(k)
+                .ok()
+                .and_then(|k| first.checked_add(k))
+                .is_some_and(|reg| *word == Expr::Var(Var::S(reg)))
+        });
+    consecutive.then_some(*first)
+}
+
+/// The node memory of a node intersection after this pass: the buffer resource its
+/// descriptor describes. The pass replaces the four descriptor words by one
+/// [`Expr::BufferWord`] of that resource at offset 0. It marks the resource and is never
+/// printed as a read. The node pointer in the address operands counts from the start of that
+/// buffer.
+pub fn node_memory(op: &BvhIntersect) -> Option<ResId> {
+    match op.descriptor.as_slice() {
+        [Expr::BufferWord { res, .. }] => Some(*res),
+        _ => None,
     }
 }
 

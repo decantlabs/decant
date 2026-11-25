@@ -11,6 +11,8 @@
 //!   title also pairs programs with root signatures that lack their registers altogether.
 //! * A buffer behind a root descriptor is declared at the register of that parameter.
 //! * A sampler built from constants is read from the sampler heap at the index the host gives.
+//! * The node memory of a node intersection is a shader resource view read as words. Its class
+//!   comes from the binding table when the container has a record for it, else it is `t`.
 //!
 //! A table slot is 32 bytes in a resource table and 16 bytes in a sampler table.
 
@@ -97,6 +99,27 @@ fn declared(
         .iter()
         .find(|r| r.class == record.class && (r.lower..=r.upper).contains(&record.register))
         .copied()
+}
+
+/// The class of the node memory of a node intersection in a table: from the binding table,
+/// else a shader resource view. Only a view the HLSL helper can read as words is allowed.
+fn node_memory_class(
+    program: &StageProgram,
+    dword: u8,
+    offset: u32,
+) -> Result<RegisterClass, Refusal> {
+    let class = program
+        .binding_table
+        .iter()
+        .find(|r| r.sgpr == dword && r.word_offset * 4 == offset)
+        .map_or(RegisterClass::Srv, |record| record.class);
+    if class != RegisterClass::Srv {
+        return Err(refuse(
+            "bvh-node-class",
+            format!("table dword {dword} offset {offset:#x} is no shader resource view"),
+        ));
+    }
+    Ok(class)
 }
 
 fn usage_fits(class: RegisterClass, usage: ResourceUse) -> bool {
@@ -279,7 +302,9 @@ pub fn place(
     host: &dyn Host,
 ) -> Result<Needs, Refusal> {
     let mut needs = Needs::default();
-    for res in &mut func.resources {
+    let nodes = super::node_memories(func);
+    for (id, res) in func.resources.iter_mut().enumerate() {
+        let node_memory = nodes.contains(&crate::ir::ResId(id as u32));
         let placement = match res.origin {
             Origin::Table { sgpr, offset } => {
                 let sampler = matches!(res.usage, ResourceUse::Sampler { .. });
@@ -300,7 +325,11 @@ pub fn place(
                 // The container's tables and the mirror count the registers of every graphics
                 // stage from 8, whatever machine register the stage starts at.
                 let dword = program.stage.mirror_dword(sgpr);
-                let class = class_of(program, root_sig, sgpr, dword, slot, offset, res.usage)?;
+                let class = if node_memory {
+                    node_memory_class(program, dword, offset)?
+                } else {
+                    class_of(program, root_sig, sgpr, dword, slot, offset, res.usage)?
+                };
                 res.declared = declared(program, dword, offset);
                 needs.mirror_dwords.push(dword);
                 if sampler {

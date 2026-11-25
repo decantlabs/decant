@@ -10,6 +10,7 @@
 //! and its result with `asuint`.
 
 mod buffer;
+mod bvh;
 pub mod expr;
 mod image;
 pub(crate) mod simplify;
@@ -148,6 +149,9 @@ struct Printer<'a> {
     typed_rows: BTreeMap<ResId, String>,
     /// Whether single-component non-d16 typed loads use the scalar `decant_typed_decode_x` helper.
     typed_decode_x: bool,
+    /// The node intersection of the statement before and the local that holds its result
+    /// words, see [`bvh::assign`].
+    bvh: Option<(crate::ir::BvhIntersect, String)>,
 }
 
 impl Printer<'_> {
@@ -256,6 +260,15 @@ impl Printer<'_> {
     }
 
     fn stmt(&mut self, s: &Stmt) -> Result<(), Refusal> {
+        if !matches!(
+            s,
+            Stmt::Set {
+                value: Expr::BvhWord(..),
+                ..
+            }
+        ) {
+            self.bvh = None;
+        }
         match s {
             Stmt::Set { dst, value, guard } => {
                 let ty = if self.inline.remove(dst) {
@@ -267,6 +280,9 @@ impl Printer<'_> {
                 } else {
                     ""
                 };
+                if let Expr::BvhWord(op, word) = value {
+                    return bvh::assign(self, *guard, ty, *dst, op, *word);
+                }
                 if !matches!(value, Expr::BufferWord { res, .. } if self.by_index(*res)) {
                     self.assign(*guard, ty, Some(*dst), value);
                     return Ok(());
@@ -341,6 +357,7 @@ impl Printer<'_> {
 
     fn nodes(&mut self, nodes: &[Node]) -> Result<(), Refusal> {
         for n in nodes {
+            self.bvh = None;
             match n {
                 Node::Block(stmts) => {
                     for s in stmts {
@@ -416,6 +433,7 @@ fn collect_helpers(func: &Function) -> Vec<&'static Helper> {
             }
             Expr::BufferWord { offset, .. } => walk(offset, out),
             Expr::CodeWord(at) => walk(at, out),
+            Expr::BvhWord(op, _) => op.address.iter().for_each(|a| walk(a, out)),
             _ => {}
         }
     }
@@ -456,6 +474,9 @@ fn collect_helpers(func: &Function) -> Vec<&'static Helper> {
     }
     let mut out = Vec::new();
     nodes(&func.body, &mut out);
+    if bvh::used(&func.body) {
+        add(&bvh::INTERSECT, &mut out);
+    }
     for h in buffer::shadow_helpers(func) {
         add(h, &mut out);
     }
@@ -724,7 +745,6 @@ fn declarations(func: &Function, exec_const: bool) -> (BTreeSet<Var>, BTreeSet<V
 
 /// Prints `func`. Every resource must be placed.
 pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
-    crate::refuse_unlowered_bvh(func)?;
     let mut simplified = func.clone();
     let exec_const = simplify::run(&mut simplified);
     // After the constants are folded: a code read at a constant address is its word.
@@ -732,6 +752,7 @@ pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
     // The raw view of a heap slot may start before the title's first byte.
     buffer::add_view_offsets(&mut simplified, cx);
     let func = &simplified;
+    bvh::check(func)?;
     let mut out = String::new();
     for l in cx.header {
         writeln!(out, "// {l}").expect("writing to a string");
@@ -868,7 +889,7 @@ pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
     expr::for_each_expr(func, &mut |e| all += u32::from(by_index(e)));
     func.for_each_stmt(&mut |s| {
         if let Stmt::Set { value, .. } = s {
-            whole += u32::from(by_index(value));
+            whole += u32::from(by_index(value) || bvh::by_index(func, value));
         }
     });
     if all != whole {
@@ -1041,6 +1062,7 @@ pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
         inline,
         typed_rows,
         typed_decode_x,
+        bvh: None,
     };
     if !cx.iface.outputs.is_empty() {
         p.line("DecantOut decant_out = (DecantOut)0;");

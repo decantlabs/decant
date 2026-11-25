@@ -308,8 +308,10 @@ pub(super) fn hoisted_typed_rows(
 /// format conversions of the typed `tbuffer` loads and the conversions of a typed view.
 pub(super) fn preamble(func: &Function, cx: &Context, out: &mut String) -> Result<(), Refusal> {
     let mut constant = false;
+    // Node memory is read by the node intersection helper, which checks its view itself.
+    let nodes = crate::resource::node_memories(func);
     for (id, r) in func.resources.iter().enumerate() {
-        if !matches!(r.usage, ResourceUse::Words { .. }) {
+        if !matches!(r.usage, ResourceUse::Words { .. }) || nodes.contains(&ResId(id as u32)) {
             continue;
         }
         if r.declared.is_some_and(|d| d.psv_type == 9) {
