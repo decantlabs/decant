@@ -708,6 +708,7 @@ unsafe extern "system" fn fault_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     let engine = Engine::started();
     let handled = (write && engine.is_some_and(|e| e.on_write_fault(address)))
         || (access != ACCESS_EXECUTE && commit_on_access(address))
+        || (write && engine.is_some_and(|e| e.on_write_fault(address)))
         || engine.is_some_and(|e| e.fault_in(address, write));
     if handled { EXCEPTION_CONTINUE_EXECUTION } else { EXCEPTION_CONTINUE_SEARCH }
 }
@@ -1675,7 +1676,12 @@ impl Engine {
                 Self::protect_runs(open, PAGE_READWRITE);
                 true
             }
-            None => accessible(page, true),
+            None => {
+                if !accessible(page, true) {
+                    Self::protect_runs(vec![page], PAGE_READWRITE);
+                }
+                accessible(page, true)
+            }
         };
         if !was_held && track.is_held(index, now) {
             let hot = HOT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2883,5 +2889,86 @@ mod tests {
             Ok(_) => {}
             Err(e) => assert!(matches!(e, EngineError::Unsupported(_))),
         }
+    }
+
+    #[test]
+    fn write_fault_recovers_when_concurrent_commit_and_take_dirty_protect_page() {
+        let Some(e) = held(|| Engine::load_limited(4, 4)) else { return };
+        e.set_tracking(true);
+        let area = e.reserve(0, 2 * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(1).unwrap();
+        e.map_frames(area, &frames).unwrap();
+
+        // Thread A faults on an uncommitted tracked view page: first on_write_fault sees !accessible.
+        assert!(!accessible(area, false));
+        assert!(!e.on_write_fault(area));
+
+        // Thread B commits the page and take_dirty marks it clean with PAGE_READONLY.
+        assert!(Engine::commit_on_access_in(&e.state, area));
+        assert!(e.take_dirty(usize::MAX).contains(&page_of(frames[0])));
+        assert!(accessible(area, false));
+        assert!(!accessible(area, true));
+
+        // Thread A continues: commit_on_access_in sees it already committed, fault_in alone would fail,
+        // and the second on_write_fault reopens the page so the write succeeds.
+        assert!(!Engine::commit_on_access_in(&e.state, area));
+        assert!(!e.fault_in(area, true));
+        assert!(e.on_write_fault(area));
+        assert!(accessible(area, true));
+        write(area, 3, 0x42);
+        assert_eq!(read(area, 3), 0x42);
+
+        // When the tracker already considers the page dirty (on_fault returns None) yet the page is
+        // still PAGE_READONLY, on_write_fault must restore PAGE_READWRITE instead of returning false.
+        Engine::protect_runs(vec![area], PAGE_READONLY);
+        assert!(!accessible(area, true));
+        assert!(e.on_write_fault(area));
+        assert!(accessible(area, true));
+        write(area, 4, 0x55);
+        assert_eq!(read(area, 4), 0x55);
+
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
+    }
+
+    #[test]
+    fn concurrent_writers_and_take_dirty_on_uncommitted_tracked_pages() {
+        let Some((_guard, e)) = tracked() else { return };
+        const PAGES: usize = 64;
+        const WRITERS: usize = 4;
+        let area = e.reserve(0, PAGES * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(PAGES).unwrap();
+        e.map_frames(area, &frames).unwrap();
+
+        let barrier = std::sync::Barrier::new(WRITERS + 1);
+        std::thread::scope(|scope| {
+            for tid in 0..WRITERS {
+                let b = &barrier;
+                scope.spawn(move || {
+                    b.wait();
+                    for round in 0..8u8 {
+                        for p in 0..PAGES {
+                            let idx = (p + tid * 7) % PAGES;
+                            write(area + idx * P, tid, round.wrapping_add(idx as u8));
+                        }
+                    }
+                });
+            }
+            barrier.wait();
+            for _ in 0..400 {
+                let _ = e.take_dirty(16);
+                std::thread::yield_now();
+            }
+        });
+
+        for p in 0..PAGES {
+            for tid in 0..WRITERS {
+                let expected = 7u8.wrapping_add(p as u8);
+                assert_eq!(read(area + p * P, tid), expected);
+            }
+        }
+        let _ = e.take_dirty(usize::MAX);
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
     }
 }
