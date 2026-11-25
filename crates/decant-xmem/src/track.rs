@@ -41,6 +41,7 @@ pub struct Track {
     /// Per pool page: it is in `pending`.
     queued: Vec<bool>,
     aliases: HashMap<u32, Vec<Alias>>,
+    addresses: HashMap<usize, (u32, bool)>,
     held: HashMap<u32, Instant>,
     /// When `take` last made the page clean, and the quick faults in a row since (`HOT_WINDOW`).
     cleaned: HashMap<u32, (Instant, u8)>,
@@ -79,6 +80,11 @@ impl Track {
         self.committed.resize(pages, false);
     }
 
+    /// The pool page at a writable view address, without consulting the address space registry.
+    pub fn writable_page(&self, addr: usize) -> Option<u32> {
+        self.addresses.get(&addr).and_then(|&(page, rw)| rw.then_some(page))
+    }
+
     /// The addresses of the read write views of `page`.
     fn rw(&self, page: u32) -> Vec<usize> {
         self.aliases.get(&page).map(|v| v.iter().filter(|a| a.rw).map(|a| a.addr).collect()).unwrap_or_default()
@@ -104,12 +110,14 @@ impl Track {
 
     /// A view of the page appeared at `addr`, with the title protection `rw` (a new map counts as a write).
     pub fn on_map(&mut self, page: u32, addr: usize, rw: bool) -> Vec<usize> {
+        self.addresses.insert(addr, (page, rw));
         self.aliases.entry(page).or_default().push(Alias { addr, rw });
         self.dirty(page)
     }
 
     /// The view of the page at `addr` is gone.
     pub fn on_unmap(&mut self, page: u32, addr: usize) {
+        self.addresses.remove(&addr);
         if let Some(v) = self.aliases.get_mut(&page) {
             v.retain(|a| a.addr != addr);
             if v.is_empty() {
@@ -232,6 +240,21 @@ mod tests {
 
     fn all(_: u32) -> bool {
         true
+    }
+
+    #[test]
+    fn writable_addresses_follow_alias_removal_and_reuse() {
+        let mut t = track();
+        t.on_map(2, 0x10_0000, true);
+        t.on_map(2, 0x20_0000, false);
+        assert_eq!(t.writable_page(0x10_0000), Some(2));
+        assert_eq!(t.writable_page(0x20_0000), None);
+        t.on_unmap(2, 0x10_0000);
+        assert_eq!(t.writable_page(0x10_0000), None);
+        t.on_map(3, 0x10_0000, true);
+        assert_eq!(t.writable_page(0x10_0000), Some(3));
+        t.on_unmap(2, 0x20_0000);
+        assert_eq!(t.writable_page(0x10_0000), Some(3));
     }
 
     #[test]

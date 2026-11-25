@@ -5,6 +5,11 @@
 //! `regions`. This module only makes the Windows calls, each behind a `// SAFETY:` comment, and
 //! keeps the registry in step with what Windows holds.
 //!
+//! Dirty tracking has its own mutex. Dirty takes and tracked write faults never acquire the
+//! address space mutex. Mapping changes acquire the address space mutex first, then the dirty
+//! mutex, and hold both through alias updates and protection changes. Pool view metadata stays
+//! with the tracker so dirty takes can query commitment without the address space registry.
+//!
 //! `VirtualAlloc2`, `MapViewOfFile3` and `UnmapViewOfFile2` (Windows 10 1803 and later) are
 //! looked up in `kernelbase.dll` when the engine starts. Without them the engine does not start
 //! and every call answers `EngineError::Unsupported`, so `xmem.dll` still loads on older systems.
@@ -16,7 +21,7 @@ use std::fmt;
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, Once, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, PoisonError};
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{CloseHandle, EXCEPTION_ACCESS_VIOLATION, ERROR_NOT_ALL_ASSIGNED, GetLastError, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS};
@@ -576,13 +581,20 @@ struct State {
     regions: Regions,
     /// Commits that `place` backed with pool pages: base address to first frame and page count.
     commits: BTreeMap<usize, (u32, usize)>,
-    /// The dirty tracking of the GPU mirror, on after `set_tracking`.
-    track: Option<Track>,
+    dirty: Arc<Mutex<Dirty>>,
     /// What changed in the address space, for the GPU mirror.
     journal: Journal,
     /// The commits of `commit_region` by base, with one flag per page: the GPU was given an address in
     /// it (`gpu_use`). Only such pages are tracked and reported to the GPU mirror.
     on_demand: BTreeMap<usize, Vec<bool>>,
+}
+
+/// The tracker and its pool views share a lock separate from address space inspection.
+/// Mutations take the state lock before this lock and keep it through protection changes.
+#[derive(Default)]
+struct Dirty {
+    track: Option<Track>,
+    sections: Vec<(usize, usize, usize)>,
 }
 
 thread_local! {
@@ -629,12 +641,13 @@ pub struct Engine {
     api: Api,
     /// The most pages the pool may reach, whatever the system allows.
     limit_pages: usize,
-    /// Whether `State::track` is on, read by the fault handler without the lock.
+    /// Whether tracking is on, read by the fault handler without the lock.
     tracking: AtomicBool,
     /// The sequence number of the last journal record, readable without the lock.
     journal_seq: AtomicU64,
     /// Boxed so that its address stays put when the engine moves: the fault handler finds it in `STATES`.
     state: Box<Mutex<State>>,
+    dirty: Arc<Mutex<Dirty>>,
 }
 
 /// The state of every live engine, by address: the fault handler commits pages of any of them (the one
@@ -693,8 +706,8 @@ unsafe extern "system" fn fault_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     let address = record.ExceptionInformation[1];
     let write = access == ACCESS_WRITE;
     let engine = Engine::started();
-    let handled = (access != ACCESS_EXECUTE && commit_on_access(address))
-        || (write && engine.is_some_and(|e| e.on_write_fault(address)))
+    let handled = (write && engine.is_some_and(|e| e.on_write_fault(address)))
+        || (access != ACCESS_EXECUTE && commit_on_access(address))
         || engine.is_some_and(|e| e.fault_in(address, write));
     if handled { EXCEPTION_CONTINUE_EXECUTION } else { EXCEPTION_CONTINUE_SEARCH }
 }
@@ -731,10 +744,11 @@ impl Engine {
     pub fn load_limited(capacity_pages: usize, limit_pages: usize) -> Result<Engine, EngineError> {
         let api = Api::load()?;
         install_fault_handler();
-        let state = State { sections: Vec::new(), pages: PageAllocator::new(capacity_pages), regions: Regions::new(), commits: BTreeMap::new(), track: None, journal: Journal::new(), on_demand: BTreeMap::new() };
+        let dirty = Arc::new(Mutex::new(Dirty::default()));
+        let state = State { sections: Vec::new(), pages: PageAllocator::new(capacity_pages), regions: Regions::new(), commits: BTreeMap::new(), dirty: Arc::clone(&dirty), journal: Journal::new(), on_demand: BTreeMap::new() };
         let state = Box::new(Mutex::new(state));
         STATES.lock().unwrap_or_else(PoisonError::into_inner).push(&raw const *state as usize);
-        Ok(Engine { api, limit_pages, tracking: AtomicBool::new(false), journal_seq: AtomicU64::new(0), state })
+        Ok(Engine { api, limit_pages, tracking: AtomicBool::new(false), journal_seq: AtomicU64::new(0), state, dirty })
     }
 
     /// The engine of this process. The size of the section is `DECANT_XMEM_PHYSICAL_MIB` MiB when
@@ -773,7 +787,7 @@ impl Engine {
 
     /// Makes sure the first backing section exists, created on first use. Large pages are tried
     /// first and need the lock memory privilege. Without it normal pages serve, and that is logged once.
-    fn section(&self, st: &mut State) -> Result<(), EngineError> {
+    fn section(&self, st: &mut State, dirty: &mut Dirty) -> Result<(), EngineError> {
         if !st.sections.is_empty() {
             return Ok(());
         }
@@ -801,22 +815,24 @@ impl Engine {
         };
         let pages = st.pages.capacity();
         st.sections.push(Section::new(handle, 0, pages, "MapViewOfFile")?);
+        dirty.sections.push((0, pages, st.sections.last().unwrap().ro_view));
         Ok(())
     }
 
     /// Grows the pool by `extra` pages of normal pages, in sections of at most `MAX_SECTION_PAGES`:
     /// D3D12 opens a section of 2 GiB as a heap for the GPU but refused a page pool of several GiB
     /// as one section (E_INVALIDARG), so a larger growth becomes several sections.
-    fn grow(&self, st: &mut State, extra: usize) -> Result<(), EngineError> {
+    fn grow(&self, st: &mut State, dirty: &mut Dirty, extra: usize) -> Result<(), EngineError> {
         let mut left = extra;
         while left > 0 {
             let pages = left.min(MAX_SECTION_PAGES);
             let handle = create_section(pages * PAGE_BYTES, false).ok_or_else(|| Api::last_error("CreateFileMappingW (agrandir)"))?;
             let start = st.pages.capacity();
             st.sections.push(Section::new(handle, start, pages, "MapViewOfFile (agrandir)")?);
+            dirty.sections.push((start, pages, st.sections.last().unwrap().ro_view));
             st.pages.grow(pages);
             let total = st.pages.capacity();
-            if let Some(track) = st.track.as_mut() {
+            if let Some(track) = dirty.track.as_mut() {
                 track.grow(total);
             }
             left -= pages;
@@ -879,18 +895,21 @@ impl Engine {
     /// changes nothing and succeeds, as `VirtualAlloc` does.
     pub fn place(&self, address: usize, size: usize, commit: bool, protect: u32) -> Result<Placed, EngineError> {
         let mut st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         if commit
             && let Ok(found) = st.regions.covering(address, size)
             && found.iter().all(|(_, r)| r.kind != Kind::Placeholder)
         {
             return Ok(Placed { cuts: 0, committed: true, pages: found.iter().all(|(_, r)| matches!(r.kind, Kind::View { .. })) });
         }
-        self.place_locked(&mut st, address, size, commit, protect)
+        self.place_locked(&mut st, dirty, address, size, commit, protect)
     }
 
-    fn place_locked(&self, st: &mut State, address: usize, size: usize, commit: bool, protect: u32) -> Result<Placed, EngineError> {
+    fn place_locked(&self, st: &mut State, dirty: &mut Dirty, address: usize, size: usize, commit: bool, protect: u32) -> Result<Placed, EngineError> {
         if commit && view_protection(protect) == PAGE_READWRITE {
-            match self.commit_pages(st, address, size, protect) {
+            match self.commit_pages(st, dirty, address, size, protect) {
                 Ok(cuts) => return Ok(Placed { cuts, committed: true, pages: true }),
                 Err(EngineError::OutOfPages) => {
                     decant_log::trace(&format!("[xmem] commit 0x{address:x}, 0x{size:x} octets : pas de suite de pages libre, memoire privee a la place\r\n"));
@@ -917,6 +936,9 @@ impl Engine {
             return Err(EngineError::Invalid("taille de commit"));
         }
         let mut st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         let at = if address != 0 {
             self.api.reserve(address, size)?
         } else {
@@ -947,9 +969,10 @@ impl Engine {
         }
         st.on_demand.insert(at, vec![false; size / PAGE_BYTES]);
         self.note_flags(&mut st, journal::RESERVE, at, size / PAGE_BYTES, 0, journal::ON_DEMAND);
-        match self.place_locked(&mut st, at, size, true, protect) {
+        match self.place_locked(&mut st, dirty, at, size, true, protect) {
             Ok(placed) => Ok((at, placed.pages)),
             Err(e) => {
+                drop(dirty_guard);
                 drop(st);
                 let _ = self.release(at);
                 Err(e)
@@ -977,6 +1000,9 @@ impl Engine {
     pub fn gpu_use(&self, address: usize, len: usize) -> usize {
         let Some(end) = address.checked_add(len.max(1)) else { return 0 };
         let mut st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         let Some((&base, active)) = st.on_demand.range(..=address).next_back() else { return 0 };
         let pages = active.len();
         if address - base >= pages * PAGE_BYTES {
@@ -1005,7 +1031,7 @@ impl Engine {
             }
         }
         let mut open = Vec::new();
-        if let Some(track) = st.track.as_mut() {
+        if let Some(track) = dirty.track.as_mut() {
             for &(addr, page, rw) in &mapped {
                 open.extend(track.on_map(page, addr, rw));
             }
@@ -1026,17 +1052,17 @@ impl Engine {
 
     /// The commit of `place` in pages: a run of the pool mapped over the range, old bytes cleared.
     /// Returns the number of cuts made. `OutOfPages` when no run can be had.
-    fn commit_pages(&self, st: &mut State, address: usize, size: usize, protect: u32) -> Result<usize, EngineError> {
+    fn commit_pages(&self, st: &mut State, dirty: &mut Dirty, address: usize, size: usize, protect: u32) -> Result<usize, EngineError> {
         if size == 0 || !size.is_multiple_of(PAGE_BYTES) {
             return Err(EngineError::Invalid("taille de commit"));
         }
         let count = size / PAGE_BYTES;
-        self.section(st)?;
-        self.make_room(st, count, false)?;
+        self.section(st, dirty)?;
+        self.make_room(st, dirty, count, false)?;
         let first = st.pages.allocate_run(count).ok_or(EngineError::OutOfPages)?;
         let frames: Vec<u32> = (0..count as u32).map(|k| first + k * FRAMES_PER_PAGE).collect();
-        self.track_changed(st, &frames);
-        let mapped = self.carve(st, address, size).and_then(|cuts| self.map_one(st, address, first, count, view_protection(protect)).map(|()| cuts));
+        self.track_changed(dirty, &frames);
+        let mapped = self.carve(st, address, size).and_then(|cuts| self.map_one(st, dirty, address, first, count, view_protection(protect)).map(|()| cuts));
         let cuts = match mapped {
             Ok(cuts) => cuts,
             Err(e) => {
@@ -1079,9 +1105,12 @@ impl Engine {
     /// placeholders next to it. The pages of a commit go back to the pool. Returns its size.
     pub fn unplace(&self, address: usize) -> Result<usize, EngineError> {
         let mut st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         if let Some(&(first, count)) = st.commits.get(&address) {
             let size = count * PAGE_BYTES;
-            self.clear_range(&mut st, address, size)?;
+            self.clear_range(&mut st, dirty, address, size)?;
             st.commits.remove(&address);
             let frames: Vec<u32> = (0..count as u32).map(|k| first + k * FRAMES_PER_PAGE).collect();
             st.pages.free(&frames)?;
@@ -1100,16 +1129,19 @@ impl Engine {
     /// in order. Fails when the pool is full.
     pub fn allocate_pages(&self, count: usize) -> Result<Vec<u32>, EngineError> {
         let mut st = self.lock();
-        self.section(&mut st)?;
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
+        self.section(&mut st, dirty)?;
         let free = st.pages.capacity() - st.pages.used_count();
-        let grown = self.make_room(&mut st, count, true);
+        let grown = self.make_room(&mut st, dirty, count, true);
         // A section that could not be made does not fail a request the free pages can still serve.
         let outcome = match grown {
             Err(e) if free < count => Err(e),
             _ => st.pages.allocate(count).ok_or(EngineError::OutOfPages),
         };
         if let Ok(frames) = &outcome {
-            self.track_changed(&mut st, frames);
+            self.track_changed(dirty, frames);
         }
         let (pool, used) = (st.pages.capacity(), st.pages.used_count());
         let refused = if outcome.is_err() { ", refuse" } else { "" };
@@ -1130,7 +1162,10 @@ impl Engine {
         }
         let count = (offset + data.len()).div_ceil(PAGE_BYTES);
         let frames = frames.get(..count).ok_or(EngineError::Invalid("fewer frames than the data covers"))?;
-        let mut st = self.lock();
+        let st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         let mut targets = Vec::with_capacity(count);
         for &frame in frames {
             if !st.pages.is_allocated(frame) {
@@ -1156,7 +1191,7 @@ impl Engine {
             written.extend(index_of(frames[k]).map(|index| (index, start, n)));
             at += n;
         }
-        self.track_changed(&mut st, frames);
+        self.track_changed(dirty, frames);
         let mut seen: Vec<(usize, usize)> = Vec::new();
         for (base, region) in st.regions.views() {
             let Kind::View { first_frame } = region.kind else { continue };
@@ -1190,15 +1225,21 @@ impl Engine {
     /// Consecutive frames share one view.
     pub fn map_frames(&self, base: usize, frames: &[u32]) -> Result<(), EngineError> {
         let mut st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         let entries: Vec<(usize, u32)> = frames.iter().enumerate().map(|(i, &f)| (base + i * PAGE_BYTES, f)).collect();
-        self.map_entries(&mut st, &entries)
+        self.map_entries(&mut st, dirty, &entries)
     }
 
     /// Unmaps `count` pages from `base`, which return to the reserved state.
     pub fn unmap_pages(&self, base: usize, count: usize) -> Result<(), EngineError> {
         let mut st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         let size = count.checked_mul(PAGE_BYTES).ok_or(EngineError::Invalid("plage trop grande"))?;
-        self.clear_range(&mut st, base, size)
+        self.clear_range(&mut st, dirty, base, size)
     }
 
     /// Shows at `to` the pool pages that the `count` pages from `from` show, page by page: one more
@@ -1209,6 +1250,9 @@ impl Engine {
     pub fn show_pages_at(&self, to: usize, from: usize, count: usize) -> Result<(), EngineError> {
         let (to, from) = (to & !(PAGE_BYTES - 1), from & !(PAGE_BYTES - 1));
         let mut st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         let mut entries: Vec<(usize, u32)> = Vec::with_capacity(count);
         for k in 0..count {
             let page = k.checked_mul(PAGE_BYTES).and_then(|d| from.checked_add(d)).ok_or(EngineError::Invalid("plage trop grande"))?;
@@ -1218,19 +1262,25 @@ impl Engine {
             };
             entries.push((to + k * PAGE_BYTES, frame));
         }
-        self.map_entries(&mut st, &entries)
+        self.map_entries(&mut st, dirty, &entries)
     }
 
     /// Maps each frame at its own address, one page each, with 0 unmapping, as `map_frames`.
     pub fn map_scatter(&self, entries: &[(usize, u32)]) -> Result<(), EngineError> {
         let mut st = self.lock();
-        self.map_entries(&mut st, entries)
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
+        self.map_entries(&mut st, dirty, entries)
     }
 
     /// Releases the reservation that starts at `base`: its views are unmapped, its placeholders
     /// released and its address range given back.
     pub fn release(&self, base: usize) -> Result<(), EngineError> {
         let mut st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         for at in st.regions.reservation_at(base)? {
             match st.regions.at(at).ok_or(RegionError::Unknown)?.kind {
                 Kind::Placeholder => {
@@ -1240,7 +1290,7 @@ impl Engine {
                 Kind::Allocation => self.api.release_placeholder(at)?,
                 Kind::View { .. } => {
                     self.api.unmap(at, false)?;
-                    self.forget_view(&mut st, at)?;                    // The pages of a commit go back to the pool with the reservation.
+                    self.forget_view(&mut st, dirty, at)?;                    // The pages of a commit go back to the pool with the reservation.
                     if let Some((first, count)) = st.commits.remove(&at) {
                         let frames: Vec<u32> = (0..count as u32).map(|k| first + k * FRAMES_PER_PAGE).collect();
                         let _ = st.pages.free(&frames);
@@ -1298,7 +1348,7 @@ impl Engine {
     /// size, the pool grows by one section big enough for the whole request. With `scatter`, a
     /// request that does not fit the room for a section may still grow the pool by what is missing,
     /// and is then served by scattered pages. The pool never grows past `limit_pages`.
-    fn make_room(&self, st: &mut State, count: usize, scatter: bool) -> Result<(), EngineError> {
+    fn make_room(&self, st: &mut State, dirty: &mut Dirty, count: usize, scatter: bool) -> Result<(), EngineError> {
         let pool = st.pages.capacity();
         let free = pool - st.pages.used_count();
         let room = self.limit_pages.saturating_sub(pool);
@@ -1309,7 +1359,7 @@ impl Engine {
         let reserved = !on_wine();
         let available = if reserved {
             u64::MAX
-        } else if st.track.is_some() {
+        } else if dirty.track.is_some() {
             available_commit() / 2
         } else {
             available_commit()
@@ -1328,7 +1378,7 @@ impl Engine {
             Growth::None => Ok(()),
             Growth::Add(extra) if count.saturating_sub(if scatter { free } else { 0 }) <= room => {
                 let extra = extra.min(room);
-                self.grow(st, extra)?;
+                self.grow(st, dirty, extra)?;
                 let bound = if reserved {
                     format!("sections reservees, bornee par la limite du pool seule ({} pages)", self.limit_pages)
                 } else {
@@ -1383,7 +1433,7 @@ impl Engine {
     }
 
     /// Maps the entries (address, frame), validated first so that a bad entry changes nothing.
-    fn map_entries(&self, st: &mut State, entries: &[(usize, u32)]) -> Result<(), EngineError> {
+    fn map_entries(&self, st: &mut State, dirty: &mut Dirty, entries: &[(usize, u32)]) -> Result<(), EngineError> {
         let mut spans: Vec<(usize, u32, u32)> = Vec::with_capacity(entries.len());
         for &(address, frame) in entries {
             let base = address & !(PAGE_BYTES - 1);
@@ -1394,7 +1444,7 @@ impl Engine {
             spans.push((base, frame, covering[0].1.protect));
         }
         for &(base, _, _) in &spans {
-            self.clear_range(st, base, PAGE_BYTES)?;
+            self.clear_range(st, dirty, base, PAGE_BYTES)?;
         }
         // Consecutive entries that go to consecutive addresses with consecutive frames share a view.
         let mut i = 0;
@@ -1408,7 +1458,7 @@ impl Engine {
             while i + n < spans.len() && spans[i + n].0 == base + n * PAGE_BYTES && spans[i + n].1 == frame + n as u32 * FRAMES_PER_PAGE && spans[i + n].2 == protect {
                 n += 1;
             }
-            self.map_one(st, base, frame, n, view_protection(protect))?;
+            self.map_one(st, dirty, base, frame, n, view_protection(protect))?;
             i += n;
         }
         Ok(())
@@ -1416,7 +1466,7 @@ impl Engine {
 
     /// Gives `[base, base + size)` back as placeholders: the views that touch it are unmapped (the
     /// pages of a view that stick out are mapped again), and the placeholders are joined.
-    fn clear_range(&self, st: &mut State, base: usize, size: usize) -> Result<(), EngineError> {
+    fn clear_range(&self, st: &mut State, dirty: &mut Dirty, base: usize, size: usize) -> Result<(), EngineError> {
         let start = base & !(PAGE_BYTES - 1);
         let end = base.checked_add(size).and_then(|e| e.checked_next_multiple_of(PAGE_BYTES)).ok_or(RegionError::BadRange)?;
         let found = st.regions.covering(start, end - start)?;
@@ -1428,12 +1478,12 @@ impl Engine {
             self.api.unmap(at, true)?;
             st.regions.clear_view(at)?;
             st.pages.unmap(first_frame, count)?;
-            self.track_unmap(st, at, first_frame, count);
+            self.track_unmap(st, dirty, at, first_frame, count);
             let protect = view_protection(region.protect);
             for k in 0..count {
                 let page = at + k * PAGE_BYTES;
                 if page < start || page >= end {
-                    self.map_one(st, page, first_frame + k as u32 * FRAMES_PER_PAGE, 1, protect)?;
+                    self.map_one(st, dirty, page, first_frame + k as u32 * FRAMES_PER_PAGE, 1, protect)?;
                 }
             }
         }
@@ -1442,9 +1492,9 @@ impl Engine {
 
     /// Maps `count` consecutive pages from `first` over `[at, at + count * 64 KiB)`, which lies in
     /// placeholders of one reservation.
-    fn map_one(&self, st: &mut State, at: usize, first: u32, count: usize, protect: u32) -> Result<(), EngineError> {
+    fn map_one(&self, st: &mut State, dirty: &mut Dirty, at: usize, first: u32, count: usize, protect: u32) -> Result<(), EngineError> {
         let start = index_of(first).ok_or(PageError::BadFrame(first))?;
-        self.section(st)?;
+        self.section(st, dirty)?;
         self.coalesce(st, at, count * PAGE_BYTES)?;
         // One view per backing section: a run that crosses the end of a section is mapped in parts.
         let mut done = 0;
@@ -1458,26 +1508,26 @@ impl Engine {
             self.api.map(handle, seg_at, offset, n * PAGE_BYTES, protect)?;
             st.regions.set_view(seg_at, seg_first)?;
             st.pages.map(seg_first, n)?;
-            self.track_map(st, seg_at, seg_first, n, protect);
+            self.track_map(st, dirty, seg_at, seg_first, n, protect);
             done += n;
         }
         Ok(())
     }
 
     /// Registry side of ending a view: the pages lose a view and the range stays a placeholder.
-    fn forget_view(&self, st: &mut State, base: usize) -> Result<(), EngineError> {
+    fn forget_view(&self, st: &mut State, dirty: &mut Dirty, base: usize) -> Result<(), EngineError> {
         let region = st.regions.clear_view(base)?;
         if let Kind::View { first_frame } = region.kind {
             st.pages.unmap(first_frame, region.size / PAGE_BYTES)?;
-            self.track_unmap(st, base, first_frame, region.size / PAGE_BYTES);
+            self.track_unmap(st, dirty, base, first_frame, region.size / PAGE_BYTES);
         }
         Ok(())
     }
 
     /// Notes that the view of `count` pages from `first_frame` at `at` is gone: the dirty tracking
     /// forgets its addresses and the GPU mirror is told.
-    fn track_unmap(&self, st: &mut State, at: usize, first_frame: u32, count: usize) {
-        if let (Some(track), Some(first)) = (st.track.as_mut(), index_of(first_frame)) {
+    fn track_unmap(&self, st: &mut State, dirty: &mut Dirty, at: usize, first_frame: u32, count: usize) {
+        if let (Some(track), Some(first)) = (dirty.track.as_mut(), index_of(first_frame)) {
             for k in 0..count {
                 track.on_unmap((first + k) as u32, at + k * PAGE_BYTES);
             }
@@ -1488,11 +1538,11 @@ impl Engine {
     /// Notes that the view of `count` pages from `first_frame` at `at` exists, with the view protection `protect`.
     /// A new map counts as a write: the pages are dirty, and the other views of them read write again.
     /// Pages of a commit of `commit_region` that the GPU was not given yet stay out of both.
-    fn track_map(&self, st: &mut State, at: usize, first_frame: u32, count: usize, protect: u32) {
+    fn track_map(&self, st: &mut State, dirty: &mut Dirty, at: usize, first_frame: u32, count: usize, protect: u32) {
         let Some(first) = index_of(first_frame) else { return };
         let shown: Vec<bool> = (0..count).map(|k| Self::shown(st, at + k * PAGE_BYTES)).collect();
         let mut open = Vec::new();
-        if let Some(track) = st.track.as_mut() {
+        if let Some(track) = dirty.track.as_mut() {
             for k in (0..count).filter(|&k| shown[k]) {
                 open.extend(track.on_map((first + k) as u32, at + k * PAGE_BYTES, protect == PAGE_READWRITE));
             }
@@ -1510,9 +1560,9 @@ impl Engine {
 
     /// Notes that the bytes of `frames` changed outside the title's views: the allocator handed them
     /// out, or the engine wrote them (`write_frames`).
-    fn track_changed(&self, st: &mut State, frames: &[u32]) {
+    fn track_changed(&self, dirty: &mut Dirty, frames: &[u32]) {
         let mut open = Vec::new();
-        if let Some(track) = st.track.as_mut() {
+        if let Some(track) = dirty.track.as_mut() {
             for &frame in frames {
                 if let Some(page) = index_of(frame) {
                     open.extend(track.on_changed(page as u32));
@@ -1563,8 +1613,11 @@ impl Engine {
     /// Switches the dirty tracking of the GPU mirror on or off. On, every page that a view maps starts
     /// dirty, so the first sync copies them all.
     pub fn set_tracking(&self, on: bool) {
-        let mut st = self.lock();
-        if on == st.track.is_some() {
+        let st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
+        if on == dirty.track.is_some() {
             return;
         }
         if !on {
@@ -1576,7 +1629,7 @@ impl Engine {
                 }
             }
             Self::protect_runs(open, PAGE_READWRITE);
-            st.track = None;
+            dirty.track = None;
             self.tracking.store(false, Ordering::Release);
             return;
         }
@@ -1590,7 +1643,7 @@ impl Engine {
                 }
             }
         }
-        st.track = Some(track);
+        dirty.track = Some(track);
         self.tracking.store(true, Ordering::Release);
     }
 
@@ -1608,15 +1661,13 @@ impl Engine {
             return false;
         }
         let page = address & !(PAGE_BYTES - 1);
-        let mut st = self.lock();
-        let Some((base, region)) = st.regions.containing(page) else { return false };
-        let Kind::View { first_frame } = region.kind else { return false };
-        if view_protection(region.protect) != PAGE_READWRITE {
+        let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(track) = dirty.track.as_mut() else { return false };
+        let Some(index) = track.writable_page(page) else { return false };
+        // An untouched section page needs the commit path before protection can change.
+        if !accessible(page, false) {
             return false;
         }
-        let Some(first) = index_of(first_frame) else { return false };
-        let index = (first + (page - base) / PAGE_BYTES) as u32;
-        let Some(track) = st.track.as_mut() else { return false };
         let now = Instant::now();
         let was_held = track.is_held(index, now);
         let handled = match track.on_fault(index, now) {
@@ -1666,7 +1717,10 @@ impl Engine {
     fn commit_on_access_in(state: &Mutex<State>, address: usize) -> bool {
         static COMMITS: AtomicU64 = AtomicU64::new(0);
         let page = address & !(PAGE_BYTES - 1);
-        let mut st = lock_state(state);
+        let st = lock_state(state);
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         let Some((base, region)) = st.regions.containing(page) else { return false };
         let Kind::View { first_frame } = region.kind else { return false };
         let Some(first) = index_of(first_frame) else { return false };
@@ -1674,7 +1728,7 @@ impl Engine {
         if !matches!(Self::commit_page(&st, index), Ok(true)) {
             return false;
         }
-        if let Some(open) = st.track.as_mut().and_then(|track| track.on_fault(index as u32, Instant::now())) {
+        if let Some(open) = dirty.track.as_mut().and_then(|track| track.on_fault(index as u32, Instant::now())) {
             Self::protect_runs(open, PAGE_READWRITE);
         }
         let n = COMMITS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1688,12 +1742,12 @@ impl Engine {
     /// next one. The caller copies them from the read only view of their section after this returns.
     pub fn take_dirty(&self, cap: usize) -> Vec<u32> {
         let asked = Instant::now();
-        let mut st = self.lock();
+        let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
         let locked = Instant::now();
-        if st.track.is_none() {
+        if dirty.track.is_none() {
             return Vec::new();
         }
-        let sections: Vec<(usize, usize, usize)> = st.sections.iter().map(|s| (s.start, s.pages, s.ro_view)).collect();
+        let sections = dirty.sections.clone();
         let runs_seen = std::cell::RefCell::new(CommittedRuns::default());
         let committed = |page: u32| {
             let i = page as usize;
@@ -1702,13 +1756,14 @@ impl Engine {
                 .find(|&&(start, pages, _)| i >= start && i < start + pages)
                 .is_some_and(|&(start, _, view)| runs_seen.borrow_mut().is_committed(view + (i - start) * PAGE_BYTES, query_region))
         };
-        let Some(track) = st.track.as_mut() else { return Vec::new() };
+        let Some(track) = dirty.track.as_mut() else { return Vec::new() };
         let pending = track.pending_len();
         let (pages, protect) = track.take(Instant::now(), cap, committed);
         let taken = Instant::now();
         let runs = protect.len();
         Self::protect_runs(protect, PAGE_READONLY);
         let done = Instant::now();
+        drop(dirty);
         take_stats(pages.len(), runs, pending, runs_seen.borrow().queries, [locked - asked, taken - locked, done - taken]);
         pages
     }
@@ -1734,7 +1789,10 @@ impl Engine {
     /// from now, as after any kernel write.
     pub fn end_write(&self, address: usize, len: usize) {
         let Some(end) = address.checked_add(len).filter(|_| len != 0) else { return };
-        let mut st = self.lock();
+        let st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         let now = Instant::now();
         let mut page = address & !(PAGE_BYTES - 1);
         while page < end {
@@ -1745,7 +1803,7 @@ impl Engine {
             let region_end = base + region.size;
             if let Kind::View { first_frame } = region.kind
                 && let Some(first) = index_of(first_frame)
-                && let Some(track) = st.track.as_mut()
+                && let Some(track) = dirty.track.as_mut()
             {
                 while page < end && page < region_end {
                     track.hold_from((first + (page - base) / PAGE_BYTES) as u32, now);
@@ -1762,7 +1820,10 @@ impl Engine {
             return;
         }
         let Some(end) = address.checked_add(len) else { return };
-        let mut st = self.lock();
+        let st = self.lock();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = &mut *dirty_guard;
         let mut open = Vec::new();
         let mut page = address & !(PAGE_BYTES - 1);
         while page < end {
@@ -1778,7 +1839,7 @@ impl Engine {
                 while page < end && page < region_end {
                     let index = first + (page - base) / PAGE_BYTES;
                     let _ = Self::commit_page(&st, index);
-                    if let Some(track) = st.track.as_mut() {
+                    if let Some(track) = dirty.track.as_mut() {
                         open.extend(track.prepare_until(index as u32, until));
                     }
                     page += PAGE_BYTES;
@@ -2463,6 +2524,73 @@ mod tests {
 
     fn page_of(frame: u32) -> u32 {
         index_of(frame).unwrap() as u32
+    }
+
+    #[test]
+    fn dirty_take_and_write_faults_finish_while_the_state_lock_is_held() {
+        let Some((_guard, e)) = tracked() else { return };
+        let area = e.reserve(0, 2 * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(1).unwrap();
+        e.map_frames(area, &frames).unwrap();
+        e.map_frames(area + P, &frames).unwrap();
+        write(area, 0, 1);
+        let (send, recv) = std::sync::mpsc::channel();
+        let state = e.lock();
+        let worker = std::thread::spawn(move || {
+            let first = e.take_dirty(usize::MAX);
+            write(area + P, 0, 2);
+            let second = e.take_dirty(usize::MAX);
+            send.send((first, second, read(area, 0))).unwrap();
+        });
+        let result = recv.recv_timeout(std::time::Duration::from_secs(5));
+        drop(state);
+        worker.join().unwrap();
+        let (first, second, value) = result.expect("dirty tracking waited for the state lock");
+        assert!(first.contains(&page_of(frames[0])));
+        assert!(second.contains(&page_of(frames[0])));
+        assert_eq!(value, 2);
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
+    }
+
+    #[test]
+    fn concurrent_writes_alias_maps_and_dirty_takes_keep_the_last_write() {
+        let Some((_guard, e)) = tracked() else { return };
+        let area = e.reserve(0, 3 * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(2).unwrap();
+        e.map_frames(area, &frames[..1]).unwrap();
+        e.map_frames(area + P, &frames[..1]).unwrap();
+        write(area, 0, 1);
+        e.take_dirty(usize::MAX);
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                for i in 0..500 {
+                    write(area + (i % 2) * P, 0, (i % 251) as u8);
+                    std::thread::yield_now();
+                }
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..200 {
+                    e.map_frames(area + 2 * P, &frames[1..]).unwrap();
+                    e.unmap_pages(area + 2 * P, 1).unwrap();
+                }
+            });
+            barrier.wait();
+            for _ in 0..500 {
+                let pages = e.take_dirty(1);
+                assert!(pages.len() <= 1);
+                std::thread::yield_now();
+            }
+        });
+        write(area + P, 0, 253);
+        assert!(e.take_dirty(usize::MAX).contains(&page_of(frames[0])));
+        assert_eq!(read(area, 0), 253);
+        assert!(e.dirty.lock().unwrap().track.as_ref().unwrap().writable_page(area + 2 * P).is_none());
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
     }
 
     #[test]
