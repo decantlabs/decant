@@ -32,6 +32,7 @@
 pub mod adapter_choice;
 pub mod abi;
 pub mod alloc_info;
+pub mod alloc_pool;
 pub mod compile_service;
 pub mod detile_plan;
 pub mod direct_cache;

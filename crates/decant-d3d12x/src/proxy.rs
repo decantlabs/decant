@@ -460,6 +460,13 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
             crate::indirect_clamp::list_forget(this as usize);
             crate::present::list_reset(proxy.pc as usize);
         }
+        if proxy.kind == Kind::List as i32 || proxy.kind == Kind::DmaList as i32 {
+            crate::alloc_pool::forget_list(proxy.pc as usize);
+        }
+        if proxy.kind == Kind::Allocator as i32 {
+            // SAFETY: final release of this title allocator proxy.
+            unsafe { crate::alloc_pool::forget(proxy.pc as usize) };
+        }
         if proxy.kind == Kind::Resource as i32 {
             crate::views_at::forget_resource(proxy.pc as usize);
             crate::detile::forget(proxy.pc as usize);
@@ -829,19 +836,21 @@ unsafe fn create_list(this: *mut Proxy, mask: u32, kind: u32, alloc: Object, pso
     // SAFETY: by the contract above.
     unsafe {
         let pc = (*this).pc;
-        let alloc = unwrap(alloc);
+        let title_alloc = unwrap(alloc);
+        let backing = crate::alloc_pool::current(title_alloc as usize) as Object;
         // A pipeline made on first bind is made here (null when the PC runtime refused it).
         let pso = unwrap(pso);
         let mut l: Object = std::ptr::null_mut();
-        let mut hr = method::<CreateList>(pc, 12)(pc, mask, kind, alloc, pso, riid, &mut l);
+        let mut hr = method::<CreateList>(pc, 12)(pc, mask, kind, backing, pso, riid, &mut l);
         if hr == E_NOINTERFACE && !is_iid(riid, &IID_GRAPHICS_COMMAND_LIST) {
             xs_log!("console device: command list IID {{{}}} unknown to the PC runtime, created as ID3D12GraphicsCommandList", guid_at(riid));
-            hr = method::<CreateList>(pc, 12)(pc, mask, kind, alloc, pso, &IID_GRAPHICS_COMMAND_LIST, &mut l);
+            hr = method::<CreateList>(pc, 12)(pc, mask, kind, backing, pso, &IID_GRAPHICS_COMMAND_LIST, &mut l);
         }
-        let kind = if is_iid(riid, &IID_DMA_COMMAND_LIST) { Kind::DmaList } else { Kind::List };
-        let hr = give(hr, l, kind, out);
+        let proxy_kind = if is_iid(riid, &IID_DMA_COMMAND_LIST) { Kind::DmaList } else { Kind::List };
+        let hr = give(hr, l, proxy_kind, out);
         if hr >= 0 && !(*out).is_null() {
-            crate::upload_mem::with(|m| m.set_allocator(*out as usize, alloc as usize));
+            crate::alloc_pool::created_on(l as usize, title_alloc as usize, backing as usize, kind as i32);
+            crate::upload_mem::with(|m| m.set_allocator(*out as usize, title_alloc as usize));
             crate::indirect_clamp::list_reset(*out as usize, pso as usize);
         }
         hr
@@ -871,6 +880,9 @@ extern "system" fn dev_create_allocator(this: *mut Proxy, kind: u32, riid: *cons
         if hr == E_NOINTERFACE && !is_iid(riid, &IID_COMMAND_ALLOCATOR) {
             xs_log!("console device: allocator IID {{{}}} unknown to the PC runtime, created as ID3D12CommandAllocator", guid_at(riid));
             hr = method::<CreateAllocator>(pc, 9)(pc, kind, &IID_COMMAND_ALLOCATOR, &mut a);
+        }
+        if hr >= 0 && !a.is_null() {
+            crate::alloc_pool::note_allocator_type(a as usize, kind as i32);
         }
         give(hr, a, Kind::Allocator, out)
     }
@@ -3699,7 +3711,7 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
         crate::rt_diag::list_reset(key, pso as usize);
         let allocator = unwrap(allocator);
         crate::upload_mem::with(|m| m.set_allocator(key, allocator as usize));
-        method::<Reset>(pc, 10)(pc, allocator, pso)
+        crate::alloc_pool::reset_list(pc as usize, allocator as usize, |backing| method::<Reset>(pc, 10)(pc, backing as Object, pso))
     }
 }
 
@@ -3768,7 +3780,15 @@ unsafe fn execute_closed(pc: Object, lists: &[Object]) {
         xs_log!("console queue: {} unclosed command lists left out of a submission of {}", lists.len() - kept.len(), lists.len());
     }
     // SAFETY: by the contract above.
-    unsafe { method::<Execute>(pc, 10)(pc, kept.len() as u32, kept.as_ptr()) };
+    unsafe {
+        if !kept.is_empty() {
+            crate::alloc_pool::note_resubmits(pc, &kept);
+        }
+        method::<Execute>(pc, 10)(pc, kept.len() as u32, kept.as_ptr());
+        if !kept.is_empty() {
+            crate::alloc_pool::executed(pc, &kept);
+        }
+    };
     crate::diagnose::removed_after(|| format!("a title submission of {} lists on queue {pc:p}", kept.len()));
 }
 

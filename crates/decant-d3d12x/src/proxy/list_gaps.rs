@@ -291,7 +291,8 @@ pub(super) extern "system" fn allocator_reset(this: *mut Proxy) -> HRESULT {
     // SAFETY: `this` is a live allocator proxy.
     unsafe {
         let pc = (*this).pc;
-        let hr = method::<AllocReset>(pc, 8)(pc);
+        let hr = crate::alloc_pool::title_reset(pc, |raw| method::<AllocReset>(raw, 8)(raw))
+            .unwrap_or_else(|| method::<AllocReset>(pc, 8)(pc));
         if hr >= 0 {
             for (res, bytes) in crate::upload_mem::with(|m| m.free_owner(pc as usize)) {
                 // SAFETY: the chunk was charged when it was added and is released once.
