@@ -58,6 +58,7 @@ On Windows, `build.cmd` builds the DLLs and test programs into `build\` (see the
 | `decant-gdk-config` | `gdk_config_reader`: reads `MicrosoftGame.config` and checks the PE headers of the title executable |
 | `decant-stub` | Generates stand in DLL projects for console modules a title imports and nothing provides |
 | `decant-log` | The session log shared by the DLLs (`DECANT_LOG`, `DECANT_LOG_PATH`) |
+| `decant-trace` | Thread local spans, lock waits, counters and frame marks written as a Perfetto JSON trace when `DECANT_TRACE` is set, an optional `tracy` feature, and `decant_trace_summary`, the analyzer of the traces |
 
 ## Tools and tests
 
