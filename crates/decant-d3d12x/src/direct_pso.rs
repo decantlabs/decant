@@ -35,6 +35,14 @@
 //!   (default a quarter of the cores, 1 to 4).
 //! * `DECANT_D3D12X_MAX_LIVE_HLSL_BYTES=<n>` is the largest stage HLSL compiled live (default 8 MiB,
 //!   `0` no limit). A larger stage without cached DXIL is refused with its size in the log.
+//! * `DECANT_D3D12X_PSO_CACHE=<dir>` is the library of driver compiled pipeline states
+//!   (`pso_library`, default `%LOCALAPPDATA%\Decant\pso-library`, `0` off).
+//!
+//! A graphics or compute pipeline made with compiled shaders keeps its driver blob in the pipeline
+//! library. The next run hands that blob to the PC runtime in the `CachedPSO` field of the
+//! description, so the driver does not compile the pipeline again. The library opens at the first
+//! direct pipeline the PC runtime made, because its folder is named after that device's adapter
+//! and driver. Its counts are logged with the summary (`pso library:`).
 //!
 //! The startup line names the translator hash of the build (`translator_hash=`), the same one the
 //! cache keys hold. `direct shaders summary:` is logged at the first pipeline, every 64 pipelines,
@@ -45,8 +53,9 @@
 
 #![allow(unsafe_code)]
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::direct_source::DirectSource;
@@ -54,6 +63,7 @@ use crate::precompile_queue::Queue;
 use crate::compile_service::{PipelineKind, Poll, Service, Settings, MAX_LIVE_HLSL_BYTES, O0_HLSL_BYTES};
 use crate::lazy_pso::{Owned, COMPUTE_DESC_SIZE, GRAPHICS_DESC_SIZE, MESH_DESC_SIZE};
 use crate::log::xs_log;
+use crate::pso_library::Library;
 use crate::shader_source::{InputElement, Linkage, Pipeline, Refusal, ShaderSource, StageInput, StageKind};
 
 impl crate::compile_service::Compiler for decant_dxc::Dxc {
@@ -140,10 +150,12 @@ fn start() -> Option<Service> {
         if let Some(Some(service)) = SERVICE.get() {
             service.log_summary_if_changed();
         }
+        log_library_if_changed();
     });
     if let Err(e) = ticker {
         xs_log!("direct shaders: could not start the summary timer ({e})");
     }
+    LIBRARY.get_or_init(open_library);
     let service = Service::new(source, Arc::new(dxc), settings);
     service.set_live(live_limit);
     Some(service)
@@ -153,6 +165,26 @@ static SERVICE: OnceLock<Option<Service>> = OnceLock::new();
 static SOURCE: OnceLock<Arc<DirectSource>> = OnceLock::new();
 static QUEUE: OnceLock<Option<Arc<Queue>>> = OnceLock::new();
 static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
+
+/// The pipeline library key of each pipeline handed out with compiled shaders and not made yet,
+/// by the address of its console description copy, and whether it got a stored blob.
+static WAITING: LazyLock<Mutex<HashMap<usize, (u128, bool)>>> = LazyLock::new(Mutex::default);
+
+/// The pipeline library of the run, once the direct service started with it on.
+fn library() -> Option<&'static Library> {
+    LIBRARY.get()?.as_ref()
+}
+
+/// The library of `DECANT_D3D12X_PSO_CACHE`, `None` when it is off.
+fn open_library() -> Option<Library> {
+    let Some(root) = crate::pso_library::configured_root() else {
+        xs_log!("direct shaders: the pipeline library is off");
+        return None;
+    };
+    xs_log!("direct shaders: pipeline library under {}", root.display());
+    Some(Library::new(root, TRANSLATOR_HASH))
+}
 
 pub(crate) fn register(owned: &Owned, sequence: u32) -> Option<u128> {
     let count = precompile_threads();
@@ -193,6 +225,21 @@ extern "C" fn log_final_summary() {
     if let Some(Some(service)) = SERVICE.get() {
         service.log_summary();
     }
+    if let Some(library) = library() {
+        xs_log!("direct shaders: {}", library.summary());
+    }
+}
+
+/// Logs the counts of the pipeline library when they changed since the last time.
+fn log_library_if_changed() {
+    static LAST: Mutex<String> = Mutex::new(String::new());
+    let Some(library) = library() else { return };
+    let line = library.summary();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != line {
+        xs_log!("direct shaders: {line}");
+        *last = line;
+    }
 }
 
 pub(crate) fn note_present() {
@@ -210,8 +257,48 @@ pub(crate) fn pipeline_done_for(service: Option<&'static Service>, owned: &Owned
         MESH_DESC_SIZE => PipelineKind::Mesh,
         _ => return,
     };
+    if let Some((false, _)) = creation {
+        library_refused(owned);
+    }
     if let Some(service) = service.or_else(current) {
         service.pipeline_done(kind, creation);
+    }
+}
+
+/// The library key waiting for the PC creation of `owned`, taken out.
+fn take_waiting(owned: &Owned) -> Option<(u128, bool)> {
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).remove(&(owned.desc().as_ptr() as usize))
+}
+
+/// The PC runtime refused the pipeline of `owned` with its compiled shaders. A stored blob it was
+/// given is deleted, since the blob may be the reason.
+fn library_refused(owned: &Owned) {
+    let Some(library) = library() else { return };
+    let Some((key, true)) = take_waiting(owned) else { return };
+    let on = library.reject(key);
+    xs_log!("direct shaders: the PC runtime refused pipeline library blob {key:032x}{}", if on { "" } else { ", the library stops for this run" });
+}
+
+/// The PC runtime made `made` from the compiled shaders of `owned`. Opens the library with its
+/// adapter on the first call, and stores the driver blob of a pipeline that came without one.
+fn library_made(made: usize, owned: &Owned) {
+    let Some(library) = library() else { return };
+    let Some((key, attached)) = take_waiting(owned) else { return };
+    let pso = made as *mut std::ffi::c_void;
+    let opened = library.open(|| {
+        let adapter = crate::pso_library::adapter_of(pso);
+        match &adapter {
+            Some(a) => xs_log!("direct shaders: pipeline library for adapter {:04X}:{:04X}, driver {:#x}", a.vendor_id, a.device_id, a.driver_version),
+            None => xs_log!("direct shaders: DXGI gives no adapter or driver version, the pipeline library stays closed"),
+        }
+        adapter
+    });
+    if attached || opened.is_none() {
+        return;
+    }
+    let Some(blob) = crate::pso_library::cached_blob(pso) else { return };
+    if let Err(e) = library.keep(key, &blob) {
+        xs_log!("direct shaders: pipeline library could not store {key:032x} ({e})");
     }
 }
 
@@ -235,7 +322,10 @@ fn current() -> Option<&'static Service> {
 /// The pipeline `made` was made with the direct shaders of `owned` (the console shaders it holds): keeps what each
 /// stage reads from its tables for the kind check (`kind_check`), from the console containers, so a
 /// pipeline taken from the disk cache has it too.
+///
+/// The pipeline library keeps the driver blob of the pipeline here as well.
 pub fn kind_made(made: usize, owned: &Owned) {
+    library_made(made, owned);
     if !crate::kind_check::tracking() {
         return;
     }
@@ -264,10 +354,12 @@ pub enum Choice {
     Direct(Patched),
 }
 
-/// A description pointing at compiled shaders it keeps alive.
+/// A description pointing at compiled shaders, and at a stored driver blob when the pipeline
+/// library has one, which it keeps alive.
 pub struct Patched {
     desc: Vec<u8>,
-    _dxil: Vec<Arc<[u8]>>,
+    dxil: Vec<Arc<[u8]>>,
+    _blob: Option<Vec<u8>>,
 }
 
 impl Patched {
@@ -335,7 +427,13 @@ pub(crate) fn choose_with_budget(object: usize, owned: &Owned, key: Option<u128>
 /// The choice that follows a poll answer.
 fn choice_from(owned: &Owned, verdict: Poll) -> Choice {
     match verdict {
-        Poll::Ready(dxil) => Choice::Direct(patch(owned.desc(), &dxil)),
+        Poll::Ready(dxil) => {
+            let mut patched = patch(owned.desc(), &dxil);
+            if let Some(library) = library() {
+                attach_blob(library, owned, &mut patched);
+            }
+            Choice::Direct(patched)
+        }
         Poll::Refused(_) => Choice::Original,
         Poll::Pending => Choice::Pending,
     }
@@ -461,7 +559,29 @@ fn patch(desc: &[u8], dxil: &[Arc<[u8]>]) -> Patched {
         copy[at..at + 8].copy_from_slice(&(d.as_ptr() as u64).to_le_bytes());
         copy[at + 8..at + 16].copy_from_slice(&(d.len() as u64).to_le_bytes());
     }
-    Patched { desc: copy, _dxil: dxil.to_vec() }
+    Patched { desc: copy, dxil: dxil.to_vec(), _blob: None }
+}
+
+/// Points `patched` at the stored driver blob of its pipeline, when the library has one, and
+/// notes its key for [`library_made`] and [`library_refused`].
+fn attach_blob(library: &Library, owned: &Owned, patched: &mut Patched) {
+    let Some(key) = library_key(owned, patched) else { return };
+    let Some(at) = crate::pso_library::cached_field(patched.desc.len()) else { return };
+    let blob = library.lookup(key);
+    if let Some(blob) = &blob {
+        patched.desc[at..at + 8].copy_from_slice(&(blob.as_ptr() as u64).to_le_bytes());
+        patched.desc[at + 8..at + 16].copy_from_slice(&(blob.len() as u64).to_le_bytes());
+    }
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).insert(owned.desc().as_ptr() as usize, (key, blob.is_some()));
+    patched._blob = blob;
+}
+
+/// The library key of a patched description: its state, its compiled stages and the direct key of
+/// the console pipeline.
+fn library_key(owned: &Owned, patched: &Patched) -> Option<u128> {
+    let identity = crate::direct_cache::pipeline_key(&pipeline_of(owned).ok()?, TRANSLATOR_HASH, "");
+    let stages: Vec<&[u8]> = patched.dxil.iter().map(|d| &d[..]).collect();
+    crate::pso_library::pipeline_key(&patched.desc, &stages, identity)
 }
 
 #[cfg(test)]
