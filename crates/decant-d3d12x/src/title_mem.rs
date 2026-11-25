@@ -771,6 +771,7 @@ impl State {
 
     /// Applies the pending tile mappings on the private queue and signals the fence. Returns the ranges.
     fn update_tiles(&mut self) -> u64 {
+        let _trace = decant_trace::span("title_mem", "update_tiles");
         let calls = self.mirror.drain_updates();
         if calls.is_empty() {
             return 0;
@@ -798,12 +799,16 @@ impl State {
     /// Copies the pool pages written since the last sync from the read only section views into the
     /// pool heaps. Returns how many.
     fn upload(&mut self, api: &Api) -> u64 {
+        let _trace = decant_trace::span("title_mem", "upload");
         let mut total = 0;
         loop {
             self.dirty.resize(TAKE_PAGES, 0);
             // SAFETY: `dirty` has room for `TAKE_PAGES` entries.
             let asked = Instant::now();
-            let n = unsafe { (api.take_dirty)(self.dirty.as_mut_ptr(), TAKE_PAGES as u32) } as usize;
+            let n = {
+                let _take = decant_trace::span("title_mem", "take_dirty");
+                unsafe { (api.take_dirty)(self.dirty.as_mut_ptr(), TAKE_PAGES as u32) }
+            } as usize;
             self.stats.take_micros += asked.elapsed().as_micros() as u64;
             let mut pages = std::mem::take(&mut self.dirty);
             pages.truncate(n);
@@ -815,7 +820,10 @@ impl State {
                 self.mirror.give_tile(page);
             }
             let copying = Instant::now();
-            total += self.copy_runs(api, &pages);
+            total += {
+                let _copy = decant_trace::span("title_mem", "copy_runs");
+                self.copy_runs(api, &pages)
+            };
             self.stats.copy_micros += copying.elapsed().as_micros() as u64;
             self.dirty = pages;
             if n < TAKE_PAGES {
@@ -935,7 +943,7 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
         return None;
     }
     let api = api()?;
-    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.lock().unwrap_or_else(|e| e.into_inner()));
     let st = guard.as_mut()?;
     if !st.tracking {
         st.tracking = true;
@@ -1032,22 +1040,41 @@ fn span_of(va: u64, len: u64, give: bool) -> Option<Span> {
     span_of_with(va, len, give, &mut false)
 }
 
-fn span_of_with(va: u64, len: u64, give: bool, fresh: &mut bool) -> Option<Span> {
-    static SEEN: AtomicI32 = AtomicI32::new(0);
-    static NEAR: AtomicI32 = AtomicI32::new(0);
-    let span = with_state(|st, api| {
+impl State {
+    fn translate_span(&mut self, api: &Api, va: u64, len: u64, give: bool) -> Option<(Span, bool)> {
         if give {
-            st.give(api, va, len.max(ADDRESS_REACH));
+            self.give(api, va, len.max(ADDRESS_REACH));
             // Pages the title never wrote have no mirror tile and read as zeros. The first `ADDRESS_REACH`
             // bytes of a span the GPU is given get tiles anyway: the GPU may write there (a root UAV, a
             // counter) and read it back later.
-            st.mirror.give_span(va, len.clamp(1, ADDRESS_REACH));
+            self.mirror.give_span(va, len.clamp(1, ADDRESS_REACH));
         }
-        let placed = st.mirror.translate(va, len)?;
-        let w = st.windows.get(placed.buffer)?.as_ref()?;
-        *fresh = st.mirror.pending_in(placed.buffer, placed.offset, len);
-        Some(Span { resource: w.resource.as_raw() as usize, gpu: w.gpu + placed.offset, offset: placed.offset, left: placed.left })
-    })??;
+        let placed = self.mirror.translate(va, len)?;
+        let w = self.windows.get(placed.buffer)?.as_ref()?;
+        let is_fresh = self.mirror.pending_in(placed.buffer, placed.offset, len);
+        Some((Span { resource: w.resource.as_raw() as usize, gpu: w.gpu + placed.offset, offset: placed.offset, left: placed.left }, is_fresh))
+    }
+}
+
+/// Translates a batch of `(va, len)` spans under one state lock and one journal drain.
+pub fn translate_fresh_batch(spans: &[(u64, u64)], out: &mut Vec<Option<(Span, bool)>>) {
+    out.clear();
+    if spans.is_empty() {
+        return;
+    }
+    let filled = with_state(|st, api| {
+        out.extend(spans.iter().map(|&(va, len)| st.translate_span(api, va, len, true)));
+    });
+    if filled.is_none() {
+        out.resize(spans.len(), None);
+    }
+}
+
+fn span_of_with(va: u64, len: u64, give: bool, fresh: &mut bool) -> Option<Span> {
+    static SEEN: AtomicI32 = AtomicI32::new(0);
+    static NEAR: AtomicI32 = AtomicI32::new(0);
+    let (span, is_fresh) = with_state(|st, api| st.translate_span(api, va, len, give))??;
+    *fresh = is_fresh;
     if SEEN.fetch_add(1, Ordering::Relaxed) < 3 {
         xs_log!("title memory: title address {va:#x} ({len} bytes) is at offset {:#x} of a window buffer, GPU address {:#x}", span.offset, span.gpu);
     }
@@ -1182,6 +1209,7 @@ pub unsafe fn sync(queue: *mut c_void) {
     if !enabled() {
         return;
     }
+    let _trace = decant_trace::span("title_mem", "sync");
     // SAFETY: by the contract above.
     let Some(queue_ref) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
     let written = with_state(|st, api| {
@@ -1235,6 +1263,7 @@ pub unsafe fn sync(queue: *mut c_void) {
     // A placed texture whose memory the title wrote is filled again (after this lock is given back:
     // the detile table asks for tiles under its own lock).
     if let Some(written) = written.filter(|w| !w.is_empty()) {
+        let _note_tiles = decant_trace::span("title_mem", "note_tiles");
         crate::detile::note_tiles(&written);
     }
 }
@@ -1384,5 +1413,16 @@ mod tests {
         let runs = runs_by_heap(&[5, 6, 7, 1023, 1024, 1025, 9]);
         assert_eq!(runs, [(0, vec![(0, 3, 5), (3, 1, 1023), (6, 1, 9)]), (1, vec![(4, 2, 0)])], "a run ends at a heap's end and where the pages jump");
         assert!(runs_by_heap(&[]).is_empty());
+    }
+
+    #[test]
+    fn translate_fresh_batch_clears_and_returns_none_when_disabled() {
+        let mut out = Vec::with_capacity(8);
+        out.push(Some((Span { resource: 1, gpu: 2, offset: 3, left: 4 }, true)));
+        translate_fresh_batch(&[], &mut out);
+        assert!(out.is_empty());
+        translate_fresh_batch(&[(0x1000, 64), (0x2000, 128)], &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(Option::is_none));
     }
 }

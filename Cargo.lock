@@ -193,6 +193,7 @@ dependencies = [
  "decant-shader",
  "decant-testkit",
  "decant-texture",
+ "decant-trace",
  "png",
  "serde",
  "serde_json",

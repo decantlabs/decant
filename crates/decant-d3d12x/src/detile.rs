@@ -669,6 +669,7 @@ impl Detiler {
 
     /// As [`Detiler::run`], writing the per job outcomes into `submitted` to reuse its allocation.
     pub fn run_into(&mut self, queue: &ID3D12CommandQueue, jobs: &[Job<'_>], wait: bool, submitted: &mut Vec<bool>) {
+        let _trace = decant_trace::span("detile", "run_into");
         submitted.clear();
         submitted.resize(jobs.len(), false);
         let mut prepared = Vec::with_capacity(jobs.len());
@@ -711,6 +712,7 @@ impl Detiler {
 
     /// Waits until everything submitted so far is done on the GPU, 5 seconds at most per queue.
     pub fn wait_idle(&self) {
+        let _trace = decant_trace::span("detile", "wait_idle");
         for q in self.queues.values() {
             // SAFETY: a live fence, and the event is closed before leaving.
             unsafe {
@@ -840,6 +842,9 @@ static HAS_PENDING_FILLS: AtomicBool = AtomicBool::new(false);
 struct RegistryScratch {
     ready: Vec<(usize, u64)>,
     exhausted: Vec<usize>,
+    pending_items: Vec<(usize, u64, u64)>,
+    pending_spans: Vec<(u64, u64)>,
+    translated: Vec<Option<(crate::title_mem::Span, bool)>>,
     resources: Vec<Option<ID3D12Resource>>,
     job_res: Vec<usize>,
     outcome: Vec<bool>,
@@ -992,7 +997,7 @@ fn tuning() -> Tuning {
 static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
 
 fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
-    let mut guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = decant_trace::timed_lock("detile::REGISTRY", || REGISTRY.lock().unwrap_or_else(|e| e.into_inner()));
     f(guard.get_or_insert_with(Registry::default))
 }
 
@@ -1283,6 +1288,7 @@ pub unsafe fn flush(queue: *mut c_void) {
     if !enabled() || !HAS_PENDING_FILLS.load(Ordering::Acquire) {
         return;
     }
+    let _trace = decant_trace::span("detile", "flush");
     // SAFETY: by the contract of this function.
     let Some(queue) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
     // SAFETY: a live queue.
@@ -1325,8 +1331,12 @@ pub unsafe fn flush(queue: *mut c_void) {
         let mut unreachable = 0u32;
         let mut exhausted = std::mem::take(&mut r.scratch.exhausted);
         exhausted.clear();
+        let mut pending_items = std::mem::take(&mut r.scratch.pending_items);
+        pending_items.clear();
+        let mut pending_spans = std::mem::take(&mut r.scratch.pending_spans);
+        pending_spans.clear();
         for &res in &r.pending {
-            let Some(texture) = r.textures.get_mut(&res) else {
+            let Some(texture) = r.textures.get(&res) else {
                 exhausted.push(res);
                 continue;
             };
@@ -1334,19 +1344,30 @@ pub unsafe fn flush(queue: *mut c_void) {
                 exhausted.push(res);
                 continue;
             }
-            match crate::title_mem::translate_fresh(texture.va, texture.plan.size) {
+            pending_items.push((res, texture.va, texture.plan.size));
+            pending_spans.push((texture.va, texture.plan.size));
+        }
+        let mut translated = std::mem::take(&mut r.scratch.translated);
+        crate::title_mem::translate_fresh_batch(&pending_spans, &mut translated);
+        for (&(res, _, _), mapped) in pending_items.iter().zip(&translated) {
+            match mapped {
                 // Fresh mappings go out with the next sync, before the next submission.
                 Some((_, true)) if tuning.defer_fresh_spans => r.deferred += 1,
                 Some((span, _)) => ready.push((res, span.gpu)),
                 None => {
-                    texture.attempts += 1;
                     unreachable += 1;
-                    if !texture.wants_fill() {
-                        exhausted.push(res);
+                    if let Some(texture) = r.textures.get_mut(&res) {
+                        texture.attempts += 1;
+                        if !texture.wants_fill() {
+                            exhausted.push(res);
+                        }
                     }
                 }
             }
         }
+        r.scratch.pending_items = pending_items;
+        r.scratch.pending_spans = pending_spans;
+        r.scratch.translated = translated;
         for &res in &exhausted {
             r.pending.remove(&res);
         }
