@@ -50,7 +50,7 @@ yet is refused with a `Refusal` whose `key()` is stable (`op:v_sqrt_f32`, `resou
 | `src/structure/` | blocks to structured statements: `if`, `else`, loops with `break` and `continue` |
 | `src/resource/` | descriptor tracing, dead code removal, placement against the root signature |
 | `src/stage/` | entry state, inputs, exports and linking per stage |
-| `src/hlsl/` | the printer |
+| `src/hlsl/` | the printer, with the node intersection helper in `bvh.rs` |
 | `src/cache.rs` | the cache key of a translation |
 | `src/census.rs`, `src/corpus.rs`, `src/bin/` | the corpus census tool |
 
@@ -92,8 +92,27 @@ Both BVH intersection instructions lift to explicit native node intersection exp
 The IR preserves four descriptor words, all address words, pointer width, packed direction
 encoding, instruction flags and four result words. Consecutive and NSA addresses are supported.
 This is one node test with native result encoding. It cannot be replaced by a full RayQuery
-traversal. HLSL translation reports `resource:bvh-node-backend` until compatible node memory
-and intersection lowering are available. This change does not make BVH pipelines executable.
+traversal.
+
+## Node intersections in HLSL
+
+The resource pass traces the four descriptor registers of a node intersection like any buffer
+descriptor (a table slot, a heap index or a view built around a root descriptor) and binds them
+as one read only `ByteAddressBuffer`, the node memory. A table slot of node memory is a `t`
+view unless the binding table says otherwise, and a node memory that is no raw read only view
+is refused (`resource:bvh-node-class`, `resource:bvh-node-view`).
+
+`src/hlsl/bvh.rs` prints each intersection as one call of `decant_bvh_intersect`, a single node
+box and triangle test in the public RDNA2 node layout of Mesa (`bvh_defines.h` and
+`radv_nir_rt_common.c` at `f8281cfa33e2`). The four result words are the components of the
+`uint4` it returns: the child pointers nearest first for a box node, the distance numerator and
+denominator and two barycentric numerators for a triangle node. The A16 direction packing comes
+from the LLVM AMDGPU backend. The module comment lists what the helper does not reproduce: it
+follows Mesa's software path, it was not compared with console hardware results, and it does
+not read the descriptor flags.
+
+The translation does not fill the node memory. Building or converting the console format BVH
+nodes in GPU memory, so that the view the layer binds holds them, is handled separately.
 
 Prior art was inspected for operand and lane behavior in the local victory shader lowerer
 and xcl register selection implementation. No code was copied.

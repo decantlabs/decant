@@ -81,7 +81,9 @@ pub fn write(e: &Expr, iface: &Interface, resources: &[Resource], o: &mut String
         o.push_str(post);
     };
     match e {
-        Expr::BvhWord(..) => panic!("BVH node intersection must be lowered before HLSL printing"),
+        // `bvh::check` refuses one that is not the whole value of an assignment, and
+        // `bvh::assign` prints those.
+        Expr::BvhWord(..) => unreachable!("a node intersection is printed by its assignment"),
         Expr::U32(v) => {
             let _ = write!(o, "{v}u");
         }

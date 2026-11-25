@@ -6,7 +6,8 @@
 //!
 //! 1. [`trace`] follows the words from the load to the use and gives every use a
 //!    [`crate::ir::ResId`] with an [`crate::ir::Origin`]: table and offset, root descriptor, or
-//!    constants.
+//!    constants. The descriptor of a node intersection becomes the buffer of its node memory
+//!    ([`trace::node_memory`]).
 //! 2. [`dce`] removes the register traffic that only carried descriptor words.
 //! 3. [`place`] turns each origin into a [`crate::api::Placement`] with the root signature in hand.
 
@@ -17,10 +18,25 @@ pub mod trace;
 
 use std::collections::BTreeSet;
 
-use crate::ir::{BufferOp, Desc, Expr, Function, ImageOp, Node, Origin, Resource, Stmt, Var};
+use crate::ir::{
+    BufferOp, Desc, Expr, Function, ImageOp, Node, Origin, ResId, Resource, Stmt, Var,
+};
 
 pub use place::place;
-pub use trace::trace;
+pub use trace::{node_memory, trace};
+
+/// The resources that hold the node memory of a node intersection after [`trace`].
+pub fn node_memories(func: &Function) -> BTreeSet<ResId> {
+    let mut out = BTreeSet::new();
+    crate::hlsl::expr::for_each_expr(func, &mut |e| {
+        if let Expr::BvhWord(op, _) = e
+            && let Some(res) = node_memory(op)
+        {
+            out.insert(res);
+        }
+    });
+    out
+}
 
 /// Calls `f` on every variable an expression reads.
 pub fn reads(e: &Expr, f: &mut impl FnMut(Var)) {
@@ -164,6 +180,11 @@ fn expr_indices(e: &Expr, resources: &[Resource], f: &mut impl FnMut(Var)) {
             expr_indices(b, resources, f);
         }
         Expr::Call(_, args) => args.iter().for_each(|a| expr_indices(a, resources, f)),
+        Expr::BvhWord(op, _) => op
+            .descriptor
+            .iter()
+            .chain(&op.address)
+            .for_each(|a| expr_indices(a, resources, f)),
         _ => {}
     }
 }
