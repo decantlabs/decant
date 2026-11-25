@@ -51,6 +51,7 @@ pub mod present_over;
 pub mod rts0;
 pub mod resource_args;
 pub mod sampler_registry;
+pub mod uav_barrier_merge;
 pub mod slot_tags;
 pub mod shader_source;
 pub mod title_heap;

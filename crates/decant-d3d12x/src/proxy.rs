@@ -456,6 +456,7 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
             crate::title_heap::list_reset(this as usize);
             crate::cbv_copies::forget(this as usize);
             crate::flicker_probe::forget(this as usize);
+            crate::uav_barrier_merge::reset(this as usize);
             crate::present::list_reset(proxy.pc as usize);
         }
         if proxy.kind == Kind::Resource as i32 {
@@ -3520,6 +3521,12 @@ extern "system" fn list_uav_barrier(this: *mut Proxy, n: u32, barriers: *const c
     if !crate::abi::newer_layout() {
         return unknown_slot(this.cast(), Kind::List, 146);
     }
+    if !crate::uav_barrier_merge::take_global(this as usize) {
+        if log_due(&N) {
+            xs_log!("console list slot 146 (UAV barrier, n {n}, barriers {barriers:?}): dropped, a global UAV barrier is already pending on this list");
+        }
+        return;
+    }
     let global = crate::list_sync::global_uav_barrier();
     // SAFETY: `this` is a live proxy; PC slot 26 of ID3D12GraphicsCommandList is ResourceBarrier.
     unsafe {
@@ -3686,6 +3693,7 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
     crate::draw_diag::forget(key);
     crate::flicker_probe::forget(key);
     crate::kind_check::reset(key);
+    crate::uav_barrier_merge::reset(key);
     // SAFETY: `this` is a live proxy, `allocator` and `pso` are proxies or PC objects.
     unsafe {
         let pc = (*this).pc;
@@ -4389,7 +4397,11 @@ extern "system" fn list_resource_barrier(this: *mut Proxy, n: u32, barriers: *co
             .collect();
         crate::detile::note_transitions(pc as usize, &noted);
         crate::present::note_list_transitions(pc as usize, &noted);
-        method::<Barriers>(pc, 26)(pc, n, copy.as_ptr().cast());
+        crate::uav_barrier_merge::filter_barriers(this as usize, &mut copy);
+        if copy.is_empty() {
+            return;
+        }
+        method::<Barriers>(pc, 26)(pc, copy.len() as u32, copy.as_ptr().cast());
     }
 }
 
@@ -4515,8 +4527,12 @@ fn clear_uav(this: *mut Proxy, gpu: u64, cpu: u64, res: Object, values: *const c
         let pc = (*this).pc;
         let gpu = heap_pages::host_handle(this as usize, gpu, || 1);
         match clear {
-            crate::view_raw::Clear::AsIs => method::<ClearUavView>(pc, if float { 50 } else { 49 })(pc, gpu, cpu as u64, unwrap(res), values, n, rects),
+            crate::view_raw::Clear::AsIs => {
+                crate::uav_barrier_merge::mark_pending(this as usize);
+                method::<ClearUavView>(pc, if float { 50 } else { 49 })(pc, gpu, cpu as u64, unwrap(res), values, n, rects);
+            }
             crate::view_raw::Clear::Words(w) => {
+                crate::uav_barrier_merge::mark_pending(this as usize);
                 let words = [w; 4];
                 method::<ClearUavView>(pc, 49)(pc, gpu, cpu as u64, unwrap(res), words.as_ptr().cast(), n, rects);
             }
@@ -4628,6 +4644,7 @@ extern "system" fn list_execute_indirect(this: *mut Proxy, sig: Object, max: u32
         list_mirror::prepare(this, crate::user_mirror::Bind::Graphics);
         list_mirror::prepare(this, crate::user_mirror::Bind::Compute);
         crate::rt_diag::count(&crate::rt_diag::INDIRECT);
+        crate::uav_barrier_merge::mark_pending(this as usize);
         let pc_arg = unwrap(arg);
         let pc_count = unwrap(count);
         type GetListType = unsafe extern "system" fn(Object) -> u32;

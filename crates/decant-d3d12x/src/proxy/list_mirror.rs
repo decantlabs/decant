@@ -852,6 +852,7 @@ pub(super) extern "system" fn list_draw_instanced(this: *mut Proxy, vertices: u3
     describe_draw(this, n);
     crate::draw_diag::describe(this as usize, n, "DrawInstanced", None, start_vertex, instances);
     crate::flicker_probe::draw(this as usize, crate::flicker_probe::Draw::Plain { vertices, first: start_vertex });
+    crate::uav_barrier_merge::mark_pending(this as usize);
     if vertices > 0
         && vertices.is_multiple_of(3)
         && let Some(vb) = crate::rect_list::rect_vb0(this as usize)
@@ -876,6 +877,7 @@ pub(super) extern "system" fn list_draw_indexed_instanced(this: *mut Proxy, indi
     describe_draw(this, n);
     crate::draw_diag::describe(this as usize, n, "DrawIndexedInstanced", Some((indices, start_index, base_vertex)), 0, instances);
     crate::flicker_probe::draw(this as usize, crate::flicker_probe::Draw::Indexed { count: indices, first: start_index, base: base_vertex });
+    crate::uav_barrier_merge::mark_pending(this as usize);
     // SAFETY: `this` is a live list proxy.
     unsafe {
         let pc = (*this).pc;
@@ -891,6 +893,7 @@ pub(super) extern "system" fn list_dispatch(this: *mut Proxy, x: u32, y: u32, z:
     prepare(this, Bind::Compute);
     crate::rt_diag::count(&crate::rt_diag::DISPATCHES);
     describe_dispatch(this, crate::draw_diag::dispatch(this as usize, x, y, z));
+    crate::uav_barrier_merge::mark_pending(this as usize);
     // SAFETY: `this` is a live list proxy.
     unsafe {
         let pc = (*this).pc;
