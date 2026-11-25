@@ -13,8 +13,8 @@ use crate::api::{
 use crate::refusal::{Refusal, RefusalKind};
 
 /// Every program starts with six words that are not code: two instructions that do nothing
-/// (`v_nop` in the two word encoding) with a data word after each. Measured on the 26,503
-/// programs of the title: word 6 is always the first instruction.
+/// (`v_nop` in the two word encoding) with a data word after each. Measured on every program of
+/// a retail title: word 6 is always the first instruction.
 pub const SIGNATURE_WORDS: usize = 6;
 
 /// The hash the layer names override files by: FNV-1a, 64 bit, over the whole container.
