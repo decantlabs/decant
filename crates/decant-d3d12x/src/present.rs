@@ -495,6 +495,9 @@ fn make(queue: &ID3D12CommandQueue, w: u32, h: u32, fmt: DXGI_FORMAT) -> windows
     }
 }
 
+/// Flush recorded trace events periodically so long runs keep trace JSON on disk.
+const TRACE_FLUSH_INTERVAL: u64 = 300;
+
 /// Copies `resource` into the next back buffer and presents it. False when it cannot be shown
 /// (not enabled, no window, a format a swap chain does not take, a failed call), logged once.
 ///
@@ -511,6 +514,7 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
     if !enabled() || queue.is_null() || resource.is_null() {
         return false;
     }
+    let _trace = decant_trace::span("present", "show");
     // SAFETY: by the contract above.
     let (Some(queue), Some(source)) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }, unsafe { ID3D12Resource::from_raw_borrowed(&resource) }) else {
         return false;
@@ -521,7 +525,7 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
         return fail(format!("back buffer format {} has no swap chain form", d.Format.0));
     };
     let (w, h) = (d.Width as u32, d.Height);
-    let mut guard = PRESENTER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = decant_trace::timed_lock("present::PRESENTER", || PRESENTER.lock().unwrap_or_else(|e| e.into_inner()));
     if guard.as_ref().is_none_or(|p| p.size != (w, h, fmt) || p.queue.as_raw() != queue.as_raw()) {
         *guard = None;
         match make(queue, w, h, fmt) {
@@ -532,10 +536,11 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
     let Some(p) = guard.as_mut() else { return false };
     // SAFETY: COM calls on the presenter's live objects; each back buffer is reused only after its
     // last copy completed on the GPU.
-    let result: windows::core::Result<()> = unsafe {
+    let result: windows::core::Result<u64> = unsafe {
         (|| {
             let i = p.swap.GetCurrentBackBufferIndex() as usize % 2;
             if p.fence.GetCompletedValue() < p.marks[i] {
+                let _wait = decant_trace::span("present", "fence_wait");
                 // A null event makes the call wait until the value is reached.
                 p.fence.SetEventOnCompletion(p.marks[i], windows::Win32::Foundation::HANDLE::default())?;
             }
@@ -545,12 +550,15 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
             // A console title usually presents its back buffer in RENDER_TARGET, but it may also
             // leave it in COMMON or PRESENT. The tracked state avoids a mismatch with the barrier.
             let src_state = source_state(source.as_raw() as usize);
-            let mut before = Vec::with_capacity(2);
+            let mut before_len = 0usize;
+            let mut before = [D3D12_RESOURCE_BARRIER::default(), D3D12_RESOURCE_BARRIER::default()];
             if src_state != D3D12_RESOURCE_STATE_COPY_SOURCE {
-                before.push(transition(source, src_state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                before[before_len] = transition(source, src_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                before_len += 1;
             }
-            before.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST));
-            p.list.ResourceBarrier(&before);
+            before[before_len] = transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+            before_len += 1;
+            p.list.ResourceBarrier(&before[..before_len]);
             p.list.CopyResource(&back, source);
             p.frames += 1;
             let probing = probe_enabled() && (p.frames <= 4 || p.frames % 16 == 0 || (dump_dir().is_some() && burst_frame(p.frames)));
@@ -648,12 +656,15 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
             } else {
                 D3D12_RESOURCE_STATE_COPY_DEST
             };
-            let mut after = Vec::with_capacity(2);
+            let mut after_len = 0usize;
+            let mut after = [D3D12_RESOURCE_BARRIER::default(), D3D12_RESOURCE_BARRIER::default()];
             if src_state != D3D12_RESOURCE_STATE_COPY_SOURCE {
-                after.push(transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, src_state));
+                after[after_len] = transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, src_state);
+                after_len += 1;
             }
-            after.push(transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT));
-            p.list.ResourceBarrier(&after);
+            after[after_len] = transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT);
+            after_len += 1;
+            p.list.ResourceBarrier(&after[..after_len]);
             p.list.Close()?;
             // the copy reads the title's target: a release of it waits for this submission too
             let list: ID3D12CommandList = p.list.cast()?;
@@ -662,7 +673,10 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
             if tracked {
                 crate::retire::submitted(p.queue.as_raw());
             }
-            p.swap.Present(0, DXGI_PRESENT(0)).ok()?;
+            {
+                let _dxgi = decant_trace::span("present", "dxgi_present");
+                p.swap.Present(0, DXGI_PRESENT(0)).ok()?;
+            }
             p.next += 1;
             p.queue.Signal(&p.fence, p.next)?;
             p.marks[i] = p.next;
@@ -727,19 +741,26 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
                     );
                 }
             }
-            Ok(())
+            Ok(p.frames)
         })()
     };
+    drop(guard);
     match result {
-        Ok(()) => {
+        Ok(frame_num) => {
             static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 xs_log!("present: first frame shown ({w}x{h}, format {})", d.Format.0);
             }
+            if decant_trace::enabled() {
+                decant_trace::frame_mark();
+                if frame_num.is_multiple_of(TRACE_FLUSH_INTERVAL) {
+                    let _ = decant_trace::flush();
+                }
+            }
             true
         }
         Err(e) => {
-            *guard = None;
+            *PRESENTER.lock().unwrap_or_else(|e| e.into_inner()) = None;
             fail(format!("{e}"))
         }
     }
@@ -788,7 +809,9 @@ pub(crate) fn note_list_transitions(list: usize, transitions: &[(usize, u32, u32
 pub(crate) fn list_reset(list: usize) {
     if list != 0 {
         with_states(|s| {
-            s.list_notes.remove(&list);
+            if let Some(entries) = s.list_notes.get_mut(&list) {
+                entries.clear();
+            }
         });
     }
 }
@@ -799,10 +822,11 @@ pub(crate) fn list_submitted(lists: &[usize]) {
         return;
     }
     with_states(|s| {
+        let StateTracker { resources, list_notes } = s;
         for &list in lists {
-            if let Some(notes) = s.list_notes.get(&list).cloned() {
-                for (res, after) in notes {
-                    s.resources.insert(res, after);
+            if let Some(notes) = list_notes.get(&list) {
+                for &(res, after) in notes {
+                    resources.insert(res, after);
                 }
             }
         }
@@ -1011,5 +1035,20 @@ mod tests {
 
         forget_resource(res);
         list_reset(list);
+    }
+
+    #[test]
+    fn list_reset_reuses_list_notes_allocation() {
+        let res = 0xCAFE_0011usize;
+        let list = 0xCAFE_0012usize;
+        note_list_transitions(list, &[(res, 0, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32)]);
+        let cap_before = with_states(|s| s.list_notes.get(&list).map(Vec::capacity));
+        assert!(cap_before.is_some_and(|c| c >= 1));
+        list_reset(list);
+        let state_after = with_states(|s| s.list_notes.get(&list).map(|v| (v.len(), v.capacity())));
+        assert_eq!(state_after, Some((0, cap_before.unwrap())));
+        with_states(|s| {
+            s.list_notes.remove(&list);
+        });
     }
 }

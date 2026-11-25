@@ -27,6 +27,7 @@ harness = false
 decant-texture.workspace = true
 decant-log = { path = "../decant-log" }
 decant-testkit = { path = "../decant-testkit" }
+decant-trace = { path = "../decant-trace" }
 decant-shader.workspace = true
 decant-dxc.workspace = true
 decant-extract-shaders.workspace = true

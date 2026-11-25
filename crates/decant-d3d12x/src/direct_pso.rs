@@ -76,6 +76,7 @@ impl crate::compile_service::Compiler for decant_dxc::Dxc {
     }
 
     fn compile(&self, hlsl: &str, entry: &str, profile: &str, args: &[String]) -> Result<Vec<u8>, String> {
+        let _trace = decant_trace::span("direct_pso", "compile");
         decant_dxc::Dxc::compile(self, hlsl, entry, profile, args)
     }
 }
@@ -356,6 +357,7 @@ fn current() -> Option<&'static Service> {
 ///
 /// The pipeline library keeps the driver blob of the pipeline here as well.
 pub fn kind_made(made: usize, owned: &Owned) {
+    let _trace = decant_trace::span("direct_pso", "create");
     library_made(made, owned);
     if !crate::kind_check::tracking() {
         return;
@@ -457,6 +459,7 @@ pub(crate) fn note_pending(object: usize, logged: &AtomicBool) {
 /// precompile queue when the pipeline has a `key` there.
 pub(crate) fn choose_with_budget(object: usize, owned: &Owned, key: Option<u128>, wait: Duration) -> Choice {
     let Some(service) = current() else { return Choice::Original };
+    let _trace = decant_trace::span("direct_pso", "choose");
     let begun = Instant::now();
     let from_queue = key.and_then(|key| QUEUE.get()?.as_ref()?.bind(service, key, wait));
     let verdict = match from_queue {
@@ -498,7 +501,12 @@ fn poll_within(service: &Service, object: usize, wait: Duration, poll: impl Fn()
         return first;
     }
     let left = wait.saturating_sub(begun.elapsed());
-    if !left.is_zero() && service.wait(object, left) { poll() } else { first }
+    if !left.is_zero() {
+        let _wait = decant_trace::span("direct_pso", "wait");
+        if service.wait(object, left) { poll() } else { first }
+    } else {
+        first
+    }
 }
 
 /// How long a compute pipeline waits before it is marked late (`DECANT_D3D12X_COMPUTE_WAIT_MS`,
@@ -554,6 +562,7 @@ fn stage_offsets(desc: &[u8]) -> Vec<(StageKind, usize)> {
 
 /// The translator's input for a copied description (also what `pipeline_manifest` records).
 pub(crate) fn pipeline_of(owned: &Owned) -> Result<Pipeline, Refusal> {
+    let _trace = decant_trace::span("direct_pso", "translate");
     let desc = owned.desc();
     let offsets = stage_offsets(desc);
     if offsets.is_empty() {
@@ -948,5 +957,32 @@ mod tests {
         assert_eq!(read_u64(patched.desc(), 0x18), dxil[1].as_ptr() as u64);
         assert_eq!(read_u64(patched.desc(), 0x20), 6);
         assert_eq!(patched.desc()[0x50..], d[0x50..]);
+    }
+
+    #[test]
+    fn trace_emission_records_hot_path_spans_and_flushes_json() {
+        let dir = std::env::temp_dir().join(format!("decant-d3d12x-trace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hotpaths.json");
+        decant_trace::start(&path);
+
+        let mut c = [0u8; COMPUTE_DESC_SIZE];
+        let cs = b"cs_trace";
+        c[0x08..0x10].copy_from_slice(&(cs.as_ptr() as u64).to_le_bytes());
+        c[0x10..0x18].copy_from_slice(&(cs.len() as u64).to_le_bytes());
+        // SAFETY: `c` points to live `cs`.
+        let owned = unsafe { crate::lazy_pso::copy_compute(c.as_ptr().cast::<c_void>()) };
+        let _ = pipeline_of(&owned);
+        kind_made(0, &owned);
+        decant_trace::frame_mark();
+        decant_trace::stop();
+        decant_trace::flush().unwrap();
+
+        let json = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let summary = decant_trace::summarize(&json).unwrap();
+        assert_eq!(summary.frames, 1);
+        assert!(summary.spans.iter().any(|s| s.cat == "direct_pso" && s.name == "translate"));
+        assert!(summary.spans.iter().any(|s| s.cat == "direct_pso" && s.name == "create"));
     }
 }
