@@ -81,6 +81,39 @@ pub fn standin_enabled() -> bool {
     }
 }
 
+/// Active pipeline metadata tracked for a command list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActivePso {
+    /// Pipeline number when known (from deferred pipeline creation or a stand in).
+    pub number: Option<u32>,
+    /// Raw pipeline pointer value.
+    pub pso: usize,
+    /// Shader stage names and content hashes when recorded.
+    pub shaders: String,
+    /// Whether this pipeline was refused or missing on first bind.
+    pub missing: bool,
+}
+
+impl ActivePso {
+    /// Formats the active pipeline for DRED fault diagnostics.
+    pub fn format_summary(&self) -> String {
+        let mut head = match (self.number, self.pso) {
+            (Some(n), _) => format!("pipeline {n}"),
+            (None, pso) if pso != 0 => format!("pso {pso:#x}"),
+            (None, 0) => String::from("pso 0x0"),
+            _ => unreachable!(),
+        };
+        if self.missing {
+            head.push_str(" (missing)");
+        }
+        if self.shaders.is_empty() {
+            head
+        } else {
+            format!("{head} [{}]", self.shaders)
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     /// Stand in number to the description of the refused pipeline it stands for.
@@ -91,6 +124,12 @@ struct State {
     frame_binds: BTreeMap<u32, u64>,
     /// Stand ins that had work left out since the last report, with the number of calls.
     frame_skips: BTreeMap<u32, u64>,
+    /// Command list pointer (PC list when available, otherwise proxy) to its active pipeline.
+    active: HashMap<usize, ActivePso>,
+    /// Command list proxy pointer to its PC command list pointer.
+    proxy_to_pc: HashMap<usize, usize>,
+    /// Pipeline pointer to its recorded number and shader hashes.
+    pipelines: HashMap<usize, ActivePso>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -151,22 +190,53 @@ pub unsafe fn standin_id(object: *mut c_void) -> Option<u32> {
 /// which the caller then does not relay.
 ///
 /// # Safety
-/// As for [`standin_id`].
+/// `list` is 0 or a live command list proxy whose second word is its PC command list pointer, and
+/// `pso` is null or a COM object (starts with a vtable pointer).
 pub unsafe fn bind(list: usize, pso: *mut c_void) -> bool {
-    if !standin_enabled() {
-        if MISSING.load(Ordering::Relaxed) {
-            with(|s| s.bound.remove(&list));
-        }
-        return false;
-    }
+    // SAFETY: by the contract above.
+    let pc_list = if list != 0 { unsafe { *(list as *const usize).add(1) } } else { 0 };
+    let track_key = if pc_list != 0 { pc_list } else { list };
     // SAFETY: by the contract above.
     let id = unsafe { standin_id(pso) };
-    with(|s| match id {
-        Some(id) => {
-            s.bound.insert(list, id);
-            *s.frame_binds.entry(id).or_default() += 1;
+    // SAFETY: `pso` is non null and starts with a vtable pointer. When `is_lazy` is true, its
+    // `#[repr(C)]` header places `number: u32` right after `vtbl` and `refs`.
+    let lazy_number = if id.is_none() && !pso.is_null() && unsafe { crate::lazy_pso::is_lazy(pso) } {
+        Some(unsafe { *(pso as *const u8).add(std::mem::size_of::<usize>() + 4).cast::<u32>() })
+    } else {
+        None
+    };
+
+    with(|s| {
+        if pc_list != 0 && list != 0 {
+            s.proxy_to_pc.insert(list, pc_list);
         }
-        None => {
+        if track_key != 0 {
+            if pso.is_null() {
+                s.active.remove(&track_key);
+            } else if let Some(id) = id {
+                let shaders = s.refused.get(id as usize).cloned().unwrap_or_default();
+                s.active.insert(
+                    track_key,
+                    ActivePso { number: Some(id), pso: pso as usize, shaders, missing: true },
+                );
+            } else {
+                let mut entry = s.pipelines.get(&(pso as usize)).cloned().unwrap_or_default();
+                entry.pso = pso as usize;
+                entry.number = entry.number.or(lazy_number);
+                s.active.insert(track_key, entry);
+            }
+        }
+        if standin_enabled() {
+            match id {
+                Some(id) => {
+                    s.bound.insert(list, id);
+                    *s.frame_binds.entry(id).or_default() += 1;
+                }
+                None => {
+                    s.bound.remove(&list);
+                }
+            }
+        } else if MISSING.load(Ordering::Relaxed) {
             s.bound.remove(&list);
         }
     });
@@ -186,7 +256,74 @@ pub fn bind_missing(list: usize) {
     with(|s| {
         s.bound.insert(list, MISSING_ID);
         *s.frame_binds.entry(MISSING_ID).or_default() += 1;
+        let key = s.proxy_to_pc.get(&list).copied().unwrap_or(list);
+        if key != 0 {
+            let entry = s.active.entry(key).or_default();
+            entry.missing = true;
+        }
     });
+}
+
+/// Records pipeline number and shader hashes for `pso` so later binds on any list report them.
+#[cfg(test)]
+pub fn register_pipeline(pso: usize, number: Option<u32>, stages: &[Stage]) {
+    if pso == 0 {
+        return;
+    }
+    let shaders = describe_stages(stages);
+    with(|s| {
+        s.pipelines.insert(pso, ActivePso { number, pso, shaders, missing: false });
+    });
+}
+
+/// Records `active` as the active pipeline on command list `list`.
+#[cfg(test)]
+pub fn track_bind(list: usize, active: ActivePso) {
+    if list == 0 {
+        return;
+    }
+    with(|s| {
+        let key = s.proxy_to_pc.get(&list).copied().unwrap_or(list);
+        s.active.insert(key, active);
+    });
+}
+
+/// Clears the active pipeline tracked for command list `list` when it is reset.
+#[cfg(test)]
+pub fn reset_list(list: usize) {
+    forget_list(list);
+}
+
+/// Clears the active pipeline tracked for command list `list` when it is closed.
+#[cfg(test)]
+pub fn close_list(list: usize) {
+    forget_list(list);
+}
+
+#[cfg(test)]
+fn forget_list(list: usize) {
+    if list == 0 {
+        return;
+    }
+    with(|s| {
+        s.active.remove(&list);
+        if let Some(pc) = s.proxy_to_pc.get(&list).copied() {
+            s.active.remove(&pc);
+        }
+    });
+}
+
+/// Returns the active pipeline currently tracked for command list `list`, if any.
+pub fn active_pso(list: usize) -> Option<ActivePso> {
+    if list == 0 {
+        return None;
+    }
+    with(|s| {
+        s.active
+            .get(&list)
+            .cloned()
+            .or_else(|| s.proxy_to_pc.get(&list).and_then(|pc| s.active.get(pc)).cloned())
+    })
 }
 
 /// Whether a draw, dispatch or indirect execution on `list` is left out because a stand in is bound.
@@ -322,3 +459,104 @@ static VTBL: VTable = VTable([
     not_known,
     not_known,
 ]);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracks_active_pso_and_clears_on_reset_and_close() {
+        let list_a = 0x1001_0001;
+        let list_b = 0x1001_0002;
+        assert_eq!(active_pso(list_a), None);
+
+        track_bind(
+            list_a,
+            ActivePso {
+                number: Some(12),
+                pso: 0xABCD,
+                shaders: String::from("VS 1111222233334444 hit, PS 5555666677778888 miss"),
+                missing: false,
+            },
+        );
+        track_bind(
+            list_b,
+            ActivePso {
+                number: Some(99),
+                pso: 0xDEAD,
+                shaders: String::from("CS 9999aaaabbbbcccc hit"),
+                missing: false,
+            },
+        );
+
+        let a = active_pso(list_a).expect("list A should have an active pipeline");
+        assert_eq!(a.number, Some(12));
+        assert_eq!(a.pso, 0xABCD);
+        assert!(a.shaders.contains("1111222233334444"));
+        assert!(!a.missing);
+
+        reset_list(list_a);
+        assert_eq!(active_pso(list_a), None);
+        assert!(active_pso(list_b).is_some());
+
+        close_list(list_b);
+        assert_eq!(active_pso(list_b), None);
+    }
+
+    #[test]
+    fn bind_tracks_proxy_to_pc_list_and_registered_shaders() {
+        let pc_list = 0x2001_0010usize;
+        let proxy_stub: [usize; 2] = [0x9000, pc_list];
+        let proxy_ptr = proxy_stub.as_ptr() as usize;
+
+        let pso_vtbl: usize = 0x8000;
+        let pso_stub: [usize; 2] = [&raw const pso_vtbl as usize, 0];
+        let pso_ptr = pso_stub.as_ptr() as *mut c_void;
+
+        register_pipeline(
+            pso_ptr as usize,
+            Some(7),
+            &[
+                Stage { name: "VS", hash: 0x0123_4567_89ab_cdef, outcome: Outcome::Hit },
+                Stage { name: "PS", hash: 0xfedc_ba98_7654_3210, outcome: Outcome::Miss },
+            ],
+        );
+
+        // SAFETY: `proxy_stub` has the PC command list pointer in its second word and `pso_stub`
+        // starts with a readable vtable pointer.
+        let skipped = unsafe { bind(proxy_ptr, pso_ptr) };
+        assert!(!skipped);
+
+        let by_pc = active_pso(pc_list).expect("PC command list should be tracked");
+        assert_eq!(by_pc.number, Some(7));
+        assert_eq!(by_pc.shaders, "VS 0123456789abcdef hit, PS fedcba9876543210 miss");
+        assert_eq!(active_pso(proxy_ptr), Some(by_pc));
+
+        bind_missing(proxy_ptr);
+        let marked = active_pso(pc_list).expect("missing bind should preserve pipeline info");
+        assert!(marked.missing);
+        assert_eq!(marked.number, Some(7));
+
+        // SAFETY: `proxy_stub` is live and null PSO clears the active pipeline.
+        unsafe { bind(proxy_ptr, std::ptr::null_mut()) };
+        assert_eq!(active_pso(pc_list), None);
+        assert_eq!(active_pso(proxy_ptr), None);
+    }
+
+    #[test]
+    fn active_pso_summary_formats_variants() {
+        let with_shaders = ActivePso {
+            number: Some(42),
+            pso: 0x1234,
+            shaders: String::from("CS aabbccdd11223344 hit"),
+            missing: false,
+        };
+        assert_eq!(with_shaders.format_summary(), "pipeline 42 [CS aabbccdd11223344 hit]");
+
+        let missing = ActivePso { number: Some(5), pso: 0x100, shaders: String::new(), missing: true };
+        assert_eq!(missing.format_summary(), "pipeline 5 (missing)");
+
+        let raw_only = ActivePso { number: None, pso: 0xdeadbeef, shaders: String::new(), missing: false };
+        assert_eq!(raw_only.format_summary(), "pso 0xdeadbeef");
+    }
+}
