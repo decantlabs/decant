@@ -25,6 +25,8 @@
 //!   written since the last time (page protection, see its `track` module). `sync` runs before every
 //!   submission of the title: it applies the changes, copies the dirty pages from the read only view of
 //!   their section into the heap, and makes the submitting queue wait for the tile mappings.
+//!   Batches of at least 16 MiB use scoped copying threads sized to host parallelism and batch size.
+//!   Each job covers at most 4 MiB within one section and heap. Threads join before tile mappings.
 //!
 //! Nothing here keeps a section committed: no heap is opened on memory of the title, so the commit
 //! comes back when the process ends, killed or not. The two DLLs only meet through exports of
@@ -66,6 +68,60 @@ pub const POOL_HEAP_BYTES: u64 = HEAP_PAGES as u64 * PAGE;
 
 /// Pages asked of `DecantXmemGpuTakeDirty` in one call.
 const TAKE_PAGES: usize = 65536;
+/// Bound each copy job to 4 MiB and assign at least 8 MiB per copying thread.
+const COPY_CHUNK_PAGES: usize = 64;
+const COPY_THREAD_PAGES: usize = 128;
+
+#[derive(Clone, Copy, Debug)]
+struct CopyJob {
+    source: usize,
+    destination: usize,
+    pages: usize,
+}
+
+fn plan_copy(jobs: &mut Vec<CopyJob>, source: usize, destination: usize, pages: usize) {
+    for start in (0..pages).step_by(COPY_CHUNK_PAGES) {
+        jobs.push(CopyJob {
+            source: source + start * PAGE as usize,
+            destination: destination + start * PAGE as usize,
+            pages: (pages - start).min(COPY_CHUNK_PAGES),
+        });
+    }
+}
+
+fn copy_threads(pages: usize, cores: usize) -> usize {
+    (pages / COPY_THREAD_PAGES).max(1).min(cores.max(1))
+}
+
+/// # Safety
+/// Sources must be readable and destinations writable until this function returns.
+/// All destination ranges must be disjoint and must not overlap any source.
+unsafe fn execute_copies(jobs: &[CopyJob], cores: usize) {
+    let pages = jobs.iter().map(|job| job.pages).sum();
+    let threads = copy_threads(pages, cores).min(jobs.len());
+    let copy = |batch: &[CopyJob]| {
+        for job in batch {
+            // SAFETY: the caller guarantees live disjoint ranges for every job.
+            unsafe { std::ptr::copy_nonoverlapping(job.source as *const u8, job.destination as *mut u8, job.pages * PAGE as usize) };
+        }
+    };
+    if threads <= 1 {
+        copy(jobs);
+        return;
+    }
+    std::thread::scope(|scope| {
+        let mut batches = jobs.chunks(jobs.len().div_ceil(threads));
+        let inline = batches.next().unwrap_or_default();
+        for batch in batches {
+            // A failed thread allocation keeps this batch on the submitting thread.
+            if std::thread::Builder::new().spawn_scoped(scope, || copy(batch)).is_err() {
+                copy(batch);
+            }
+        }
+        copy(inline);
+    });
+}
+
 /// Journal records read in one call.
 const CHANGE_RECORDS: usize = 4096;
 /// How often the modules loaded since are looked at for file reads (`DecantXmemGpuGuardModules`).
@@ -752,6 +808,7 @@ impl State {
             let mut pages = std::mem::take(&mut self.dirty);
             pages.truncate(n);
             pages.sort_unstable();
+            pages.dedup();
             // A page copied for the first time has bytes now: it gets its mirror tile here (in page order,
             // so consecutive pages get consecutive tiles), and the window shows it from this sync on.
             for &page in &pages {
@@ -769,9 +826,20 @@ impl State {
     }
 
     /// Copies sorted pool pages, consecutive pages of one section with consecutive mirror tiles of one heap
-    /// in one memcpy. A page with no mirror tile (never mapped for the GPU) is left out.
+    /// in bounded copy jobs. A page with no mirror tile (never mapped for the GPU) is left out.
     fn copy_runs(&mut self, api: &Api, pages: &[u32]) -> u64 {
         let mut copied = 0;
+        let mut jobs = Vec::new();
+        self.plan_runs(api, pages, &mut jobs, &mut copied);
+        static CORES: OnceLock<usize> = OnceLock::new();
+        let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from));
+        // SAFETY: sorted unique pool pages have unique mirror tiles. Planning keeps each job
+        // inside a live section and heap. The state lock keeps the heaps alive until workers join.
+        unsafe { execute_copies(&jobs, cores) };
+        copied
+    }
+
+    fn plan_runs(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, copied: &mut u64) {
         let mut i = 0;
         while i < pages.len() {
             let first = pages[i];
@@ -793,15 +861,13 @@ impl State {
             // One run never leaves its section: the tail of a section is cut off and copied by page.
             let in_section = self.sections.iter().find(|&&(_, f, p)| first >= f && first - f < p).map_or(1, |&(_, f, p)| (f + p - first) as usize);
             let (head, rest) = (n.min(in_section), n.saturating_sub(in_section));
-            // SAFETY: the source is `head` pages of a section view of `xmem.dll`, the destination `head` tiles of a mapped pool heap.
-            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, (dst + tile as usize * PAGE as usize) as *mut u8, head * PAGE as usize) };
-            copied += head as u64;
+            plan_copy(jobs, src, dst + tile as usize * PAGE as usize, head);
+            *copied += head as u64;
             self.written.extend(first_tile..first_tile + head as u32);
             if rest > 0 {
-                copied += self.copy_runs(api, &pages[i - rest..i]);
+                self.plan_runs(api, &pages[i - rest..i], jobs, copied);
             }
         }
-        copied
     }
 }
 
@@ -1213,6 +1279,48 @@ pub fn tiles_of(va: u64, len: u64) -> Option<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_planning_bounds_chunks_and_thread_counts() {
+        assert_eq!(copy_threads(0, 8), 1);
+        assert_eq!(copy_threads(255, 8), 1);
+        assert_eq!(copy_threads(256, 8), 2);
+        assert_eq!(copy_threads(4096, 3), 3);
+        assert_eq!(copy_threads(4096, 0), 1);
+        let mut jobs = Vec::new();
+        plan_copy(&mut jobs, 0, 1024, 0);
+        assert!(jobs.is_empty());
+        plan_copy(&mut jobs, 0, 1024, 131);
+        assert_eq!(jobs.iter().map(|job| job.pages).collect::<Vec<_>>(), [64, 64, 3]);
+        for (i, job) in jobs.iter().enumerate() {
+            assert_eq!(job.source, i * 64 * PAGE as usize);
+            assert_eq!(job.destination, 1024 + job.source);
+        }
+    }
+
+    #[test]
+    fn parallel_copies_match_inline_with_scattered_ranges_and_repeated_batches() {
+        let pages = 259;
+        let source: Vec<u8> = (0..pages * PAGE as usize).map(|i| (i / PAGE as usize + i % 251) as u8).collect();
+        let mut inline = vec![0xa5; source.len()];
+        let mut parallel = inline.clone();
+        let mut jobs = Vec::new();
+        for (output, cores) in [(&mut inline, 1), (&mut parallel, 4)] {
+            jobs.clear();
+            for (src, dst, count) in [(130, 0, 129), (0, 130, 128)] {
+                plan_copy(&mut jobs, source.as_ptr() as usize + src * PAGE as usize, output.as_mut_ptr() as usize + dst * PAGE as usize, count);
+            }
+            for _ in 0..3 {
+                // SAFETY: vectors live until the workers join and the destination spans are disjoint.
+                unsafe { execute_copies(&jobs, cores) };
+            }
+        }
+        assert_eq!(parallel, inline);
+        assert_eq!(&parallel[..129 * PAGE as usize], &source[130 * PAGE as usize..]);
+        assert!(parallel[129 * PAGE as usize..130 * PAGE as usize].iter().all(|&b| b == 0xa5));
+        assert_eq!(&parallel[130 * PAGE as usize..258 * PAGE as usize], &source[..128 * PAGE as usize]);
+        assert!(parallel[258 * PAGE as usize..].iter().all(|&b| b == 0xa5));
+    }
 
     #[test]
     fn a_page_is_zero_only_when_every_byte_is_zero() {
