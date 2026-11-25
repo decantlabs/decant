@@ -1221,6 +1221,13 @@ pub fn run_with_drive(exe: &Path, args: &[String], folder: &Path, extra_env: &[(
     // within the same timeout (see `relaunch`).
     let file = folder.join(relaunch::FILE_NAME);
     let mut env: Vec<(String, String)> = extra_env.iter().cloned().chain(pls.env().iter().cloned()).collect();
+    if let Some((key, val)) = crate::precompile::default_pipeline_manifest_env(folder, &env, |k| std::env::var(k).ok()) {
+        if let Some(parent) = Path::new(&val).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        log.line(&format!("pipeline manifest: {val}"));
+        env.push((key, val));
+    }
     env.push((relaunch::FILE_ENV.to_owned(), file.to_string_lossy().into_owned()));
     let (mut exe, mut args) = (exe.to_path_buf(), args.to_vec());
     let deadline = timeout.map(|t| Instant::now() + t);

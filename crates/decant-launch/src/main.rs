@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use decant_launch::{run, stage, title_executable};
+use decant_launch::{precompile, run, stage, title_executable};
 
 #[derive(Parser)]
 #[command(name = "decant-launch", about = "Stage a GDK package and run its title on Windows with the Decant shims")]
@@ -20,6 +20,8 @@ struct Cli {
 enum Command {
     /// Link the package into the overlay folder and copy the shim DLLs there.
     Stage(StageArgs),
+    /// Precompile direct shaders into the disk cache from a manifest or shader archives.
+    Precompile(PrecompileArgs),
     /// Run the staged title under the debugger and log the run.
     Run(RunArgs),
     /// Stage, then run.
@@ -29,6 +31,28 @@ enum Command {
         #[command(flatten)]
         run: RunOptions,
     },
+}
+
+#[derive(Args)]
+struct PrecompileArgs {
+    /// The package folder (read only).
+    #[arg(long)]
+    package: Option<PathBuf>,
+    /// The staged overlay folder.
+    #[arg(long)]
+    overlay: Option<PathBuf>,
+    /// Direct shader disk cache folder (default: DECANT_D3D12X_DIRECT_CACHE or %LOCALAPPDATA%\Decant\direct-dxil).
+    #[arg(long)]
+    cache: Option<PathBuf>,
+    /// Pipeline manifest file (default: %LOCALAPPDATA%\Decant\<title-id>\manifest.txt when present).
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+    /// Worker threads for decant_shader_warm.
+    #[arg(long)]
+    threads: Option<usize>,
+    /// Show a lightweight native Win32 progress window while warming.
+    #[arg(long, alias = "precompile-ui")]
+    ui: bool,
 }
 
 #[derive(Args)]
@@ -71,6 +95,12 @@ struct RunOptions {
     /// Run the title at below normal CPU and GPU scheduling priority (same as DECANT_GENTLE=1).
     #[arg(long)]
     gentle: bool,
+    /// Precompile direct shaders before starting the title.
+    #[arg(long)]
+    precompile: bool,
+    /// Precompile direct shaders with a lightweight native Win32 progress window before starting the title.
+    #[arg(long = "precompile-ui")]
+    precompile_ui: bool,
     /// Arguments for the title.
     #[arg(last = true)]
     args: Vec<String>,
@@ -105,10 +135,32 @@ fn do_stage(a: &StageArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn do_run(overlay: &std::path::Path, o: &RunOptions) -> Result<ExitCode, String> {
+fn do_precompile(a: &PrecompileArgs) -> Result<(), String> {
+    let cfg = precompile::PrecompileConfig {
+        package: a.package.clone(),
+        overlay: a.overlay.clone(),
+        cache: a.cache.clone(),
+        manifest: a.manifest.clone(),
+        threads: a.threads,
+        ui: a.ui,
+    };
+    precompile::precompile(&cfg).map(|_| ())
+}
+
+fn do_run(package: Option<&std::path::Path>, overlay: &std::path::Path, o: &RunOptions) -> Result<ExitCode, String> {
     let overlay = std::fs::canonicalize(overlay).map_err(|e| format!("{}: {e}", overlay.display()))?;
     // Without the `\\?\` prefix canonicalize adds, as the loader reports DLL paths.
     let overlay = overlay.to_str().and_then(|s| s.strip_prefix(r"\\?\")).map_or(overlay.clone(), PathBuf::from);
+    if o.precompile || o.precompile_ui {
+        precompile::precompile(&precompile::PrecompileConfig {
+            package: package.map(PathBuf::from),
+            overlay: Some(overlay.clone()),
+            cache: None,
+            manifest: None,
+            threads: None,
+            ui: o.precompile_ui,
+        })?;
+    }
     let exe = title_executable(&overlay, o.exe.as_deref())?;
     let log_path = o.log.clone().unwrap_or_else(|| overlay.join("decant_launch.log"));
     let mut sink = Both(std::fs::File::create(&log_path).ok());
@@ -137,8 +189,9 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.command {
         Command::Stage(a) => do_stage(a).map(|()| ExitCode::SUCCESS),
-        Command::Run(a) => do_run(&a.overlay, &a.options),
-        Command::All { stage, run } => do_stage(stage).and_then(|()| do_run(&stage.overlay, run)),
+        Command::Precompile(a) => do_precompile(a).map(|()| ExitCode::SUCCESS),
+        Command::Run(a) => do_run(None, &a.overlay, &a.options),
+        Command::All { stage, run } => do_stage(stage).and_then(|()| do_run(Some(&stage.package), &stage.overlay, run)),
     };
     result.unwrap_or_else(|e| {
         eprintln!("decant-launch: {e}");
