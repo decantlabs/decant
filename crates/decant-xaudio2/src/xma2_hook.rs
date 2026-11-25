@@ -1,5 +1,4 @@
-//! The C ABI of an optional software XMA2 decoder DLL (risk R5 in docs/LAUNCH_ARCHITECTURE.md),
-//! formerly `xma2_hook.h`.
+//! The C ABI of an optional software XMA2 decoder DLL, for PCs without a hardware XMA decoder.
 //!
 //! XAudio2 2.9 on Windows accepts PCM, ADPCM and xWMA only. XMA is documented as Xbox only
 //! (<https://learn.microsoft.com/en-us/windows/win32/xaudio2/xaudio2-redistributable>). A console
