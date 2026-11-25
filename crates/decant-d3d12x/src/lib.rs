@@ -46,6 +46,7 @@ pub mod list_sync;
 pub mod page_maps;
 pub mod mesh_pso;
 pub mod pipeline_manifest;
+pub mod pso_library;
 pub mod rts0;
 pub mod resource_args;
 pub mod sampler_registry;
