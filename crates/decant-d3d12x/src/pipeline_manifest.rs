@@ -13,10 +13,18 @@
 //! containers come from the title's shader archive by hash, or from the layer's dump of containers
 //! that are in no archive). Like every file produced from a title it stays outside the repository.
 //!
-//! # Format, version 1
+//! # Format, versions 1 and 2
+//!
+//! Version 1 remains readable. Version 2 optionally appends `pcstate=<hex>` to a `P` line.
+//! The hex encodes the public x64 PC description with pointers and cached blobs cleared.
+//! It preserves every inline byte used by `pso_library`, including unused target slots.
+//! Readers accept extended records under either header when appending to an existing file.
+//! Graphics records without this token can compile DXIL but cannot warm driver PSOs.
+//! Root layouts store static sampler bindings only. Offline PSO creation must refuse those
+//! layouts because their full sampler descriptions are unavailable.
 //!
 //! UTF-8 text, one record per line, fields separated by one space. Lines starting with `#` are
-//! comments, the first line is `# decant pipeline manifest 1`. Numbers are decimal unless they are
+//! comments, the first line names version 1 or 2. Numbers are decimal unless they are
 //! hashes (16 lower case hex digits) or flags (`0x` and hex digits).
 //!
 //! A root signature, written once before the first pipeline that names it:
@@ -70,11 +78,70 @@ use crate::shader_source::{InputElement, Linkage, StageKind};
 /// The switch that names the manifest file.
 pub const SWITCH: &str = "DECANT_D3D12X_PIPELINE_MANIFEST";
 /// The first line of a manifest.
-pub const HEADER: &str = "# decant pipeline manifest 1";
+pub const HEADER: &str = "# decant pipeline manifest 2";
+
+/// State bytes from the public x64 PC description layout in d3d12.h.
+/// Only inline state is retained. Pointer fields and cached blobs are never written.
+/// Graphics includes blend, sample mask, rasterizer, depth stencil, strip cut,
+/// topology, all target formats, sample description, node mask and pipeline flags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PcState {
+    desc: Vec<u8>,
+}
+
+impl PcState {
+    fn ranges(size: usize) -> &'static [(usize, usize)] {
+        match size {
+            0x290 => &[(0x70, 0x224), (0x230, 0x234), (0x238, 0x274), (0x288, 0x28c)],
+            0x38 => &[(0x18, 0x1c), (0x30, 0x34)],
+            _ => &[],
+        }
+    }
+
+    /// Captures all inline state needed by the runtime cache key.
+    /// Mesh and stream output descriptions are not supported by the disk cache.
+    pub fn capture(desc: &[u8]) -> Option<Self> {
+        let ranges = Self::ranges(desc.len());
+        if ranges.is_empty() || (desc.len() == 0x290 && desc[0x60..0x64] != [0; 4]) {
+            return None;
+        }
+        let mut state = vec![0; desc.len()];
+        for &(start, end) in ranges {
+            state[start..end].copy_from_slice(&desc[start..end]);
+        }
+        Some(Self { desc: state })
+    }
+
+    /// The description with pointer fields cleared.
+    pub fn description(&self) -> &[u8] {
+        &self.desc
+    }
+
+    fn text(&self) -> String {
+        self.desc.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn parse(text: &str) -> Result<Self, String> {
+        if !matches!(text.len(), 112 | 1312) || !text.is_ascii() {
+            return Err("pcstate needs a compute or graphics description in hex".into());
+        }
+        let desc = (0..text.len()).step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|_| "bad pcstate hex".to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let state = Self::capture(&desc).ok_or("unsupported pcstate")?;
+        if state.desc != desc {
+            return Err("pcstate has nonzero pointer or reserved fields".into());
+        }
+        Ok(state)
+    }
+}
+
 
 /// One pipeline of a manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
+    /// Complete inline PC state when recorded by version 2.
+    pub pc_state: Option<PcState>,
     /// The id of its root signature, `None` when the layer did not know it.
     pub root: Option<u64>,
     /// How its stages link. `linkage.stages` are the kinds of `stages`.
@@ -304,6 +371,7 @@ pub fn parse_pipeline(line: &str) -> Result<Record, String> {
         "-" => None,
         r => Some(u64::from_str_radix(r, 16).map_err(|_| format!("bad root id `{r}`"))?),
     };
+    let mut pc_state = None;
     let mut linkage = Linkage::default();
     let mut stages = Vec::new();
     let mut rest: Vec<&str> = Vec::new();
@@ -315,6 +383,10 @@ pub fn parse_pipeline(line: &str) -> Result<Record, String> {
         let n = || value.parse::<u32>().map_err(|_| format!("`{t}`: not a number"));
         let list = || value.split(',').filter(|v| !v.is_empty());
         match key {
+            "pcstate" => {
+                if pc_state.is_some() { return Err("duplicate pcstate".into()) }
+                pc_state = Some(PcState::parse(value)?);
+            }
             "topo" => linkage.topology_type = n()?,
             "msaa" => linkage.sample_count = n()?,
             "ds" => linkage.depth_format = n()?,
@@ -335,7 +407,7 @@ pub fn parse_pipeline(line: &str) -> Result<Record, String> {
         return Err("pipeline line without stages".into());
     }
     linkage.stages = stages.iter().map(|(k, _)| *k).collect();
-    Ok(Record { root, linkage, stages })
+    Ok(Record { pc_state, root, linkage, stages })
 }
 
 /// A manifest from its text: the root signatures, and every distinct pipeline once, in the order
@@ -403,6 +475,11 @@ impl Writer {
     /// with one call and no buffer, so a title that is stopped loses nothing that was recorded.
     /// Whether the pipeline was new.
     pub fn record(&mut self, root: Option<&RootLayout>, linkage: &Linkage, stages: &[&[u8]]) -> std::io::Result<bool> {
+        self.record_state(root, linkage, stages, None)
+    }
+
+    /// Records a pipeline with complete inline state for offline PSO creation.
+    pub fn record_state(&mut self, root: Option<&RootLayout>, linkage: &Linkage, stages: &[&[u8]], state: Option<&PcState>) -> std::io::Result<bool> {
         let hashes: Vec<u64> = stages.iter().map(|b| *self.hashes.entry((b.as_ptr() as usize, b.len())).or_insert_with(|| decant_shader::container::fnv1a64(b))).collect();
         let (root_line, id) = match root {
             Some(layout) => {
@@ -412,7 +489,10 @@ impl Writer {
             }
             None => (None, None),
         };
-        let line = pipeline_line(id, linkage, &hashes);
+        let mut line = pipeline_line(id, linkage, &hashes);
+        if let Some(state) = state {
+            line.push_str(&format!(" pcstate={}", state.text()));
+        }
         if !self.lines.insert(Fnv128::default().bytes(line.as_bytes()).finish()) {
             return Ok(false);
         }
@@ -466,7 +546,7 @@ pub(crate) fn created(owned: &crate::lazy_pso::Owned) {
     };
     let stages: Vec<&[u8]> = pipeline.stages.iter().map(|s| &*s.bytes).collect();
     let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-    match w.record(Some(&pipeline.root), &pipeline.linkage, &stages) {
+    match w.record_state(Some(&pipeline.root), &pipeline.linkage, &stages, PcState::capture(owned.desc()).as_ref()) {
         Ok(true) if w.pipelines.is_power_of_two() => xs_log!("pipeline manifest: {} pipelines, {} root signatures recorded", w.pipelines, w.roots.len()),
         Ok(_) => {}
         Err(e) => {
@@ -522,6 +602,49 @@ mod tests {
     }
 
     #[test]
+    fn version_one_records_keep_their_original_meaning() {
+        let text = "# decant pipeline manifest 1\nP - topo=0 msaa=0 ds=0 rt= so=0 in= CS 0000000000000007\n";
+        let manifest = parse(text).unwrap();
+        assert_eq!(manifest.pipelines.len(), 1);
+        assert!(manifest.pipelines[0].pc_state.is_none());
+        assert_eq!(manifest.pipelines[0].stages, [(StageKind::Compute, 7)]);
+    }
+
+    #[test]
+    fn version_two_state_round_trips_and_matches_the_runtime_key() {
+        let dir = TempDir::new("manifest-state");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("manifest.txt");
+        let mut desc = vec![0x35; 0x290];
+        desc[0x60..0x64].fill(0);
+        let state = PcState::capture(&desc).unwrap();
+        let stages: [&[u8]; 2] = [b"vertex", b"pixel"];
+        {
+            let mut writer = Writer::open(&path).unwrap();
+            assert!(writer.record_state(Some(&layout()), &graphics(), &stages, Some(&state)).unwrap());
+            let mut other = desc.clone();
+            other[0x1c0] ^= 1;
+            assert!(writer.record_state(Some(&layout()), &graphics(), &stages, PcState::capture(&other).as_ref()).unwrap());
+        }
+        let manifest = read(&path).unwrap();
+        assert_eq!(manifest.pipelines.len(), 2);
+        assert_eq!(manifest.pipelines[0].pc_state.as_ref(), Some(&state));
+        assert_eq!(PcState::parse(&state.text()).unwrap(), state);
+        assert_eq!(crate::pso_library::pipeline_key(&desc, &stages, 9), crate::pso_library::pipeline_key(state.description(), &stages, 9));
+        assert_ne!(manifest.pipelines[0].pc_state, manifest.pipelines[1].pc_state);
+        let compute = PcState::capture(&[0x52; 0x38]).unwrap();
+        assert_eq!(PcState::parse(&compute.text()).unwrap(), compute);
+        assert!(PcState::parse("00").is_err());
+        let mut pointer = state.text();
+        pointer.replace_range(..2, "01");
+        assert!(PcState::parse(&pointer).is_err());
+        assert!(PcState::capture(&[1; 0x290]).is_none());
+        assert!(PcState::capture(&[0; 0x2b0]).is_none());
+        let extended = format!("# decant pipeline manifest 1\nP - topo=3 VS 0000000000000001 pcstate={}\n", state.text());
+        assert!(parse(&extended).unwrap().pipelines[0].pc_state.is_some());
+    }
+
+    #[test]
     fn a_root_signature_reads_back_as_written() {
         let text = root_text(&layout());
         assert_eq!(
@@ -543,7 +666,7 @@ mod tests {
             "P 0123456789abcdef topo=3 msaa=1 ds=40 rt=28,10 so=0 in=POSITION.0.6.0.0.v.0,odd%20name%2E%25.2.16.1.12.i.1 VS 28d887aa04ffa15a PS b40d9ca24fe3d23d"
         );
         let r = parse_pipeline(&line).expect("parses");
-        assert_eq!(r, Record { root: Some(0x0123_4567_89ab_cdef), linkage: graphics(), stages: vec![(StageKind::Vertex, 0x28d8_87aa_04ff_a15a), (StageKind::Pixel, 0xb40d_9ca2_4fe3_d23d)] });
+        assert_eq!(r, Record { pc_state: None, root: Some(0x0123_4567_89ab_cdef), linkage: graphics(), stages: vec![(StageKind::Vertex, 0x28d8_87aa_04ff_a15a), (StageKind::Pixel, 0xb40d_9ca2_4fe3_d23d)] });
         // A compute pipeline without a known root signature.
         let compute = Linkage { stages: vec![StageKind::Compute], ..Linkage::default() };
         let line = pipeline_line(None, &compute, &[7]);
@@ -582,7 +705,7 @@ mod tests {
         let id = root_id(&root_text(&layout()));
         assert_eq!(m.roots.get(&id), Some(&layout()));
         let fnv = decant_shader::container::fnv1a64;
-        assert_eq!(m.pipelines[0], Record { root: Some(id), linkage: graphics(), stages: vec![(StageKind::Vertex, fnv(&vs)), (StageKind::Pixel, fnv(&ps))] });
+        assert_eq!(m.pipelines[0], Record { pc_state: None, root: Some(id), linkage: graphics(), stages: vec![(StageKind::Vertex, fnv(&vs)), (StageKind::Pixel, fnv(&ps))] });
         assert_eq!(m.pipelines[2].root, None);
     }
 

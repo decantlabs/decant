@@ -4,6 +4,13 @@
 //! (`decant-shader` via `DirectSource`), compiler (`decant-dxc::Dxc`) and disk cache
 //! (`direct_cache::DiskCache`) through `compile_service::Service`, the same path the layer runs.
 //!
+//! `--warm-pso` adds a second stage that creates headless PC pipelines and stores driver blobs.
+//! `--pso-cache` selects the runtime PSO cache directory. It otherwise follows
+//! `DECANT_D3D12X_PSO_CACHE`. Progress uses `PROGRESS_PSO` and the report counts successful
+//! creation, accepted cache hits, stored blobs, failures and unsupported records.
+//! Graphics needs version 2 inline state. Version 1 compute uses node mask and flags of zero.
+//! Static sampler layouts are skipped because the manifest lacks sampler descriptions.
+//!
 //! Shader bytes are never stored in a manifest or in this tool's report. Each stage is resolved by
 //! its 64 bit FNV 1a container hash from `--shaders` archives first and then as `<hash>.bin` under
 //! `--dump-dir`. When `--manifest` is omitted, single stage records are built from the resolved
@@ -43,6 +50,12 @@ struct Args {
     /// Pipeline manifest written by a game run with DECANT_D3D12X_DIRECT=1 and DECANT_D3D12X_PIPELINE_MANIFEST.
     #[arg(long)]
     manifest: Option<PathBuf>,
+    /// Create headless PC pipeline states after compiling DXIL.
+    #[arg(long, requires = "manifest")]
+    warm_pso: bool,
+    /// Driver PSO cache directory shared with the runtime.
+    #[arg(long, requires = "warm_pso")]
+    pso_cache: Option<PathBuf>,
     /// Optional bind order file used to rank pipelines before applying --top.
     #[arg(long = "bind-order")]
     bind_order: Option<PathBuf>,
@@ -376,7 +389,7 @@ fn build_corpus_manifest(
             sample_count: u32::from(kind != StageKind::Compute),
             ..Linkage::default()
         };
-        manifest.pipelines.push(Record { root: Some(root_id), linkage, stages: vec![(kind, hash)] });
+        manifest.pipelines.push(Record { pc_state: None, root: Some(root_id), linkage, stages: vec![(kind, hash)] });
         if let Some(map) = &mut kept_bytes {
             map.insert(hash, Arc::from(bytes));
         }
@@ -591,6 +604,314 @@ fn emit_progress(done: usize, total: usize, ready: u64, compiled: u64, cache_hit
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
 }
+
+/// A pointer free description prepared without a device.
+#[cfg(any(windows, test))]
+fn prepare_pso(record: &Record, root: &RootLayout) -> Result<Vec<u8>, String> {
+    if !root.static_samplers.is_empty() {
+        return Err("root signature has static sampler bindings without descriptions".into());
+    }
+    let kinds: Vec<_> = record.stages.iter().map(|s| s.0).collect();
+    if kinds != record.linkage.stages {
+        return Err("stage linkage differs from the recorded stages".into());
+    }
+    let compute = kinds == [StageKind::Compute];
+    if !compute && (kinds.first() != Some(&StageKind::Vertex)
+        || kinds.iter().any(|k| matches!(k, StageKind::Compute | StageKind::Mesh | StageKind::Amplification))
+        || kinds.iter().collect::<HashSet<_>>().len() != kinds.len()) {
+        return Err("unsupported graphics stage combination".into());
+    }
+    if record.linkage.stream_output {
+        return Err("stream output is not supported by the PSO cache".into());
+    }
+    let desc = match &record.pc_state {
+        Some(state) => state.description().to_vec(),
+        None if compute => vec![0; 0x38],
+        None => return Err("graphics pipeline needs version 2 full state".into()),
+    };
+    if desc.len() != if compute { 0x38 } else { 0x290 } {
+        return Err("PC state does not match the pipeline kind".into());
+    }
+    if !compute {
+        let n = |at| u32::from_le_bytes(desc[at..at + 4].try_into().unwrap_or_default());
+        let l = &record.linkage;
+        if l.targets.len() > 8 || l.inputs.len() > 32 || l.sample_count == 0
+            || n(0x230) as usize != l.inputs.len() || n(0x240) as usize != l.targets.len()
+            || n(0x23c) != l.topology_type || n(0x264) != l.depth_format || n(0x268) != l.sample_count
+            || l.targets.iter().enumerate().any(|(i, f)| n(0x244 + 4 * i) != *f) {
+            return Err("PC graphics state differs from linkage".into());
+        }
+    }
+    Ok(desc)
+}
+
+#[derive(Default)]
+struct PsoReport {
+    warm: AtomicU64,
+    hits: AtomicU64,
+    stored: AtomicU64,
+    failed: AtomicU64,
+    skipped: AtomicU64,
+}
+
+impl PsoReport {
+    fn line(&self) -> String {
+        format!("pso_warm={} pso_hits={} pso_stored={} pso_failed={} pso_skipped={}",
+            self.warm.load(Ordering::Relaxed), self.hits.load(Ordering::Relaxed),
+            self.stored.load(Ordering::Relaxed), self.failed.load(Ordering::Relaxed), self.skipped.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(not(windows))]
+fn warm_psos(args: &Args, records: &[Record], _: &Manifest, _: &Containers, _: &Service, _: usize) -> PsoReport {
+    skip_psos(args, records.len(), "headless D3D12 PSO warming requires Windows")
+}
+
+fn skip_psos(args: &Args, total: usize, reason: &str) -> PsoReport {
+    log(&format!("Stage 2 skipped: {reason}"));
+    let report = PsoReport::default();
+    report.skipped.store(total as u64, Ordering::Relaxed);
+    if args.progress { println!("PROGRESS_PSO {total}/{total} {}", report.line()); }
+    report
+}
+
+/// All native calls use the system runtime and owned buffers. No command queue is needed.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod offline_pso {
+    use super::*;
+    use std::ffi::{CStr, CString, c_void};
+    use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_12_0, ID3DBlob};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIDevice, IDXGIAdapter1, IDXGIFactory4};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    use windows::core::{GUID, Interface, PCSTR};
+    use d3d12_xs::pso_library::{self, Library};
+
+    type CreateDevice = unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> i32;
+    type Serialize = unsafe extern "system" fn(*const D3D12_VERSIONED_ROOT_SIGNATURE_DESC, *mut *mut c_void, *mut *mut c_void) -> i32;
+
+    fn export(name: &CStr) -> Option<usize> {
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        let path: Vec<u16> = PathBuf::from(std::env::var_os("SystemRoot")?).join("System32/d3d12.dll")
+            .as_os_str().to_string_lossy().encode_utf16().chain(Some(0)).collect();
+        // SAFETY: both names are terminated. The system module stays loaded for this process.
+        unsafe {
+            let module = LoadLibraryW(path.as_ptr());
+            if module.is_null() { return None }
+            GetProcAddress(module, name.as_ptr().cast()).map(|f| f as usize)
+        }
+    }
+
+    fn device() -> Option<ID3D12Device> {
+        let create = export(c"D3D12CreateDevice")?;
+        // SAFETY: the export has the declared signature. COM outputs are owned references.
+        unsafe {
+            let create: CreateDevice = std::mem::transmute(create);
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let mut i = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(i) {
+                i += 1;
+                let Ok(desc) = adapter.GetDesc1() else { continue };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 { continue }
+                let mut raw = std::ptr::null_mut();
+                if create(adapter.as_raw(), D3D_FEATURE_LEVEL_12_0.0 as u32, &ID3D12Device::IID, &mut raw) >= 0 && !raw.is_null() {
+                    return Some(ID3D12Device::from_raw(raw));
+                }
+            }
+        }
+        None
+    }
+
+    fn identity(device: &ID3D12Device) -> Option<pso_library::AdapterIdentity> {
+        // SAFETY: these queries borrow live COM objects and return owned adapter references.
+        unsafe {
+            let luid = device.GetAdapterLuid();
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
+            let desc = adapter.GetDesc1().ok()?;
+            Some(pso_library::AdapterIdentity {
+                luid: u64::from(luid.LowPart) | (u64::from(luid.HighPart as u32) << 32),
+                vendor_id: desc.VendorId, device_id: desc.DeviceId, subsys_id: desc.SubSysId,
+                revision: desc.Revision, driver_version: adapter.CheckInterfaceSupport(&IDXGIDevice::IID).ok()? as u64,
+            })
+        }
+    }
+
+    fn root_signature(device: &ID3D12Device, layout: &RootLayout) -> Result<ID3D12RootSignature, String> {
+        if !layout.static_samplers.is_empty() { return Err("static sampler descriptions unavailable".into()) }
+        let ranges: Vec<Vec<D3D12_DESCRIPTOR_RANGE1>> = layout.params.iter().map(|p| {
+            if let RootParamKind::Table(ranges) = &p.kind {
+                ranges.iter().map(|r| D3D12_DESCRIPTOR_RANGE1 {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE(match r.class { RegisterClass::Srv => 0, RegisterClass::Uav => 1, RegisterClass::Cbv => 2, RegisterClass::Sampler => 3 }),
+                    NumDescriptors: r.count, BaseShaderRegister: r.base, RegisterSpace: r.space,
+                    Flags: D3D12_DESCRIPTOR_RANGE_FLAGS(r.flags as i32), OffsetInDescriptorsFromTableStart: r.offset,
+                }).collect()
+            } else { Vec::new() }
+        }).collect();
+        let params: Vec<_> = layout.params.iter().zip(&ranges).map(|(p, ranges)| {
+            let (kind, data) = match &p.kind {
+                RootParamKind::Table(_) => (0, D3D12_ROOT_PARAMETER1_0 { DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 { NumDescriptorRanges: ranges.len() as u32, pDescriptorRanges: ranges.as_ptr() } }),
+                RootParamKind::Constants { register, space, count } => (1, D3D12_ROOT_PARAMETER1_0 { Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: *register, RegisterSpace: *space, Num32BitValues: *count } }),
+                RootParamKind::Descriptor { class, register, space } => (
+                    match class { RegisterClass::Cbv => 2, RegisterClass::Srv => 3, RegisterClass::Uav => 4, RegisterClass::Sampler => 4 },
+                    D3D12_ROOT_PARAMETER1_0 { Descriptor: D3D12_ROOT_DESCRIPTOR1 { ShaderRegister: *register, RegisterSpace: *space, Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE } }),
+            };
+            D3D12_ROOT_PARAMETER1 { ParameterType: D3D12_ROOT_PARAMETER_TYPE(kind), Anonymous: data, ShaderVisibility: D3D12_SHADER_VISIBILITY(p.visibility as i32) }
+        }).collect();
+        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC { Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 { Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32, pParameters: params.as_ptr(), NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(), Flags: D3D12_ROOT_SIGNATURE_FLAGS(layout.flags as i32),
+            } } };
+        let serialize = export(c"D3D12SerializeVersionedRootSignature").ok_or("system root signature serializer unavailable")?;
+        let (mut raw, mut errors) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: all descriptions and their nested arrays live through serialization.
+        unsafe {
+            let serialize: Serialize = std::mem::transmute(serialize);
+            let hr = serialize(&desc, &mut raw, &mut errors);
+            let error = if errors.is_null() { None } else { Some(ID3DBlob::from_raw(errors)) };
+            let blob = if raw.is_null() { None } else { Some(ID3DBlob::from_raw(raw)) };
+            if hr < 0 { return Err(format!("root signature serialization failed {hr:#x}")) }
+            drop(error);
+            let blob = blob.ok_or("root signature serializer returned no blob")?;
+            let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+            device.CreateRootSignature(0, bytes).map_err(|e| e.to_string())
+        }
+    }
+
+    fn make(device: &ID3D12Device, root: &ID3D12RootSignature, record: &Record, desc: &[u8], stages: &[Arc<[u8]>], blob: Option<&[u8]>) -> Result<ID3D12PipelineState, String> {
+        let names: Vec<_> = record.linkage.inputs.iter().map(|e| CString::new(e.semantic.as_str()).map_err(|e| e.to_string())).collect::<Result<_, _>>()?;
+        let inputs: Vec<_> = record.linkage.inputs.iter().zip(&names).map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(name.as_ptr().cast()), SemanticIndex: e.index, Format: DXGI_FORMAT(e.format as i32),
+            InputSlot: e.slot, AlignedByteOffset: e.offset, InputSlotClass: D3D12_INPUT_CLASSIFICATION(i32::from(e.per_instance)), InstanceDataStepRate: e.step_rate,
+        }).collect();
+        let mut bytes = desc.to_vec();
+        bytes[..8].copy_from_slice(&(root.as_raw() as u64).to_le_bytes());
+        for ((kind, _), stage) in record.stages.iter().zip(stages) {
+            let at = match kind { StageKind::Vertex | StageKind::Compute => 8, StageKind::Pixel => 24, StageKind::Domain => 40, StageKind::Hull => 56, StageKind::Geometry => 72, _ => return Err("unsupported PSO stage".into()) };
+            bytes[at..at + 8].copy_from_slice(&(stage.as_ptr() as u64).to_le_bytes());
+            bytes[at + 8..at + 16].copy_from_slice(&(stage.len() as u64).to_le_bytes());
+        }
+        if bytes.len() == 0x290 {
+            bytes[0x228..0x230].copy_from_slice(&(inputs.as_ptr() as u64).to_le_bytes());
+            let graphics: &mut [u8; 0x290] = bytes.as_mut_slice().try_into().map_err(|_| "graphics description size")?;
+            d3d12_xs::stream_pso::valid_states(graphics);
+        }
+        if let Some(blob) = blob {
+            let at = pso_library::cached_field(bytes.len()).ok_or("description size")?;
+            bytes[at..at + 8].copy_from_slice(&(blob.as_ptr() as u64).to_le_bytes());
+            bytes[at + 8..at + 16].copy_from_slice(&(blob.len() as u64).to_le_bytes());
+        }
+        let aligned: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b)).collect();
+        // SAFETY: the aligned public description has live root, shader, input and blob pointers.
+        // It is borrowed only. The manually dropped root field owns no additional reference.
+        unsafe {
+            if bytes.len() == 0x38 {
+                device.CreateComputePipelineState(&*aligned.as_ptr().cast::<D3D12_COMPUTE_PIPELINE_STATE_DESC>())
+            } else {
+                device.CreateGraphicsPipelineState(&*aligned.as_ptr().cast::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>())
+            }.map_err(|e| e.to_string())
+        }
+    }
+
+    pub(super) fn run(args: &Args, records: &[Record], manifest: &Manifest, containers: &Containers, service: &Service, threads: usize) -> PsoReport {
+        let report = PsoReport::default();
+        let Some(device) = device() else {
+            return skip_psos(args, records.len(), "no D3D12 hardware adapter is present");
+        };
+        let Some(folder) = args.pso_cache.clone().or_else(pso_library::configured_root) else {
+            return skip_psos(args, records.len(), "the PSO disk cache is disabled");
+        };
+        let library = Library::new(folder, env!("DECANT_DIRECT_TRANSLATOR_HASH"));
+        if library.open(|| identity(&device)).is_none() {
+            return skip_psos(args, records.len(), "adapter or driver identity unavailable");
+        }
+        let cursor = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        let progress_lock = std::sync::Mutex::new(());
+        let emit = |n| {
+            if args.progress { println!("PROGRESS_PSO {n}/{} {}", records.len(), report.line()); }
+        };
+        emit(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    loop {
+                        let i = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some(record) = records.get(i) else { break };
+                        let prepared = record.root.and_then(|id| manifest.roots.get(&id)).ok_or_else(|| "unknown root signature".to_string())
+                            .and_then(|root| prepare_pso(record, root).map(|desc| (root, desc)));
+                        match prepared {
+                            Err(e) => { report.skipped.fetch_add(1, Ordering::Relaxed); log(&format!("Stage 2 pipeline {} skipped: {e}", i + 1)); }
+                            Ok((layout, desc)) => {
+                                let result = (|| {
+                                    let pipeline = pipeline_of(record, manifest, containers).map_err(|e| e.to_string())?;
+                                    let identity = d3d12_xs::direct_cache::pipeline_key(&pipeline, env!("DECANT_DIRECT_TRANSLATOR_HASH"), "");
+                                    let Poll::Ready(stages) = service.poll(i + 1, || Ok(pipeline)) else { return Err("compiled DXIL unavailable".into()) };
+                                    if stages.len() != record.stages.len() { return Err("compiled stage count differs from manifest".into()) }
+                                    let stage_refs: Vec<_> = stages.iter().map(|s| &s[..]).collect();
+                                    let key = pso_library::pipeline_key(&desc, &stage_refs, identity).ok_or("unsupported cache key")?;
+                                    let root = root_signature(&device, layout)?;
+                                    let cached = library.lookup(key);
+                                    let made = match make(&device, &root, record, &desc, &stages, cached.as_deref()) {
+                                        Ok(pso) => { if cached.is_some() { report.hits.fetch_add(1, Ordering::Relaxed); } pso }
+                                        Err(_) if cached.is_some() => { library.reject(key); make(&device, &root, record, &desc, &stages, None)? }
+                                        Err(e) => return Err(e),
+                                    };
+                                    report.warm.fetch_add(1, Ordering::Relaxed);
+                                    let blob = pso_library::cached_blob(made.as_raw()).ok_or("driver returned no cached blob")?;
+                                    library.keep(key, &blob).map_err(|e| e.to_string())?;
+                                    report.stored.fetch_max(library.counts().stored.load(Ordering::Relaxed), Ordering::Relaxed);
+                                    Ok::<_, String>(())
+                                })();
+                                if let Err(e) = result { report.failed.fetch_add(1, Ordering::Relaxed); log(&format!("Stage 2 pipeline {} failed: {e}", i + 1)); }
+                            }
+                        }
+                        let _progress = progress_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        emit(done.fetch_add(1, Ordering::Relaxed) + 1);
+                    }
+                });
+            }
+        });
+        report
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn hardware_compute_blob_matches_the_shared_cache() {
+            let Some(device) = device() else { println!("skipped: no D3D12 hardware adapter"); return };
+            let Some(adapter) = identity(&device) else { println!("skipped: no driver identity"); return };
+            let Ok(dxc) = decant_dxc::Dxc::load() else { println!("skipped: no DXC"); return };
+            let shader = dxc.compile("groupshared uint data[2]; [numthreads(2,1,1)] void main(uint i : SV_GroupIndex) { data[i] = i; }", "main", "cs_6_0", &[]).unwrap();
+            let layout = RootLayout { version: 2, flags: 0, params: vec![], static_samplers: vec![] };
+            let record = pipeline_manifest::parse_pipeline("P - topo=0 msaa=0 ds=0 rt= so=0 in= CS 0000000000000001").unwrap();
+            let desc = prepare_pso(&record, &layout).unwrap();
+            let root = root_signature(&device, &layout).unwrap();
+            let stages: Vec<Arc<[u8]>> = vec![Arc::from(shader)];
+            let made = make(&device, &root, &record, &desc, &stages, None).unwrap();
+            let Some(blob) = pso_library::cached_blob(made.as_raw()) else { println!("skipped: driver returned no cached blob"); return };
+            let key = pso_library::pipeline_key(&desc, &[&stages[0]], 123).unwrap();
+            let dir = crate::tests::temp_dir("offline-pso");
+            let library = Library::new(dir.clone(), env!("DECANT_DIRECT_TRANSLATOR_HASH"));
+            library.open(|| Some(adapter)).unwrap();
+            library.keep(key, &blob).unwrap();
+            let reopened = Library::new(dir.clone(), env!("DECANT_DIRECT_TRANSLATOR_HASH"));
+            reopened.open(|| Some(adapter)).unwrap();
+            let cached = reopened.lookup(key).unwrap();
+            assert_eq!(cached, blob);
+            assert!(make(&device, &root, &record, &desc, &stages, Some(&cached)).is_ok());
+            assert_eq!(reopened.counts().hits.load(Ordering::Relaxed), 1);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+}
+
+#[cfg(windows)]
+use offline_pso::run as warm_psos;
 
 fn main() -> std::process::ExitCode {
     let args = Args::parse();
@@ -832,7 +1153,13 @@ fn main() -> std::process::ExitCode {
         seconds: elapsed,
         cache_bytes,
     };
-    let text = report.render();
+    let pso_report = if args.warm_pso {
+        warm_psos(&args, &pipelines, &manifest, &containers, &service, threads)
+    } else { PsoReport::default() };
+    let mut text = report.render();
+    if args.warm_pso {
+        text += &format!("PSO summary: {}\n", pso_report.line());
+    }
     print!("{text}");
     if let Some(path) = &args.report
         && let Err(e) = std::fs::write(path, &text)
@@ -840,7 +1167,7 @@ fn main() -> std::process::ExitCode {
         log(&format!("BLOCKED: report not written to {} ({e})", path.display()));
         return std::process::ExitCode::FAILURE;
     }
-    if report.failures > 0 || report.ready == 0 {
+    if report.failures > 0 || report.ready == 0 || pso_report.failed.load(Ordering::Relaxed) > 0 {
         return std::process::ExitCode::FAILURE;
     }
     std::process::ExitCode::SUCCESS
@@ -849,6 +1176,49 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pso_options_require_a_manifest_and_accept_an_optional_cache() {
+        let args = Args::try_parse_from(["warm", "--cache", "dxil", "--manifest", "pipelines.txt", "--warm-pso", "--pso-cache", "driver", "--threads", "3", "--progress"]).unwrap();
+        assert!(args.warm_pso && args.progress);
+        assert_eq!(args.pso_cache, Some(PathBuf::from("driver")));
+        assert_eq!(args.threads, 3);
+        assert!(!Args::try_parse_from(["warm", "--cache", "dxil"]).unwrap().warm_pso);
+        assert!(Args::try_parse_from(["warm", "--cache", "dxil", "--warm-pso"]).is_err());
+        assert!(Args::try_parse_from(["warm", "--cache", "dxil", "--pso-cache", "driver"]).is_err());
+        assert!(Args::try_parse_from(["warm", "--cache", "dxil", "--manifest", "p", "--warm-pso"]).unwrap().pso_cache.is_none());
+    }
+
+    #[test]
+    fn offline_descriptions_require_complete_graphics_state() {
+        let root = RootLayout { version: 2, flags: 0, params: vec![], static_samplers: vec![] };
+        let mut record = pipeline_manifest::parse_pipeline("P - topo=0 msaa=0 ds=0 rt= so=0 in= CS 0000000000000001").unwrap();
+        assert_eq!(prepare_pso(&record, &root).unwrap(), vec![0; 0x38]);
+        let mut compute = vec![0; 0x38];
+        compute[0x18] = 1;
+        compute[0x30] = 4;
+        record.pc_state = pipeline_manifest::PcState::capture(&compute);
+        assert_eq!(prepare_pso(&record, &root).unwrap(), compute);
+        let mut graphics = pipeline_manifest::parse_pipeline("P - topo=3 msaa=1 ds=40 rt=28 so=0 in=POSITION.0.6.0.0.v.0 VS 0000000000000001 PS 0000000000000002").unwrap();
+        assert!(prepare_pso(&graphics, &root).unwrap_err().contains("version 2"));
+        let mut desc = vec![0; 0x290];
+        for (at, value) in [(0x230, 1u32), (0x23c, 3), (0x240, 1), (0x244, 28), (0x264, 40), (0x268, 1), (0x26c, 7), (0x288, 4), (0x1c0, 0x1234)] {
+            desc[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        graphics.pc_state = pipeline_manifest::PcState::capture(&desc);
+        assert_eq!(prepare_pso(&graphics, &root).unwrap(), desc);
+        let stages: [&[u8]; 2] = [b"compiled vertex", b"compiled pixel"];
+        let prepared = prepare_pso(&graphics, &root).unwrap();
+        assert_eq!(d3d12_xs::pso_library::pipeline_key(&prepared, &stages, 8), d3d12_xs::pso_library::pipeline_key(&desc, &stages, 8));
+        graphics.linkage.sample_count = 2;
+        assert!(prepare_pso(&graphics, &root).is_err());
+        record.pc_state = graphics.pc_state.clone();
+        assert!(prepare_pso(&record, &root).is_err());
+        record.pc_state = None;
+        let mut sampler_root = root;
+        sampler_root.static_samplers.push(d3d12_xs::rts0::StaticSampler { register: 0, space: 0, visibility: 0 });
+        assert!(prepare_pso(&record, &sampler_root).unwrap_err().contains("sampler"));
+    }
 
     #[test]
     fn an_empty_list_selects_nothing() {
@@ -862,7 +1232,7 @@ mod tests {
         assert_eq!(set, HashSet::from([0x1, 0xdead_beef]));
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    pub(super) fn temp_dir(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let d = std::env::temp_dir().join(format!("decant-shader-warm-{tag}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         std::fs::create_dir_all(&d).unwrap();
@@ -899,6 +1269,7 @@ mod tests {
     #[test]
     fn bind_order_ranks_stage_lines_and_keeps_manifest_order_for_the_rest() {
         let rec = |stages: &[(StageKind, u64)]| Record {
+            pc_state: None,
             root: None,
             linkage: Linkage { stages: stages.iter().map(|(k, _)| *k).collect(), ..Linkage::default() },
             stages: stages.to_vec(),
