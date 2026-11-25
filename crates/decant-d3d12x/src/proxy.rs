@@ -2541,44 +2541,24 @@ fn resource_dimension_of_view(uav: bool, dim: u32) -> Option<u32> {
 /// Counts the views at an address that were skipped, for the log.
 static VIEW_AT_SKIPS: AtomicI32 = AtomicI32::new(0);
 
-/// Moves the buffer view `view` (a PC description whose format is already the PC one) `byte_off`
-/// bytes into its buffer by advancing `FirstElement`. False, with the reason logged, when the offset
-/// is no whole number of elements or the view would reach past what the PC runtime accepts.
+/// Moves views with no raw form by whole elements after checking the PC address limit.
 fn shift_buffer_view(view: &mut [u8; 0x28], uav: bool, byte_off: u64, va: u64) -> bool {
-    static FAR_LOGGED: AtomicI32 = AtomicI32::new(0);
-    static FAR_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let first_at = first_element_at(uav);
-    let stride = le_u32(view, first_at + 12);
-    let flags = le_u32(view, 0x20);
-    let element = match (flags & 1 != 0, stride) {
-        (true, _) => 4,
-        (false, 0) => crate::views_at::format_bytes(le_u32(view, 0)),
-        (false, stride) => stride,
-    };
-    let slot = view_at_slot(uav);
-    if element == 0 || !byte_off.is_multiple_of(u64::from(element)) {
+    let at = first_element_at(uav);
+    let stride = le_u32(view, at + 12);
+    let element = if le_u32(view, 0x20) & 1 != 0 { 4 } else if stride != 0 { stride } else { crate::views_at::format_bytes(le_u32(view, 0)) };
+    let first = u64::from_le_bytes(view[at..at + 8].try_into().unwrap_or_default());
+    let shifted = (element != 0 && byte_off.is_multiple_of(u64::from(element)))
+        .then(|| first.checked_add(byte_off / u64::from(element))).flatten();
+    let valid = shifted.and_then(|first| first.checked_add(u64::from(le_u32(view, at + 8))))
+        .and_then(|end| end.checked_mul(u64::from(element)))
+        .is_some_and(|end| end <= u64::from(u32::MAX) * 4);
+    if !valid {
         if log_due(&VIEW_AT_SKIPS) {
-            xs_log!("console device slot {slot}: VA {va:016X} offset {byte_off:#x} not divisible by elem {element}; skipped");
+            xs_log!("buffer view at {va:016X} has no raw form and cannot use offset {byte_off:#x} with element size {element}");
         }
         return false;
     }
-    let first = u64::from_le_bytes(view[first_at..first_at + 8].try_into().unwrap_or_default());
-    let shifted = first.saturating_add(byte_off / u64::from(element));
-    // The PC runtime takes no buffer view whose elements lie past 2^32 elements of its buffer: it
-    // calls the view invalid and removes the device. That happened with a view tens of GiB into the window,
-    // which the page mapping copies of its queue made reachable. Such a view is left out. The
-    // elements are counted in the 4 byte ones of the raw view a structured one becomes (`view_raw`).
-    let count = u64::from(le_u32(view, first_at + 8));
-    if shifted.saturating_add(count).saturating_mul(u64::from(element)) / 4 > u64::from(u32::MAX) {
-        let seen = FAR_VIEWS.fetch_add(1, Ordering::Relaxed) + 1;
-        if log_due(&FAR_LOGGED) || seen.is_power_of_two() {
-            xs_log!(
-                "console device slot {slot}: VA {va:016X} is element {shifted} (of {element} bytes) of the window buffer, past the 2^32 raw elements a PC buffer view reaches; left out ({seen} such views so far)"
-            );
-        }
-        return false;
-    }
-    view[first_at..first_at + 8].copy_from_slice(&shifted.to_le_bytes());
+    view[at..at + 8].copy_from_slice(&shifted.unwrap_or_default().to_le_bytes());
     true
 }
 
@@ -2621,7 +2601,7 @@ unsafe fn dev_create_view_at(this: *mut Proxy, rdesc: *const c_void, view: *cons
         let count = le_u32(&pc_view, first_at + 8);
         let stride = le_u32(&pc_view, first_at + 12);
         let element = if stride != 0 { stride } else { crate::views_at::format_bytes(crate::abi::pc_dxgi_format(fmt)).max(4) };
-        let span = crate::title_mem::translate(va, (first + u64::from(count)) * u64::from(element))?;
+        let span = crate::title_mem::translate(va, first.checked_add(u64::from(count))?.checked_mul(u64::from(element))?)?;
         Some((span.resource, span.offset))
     };
     // A texture view at an address no resource holds gets a texture of its own (`view_texture`).
@@ -2635,7 +2615,7 @@ unsafe fn dev_create_view_at(this: *mut Proxy, rdesc: *const c_void, view: *cons
         .map(|res| (res, 0))
         .or_else(|| crate::views_at::lookup_resource(va, is_buffer))
         .or_else(|| is_buffer.then(in_title_memory).flatten());
-    let Some((host_res, byte_off)) = found else {
+    let Some((mut host_res, byte_off)) = found else {
         // On the console a view at address 0 is a null view: reads give zeros. Skipping it left the
         // slot's old (or never written) view in place, and a shader sampling it faulted at GPU address 0.
         // The same holds for a texture view at an address no resource holds (a 3D texture, a block
@@ -2661,8 +2641,31 @@ unsafe fn dev_create_view_at(this: *mut Proxy, rdesc: *const c_void, view: *cons
         return;
     };
     pc_view[0..4].copy_from_slice(&crate::abi::pc_dxgi_format(fmt).to_le_bytes());
-    if is_buffer && byte_off != 0 && !shift_buffer_view(&mut pc_view, uav, byte_off, va) {
-        return;
+    let mut prepared_records = None;
+    let mut raw_probe = pc_view;
+    if is_buffer && !matches!(crate::view_raw::make_raw(&mut raw_probe, kind), crate::view_raw::Outcome::Raw(_)) {
+        if !shift_buffer_view(&mut pc_view, uav, byte_off, va) {
+            return;
+        }
+    } else if is_buffer {
+        let stride = le_u32(&pc_view, first_element_at(uav) + 12);
+        if stride != 0 && !byte_off.is_multiple_of(u64::from(stride)) {
+            static UNALIGNED: AtomicI32 = AtomicI32::new(0);
+            if log_due(&UNALIGNED) {
+                xs_log!("console device slot {slot}: buffer VA {va:016X} offset {byte_off:#x} with stride {stride} uses a raw view of the same bytes with record metadata");
+            }
+        }
+        // SAFETY: the lookup returned a live PC buffer resource.
+        let prepared = unsafe { crate::view_window::prepare(host_res, va, byte_off, pc_view, kind) };
+        let Some((resource, desc, records)) = prepared else {
+            if log_due(&VIEW_AT_SKIPS) {
+                xs_log!("console device slot {slot}: buffer VA {va:016X} offset {byte_off:#x} cannot be represented or its backing pages are unavailable");
+            }
+            return;
+        };
+        host_res = resource;
+        pc_view = desc;
+        prepared_records = Some(records);
     }
     if HITS.fetch_add(1, Ordering::Relaxed) < 8 {
         xs_log!("console device slot {slot} ({name}): VA {va:016X} (+{byte_off:#x}) -> host res {host_res:016X} cpu {host_cpu:016X}");
@@ -2687,7 +2690,13 @@ unsafe fn dev_create_view_at(this: *mut Proxy, rdesc: *const c_void, view: *cons
         }
         let host_res = view_resource(what, host_res, Some(&mut pc_view[..]), needs);
         let context = if uav { "console device slot 71 (CreateUavAt)" } else { "console device slot 70 (CreateSrvAt)" };
-        let outcome = if host_res.is_null() { crate::view_raw::Outcome::NotStructured } else { crate::view_raw::convert(Some(&mut pc_view), kind, false, context) };
+        let outcome = if host_res.is_null() {
+            crate::view_raw::Outcome::NotStructured
+        } else if let Some(records) = prepared_records {
+            crate::view_raw::Outcome::Raw(records)
+        } else {
+            crate::view_raw::convert(Some(&mut pc_view), kind, false, context)
+        };
         let records = outcome.raw();
         let host_res = if outcome == crate::view_raw::Outcome::Empty { std::ptr::null_mut() } else { fitted(host_res, Some(&mut pc_view), kind) };
         note_view(host_cpu, host_res, pc_view.as_ptr().cast(), va, if uav { "uav at" } else { "srv at" });

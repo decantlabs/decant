@@ -118,6 +118,8 @@ mod view_heap;
 #[cfg(windows)]
 mod view_image;
 #[cfg(windows)]
+mod view_window;
+#[cfg(windows)]
 mod view_raw;
 #[cfg(windows)]
 mod view_shadow;
