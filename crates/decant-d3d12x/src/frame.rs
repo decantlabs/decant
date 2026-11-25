@@ -152,6 +152,12 @@ impl Clock {
 
 /// Sleeps until the counter reaches `deadline`: a high resolution waitable timer for the bulk and
 /// a yield loop for the last millisecond.
+/// The longest a frame event is waited for, in ticks: about four 60 Hz frames, so a distant or infinite
+/// event never holds the caller for long. Pure, for the tests.
+pub(crate) fn bounded_deadline(deadline: i64, now: i64, freq: i64) -> i64 {
+    deadline.min(now + freq * 66 / 1000)
+}
+
 fn wait_until(deadline: i64, freq: i64) {
     // SAFETY: plain creation calls with null optional arguments.
     let timer: HANDLE = unsafe {
@@ -278,6 +284,7 @@ pub(crate) fn wait_event(kind: u32, timeout_ms: u32, aux: usize, flags: u32, tok
         }
         return (S_FALSE, None);
     }
+    let deadline = bounded_deadline(deadline, arrival, freq);
     if deadline > arrival {
         wait_until(deadline, freq);
     }
@@ -380,5 +387,19 @@ mod tests {
         assert_eq!(statistics(1, 0, &mut count, std::ptr::null_mut()), S_OK);
         assert_eq!(count, 0);
         assert_eq!(statistics(1, 0, std::ptr::null_mut(), std::ptr::null_mut()), E_INVALIDARG);
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    /// A distant frame event is waited for four frames at most.
+    #[test]
+    fn a_distant_frame_event_is_waited_for_at_most_four_frames() {
+        let freq = 1_000_000;
+        assert_eq!(bounded_deadline(10_000_000, 0, freq), 66_000);
+        assert_eq!(bounded_deadline(5_000, 0, freq), 5_000, "a near deadline is kept");
+        assert!(bounded_deadline(i64::MAX / 4, 0, freq) <= 66_000);
     }
 }
