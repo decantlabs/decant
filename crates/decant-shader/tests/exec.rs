@@ -1171,10 +1171,10 @@ fn bvh_and_r128_mimg_read_four_descriptor_sgprs() {
     let load_256 = with_r128(image(Op::image_load, v(4), v(0), s(0), s(0), 1, 0xf), false);
 
     for (insn, expected_key) in [
-        (bvh64_nsa, "op:image_bvh64_intersect_ray"),
-        (bvh32_nsa, "op:image_bvh_intersect_ray"),
-        (bvh32_no_r128, "op:image_bvh_intersect_ray"),
-        (load_r128, "form:image_load:image-r128"),
+        (bvh64_nsa, None),
+        (bvh32_nsa, None),
+        (bvh32_no_r128, None),
+        (load_r128, Some("form:image_load:image-r128")),
     ] {
         let p = build(insn, false);
         let graph = cfg::build(&p.code).unwrap();
@@ -1182,7 +1182,12 @@ fn bvh_and_r128_mimg_read_four_descriptor_sgprs() {
         let target = graph.insns().find(|i| i.op == insn.op).unwrap();
         masks.enter(target.pc);
         assert_eq!(masks.refusal(), None, "{}", insn.op.name());
-        assert_eq!(lift_program(&p).unwrap_err().key(), expected_key);
+        match expected_key {
+            Some(key) => assert_eq!(lift_program(&p).unwrap_err().key(), key),
+            None => {
+                lift_program(&p).unwrap();
+            }
+        }
     }
 
     // A live lane mask inside the 4-dword descriptor (`s3`) is still refused as `mask-as-data`.

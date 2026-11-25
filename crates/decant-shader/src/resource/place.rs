@@ -178,6 +178,11 @@ const VIEW_SHADOW_USED: u8 = u8::MAX - 1;
 /// Turns every user data read into a read of the mirror dword of that machine register.
 fn rewrite_user_data(e: &mut Expr, stage: Stage, used: &mut Vec<u8>) {
     match e {
+        Expr::BvhWord(op, _) => {
+            for value in op.descriptor.iter_mut().chain(&mut op.address) {
+                rewrite_user_data(value, stage, used);
+            }
+        }
         Expr::UserData(k) => {
             let dword = stage.mirror_dword(*k);
             used.push(dword);

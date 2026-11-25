@@ -724,6 +724,7 @@ fn declarations(func: &Function, exec_const: bool) -> (BTreeSet<Var>, BTreeSet<V
 
 /// Prints `func`. Every resource must be placed.
 pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
+    crate::refuse_unlowered_bvh(func)?;
     let mut simplified = func.clone();
     let exec_const = simplify::run(&mut simplified);
     // After the constants are folded: a code read at a constant address is its word.
@@ -830,6 +831,8 @@ pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
     }
     let dpp = helpers.iter().any(|h| {
         h.name == crate::lift::wave::DPP_ADD.name || h.name == crate::lift::wave::PERMLANE.name
+            || h.name == crate::lift::wave::BPERMUTE.name
+            || h.name == crate::lift::wave::DPP8_MOV.name
     });
     let mut uses_dpp_mov = false;
     let mut dpp_mov_needs_full_wave = false;

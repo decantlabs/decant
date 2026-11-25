@@ -81,6 +81,7 @@ pub fn write(e: &Expr, iface: &Interface, resources: &[Resource], o: &mut String
         o.push_str(post);
     };
     match e {
+        Expr::BvhWord(..) => panic!("BVH node intersection must be lowered before HLSL printing"),
         Expr::U32(v) => {
             let _ = write!(o, "{v}u");
         }
@@ -265,6 +266,11 @@ fn walk(e: &Expr, f: &mut impl FnMut(&Expr)) {
             walk(b, f);
         }
         Expr::Call(_, args) => args.iter().for_each(|a| walk(a, f)),
+        Expr::BvhWord(op, _) => op
+            .descriptor
+            .iter()
+            .chain(&op.address)
+            .for_each(|a| walk(a, f)),
         Expr::BufferWord { offset, .. } => walk(offset, f),
         Expr::CodeWord(at) => walk(at, f),
         _ => {}

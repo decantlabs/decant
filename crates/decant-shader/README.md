@@ -74,3 +74,26 @@ the header lines.
 `cargo test -p decant-shader` runs everywhere. The tests build their programs with the assembler.
 The ones that compile the HLSL need `dxc.exe` (searched in `DECANT_SHADER_DXC`, then in the Windows SDK)
 and skip the compile step with a message when it is missing.
+
+## Relative registers and native lane operations
+
+Relative source and destination moves use finite M0 analysis where possible. Unknown M0
+values select across the 256 architectural VGPRs. Signed offsets can reach registers below
+the base. Sources are captured before writes that can alias them. An invalid runtime index
+keeps the destination unchanged. A statically invalid index is refused.
+
+Compute shaders support DPP16 half float addition and DPP8 moves, alongside existing
+DPP16 moves and integer addition. Half float addition preserves the destination high half.
+DPP8 moves and `ds_bpermute_b32` require converged control flow and a native console wave
+size. Permute addresses include the immediate byte offset and wrap within the wave.
+Inactive source lanes return zero. Other stages remain refused for these native forms.
+
+Both BVH intersection instructions lift to explicit native node intersection expressions.
+The IR preserves four descriptor words, all address words, pointer width, packed direction
+encoding, instruction flags and four result words. Consecutive and NSA addresses are supported.
+This is one node test with native result encoding. It cannot be replaced by a full RayQuery
+traversal. HLSL translation reports `resource:bvh-node-backend` until compatible node memory
+and intersection lowering are available. This change does not make BVH pipelines executable.
+
+Prior art was inspected for operand and lane behavior in the local victory shader lowerer
+and xcl register selection implementation. No code was copied.

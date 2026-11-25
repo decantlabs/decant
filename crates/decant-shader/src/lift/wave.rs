@@ -755,7 +755,7 @@ pub(crate) fn check_dpp_context(
 pub(crate) static DPP_ADD: Helper = Helper {
     name: "decant_dpp_add",
     result: Ty::U32,
-    text: "uint decant_dpp_add(uint a, uint b, uint old, bool exec, uint ctrl, bool bound, uint rows, uint banks) {
+    text: "uint decant_dpp_add(uint a, uint b, uint old, bool exec, uint ctrl, bool bound, uint rows, uint banks, bool halfOp) {
     uint lane = WaveGetLaneIndex();
     uint col = lane & 15u;
     uint row = lane & ~15u;
@@ -787,7 +787,9 @@ pub(crate) static DPP_ADD: Helper = Helper {
     bool valid = inRange && ((active[safeSource >> 5u] >> (safeSource & 31u)) & 1u) != 0u;
     uint selected = WaveReadLaneAt(a, valid ? safeSource : lane);
     bool write = ((rows >> (lane >> 4u)) & (banks >> (col >> 2u)) & 1u) != 0u;
-    return write && (valid || bound) ? b + (valid ? selected : 0u) : old;
+    uint operand = valid ? selected : 0u;
+    uint sum = halfOp ? ((old & 0xffff0000u) | f32tof16(f16tof32(b) + f16tof32(operand))) : b + operand;
+    return write && (valid || bound) ? sum : old;
 }",
     needs: &[],
 };
@@ -926,7 +928,7 @@ fn check_dpp16_ctrl(insn: &Insn, word: crate::decode::Dpp16) -> Result<(), Refus
 }
 
 fn dpp_add(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
-    if cx.stage != Stage::Compute || insn.op != Op::v_add_u32 {
+    if cx.stage != Stage::Compute || !matches!(insn.op, Op::v_add_u32 | Op::v_add_f16) {
         return Ok(false);
     }
     let Some(word) = insn.dpp16() else {
@@ -957,6 +959,67 @@ fn dpp_add(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
                 Expr::Bool(word.bound_ctrl()),
                 Expr::U32(u32::from(word.row_mask())),
                 Expr::U32(u32::from(word.bank_mask())),
+                Expr::Bool(insn.op == Op::v_add_f16),
+            ],
+        ),
+    );
+    set_vdst(cx, insn, Expr::Var(result))?;
+    Ok(true)
+}
+
+pub(crate) static DPP8_MOV: Helper = Helper {
+    name: "decant_dpp8_mov",
+    result: Ty::U32,
+    text: "uint decant_dpp8_mov(uint value, uint selects, bool exec, bool fi) {
+    uint lane = WaveGetLaneIndex();
+    uint source = (lane & ~7u) | ((selects >> (3u * (lane & 7u))) & 7u);
+    uint4 active = WaveActiveBallot(exec || fi);
+    bool valid = source < WaveGetLaneCount() && ((active[source >> 5u] >> (source & 31u)) & 1u) != 0u;
+    uint selected = WaveReadLaneAt(value, valid ? source : lane);
+    return valid ? selected : 0u;
+}",
+    needs: &[],
+};
+
+pub(crate) static BPERMUTE: Helper = Helper {
+    name: "decant_bpermute",
+    result: Ty::U32,
+    text: "uint decant_bpermute(uint value, uint address, uint offset, bool exec) {
+    uint lane = WaveGetLaneIndex();
+    uint source = ((address + offset) >> 2u) & (WaveGetLaneCount() - 1u);
+    uint4 active = WaveActiveBallot(exec);
+    bool valid = ((active[source >> 5u] >> (source & 31u)) & 1u) != 0u;
+    uint selected = WaveReadLaneAt(value, valid ? source : lane);
+    return valid ? selected : 0u;
+}",
+    needs: &[],
+};
+
+fn bpermute(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
+    if insn.op != Op::ds_bpermute_b32 {
+        return Ok(false);
+    }
+    if cx.stage != Stage::Compute {
+        return Err(refuse(insn, "bpermute-stage"));
+    }
+    let Ext::Ds {
+        offset0,
+        offset1,
+        gds: false,
+    } = insn.ext
+    else {
+        return Err(form(insn, "bpermute-gds"));
+    };
+    let result = cx.tmp();
+    cx.set(
+        result,
+        Expr::Call(
+            &BPERMUTE,
+            vec![
+                bits(insn, 1)?,
+                bits(insn, 0)?,
+                Expr::U32(u32::from(offset0) | (u32::from(offset1) << 8)),
+                Expr::Var(Var::Exec),
             ],
         ),
     );
@@ -967,6 +1030,23 @@ fn dpp_add(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
 fn dpp_mov(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
     if cx.stage != Stage::Compute || insn.op != Op::v_mov_b32 {
         return Ok(false);
+    }
+    if let Some((word, fi)) = insn.dpp8() {
+        let result = cx.tmp();
+        cx.set(
+            result,
+            Expr::Call(
+                &DPP8_MOV,
+                vec![
+                    bits(insn, 0)?,
+                    Expr::U32(word.0 >> 8),
+                    Expr::Var(Var::Exec),
+                    Expr::Bool(fi),
+                ],
+            ),
+        );
+        set_vdst(cx, insn, Expr::Var(result))?;
+        return Ok(true);
     }
     let Some(word) = insn.dpp16() else {
         return Ok(false);
@@ -1163,7 +1243,12 @@ pub fn lift(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
         cx.set(Var::Exec, inside);
         return Ok(true);
     }
-    if permlane(cx, insn)? || dpp_add(cx, insn)? || dpp_mov(cx, insn)? || quad_form(cx, insn)? {
+    if bpermute(cx, insn)?
+        || permlane(cx, insn)?
+        || dpp_add(cx, insn)?
+        || dpp_mov(cx, insn)?
+        || quad_form(cx, insn)?
+    {
         return Ok(true);
     }
     if mask_number_instruction(cx, insn)? {

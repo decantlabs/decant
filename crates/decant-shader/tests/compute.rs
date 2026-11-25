@@ -480,12 +480,12 @@ fn dpp_add_emits_native_row_controls_and_masks() {
         "{text}"
     );
     assert!(
-        text.contains("return write && (valid || bound) ? b + (valid ? selected : 0u) : old;"),
+        text.contains("return write && (valid || bound) ? sum : old;"),
         "{text}"
     );
     for (i, (ctrl, source)) in controls.into_iter().enumerate() {
         assert!(text.contains(source), "{text}");
-        let args = format!(", {ctrl}u, {}, 10u, 5u)", i % 2 != 0);
+        let args = format!(", {ctrl}u, {}, 10u, 5u, false)", i % 2 != 0);
         assert!(text.contains(&args), "{text}");
     }
     compiles(&p);
