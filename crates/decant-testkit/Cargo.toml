@@ -1,6 +1,6 @@
 [package]
 name = "decant-testkit"
-description = "Helpers of the Decant test programs: loading a DLL and its exports, printing checks the way the former C tests did."
+description = "Helpers of the Decant test programs: loading a DLL and its exports, and printing checks with a shared format and exit code."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "decant-shader-bench"
-description = "The DecantShader GPU test benches: decant_shader_run (Vulkan, ash) and vkd3d_test (Direct3D 12 through vkd3d-proton), ports of the former C++ programs in src/shaders/decant_shader/harness."
+description = "The DecantShader GPU test benches: decant_shader_run (Vulkan) and vkd3d_test (Direct3D 12 through vkd3d-proton)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "decant-shader"
-description = "Direct shader translator: console GFX10 machine code to HLSL in one step, compiled with DXC when the title creates a pipeline. Clean room, see the README."
+description = "Direct shader translator: console GFX10 machine code to HLSL in one step, compiled with DXC when the title creates a pipeline."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

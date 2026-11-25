@@ -9,7 +9,6 @@ rem Every component is a Rust crate. Cargo finds the MSVC linker by itself, so n
 rem The static C runtime is the former /MT. cargo runs inside the workspace so that its rust-toolchain.toml applies.
 rem The test of xgameruntime links the public GDK xgameruntime.lib when DECANT_GDK_ROOT is set (read by the crate build script).
 rem PC DirectStorage is loaded at run time. With DECANT_GDEFLATE_ROOT set (the GDeflate folder of microsoft/DirectStorage) the GDeflate decoder is linked and the licences are copied.
-rem decant_xma2.dll loads a user supplied LGPL shared FFmpeg at run time, so no FFmpeg is needed to build it.
 if not defined DECANT_GDK_ROOT echo xgameruntime_test: online mode skipped, set DECANT_GDK_ROOT to the public GDK edition folder to build it.
 set "RUSTFLAGS=%RUSTFLAGS% -C target-feature=+crt-static"
 pushd "%R%" || exit /b 1

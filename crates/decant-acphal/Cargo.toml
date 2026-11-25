@@ -1,6 +1,6 @@
 [package]
 name = "decant-acphal"
-description = "AcpHal.dll, the console audio control processor library (APU heaps, SHAPE contexts, the IAcpHal object) in Rust."
+description = "AcpHal.dll, the console audio control processor library: APU heaps, SHAPE contexts and the IAcpHal object, with XMA contexts decoded by decant-xma."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "decant-shader-tools"
-description = "Rust port of more shader research tools of src/shaders/decant_shader: capability count, HLSL probe, translator instrumentation, SPIR-V reflection and the image checks of the bench."
+description = "More shader research tools: capability count, HLSL probe, translator instrumentation, SPIR-V reflection, opcode cross check and the image checks of the bench."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

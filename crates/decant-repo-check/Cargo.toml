@@ -1,6 +1,6 @@
 [package]
 name = "decant-repo-check"
-description = "Repository checks in Rust: tracked paths and text before review (was scripts/check_repository.py), and the third party manifest and patches (was scripts/third_party.py)."
+description = "Repository checks: check_repository tests tracked paths and text before review, and third_party lists, checks and sets up the third party manifest and patches."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

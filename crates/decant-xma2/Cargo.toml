@@ -1,6 +1,6 @@
-﻿[package]
+[package]
 name = "decant-xma2"
-description = "decant_xma2.dll, the optional Decant XMA2 fallback decoder over a user supplied LGPL shared FFmpeg, loaded at run time. Rust port of the former src/decant/xaudio2/decant_xma2.c, with its test xma2test."
+description = "decant_xma2.dll, an optional XMA2 decoder plugin for decant_xaudio2.dll that decodes with the pure Rust decant-xma, plus the xma2test program that runs it on a RIFF XMA2 file."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,10 +15,8 @@ path = "src/bin/xma2test.rs"
 
 [dependencies]
 decant-log = { path = "../decant-log" }
+decant-xma = { path = "../decant-xma" }
 decant-testkit = { path = "../decant-testkit" }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
 
 [dev-dependencies]
 # Only to check the decoder table against the consumer's declaration: linked into the tests, never into the DLL.

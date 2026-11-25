@@ -1,6 +1,6 @@
 [package]
 name = "decant-dstorage-xcrdapi"
-description = "xcrdapi.dll: the DirectStorage layer of decant-dstorage under the second name a title may import DStorageGetFactory from (the former xcrdapi.def)."
+description = "xcrdapi.dll: the DirectStorage layer of decant-dstorage under the second name a title may import DStorageGetFactory from."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

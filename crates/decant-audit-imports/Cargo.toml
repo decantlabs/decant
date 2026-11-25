@@ -1,6 +1,6 @@
 [package]
 name = "decant-audit-imports"
-description = "Rust port of src/audit_imports/audit_xbox_imports.py: lists the imports of a Xbox GDK build and what this PC can resolve."
+description = "audit_xbox_imports lists the imports of a Xbox GDK build and what this PC can resolve, and d3d12x_vtprobe checks the virtual table layout of the D3D12.X layer."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

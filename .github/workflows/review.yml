@@ -101,7 +101,7 @@ jobs:
           wineserver --wait || true
       - name: Test under Wine
         working-directory: gdk-dlls
-        # No GPU, no audio device, no title file and no FFmpeg on the hosted runner. What cannot run
+        # No GPU, no audio device, no title file on the hosted runner. What cannot run
         # there skips itself, as in the Windows job, and says so in its output.
         run: |
           fails=0
@@ -121,13 +121,13 @@ jobs:
           t dstorage_abi_test dstorage_abi_test.exe "$(win dstorage_xs.dll)" spec a
           t dstoragetest dstoragetest.exe "$(win dstorage_xs.dll)"
           t xgameruntime_test xgameruntime_test.exe "$(win xgameruntime.dll)" offline
-          # Without FFmpeg decant_xma2.dll refuses to hand out a decoder and xma2test says so with exit 1.
-          # That refusal is the clean skip: a decoding run needs an LGPL FFmpeg, which is not installed.
+          # The decoding runs are in the cargo tests. Here xma2test only has to load the DLL, get the decoder table
+          # and refuse a file that is not RIFF XMA2, which it reports with exit 1.
           echo "::group::xma2test"
           echo RIFF > dummy.xma2.wav
           out=$(timeout 120 xvfb-run -a wine64 xma2test.exe "$(win decant_xma2.dll)" dummy.xma2.wav) && code=0 || code=$?
           echo "$out"
-          if [ "$code" = 1 ] && echo "$out" | grep -q 'decoder not loaded'; then echo "PASS xma2test (no FFmpeg, refused cleanly)"; else echo "FAIL xma2test (exit $code)"; fails=$((fails + 1)); fi
+          if [ "$code" = 1 ] && echo "$out" | grep -q 'not a RIFF file'; then echo "PASS xma2test (DLL loaded, bad file refused)"; else echo "FAIL xma2test (exit $code)"; fails=$((fails + 1)); fi
           rm -f dummy.xma2.wav
           echo "::endgroup::"
           echo "$fails test program(s) failed"

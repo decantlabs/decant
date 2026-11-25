@@ -1,6 +1,6 @@
 [package]
 name = "decant-dxil"
-description = "A DXIL writer without LLVM: turns a small scalar SSA IR into a signed DXBC container holding DXIL (LLVM 3.7 bitcode), for Shader Model 6.6 compute shaders. Clean room implementation of the specification dxil-writer-spec."
+description = "A DXIL writer without LLVM: turns a small scalar SSA IR into a signed DXBC container holding DXIL (LLVM 3.7 bitcode), for Shader Model 6.6 compute shaders."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

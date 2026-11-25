@@ -1,6 +1,6 @@
 [package]
 name = "decant-linux"
-description = "The Linux launch driver of the GDK host layer and the sandbox runners: the ports of src/gdk/launch_prep.sh, sandbox/run_airgapped.sh and sandbox/test_isolation.sh, with the same commands, environment variables, messages and exit codes."
+description = "The Linux launch driver of the GDK host layer and the sandbox runners: launch_prep, run_airgapped and test_isolation, which drive curl, tar, minisign, make, Proton, Wine and docker."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

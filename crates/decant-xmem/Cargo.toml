@@ -1,6 +1,6 @@
 [package]
 name = "decant-xmem"
-description = "xmem.dll, the Decant console allocator (XMemAlloc, XMemFree and their companions) on Windows virtual memory. Replaces the former C source xmem.c, with the tests loadtest and xmem_abitest."
+description = "xmem.dll, the Decant console allocator (XMemAlloc, XMemFree and their companions) on Windows virtual memory, with the tests loadtest and xmem_abitest."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

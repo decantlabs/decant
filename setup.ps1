@@ -6,7 +6,7 @@
   Each tool is checked first. A missing one is installed with winget only after you answer yes, or
   without asking when -Yes is given. -Check only reports and installs nothing. Nothing is downloaded
   from anywhere else, and no game file, SDK or runtime outside this list is fetched.
-  Optional components (FidelityFX, DirectStorage, FFmpeg, the public GDK, the translator sources) are
+  Optional components (FidelityFX, DirectStorage, the public GDK, the translator sources) are
   listed with where to get them; they are never installed automatically.
 
 .EXAMPLE
@@ -139,7 +139,6 @@ $results | Format-Table -AutoSize -Wrap
 Write-Host 'Optional, installed by hand only when a task needs them:' -ForegroundColor Cyan
 Write-Host '  - FidelityFX SDK (AMD, MIT headers): build.cmd "<FidelityFX root>" for the upscaling test'
 Write-Host '  - DirectStorage 1.3 (NuGet Microsoft.Direct3D.DirectStorage): dstorage.dll beside a title for PC DirectStorage (loaded at run time). The GDeflate folder of microsoft/DirectStorage in DECANT_GDEFLATE_ROOT adds the GDeflate decoder when build.cmd builds the DirectStorage layer'
-Write-Host '  - FFmpeg shared libraries, LGPL build (no --enable-gpl), loaded at run time for XMA2'
 Write-Host '  - Public Microsoft GDK: https://github.com/microsoft/GDK (never the console GDKX)'
 Write-Host '  - Linux track: Rust target x86_64-pc-windows-gnu (make -C src/gdk), Docker for the air-gapped sandbox (sandbox/README.md)'
 Write-Host '  Licence: LICENSE (MIT). Credits: CREDITS.md'

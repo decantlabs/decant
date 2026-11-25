@@ -1,6 +1,6 @@
 [package]
 name = "decant-dstorage"
-description = "dstorage_xs.dll and xcrdapi.dll, the Decant DirectStorage layer: the console ABI read from a spec file, over PC DirectStorage when it is installed or a CPU fallback otherwise, with BCPack decoded in process. Rust port of the former src/gdk/dstorage, with its tests dstoragetest and dstorage_abi_test."
+description = "dstorage_xs.dll and xcrdapi.dll, the Decant DirectStorage layer: the console ABI read from a spec file, over PC DirectStorage when it is installed or a CPU fallback otherwise, with BCPack decoded in process, and the tests dstoragetest and dstorage_abi_test."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

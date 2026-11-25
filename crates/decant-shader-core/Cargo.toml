@@ -1,6 +1,6 @@
 [package]
 name = "decant-shader-core"
-description = "Shared part of the shader research tool ports: metadata rows, location tables and SPIR-V relocation (decant_shader_locate.py, decant_shader_link.py)."
+description = "Shared code of the shader research tools: metadata rows, location tables and SPIR-V relocation, with the decant_shader_locate and decant_shader_link tools."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

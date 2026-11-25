@@ -1,6 +1,5 @@
 //! `xma2test <decant_xma2.dll> <file.xma2.wav> [out.raw]`: decodes a RIFF WAVE_FORMAT_XMA2 file
-//! through the `DecantXma2Decoder` ABI exactly as a caller does. The port of the former
-//! `tests/xma2test.c`, with the same lines and exit codes. Open with the fmt chunk, Decode the
+//! through the `DecantXma2Decoder` ABI exactly as a caller does. Open with the fmt chunk, Decode the
 //! data chunk in 2048 byte blocks with a small output buffer (so leftovers are carried across
 //! calls), then flush. Prints the frame count, peak and RMS, and writes interleaved signed 16 bit
 //! samples to `out.raw` when given. Needs no game file: any XMA2 RIFF file works.
@@ -61,7 +60,7 @@ mod run {
         // SAFETY: `d` is a writable decoder table.
         let loaded = get.is_some_and(|get| unsafe { get(&mut d) } == 0 && d.abi_version == ABI_VERSION);
         let (Some(open), Some(decode), Some(close), true) = (d.open, d.decode, d.close, loaded) else {
-            println!("FAIL: decoder not loaded (is FFmpeg next to the DLL or in DECANT_FFMPEG_DIR?)");
+            println!("FAIL: decoder not loaded");
             return 1;
         };
         let Ok(file) = std::fs::read(&args[1]) else {

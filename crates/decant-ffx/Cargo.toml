@@ -1,6 +1,6 @@
 [package]
 name = "decant-ffx"
-description = "decant_ffx.dll, the Decant FidelityFX shim: forwards the five ffx* calls to the PC backend named by DECANT_FFX_BACKEND. Rust port of the former src/decant/ffx_shim.c, with its test ffxtest."
+description = "decant_ffx.dll, the Decant FidelityFX shim: forwards the five ffx* calls to the PC backend named by DECANT_FFX_BACKEND, with its test ffxtest."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

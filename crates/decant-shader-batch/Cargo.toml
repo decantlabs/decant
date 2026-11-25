@@ -1,6 +1,6 @@
 [package]
 name = "decant-shader-batch"
-description = "Rust ports of the shader batch and replay tools: decant_shader_batch.py, decant_shader_summary.py and decant_shader_one.py."
+description = "Shader batch and replay tools: translate many shaders, summarise a run, translate one shader, and build the translation cache on a player's machine."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

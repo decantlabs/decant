@@ -500,7 +500,7 @@ dependencies = [
  "decant-log",
  "decant-testkit",
  "decant-xaudio2",
- "windows-sys",
+ "decant-xma",
 ]
 
 [[package]]

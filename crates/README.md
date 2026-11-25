@@ -41,7 +41,7 @@ On Windows, `build.cmd` builds the DLLs and test programs into `build\` (see the
 | `decant-xgameruntime` | `xgameruntime.dll`, the interposer that logs what a title asks the game runtime and forwards to the PC runtime |
 | `decant-xaudio2` | `decant_xaudio2.dll`, the XAudio2 layer over `XAudio2_9.dll` |
 | `decant-xma` | XMA2 decoding in pure Rust, for the XMA contexts of AcpHal |
-| `decant-xma2` | `decant_xma2.dll`, the optional XMA2 fallback decoder over a user supplied LGPL FFmpeg loaded at run time |
+| `decant-xma2` | `decant_xma2.dll`, the optional XMA2 decoder plugin of `decant_xaudio2.dll`, built on `decant-xma` |
 | `decant-acphal` | `AcpHal.dll`, the audio control processor library: APU heaps, SHAPE contexts, the `IAcpHal` object |
 | `decant-xapu` | `xapu.dll`, the XAPU library: Opus decoding and sample rate conversion |
 | `decant-chad` | `chad.dll`, the XDSP library: partitioned convolution and FFT streams |

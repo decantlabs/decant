@@ -1,6 +1,6 @@
 [package]
 name = "decant-xgameruntime"
-description = "xgameruntime.dll, the Decant interposer: logs what a title asks the game runtime and forwards every call to the PC runtime. Rust port of the former src/gdk/xgameruntime, with its test xgameruntime_test."
+description = "xgameruntime.dll, the Decant interposer: logs what a title asks the game runtime and forwards every call to the PC runtime, with its test xgameruntime_test."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

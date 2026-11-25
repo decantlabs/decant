@@ -1,6 +1,6 @@
 [package]
 name = "decant-shader-bridge"
-description = "Rust port of the DecantShader bridge tools: decant_shader_identify.py, decant_shader_adapt.py, decant_shader_describe.py, decant_shader_serve.py and decant_shader_adapt_cache.py."
+description = "The DecantShader bridge between the translator and vkd3d-proton: identifies shader resources, adapts SPIR-V to the layout vkd3d-proton chose, describes shaders and serves and caches the results."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

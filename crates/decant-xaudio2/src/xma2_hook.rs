@@ -22,8 +22,8 @@
 //! } DecantXma2Decoder;
 //! ```
 //!
-//! One implementation is in this repository: the crate `decant-xma2` builds `decant_xma2.dll` over a
-//! user supplied LGPL shared FFmpeg that it loads at run time.
+//! One implementation is in this repository: the crate `decant-xma2` builds `decant_xma2.dll`, which
+//! decodes with the pure Rust `decant-xma`.
 //!
 //! Status: the table is defined and the loader is in the layer. The layer does NOT yet feed
 //! decoded PCM to a source voice. That needs a wrapper around

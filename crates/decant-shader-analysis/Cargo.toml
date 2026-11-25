@@ -1,6 +1,6 @@
 [package]
 name = "decant-shader-analysis"
-description = "Rust port of the read only shader research tools of src/shaders: signatures, resource lists, FSSM tables and the input convention checks."
+description = "Read only shader research tools: metadata, outputs, vertex and pixel input conventions, FSSM tables and bindings."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

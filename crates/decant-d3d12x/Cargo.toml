@@ -1,6 +1,6 @@
 [package]
 name = "decant-d3d12x"
-description = "d3d12_xs.dll, the Scarlett D3D12.X layer over a PC D3D12 runtime (root signature helpers, console ABI proxies, frame events), with its test d3d12xs_test. Rust port of the former src/gdk/d3d12_xs.c and its companions."
+description = "d3d12_xs.dll, the Scarlett D3D12.X layer over a PC D3D12 runtime (root signature helpers, console ABI proxies, frame events), with its test d3d12xs_test."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

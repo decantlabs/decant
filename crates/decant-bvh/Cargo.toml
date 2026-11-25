@@ -1,6 +1,6 @@
 [package]
 name = "decant-bvh"
-description = "decant_bvh.dll (also built as XboxBvhBuilder.dll, the stand in for the package class), the Decant DXR build interface (DecantPrebuild, DecantBuild) on native D3D12 objects. Rust port of the former src/decant/decant_bvh.cpp, with its test decant_bvh_test."
+description = "decant_bvh.dll, also built as XboxBvhBuilder.dll: the Decant DXR build interface (DecantPrebuild, DecantBuild) on native D3D12 objects, with its test decant_bvh_test."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

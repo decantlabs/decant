@@ -58,7 +58,7 @@ Optional environment variables for `build.cmd`:
 * `DECANT_GDK_ROOT`: the folder of the public GDK, to build the online test of `xgameruntime`.
 * `DECANT_GDEFLATE_ROOT`: the `GDeflate` folder of a microsoft/DirectStorage checkout, to link the GDeflate decoder of the CPU fallback.
 
-PC DirectStorage and FFmpeg are loaded at run time, so neither is needed to build.
+PC DirectStorage is loaded at run time, so it is not needed to build.
 
 The tools and tests build with cargo:
 
