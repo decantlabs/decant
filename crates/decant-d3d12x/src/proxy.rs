@@ -4130,32 +4130,30 @@ extern "system" fn queue_present_x(this: *mut Proxy, plane_count: u32, planes: *
             return hook((*this).pc, plane_count, planes, parameters);
         }
     }
-    // Plane 0 is readable for its 0x18 bytes when there is a plane at all, and its array holds
-    // `count` resource pointers.
+    // Plane entries are 0x48 bytes each: {token u64 @0, resource count u32 @8, resource array @0x10}.
+    // Plane 0 goes to the swap chain, and plane 1 (when present and DECANT_D3D12X_PRESENT_OVER != 0) is
+    // composed over it with premultiplied alpha (`present_over`).
     let plane_zero = (plane_count > 0 && !planes.is_null()).then_some(planes.cast::<u8>());
     // SAFETY: by the line above, `plane` points to a plane 0.
     let token = plane_zero.map_or(0, |plane| unsafe { plane.cast::<u64>().read_unaligned() });
-    // SAFETY: as above, the resource array is read only when the plane has one.
-    let shown = plane_zero.is_some_and(|plane| unsafe {
-        let count = plane.add(8).cast::<u32>().read_unaligned();
-        let array = plane.add(0x10).cast::<*const Object>().read_unaligned();
-        if count == 0 || array.is_null() {
-            return false;
+    // SAFETY: `planes` holds `plane_count` plane entries of 0x48 bytes each.
+    let shown = plane_zero.is_some_and(|_plane| unsafe {
+        let p0 = unwrap(crate::present_over::plane_resource(plane_count, planes, 0));
+        let p1 = unwrap(crate::present_over::plane_resource(plane_count, planes, 1));
+        if !p0.is_null() {
+            crate::capture::presented((*this).pc, p0);
         }
-        let frame = unwrap(array.read_unaligned());
-        crate::capture::presented((*this).pc, frame);
-        crate::present::show((*this).pc, frame)
+        crate::present::show_planes((*this).pc, p0, p1)
     });
     crate::pso_diag::present();
     crate::direct_pso::note_present();
     crate::watchdog_hold::note_present();
     crate::frame::mark_flipped(token);
-    // Only plane 0 is shown. A change of the plane count is logged every time (a few dozen at
-    // most): a screen the title composes from two planes shows without its second one.
     static PLANES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
     static PLANE_LINES: AtomicI32 = AtomicI32::new(0);
     if PLANES.swap(plane_count, Ordering::Relaxed) != plane_count && PLANE_LINES.fetch_add(1, Ordering::Relaxed) < 64 {
-        xs_log!("console queue slot 30 (PresentX): the plane count is now {plane_count} (token {token:016X}), only plane 0 is shown");
+        let mode = if plane_count >= 2 && crate::present_over::enabled() { "planes 0 and 1 composed" } else { "only plane 0 is shown" };
+        xs_log!("console queue slot 30 (PresentX): the plane count is now {plane_count} (token {token:016X}), {mode}");
     }
     if log_due(&N) {
         xs_log!(
