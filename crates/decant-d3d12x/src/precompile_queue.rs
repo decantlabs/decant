@@ -7,8 +7,13 @@
 //! * With two or more workers, worker 0 is a fast lane: it takes urgent jobs whose stages are all
 //!   below [`O0_HLSL_BYTES`] of HLSL. A larger job it translated goes back to the queue with its
 //!   HLSL, for the other workers.
-//! * Urgent jobs never wait for the busy gate. Background jobs start only while the title does
-//!   not bind, or when nothing else runs.
+//! * Urgent jobs never wait for the busy gate. Background jobs start while the title does not
+//!   bind. While it binds, up to [`Limits::busy_background`] of them run, one on a small machine
+//!   and more on a machine with many cores. Running urgent jobs hold background jobs back only
+//!   from [`Limits::urgent_yield`] of them on. Both limits follow the core count and are chosen,
+//!   not measured.
+//! * A progress line (`direct precompile: warmup ...`) with the queued, active, ready and failed
+//!   pipelines is logged every [`PROGRESS_PERIOD`] while those numbers change, and at exit.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -23,6 +28,9 @@ use crate::direct_cache::Fnv128;
 const MAX_ENTRIES: usize = 131_072;
 const MAGIC: &[u8] = b"SXBO\x01\0\0\0";
 const NAME: &str = "bind-order.bin";
+/// The bind history is written every this many progress periods.
+#[cfg_attr(not(windows), allow(dead_code))]
+const SAVE_EVERY_TICKS: u32 = 6;
 
 fn read_history(dir: &Path) -> Option<Vec<u128>> {
     const LIMIT: usize = 12 + MAX_ENTRIES * 16 + 16;
@@ -91,8 +99,104 @@ impl Role {
 
     /// Whether a worker of this role may start a background job now. Urgent jobs never ask: a
     /// busy title or a running background compile does not hold them back.
-    fn background(self, busy: bool, background_running: usize, urgent_running: usize) -> bool {
-        self != Role::Fast && urgent_running == 0 && (!busy || background_running == 0)
+    fn background(self, busy: bool, background_running: usize, urgent_running: usize, limits: Limits) -> bool {
+        self != Role::Fast && urgent_running < limits.urgent_yield && (!busy || background_running < limits.busy_background)
+    }
+}
+
+/// How many jobs may run together before the gate of [`Role::background`] closes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Limits {
+    /// Background jobs that may run while the title binds pipelines.
+    busy_background: usize,
+    /// Running urgent jobs from which no new background job starts.
+    urgent_yield: usize,
+}
+
+impl Limits {
+    /// The strictest limits: one background job while the title binds, none beside an urgent job.
+    /// This is what a machine of up to 7 cores gets.
+    #[cfg_attr(not(test), allow(dead_code))]
+    const SERIAL: Limits = Limits { busy_background: 1, urgent_yield: 1 };
+
+    /// The limits for `workers` precompile workers on a machine with `cores` logical cores. Every
+    /// 4 cores let one more background job run while the title binds, never more than there are
+    /// workers. Every 8 cores let one more urgent job run before background jobs yield.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn for_machine(workers: usize, cores: usize) -> Limits {
+        Limits { busy_background: (cores / 4).clamp(1, workers.max(1)), urgent_yield: (cores / 8).max(1) }
+    }
+}
+
+/// How often the progress line is considered.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PROGRESS_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The pipelines of the queue by state, at one moment.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Progress {
+    /// Waiting for a worker.
+    queued: u64,
+    /// Being translated or compiled.
+    active: u64,
+    /// With DXIL, whether compiled or read from the disk record.
+    ready: u64,
+    /// Of those, ready from the disk record before any compile.
+    cached: u64,
+    /// Refused or failed to compile.
+    failed: u64,
+}
+
+impl Progress {
+    fn total(&self) -> u64 {
+        self.queued + self.active + self.ready + self.failed
+    }
+
+    /// Whether no pipeline waits or runs.
+    fn drained(&self) -> bool {
+        self.queued == 0 && self.active == 0
+    }
+
+    /// The share of pipelines that are done, ready or failed, in percent.
+    fn percent(&self) -> u64 {
+        match self.total() {
+            0 => 100,
+            total => (self.ready + self.failed) * 100 / total,
+        }
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "direct precompile: warmup {} of {} pipelines done ({}%), {} queued, {} active, {} ready ({} from cache), {} failed{}",
+            self.ready + self.failed,
+            self.total(),
+            self.percent(),
+            self.queued,
+            self.active,
+            self.ready,
+            self.cached,
+            self.failed,
+            if self.drained() { ", queue is idle" } else { "" }
+        )
+    }
+}
+
+/// Decides which progress lines are logged: one per change, none while nothing moves.
+#[derive(Default)]
+struct ProgressLog {
+    last: Option<Progress>,
+}
+
+impl ProgressLog {
+    /// The line to log for `now`, `None` when it is the same as the last logged one or nothing was
+    /// ever queued.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn next(&mut self, now: Progress) -> Option<String> {
+        if now.total() == 0 || self.last == Some(now) {
+            return None;
+        }
+        self.last = Some(now);
+        Some(now.line())
     }
 }
 
@@ -329,6 +433,25 @@ mod runtime {
         memory_sample: Option<(Instant, bool)>,
     }
 
+    impl State {
+        /// The pipelines of the queue by state. Counted over the slots, so it cannot drift from them.
+        pub(super) fn progress(&self) -> Progress {
+            let mut progress = Progress::default();
+            for status in self.slots.values() {
+                match status {
+                    Status::Pending => progress.queued += 1,
+                    Status::Running { .. } => progress.active += 1,
+                    Status::Ready { cached, .. } => {
+                        progress.ready += 1;
+                        progress.cached += u64::from(*cached);
+                    }
+                    Status::Refused => progress.failed += 1,
+                }
+            }
+            progress
+        }
+    }
+
     type Compile = dyn Fn(&mut Job, bool) -> Outcome + Send + Sync;
 
     pub(crate) struct Queue {
@@ -337,6 +460,8 @@ mod runtime {
         epoch: Instant,
         last_bind_ms: AtomicU64,
         min_free: u64,
+        limits: Limits,
+        progress_log: Mutex<ProgressLog>,
         pub(super) state: Mutex<State>,
         changed: Condvar,
         save_lock: Mutex<()>,
@@ -349,7 +474,8 @@ mod runtime {
             count: usize,
             compile: impl Fn(&mut Job, bool) -> Outcome + Send + Sync + 'static,
         ) -> Option<Arc<Self>> {
-            Self::start_with(cache, count, compile, |i, role, f| {
+            let cores = std::thread::available_parallelism().map_or(4, |cores| cores.get());
+            Self::start_with(cache, count, Limits::for_machine(count, cores), compile, |i, role, f| {
                 let _ = role;
                 std::thread::Builder::new()
                     .name(format!("decant-precompile-{i}"))
@@ -362,6 +488,7 @@ mod runtime {
         pub(super) fn start_with(
             cache: DiskCache,
             count: usize,
+            limits: Limits,
             compile: impl Fn(&mut Job, bool) -> Outcome + Send + Sync + 'static,
             mut spawn: impl FnMut(usize, Role, Box<dyn FnOnce() + Send>) -> io::Result<()>,
         ) -> Option<Arc<Self>> {
@@ -376,6 +503,8 @@ mod runtime {
                     .and_then(|value| value.parse::<u64>().ok())
                     .unwrap_or(2048)
                     .saturating_mul(1 << 20),
+                limits,
+                progress_log: Mutex::new(ProgressLog::default()),
                 state: Mutex::new(State::default()),
                 changed: Condvar::new(),
                 save_lock: Mutex::new(()),
@@ -399,18 +528,25 @@ mod runtime {
             }
             let saver = queue.clone();
             if let Err(error) = std::thread::Builder::new().name("decant-bind-order".into()).spawn(move || {
+                let mut tick = 0u32;
                 loop {
-                    std::thread::sleep(Duration::from_secs(30));
-                    saver.save(false);
+                    std::thread::sleep(PROGRESS_PERIOD);
+                    saver.log_progress();
+                    tick += 1;
+                    if tick.is_multiple_of(SAVE_EVERY_TICKS) {
+                        saver.save(false);
+                    }
                 }
             }) {
                 xs_log!("direct precompile: could not start bind history writer ({error})");
             }
             xs_log!(
-                "direct precompile: {count} configured workers, fast lane {} below {} HLSL bytes, {} recorded pipelines",
+                "direct precompile: {count} configured workers, fast lane {} below {} HLSL bytes, {} recorded pipelines, {} background jobs while the title binds, background yields from {} urgent jobs",
                 if first_role == Role::Fast { "on" } else { "off" },
                 O0_HLSL_BYTES,
-                queue.ranks.len()
+                queue.ranks.len(),
+                queue.limits.busy_background,
+                queue.limits.urgent_yield
             );
             Some(queue)
         }
@@ -522,7 +658,28 @@ mod runtime {
             }
         }
 
+        /// Logs the progress line when the numbers changed since the last one.
+        pub(super) fn log_progress(&self) {
+            let progress = self.state.lock().unwrap_or_else(|e| e.into_inner()).progress();
+            let line = self.progress_log.lock().unwrap_or_else(|e| e.into_inner()).next(progress);
+            if let Some(line) = line {
+                xs_log!("{line}");
+            }
+        }
+
         pub(crate) fn save(&self, exiting: bool) {
+            if exiting {
+                // The last numbers of the run, unless a worker holds the lock at teardown.
+                if let Ok(state) = self.state.try_lock() {
+                    let progress = state.progress();
+                    drop(state);
+                    if let Ok(mut log) = self.progress_log.try_lock()
+                        && let Some(line) = log.next(progress)
+                    {
+                        xs_log!("{line}");
+                    }
+                }
+            }
             // DLL teardown can run with other threads already stopped. Leave the last completed
             // snapshot in place if a worker or the periodic writer held a lock.
             let _writer = if exiting {
@@ -563,7 +720,7 @@ mod runtime {
                     loop {
                         let last_bind = self.last_bind_ms.load(Ordering::Relaxed);
                         let busy = last_bind != 0 && (self.epoch.elapsed().as_millis() as u64 + 1).saturating_sub(last_bind) < 1000;
-                        let background = role.background(busy, state.background_running, state.urgent_running);
+                        let background = role.background(busy, state.background_running, state.urgent_running, self.limits);
                         let low_memory = background && self.low_memory(&mut state);
                         if let Some(popped) = state.schedule.pop(background, low_memory, fast) {
                             if popped.urgent {
@@ -725,7 +882,7 @@ mod tests {
     fn urgent_pops_never_wait_for_a_busy_title_or_a_background_compile() {
         for role in [Role::All, Role::Fast, Role::Bulk] {
             // The title binds and a background compile runs: no new background job may start.
-            let background = role.background(true, 1, 0);
+            let background = role.background(true, 1, 0, Limits::SERIAL);
             assert!(!background, "{role:?}");
             let mut queue = Schedule::default();
             queue.insert(1, (), Priority::History(0), 0, false);
@@ -734,10 +891,10 @@ mod tests {
             assert_eq!(keys(&mut queue, background, false, role == Role::Fast), [(2, true)], "{role:?}");
         }
         // An idle title lets the bulk workers start background work, never the fast lane.
-        assert!(Role::Bulk.background(false, 3, 0));
-        assert!(Role::All.background(true, 0, 0));
-        assert!(!Role::Fast.background(false, 0, 0));
-        assert!(!Role::Bulk.background(false, 0, 1));
+        assert!(Role::Bulk.background(false, 3, 0, Limits::SERIAL));
+        assert!(Role::All.background(true, 0, 0, Limits::SERIAL));
+        assert!(!Role::Fast.background(false, 0, 0, Limits::SERIAL));
+        assert!(!Role::Bulk.background(false, 0, 1, Limits::SERIAL));
         assert_eq!([Role::of(0, 1), Role::of(0, 4), Role::of(3, 4)], [Role::All, Role::Fast, Role::Bulk]);
     }
 
@@ -951,6 +1108,7 @@ mod tests {
         let queue = Queue::start_with(
             DiskCache::new(&dir.0),
             2,
+            Limits::SERIAL,
             move |job, fast| {
                 let stage = job.pipeline.stages[0].bytes[0];
                 let _ = started.send((stage, fast));
@@ -1072,6 +1230,184 @@ mod tests {
         assert_eq!(cache.read(stage_keys[0]).as_deref(), Some(dxil[0].as_ref()));
         assert_eq!(compiler.calls.load(Ordering::Relaxed), 1);
         assert_eq!(service.counters().pipe_hits.load(Ordering::Relaxed), 0, "a compiled pipeline is no pipeline hit");
+    }
+
+    #[test]
+    fn limits_follow_the_core_count_and_never_exceed_the_workers() {
+        // Up to 7 cores keep the serial gate: one background job while the title binds.
+        for cores in [1, 2, 4, 7] {
+            assert_eq!(Limits::for_machine(4, cores), Limits::SERIAL, "{cores} cores");
+        }
+        assert_eq!(Limits::for_machine(4, 8), Limits { busy_background: 2, urgent_yield: 1 });
+        assert_eq!(Limits::for_machine(4, 16), Limits { busy_background: 4, urgent_yield: 2 });
+        assert_eq!(Limits::for_machine(4, 64), Limits { busy_background: 4, urgent_yield: 8 }, "capped at the workers");
+        assert_eq!(Limits::for_machine(0, 64).busy_background, 1, "at least one");
+    }
+
+    #[test]
+    fn a_wide_machine_runs_more_background_jobs_while_the_title_binds() {
+        let wide = Limits::for_machine(4, 16);
+        // A busy title with two background jobs running: serial machines stop, wide ones go on.
+        assert!(!Role::Bulk.background(true, 2, 0, Limits::SERIAL));
+        assert!(Role::Bulk.background(true, 2, 0, wide));
+        assert!(Role::All.background(true, 3, 0, wide));
+        assert!(!Role::Bulk.background(true, 4, 0, wide), "the limit still holds");
+        // One urgent job holds background work back on a serial machine, not on a wide one.
+        assert!(!Role::Bulk.background(false, 0, 1, Limits::SERIAL));
+        assert!(Role::Bulk.background(false, 0, 1, wide));
+        assert!(!Role::Bulk.background(false, 0, 2, wide));
+        // The fast lane never takes background work.
+        assert!(!Role::Fast.background(false, 0, 0, wide));
+    }
+
+    #[test]
+    fn progress_counts_the_shares_and_prints_one_line() {
+        let progress = Progress { queued: 6, active: 2, ready: 10, cached: 4, failed: 2 };
+        assert_eq!(progress.total(), 20);
+        assert_eq!(progress.percent(), 60);
+        assert!(!progress.drained());
+        assert_eq!(
+            progress.line(),
+            "direct precompile: warmup 12 of 20 pipelines done (60%), 6 queued, 2 active, 10 ready (4 from cache), 2 failed"
+        );
+        let idle = Progress { ready: 3, failed: 1, ..Progress::default() };
+        assert!(idle.drained());
+        assert!(idle.line().ends_with("3 ready (0 from cache), 1 failed, queue is idle"), "{}", idle.line());
+        assert_eq!(Progress::default().percent(), 100);
+    }
+
+    #[test]
+    fn the_progress_log_speaks_once_per_change_and_never_for_an_empty_queue() {
+        let mut log = ProgressLog::default();
+        assert_eq!(log.next(Progress::default()), None, "nothing was ever queued");
+        let first = Progress { queued: 5, ..Progress::default() };
+        assert_eq!(log.next(first), Some(first.line()));
+        assert_eq!(log.next(first), None, "no change, no line");
+        let second = Progress { queued: 3, active: 2, ..Progress::default() };
+        assert_eq!(log.next(second), Some(second.line()));
+        let done = Progress { ready: 4, failed: 1, ..Progress::default() };
+        assert_eq!(log.next(done), Some(done.line()));
+        assert_eq!(log.next(done), None, "an idle queue stays quiet");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_queue_counts_queued_active_ready_and_failed_pipelines() {
+        use crate::compile_service::tests::{FakeCompiler, pipeline};
+        use crate::compile_service::{Poll, Service, Settings};
+        use crate::direct_cache::DiskCache;
+        use crate::shader_source::StageKind;
+        use std::sync::{Arc, Condvar, Mutex, mpsc};
+        use std::time::{Duration, Instant};
+
+        let dir = TempDir::new("precompile-progress");
+        let cache = DiskCache::new(&dir.0);
+        let service = Service::new(source(), Arc::new(FakeCompiler::default()), Settings::quiet(1));
+        let (started, jobs) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let blocked = release.clone();
+        let queue = Queue::start(cache.clone(), 1, move |job, _| {
+            let stage = job.pipeline.stages[0].bytes[0];
+            let _ = started.send(stage);
+            if stage == 1 {
+                let (lock, changed) = &*blocked;
+                let _guard = changed.wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |released| !*released).unwrap();
+            }
+            match stage {
+                3 => Some((Vec::new(), Poll::Refused("test".into()))),
+                _ => Some((vec![u128::from(stage)], Poll::Ready(Vec::new()))),
+            }
+        }).unwrap();
+        let progress = || queue.state.lock().unwrap().progress();
+        assert_eq!(progress(), Progress::default());
+
+        queue.register(&service, pipeline(&[(StageKind::Compute, &[1])]), 0).unwrap();
+        assert_eq!(jobs.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        queue.register(&service, pipeline(&[(StageKind::Compute, &[2])]), 1).unwrap();
+        queue.register(&service, pipeline(&[(StageKind::Compute, &[3])]), 2).unwrap();
+        // One pipeline with a disk record is ready at registration and counts as cached.
+        let warm = pipeline(&[(StageKind::Compute, &[4])]);
+        cache.write(0x44, b"DXBCwarm").unwrap();
+        cache.write_pipeline(service.input_key(&warm), &[0x44]).unwrap();
+        queue.register(&service, warm, 3).unwrap();
+        assert_eq!(progress(), Progress { queued: 2, active: 1, ready: 1, cached: 1, failed: 0 });
+
+        let (lock, changed) = &*release;
+        *lock.lock().unwrap() = true;
+        changed.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !progress().drained() {
+            assert!(Instant::now() < deadline, "the queue never drained: {:?}", progress());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let done = progress();
+        assert_eq!(done, Progress { queued: 0, active: 0, ready: 3, cached: 1, failed: 1 });
+        assert_eq!(done.percent(), 100);
+        queue.log_progress();
+    }
+
+    /// Runs `count` background compute jobs on a queue of 4 workers while the title keeps binding,
+    /// and returns the most jobs that ran at the same time. With `meet` the jobs wait for each
+    /// other for up to 2 seconds, else each one takes 100 ms.
+    #[cfg(windows)]
+    fn busiest_background(limits: Limits, count: u8, meet: bool) -> usize {
+        use crate::compile_service::tests::{FakeCompiler, pipeline};
+        use crate::compile_service::{Poll, Service, Settings};
+        use crate::direct_cache::DiskCache;
+        use crate::shader_source::StageKind;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        let dir = TempDir::new("precompile-parallel");
+        let service = Service::new(source(), Arc::new(FakeCompiler::default()), Settings::quiet(1));
+        let (running, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (done, finished) = mpsc::channel();
+        let (now, high) = (running.clone(), peak.clone());
+        let queue = Queue::start_with(
+            DiskCache::new(&dir.0),
+            4,
+            limits,
+            move |_, _| {
+                high.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                if meet {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while now.load(Ordering::SeqCst) < usize::from(count) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                now.fetch_sub(1, Ordering::SeqCst);
+                let _ = done.send(());
+                Some((Vec::new(), Poll::Refused("test".into())))
+            },
+            |i, _, f| std::thread::Builder::new().name(format!("decant-precompile-test-{i}")).spawn(f).map(|_| ()),
+        )
+        .unwrap();
+        // The title binds, so the busy gate is closed to all but `limits.busy_background` jobs.
+        queue.note_bind();
+        for stage in 1..=count {
+            queue.register(&service, pipeline(&[(StageKind::Compute, &[stage])]), u32::from(stage)).unwrap();
+        }
+        for _ in 0..count {
+            queue.note_bind();
+            finished.recv_timeout(Duration::from_secs(10)).expect("a job never finished");
+        }
+        peak.load(Ordering::SeqCst)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_wide_machine_compiles_background_jobs_in_parallel_while_the_title_binds() {
+        // Three bulk workers and room for three background jobs: all three run together.
+        assert_eq!(busiest_background(Limits { busy_background: 3, urgent_yield: 1 }, 3, true), 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_serial_gate_keeps_one_background_job_while_the_title_binds() {
+        assert_eq!(busiest_background(Limits::SERIAL, 3, false), 1);
     }
 
     #[test]
