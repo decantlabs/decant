@@ -38,6 +38,81 @@ struct Cell(AtomicU64);
 struct Known {
     cell: Option<&'static Cell>,
     highest_queued: u64,
+    /// The last value the title was given (rules R1 and R2): never lower, never above `MAX_VALUE`.
+    last: u64,
+}
+
+/// The largest value a fence may show the title: 56 bits, the range of the title's modular
+/// comparison (rule R2).
+pub const MAX_VALUE: u64 = (1 << 56) - 1;
+
+/// What one PC read gives the title (rules R1 and R2).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// A valid value, not below the last one: it becomes the last valid value.
+    Value(u64),
+    /// `u64::MAX` on a removed device: the title's lost-device answer.
+    Lost,
+    /// A read the layer does not pass on: the last valid value is given instead.
+    Refused { read: u64, kept: u64 },
+}
+
+/// Applies R1 and R2 to one PC read. `removed`: `GetDeviceRemovedReason` is not S_OK. `kept`: the
+/// last valid value given to the title. Pure, for the tests.
+pub fn reading(read: u64, removed: bool, kept: u64) -> Reading {
+    if read == u64::MAX {
+        return if removed { Reading::Lost } else { Reading::Refused { read, kept } };
+    }
+    if read > MAX_VALUE || read < kept {
+        return Reading::Refused { read, kept };
+    }
+    Reading::Value(read)
+}
+
+/// Whether the device of PC fence `fence` is removed (`GetDeviceRemovedReason` is not S_OK).
+#[cfg(windows)]
+fn device_removed(fence: usize) -> bool {
+    type GetDevice = unsafe extern "system" fn(Object, *const [u8; 16], *mut Object) -> i32;
+    type GetRemoved = unsafe extern "system" fn(Object) -> i32;
+    type Release = unsafe extern "system" fn(Object) -> u32;
+    // IID_ID3D12Device, {189819f1-1db6-4b57-be54-1821339b85f7}, in memory order.
+    const IID_ID3D12DEVICE: [u8; 16] = [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7];
+    let mut device: Object = std::ptr::null_mut();
+    // SAFETY: `fence` is a live PC fence (only those are in the table); the device is released below.
+    unsafe {
+        let get: GetDevice = method(fence, 7);
+        if get(fence as Object, &IID_ID3D12DEVICE, &mut device) < 0 || device.is_null() {
+            return false;
+        }
+        let reason: GetRemoved = method(device as usize, 37);
+        let removed = reason(device) != 0;
+        let release: Release = method(device as usize, 2);
+        release(device);
+        removed
+    }
+}
+
+#[cfg(not(windows))]
+fn device_removed(_fence: usize) -> bool {
+    false
+}
+
+/// The value the title is given for PC fence `fence`, applying [`reading`] and keeping the last one.
+fn settle(fence: usize, k: &mut Known) -> u64 {
+    // SAFETY: only live PC fences are ever in the table.
+    let read = unsafe { method::<GetCompletedValue>(fence, GET_COMPLETED_VALUE_SLOT)(fence as Object) };
+    let removed = read == u64::MAX && device_removed(fence);
+    match reading(read, removed, k.last) {
+        Reading::Value(v) => {
+            k.last = v;
+            v
+        }
+        Reading::Lost => u64::MAX,
+        Reading::Refused { read, kept } => {
+            xs_log!("fence cells: PC fence {fence:#x} reads {read:#x} on a live device, or outside 56 bits, or below {kept:#x}: the title is given {kept:#x}");
+            kept
+        }
+    }
 }
 
 /// All fences seen, by address. A fence stays here for the life of the process: the fence proxy
@@ -92,13 +167,23 @@ fn watcher_event() -> usize {
 
 /// Stores the completed value of every fence that has a cell into that cell.
 fn copy_values() {
-    let guard = known();
-    for (&fence, k) in guard.iter().flatten() {
+    let mut guard = known();
+    for (&fence, k) in guard.iter_mut().flatten() {
         let Some(cell) = k.cell else { continue };
-        // SAFETY: only live PC fences are ever in the table.
-        let value = unsafe { method::<GetCompletedValue>(fence, GET_COMPLETED_VALUE_SLOT)(fence as Object) };
+        let value = settle(fence, k);
         cell.0.store(value, Ordering::Release);
     }
+}
+
+/// `GetCompletedValue` as the title is given it (slot 8): the same answer the cell holds (R1, R2).
+pub fn completed_value(fence: Object) -> u64 {
+    let mut guard = known();
+    let k = guard.get_or_insert_with(HashMap::new).entry(fence as usize).or_default();
+    let value = settle(fence as usize, k);
+    if let Some(cell) = k.cell {
+        cell.0.store(value, Ordering::Release);
+    }
+    value
 }
 
 /// Has `fence` set the watcher's event when it reaches `value`.
@@ -130,9 +215,17 @@ pub fn queued(fence: Object, value: u64) {
     }
 }
 
-/// The CPU signalled `fence`.
-pub fn cpu_signalled(fence: Object) {
-    let has_cell = known().as_ref().and_then(|t| t.get(&(fence as usize))).is_some_and(|k| k.cell.is_some());
+/// The CPU signalled `fence` to `value`: the highest value known moves with it, then the cells follow.
+pub fn cpu_signalled(fence: Object, value: u64) {
+    if fence.is_null() {
+        return;
+    }
+    let has_cell = {
+        let mut guard = known();
+        let k = guard.get_or_insert_with(HashMap::new).entry(fence as usize).or_default();
+        k.highest_queued = k.highest_queued.max(value);
+        k.cell.is_some()
+    };
     if has_cell {
         copy_values();
     }
@@ -171,5 +264,31 @@ mod tests {
     fn a_null_fence_is_ignored() {
         queued(std::ptr::null_mut(), 5);
         assert!(known().as_ref().is_none_or(|t| !t.contains_key(&0)));
+    }
+}
+
+#[cfg(test)]
+mod reading_tests {
+    use super::*;
+
+    /// rule R6, first direction: MAX on a live device is not given; the last valid value is.
+    #[test]
+    fn max_on_a_live_device_is_refused_and_the_last_valid_value_is_kept() {
+        assert_eq!(reading(u64::MAX, false, 41), Reading::Refused { read: u64::MAX, kept: 41 });
+    }
+
+    /// rule R6, second direction: with the device removed, MAX is given.
+    #[test]
+    fn max_with_a_removed_device_is_given() {
+        assert_eq!(reading(u64::MAX, true, 41), Reading::Lost);
+    }
+
+    /// R2: up to 56 bits pass; above does not; the value never goes back.
+    #[test]
+    fn values_stay_within_56_bits_and_never_go_back() {
+        assert_eq!(reading(MAX_VALUE, false, 9), Reading::Value(MAX_VALUE));
+        assert_eq!(reading(1 << 56, false, 9), Reading::Refused { read: 1 << 56, kept: 9 });
+        assert_eq!(reading(7, false, 8), Reading::Refused { read: 7, kept: 8 });
+        assert_eq!(reading(8, false, 8), Reading::Value(8));
     }
 }

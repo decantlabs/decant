@@ -538,7 +538,9 @@ pub const RESOURCE_RULES: &[SlotRule] = &[
 /// (a retail title calls it, then reads the returned u64 in a loop).
 pub const FENCE_RULES: &[SlotRule] = &[
     custom(0, 2, "IUnknown"),
-    fwd(3, 9, 3, "ID3D12Object, GetDevice, GetCompletedValue, SetEventOnCompletion (PC order)"),
+    fwd(3, 7, 3, "ID3D12Object, GetDevice (PC order)"),
+    custom(8, 8, "GetCompletedValue: the cell's answer (rules R1 and R2: MAX only on a removed device)"),
+    fwd(9, 9, 9, "SetEventOnCompletion (PC order)"),
     custom(10, 10, "Signal from the CPU (PC order), then the completed value cell is refreshed"),
     fwd(11, 11, 11, "GetCreationFlags (PC order, ID3D12Fence1)"),
     custom(12, 12, "the address of the completed value (newer layout), a cell kept equal to the PC value"),
@@ -623,10 +625,12 @@ mod tests {
     fn the_fence_table_relays_the_pc_slots_and_answers_slot_12() {
         let k = Kind::Fence;
         assert_eq!((k.slots(), k.name()), (16, "fence"));
-        for s in [3u32, 8, 9, 11] {
+        for s in [3u32, 7, 9, 11] {
             let r = k.rule(s).unwrap();
             assert_eq!((r.kind, r.pc + (s as u16 - r.first)), (RuleKind::Fwd, s as u16), "slot {s}");
         }
+        // GetCompletedValue (8) is answered by the fence cell rule (rules R1 and R2), not relayed.
+        assert_eq!(k.rule(8).unwrap().kind, RuleKind::Custom, "slot 8 is the settled answer");
         assert_eq!(k.rule(10).unwrap().kind, RuleKind::Custom);
         assert_eq!(k.rule(12).unwrap().kind, RuleKind::Custom);
         assert_eq!(k.rule(13).unwrap().kind, RuleKind::Unknown);

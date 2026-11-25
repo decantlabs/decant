@@ -3956,12 +3956,19 @@ extern "system" fn fence_signal(this: *mut Proxy, value: u64) -> HRESULT {
     unsafe {
         let pc = (*this).pc;
         let hr = method::<unsafe extern "system" fn(Object, u64) -> HRESULT>(pc, 10)(pc, value);
-        crate::fence_cell::cpu_signalled(pc);
+        crate::fence_cell::cpu_signalled(pc, value);
         hr
     }
 }
 
 /// Console fence slot 12 (newer layout): the address of the completed value.
+/// Console fence slot 8, GetCompletedValue (rules R1 and R2): the same answer as the cell.
+extern "system" fn fence_get_completed(this: *mut Proxy) -> u64 {
+    // SAFETY: `this` is a live fence proxy.
+    let pc = unsafe { (*this).pc };
+    crate::fence_cell::completed_value(pc)
+}
+
 extern "system" fn fence_value_address(this: *mut Proxy) -> *const u64 {
     static LOGGED: AtomicBool = AtomicBool::new(false);
     // SAFETY: `this` is a live fence proxy.
@@ -4823,6 +4830,7 @@ fn custom(kind: Kind, slot: u32) -> Option<usize> {
         (Kind::Device, 56 | 66) => dev_serialize_pso as *const () as usize,
         (Kind::Device, 57) => pso_cache::dev_deserialize_graphics as *const () as usize,
         (Kind::Device, 76) => dev_create_committed_resource as *const () as usize,
+        (Kind::Fence, 8) => fence_get_completed as *const () as usize,
         (Kind::Fence, 10) => fence_signal as *const () as usize,
         (Kind::Fence, 12) => fence_value_address as *const () as usize,
         (Kind::Queue, 14) => queue_slot14 as *const () as usize,
