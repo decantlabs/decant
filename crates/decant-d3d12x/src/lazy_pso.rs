@@ -39,7 +39,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use windows_sys::core::{GUID, HRESULT};
@@ -103,6 +103,12 @@ pub struct Owned {
     _buffers: Vec<Vec<u8>>,
 }
 
+impl Drop for Owned {
+    fn drop(&mut self) {
+        release_shaders(&mut self.shaders);
+    }
+}
+
 impl Owned {
     /// The copied description.
     pub fn desc(&self) -> &[u8] {
@@ -116,10 +122,27 @@ impl Owned {
 }
 
 /// Shader containers that were seen, by length and identity. Pipelines naming the same bytes share
-/// one copy.
-type ShaderIndex = HashMap<(usize, u128), Arc<[u8]>>;
+/// one weak reference, and entries are pruned once no pipeline keeps them alive.
+#[derive(Default)]
+struct ShaderTable {
+    entries: HashMap<(usize, u128), Weak<[u8]>>,
+    prune_at: usize,
+}
 
-static SEEN_SHADERS: LazyLock<Mutex<ShaderIndex>> = LazyLock::new(Default::default);
+impl ShaderTable {
+    const MIN_PRUNE_AT: usize = 256;
+
+    fn maybe_prune(&mut self) {
+        let threshold = self.prune_at.max(Self::MIN_PRUNE_AT);
+        if self.entries.len() < threshold {
+            return;
+        }
+        self.entries.retain(|_, weak| weak.strong_count() > 0);
+        self.prune_at = (self.entries.len() * 2).max(Self::MIN_PRUNE_AT);
+    }
+}
+
+static SEEN_SHADERS: LazyLock<Mutex<ShaderTable>> = LazyLock::new(Default::default);
 
 /// What tells two shader containers apart: the 16 byte checksum that follows the `DXBC` magic, or a
 /// hash of all bytes when there is no such container.
@@ -139,7 +162,38 @@ fn identity(bytes: &[u8]) -> u128 {
 /// The shared copy of `bytes`.
 fn shared_copy(bytes: &[u8]) -> Arc<[u8]> {
     let key = (bytes.len(), identity(bytes));
-    SEEN_SHADERS.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert_with(|| Arc::from(bytes)).clone()
+    let mut table = SEEN_SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = table.entries.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let copy: Arc<[u8]> = Arc::from(bytes);
+    table.entries.insert(key, Arc::downgrade(&copy));
+    table.maybe_prune();
+    copy
+}
+
+/// Drops each shader reference and prunes any table entry whose last strong reference was released.
+fn release_shaders(shaders: &mut Vec<Arc<[u8]>>) {
+    if shaders.is_empty() {
+        return;
+    }
+    let mut last_refs = Vec::new();
+    for arc in shaders.drain(..) {
+        if Arc::strong_count(&arc) == 1 {
+            let key = (arc.len(), identity(&arc));
+            last_refs.push((key, arc));
+        }
+    }
+    if last_refs.is_empty() {
+        return;
+    }
+    let mut table = SEEN_SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+    for (key, arc) in last_refs {
+        drop(arc);
+        if table.entries.get(&key).is_some_and(|weak| weak.strong_count() == 0) {
+            table.entries.remove(&key);
+        }
+    }
 }
 
 fn get_u64(bytes: &[u8], at: usize) -> u64 {
@@ -324,7 +378,8 @@ struct Recipe {
     device: usize,
     create: Create,
     riid: GUID,
-    owned: Owned,
+    is_compute: bool,
+    owned: RwLock<Option<Owned>>,
 }
 
 // SAFETY: the recipe holds addresses (the device proxy, the copied description) that stay valid for
@@ -522,23 +577,31 @@ fn submit(job: MakeJob, is_compute: bool) {
     wake.notify_one();
 }
 
-/// Makes the PC pipeline of `lazy` once and tells the waiters.
+/// Makes the PC pipeline of `lazy` once, drops the retained description and shader references,
+/// and tells the waiters.
 fn run_job(lazy: &Lazy, source: MakeSource, service: Option<&'static crate::compile_service::Service>) {
-    lazy.made.get_or_init(|| match source {
-        MakeSource::Direct(patched) => {
-            let direct = make(lazy, patched.desc(), true, service);
-            if direct == 0 {
-                // The PC runtime refused the compiled shaders: use the title's own.
-                return make(lazy, lazy.recipe.owned.desc(), false, service);
+    lazy.made.get_or_init(|| {
+        let guard = lazy.recipe.owned.read().unwrap_or_else(|e| e.into_inner());
+        let Some(owned) = guard.as_ref() else {
+            return 0;
+        };
+        match source {
+            MakeSource::Direct(patched) => {
+                let direct = make(lazy, owned, patched.desc(), true, service);
+                if direct == 0 {
+                    // The PC runtime refused the compiled shaders: use the title's own.
+                    return make(lazy, owned, owned.desc(), false, service);
+                }
+                crate::direct_pso::kind_made(direct, owned);
+                direct
             }
-            crate::direct_pso::kind_made(direct, &lazy.recipe.owned);
-            direct
-        }
-        MakeSource::Original => {
-            crate::direct_pso::pipeline_done_for(service, &lazy.recipe.owned, None);
-            make(lazy, lazy.recipe.owned.desc(), false, service)
+            MakeSource::Original => {
+                crate::direct_pso::pipeline_done_for(service, owned, None);
+                make(lazy, owned, owned.desc(), false, service)
+            }
         }
     });
+    *lazy.recipe.owned.write().unwrap_or_else(|e| e.into_inner()) = None;
     let (lock, finished) = &MAKER_FINISHED;
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     finished.notify_all();
@@ -588,13 +651,14 @@ pub unsafe fn defer(device: usize, owned: Owned, riid: *const GUID, out: *mut *m
         unsafe { riid.read_unaligned() }
     };
     let number = DEFERRED.fetch_add(1, Ordering::Relaxed) as u32;
+    let is_compute = owned.desc().len() == COMPUTE_DESC_SIZE;
     let precompile_key = crate::direct_pso::register(&owned, number);
     let object = Box::new(Lazy {
         vtbl: &VTBL,
         refs: AtomicU32::new(1),
         number,
         packet: [0; 8],
-        recipe: Recipe { device, create, riid, owned },
+        recipe: Recipe { device, create, riid, is_compute, owned: RwLock::new(Some(owned)) },
         made: OnceLock::new(),
         precompile_key,
         waited: AtomicBool::new(false),
@@ -633,7 +697,7 @@ pub unsafe fn resolve(object: *mut c_void) -> Option<*mut c_void> {
     if let Some(&made) = lazy.made.get() {
         return Some(made as *mut c_void);
     }
-    let is_compute = lazy.recipe.owned.desc().len() == COMPUTE_DESC_SIZE;
+    let is_compute = lazy.recipe.is_compute;
     let first_bind = !lazy.waited.swap(true, Ordering::Relaxed);
     let allowed = crate::direct_pso::bind_wait(is_compute, first_bind, &lazy.late);
     let cap = async_bind_cap();
@@ -685,10 +749,17 @@ fn resolve_within(object: usize, lazy: &'static Lazy, is_compute: bool, allowed:
     }
 
     let service = crate::direct_pso::current_service();
-    let source = match crate::direct_pso::choose_with_budget(object, &lazy.recipe.owned, lazy.precompile_key, allowed) {
-        crate::direct_pso::Choice::Pending => return not_in_time(),
-        crate::direct_pso::Choice::Direct(patched) => MakeSource::Direct(patched),
-        crate::direct_pso::Choice::Original => MakeSource::Original,
+    let source = {
+        let guard = lazy.recipe.owned.read().unwrap_or_else(|e| e.into_inner());
+        let Some(owned) = guard.as_ref() else {
+            charge_frame();
+            return lazy.made.get().copied().unwrap_or(0) as *mut c_void;
+        };
+        match crate::direct_pso::choose_with_budget(object, owned, lazy.precompile_key, allowed) {
+            crate::direct_pso::Choice::Pending => return not_in_time(),
+            crate::direct_pso::Choice::Direct(patched) => MakeSource::Direct(patched),
+            crate::direct_pso::Choice::Original => MakeSource::Original,
+        }
     };
 
     if !async_make_enabled() {
@@ -706,7 +777,7 @@ fn resolve_within(object: usize, lazy: &'static Lazy, is_compute: bool, allowed:
 
 /// Calls the creation path for `lazy` with `desc`. Returns the PC pipeline, or 0 when the PC
 /// runtime refused it or only gave a stand in.
-fn make(lazy: &Lazy, desc: &[u8], direct: bool, service: Option<&'static crate::compile_service::Service>) -> usize {
+fn make(lazy: &Lazy, owned: &Owned, desc: &[u8], direct: bool, service: Option<&'static crate::compile_service::Service>) -> usize {
     let recipe = &lazy.recipe;
     let begun = Instant::now();
     let mut out: *mut c_void = std::ptr::null_mut();
@@ -718,7 +789,7 @@ fn make(lazy: &Lazy, desc: &[u8], direct: bool, service: Option<&'static crate::
     let made = if hr >= 0 && !out.is_null() && !stand_in { out as usize } else { 0 };
     let took = begun.elapsed();
     if direct {
-        crate::direct_pso::pipeline_done_for(service, &recipe.owned, Some((made != 0, took)));
+        crate::direct_pso::pipeline_done_for(service, owned, Some((made != 0, took)));
     }
     let ms = took.as_millis();
     let (nth, outcome) = if made != 0 { (MADE.fetch_add(1, Ordering::Relaxed), "made") } else { (REFUSED.fetch_add(1, Ordering::Relaxed), "refused") };
@@ -1118,5 +1189,82 @@ mod tests {
         assert!(std::ptr::eq(queues.next().unwrap().lazy, compute));
         assert!(std::ptr::eq(queues.next().unwrap().lazy, graphics));
         assert!(queues.next().is_none());
+    }
+
+    #[test]
+    fn identical_bytecode_blobs_share_one_arc_allocation() {
+        let shader_a = b"DXBCdedup_share_0001_payload_a".to_vec();
+        let shader_b = b"DXBCdedup_share_0001_payload_a".to_vec();
+        let desc_a = compute_desc(&shader_a);
+        let desc_b = compute_desc(&shader_b);
+        // SAFETY: both descriptions and shader slices are live for the copy calls.
+        let first = unsafe { copy_compute(desc_a.as_ptr().cast()) };
+        // SAFETY: as above.
+        let second = unsafe { copy_compute(desc_b.as_ptr().cast()) };
+        assert_eq!(first.shaders().len(), 1);
+        assert_eq!(second.shaders().len(), 1);
+        assert!(Arc::ptr_eq(&first.shaders()[0], &second.shaders()[0]));
+        assert_eq!(Arc::strong_count(&first.shaders()[0]), 2);
+
+        let key = (shader_a.len(), identity(&shader_a));
+        drop(second);
+        assert_eq!(Arc::strong_count(&first.shaders()[0]), 1);
+        drop(first);
+        let table = SEEN_SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!table.entries.contains_key(&key), "last drop prunes the interned entry");
+    }
+
+    unsafe fn always_ok_create(device: usize, _desc: *const c_void, _riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        // SAFETY: `out` is the caller's writable pointer.
+        unsafe { *out = device as *mut c_void };
+        0
+    }
+
+    #[test]
+    fn bytecode_references_drop_and_prune_after_pso_creation() {
+        let shader = b"DXBCdedup_drop_after_pso_0001";
+        let key = (shader.len(), identity(shader));
+        let first = defer_compute(0x6100_0001, shader, always_ok_create);
+        let second = defer_compute(0x6100_0002, shader, always_ok_create);
+
+        let weak = SEEN_SHADERS.lock().unwrap_or_else(|e| e.into_inner()).entries.get(&key).cloned().expect("shader is interned");
+        assert_eq!(weak.strong_count(), 2);
+
+        // SAFETY: `first` is our `Lazy` object.
+        assert_eq!(unsafe { resolve(first) }, Some(0x6100_0001 as *mut c_void));
+        // SAFETY: as above.
+        let first_lazy: &'static Lazy = unsafe { &*first.cast::<Lazy>() };
+        assert!(first_lazy.recipe.owned.read().unwrap_or_else(|e| e.into_inner()).is_none());
+        assert_eq!(weak.strong_count(), 1);
+
+        // SAFETY: `second` is our `Lazy` object.
+        assert_eq!(unsafe { resolve(second) }, Some(0x6100_0002 as *mut c_void));
+        // SAFETY: as above.
+        let second_lazy: &'static Lazy = unsafe { &*second.cast::<Lazy>() };
+        assert!(second_lazy.recipe.owned.read().unwrap_or_else(|e| e.into_inner()).is_none());
+        assert_eq!(weak.strong_count(), 0);
+        assert!(weak.upgrade().is_none(), "shared bytecode allocation is freed");
+
+        let table = SEEN_SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!table.entries.contains_key(&key), "pruned once no deferred pipeline keeps it");
+    }
+
+    #[test]
+    fn unused_weak_entries_are_pruned_when_table_grows() {
+        let mut dropped_keys = Vec::with_capacity(300);
+        for index in 0u32..300 {
+            let mut blob = b"DXBCprune_0000000000000000".to_vec();
+            blob[4..8].copy_from_slice(&index.to_le_bytes());
+            blob[8..12].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+            dropped_keys.push((blob.len(), identity(&blob)));
+            let arc = shared_copy(&blob);
+            drop(arc);
+        }
+        let keeper = shared_copy(b"DXBCprune_keeper_000000000");
+        let table = SEEN_SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        let remaining = dropped_keys.iter().filter(|key| table.entries.contains_key(key)).count();
+        assert!(remaining < 50, "expected dead weak entries to be pruned, {remaining} remained");
+        drop(table);
+        drop(keeper);
     }
 }
