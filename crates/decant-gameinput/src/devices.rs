@@ -4,7 +4,7 @@
 //! `DECANT_KEYS`) with what real hardware reports, and the hardware reads themselves. The parsing of the script and
 //! of `DECANT_KEYS` is not part of this module.
 //!
-//! Design of the real input: one XInput controller in slot 0 is enough for the one simulated pad. The keyboard is a
+//! Design of the real input: one XInput controller in any of slots 0 to 3 feeds the one simulated pad. The keyboard is a
 //! second source that is only sampled while a window of this process has the focus, so a background run never
 //! reacts to keys typed elsewhere. Both sources are combined with the same merge as the script, so a controller does
 //! not silence the keyboard and the other way round.
@@ -213,28 +213,82 @@ mod read {
         }
     }
 
+    /// Number of XInput controller slots (`XUSER_MAX_COUNT`).
+    pub(super) const SLOT_COUNT: usize = 4;
+
     /// Asking XInput about an empty slot is slow, so a missing controller is only looked for again after this pause.
-    const MISSING_PAUSE: Duration = Duration::from_secs(1);
+    pub(super) const MISSING_PAUSE: Duration = Duration::from_secs(1);
 
-    /// The earliest moment XInput may be asked again, set while slot 0 is empty.
-    static RETRY_AT: Mutex<Option<Instant>> = Mutex::new(None);
+    /// Abstraction around `XInputGetState` so slot selection and retry backoff can be unit tested without hardware.
+    pub(super) trait XInputSource {
+        fn get_state(&mut self, slot: u32) -> Option<XINPUT_GAMEPAD>;
+    }
 
-    /// The controller in XInput slot 0, or a neutral pad when there is none.
-    fn controller() -> PadState {
-        let mut retry_at = RETRY_AT.lock().unwrap_or_else(|e| e.into_inner());
-        if retry_at.is_some_and(|t| Instant::now() < t) {
-            return PadState::default();
+    struct SystemXInput;
+
+    impl XInputSource for SystemXInput {
+        fn get_state(&mut self, slot: u32) -> Option<XINPUT_GAMEPAD> {
+            let mut state = XINPUT_STATE::default();
+            // SAFETY: the out structure is the size XInput expects.
+            let status = unsafe { XInputGetState(slot, &mut state) };
+            (status == 0).then_some(state.Gamepad)
         }
-        let mut state = XINPUT_STATE::default();
-        // SAFETY: the out structure is the size XInput expects.
-        let status = unsafe { XInputGetState(0, &mut state) };
-        if status == 0 {
-            *retry_at = None;
-            pad_from_xinput(&state.Gamepad)
-        } else {
-            *retry_at = Some(Instant::now() + MISSING_PAUSE);
+    }
+
+    /// Tracks the active XInput slot and per slot retry backoff for empty slots.
+    #[derive(Debug, Default)]
+    pub(super) struct SlotPoller {
+        active: Option<usize>,
+        retry_at: [Option<Instant>; SLOT_COUNT],
+    }
+
+    impl SlotPoller {
+        pub(super) const fn new() -> Self {
+            Self { active: None, retry_at: [None; SLOT_COUNT] }
+        }
+
+        #[cfg(test)]
+        pub(super) fn active_slot(&self) -> Option<usize> {
+            self.active
+        }
+
+        fn probe_slot(&mut self, slot: usize, now: Instant, source: &mut impl XInputSource) -> Option<PadState> {
+            if self.retry_at[slot].is_some_and(|t| now < t) {
+                return None;
+            }
+            if let Some(gamepad) = source.get_state(slot as u32) {
+                self.active = Some(slot);
+                self.retry_at[slot] = None;
+                Some(pad_from_xinput(&gamepad))
+            } else {
+                self.retry_at[slot] = Some(now + MISSING_PAUSE);
+                None
+            }
+        }
+
+        /// Polls the currently active connected slot, or scans slots 0 to 3 for the first connected controller.
+        pub(super) fn poll(&mut self, now: Instant, source: &mut impl XInputSource) -> PadState {
+            if let Some(slot) = self.active {
+                if let Some(pad) = self.probe_slot(slot, now, source) {
+                    return pad;
+                }
+                self.active = None;
+            }
+            for slot in 0..SLOT_COUNT {
+                if let Some(pad) = self.probe_slot(slot, now, source) {
+                    return pad;
+                }
+            }
             PadState::default()
         }
+    }
+
+    static POLLER: Mutex<SlotPoller> = Mutex::new(SlotPoller::new());
+
+    /// The active controller across XInput slots 0 to 3, or a neutral pad when there is none.
+    fn controller() -> PadState {
+        let mut poller = POLLER.lock().unwrap_or_else(|e| e.into_inner());
+        poller.poll(Instant::now(), &mut SystemXInput)
     }
 
     /// The pad the held keys describe, neutral while no window of this process has the focus.
@@ -339,5 +393,145 @@ mod tests {
         // merged, because merge's `base` operand never goes through `deadzone`.
         let scripted = PadState { left_x: 0.02, ..PadState::default() };
         assert_eq!(merge(scripted, PadState::default()).left_x, 0.02);
+    }
+
+    #[cfg(windows)]
+    mod xinput_slot_tests {
+        use std::time::Instant;
+
+        use windows_sys::Win32::UI::Input::XboxController::{
+            XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+        };
+
+        use super::read::{MISSING_PAUSE, SLOT_COUNT, SlotPoller, XInputSource};
+        use crate::pad::{A, B, PadState, X, Y};
+
+        #[derive(Default)]
+        struct FakeXInput {
+            slots: [Option<XINPUT_GAMEPAD>; SLOT_COUNT],
+            calls: [usize; SLOT_COUNT],
+        }
+
+        impl FakeXInput {
+            fn with_button(slot: usize, w_buttons: u16) -> Self {
+                let mut fake = Self::default();
+                fake.set_button(slot, w_buttons);
+                fake
+            }
+
+            fn set_button(&mut self, slot: usize, w_buttons: u16) {
+                self.slots[slot] = Some(XINPUT_GAMEPAD { wButtons: w_buttons, ..XINPUT_GAMEPAD::default() });
+            }
+
+            fn disconnect(&mut self, slot: usize) {
+                self.slots[slot] = None;
+            }
+        }
+
+        impl XInputSource for FakeXInput {
+            fn get_state(&mut self, slot: u32) -> Option<XINPUT_GAMEPAD> {
+                let idx = slot as usize;
+                self.calls[idx] += 1;
+                self.slots[idx]
+            }
+        }
+
+        #[test]
+        fn selects_first_connected_slot_across_all_four_slots() {
+            let now = Instant::now();
+            for (slot, raw_btn, pad_btn) in [
+                (0, XINPUT_GAMEPAD_A, A),
+                (1, XINPUT_GAMEPAD_B, B),
+                (2, XINPUT_GAMEPAD_X, X),
+                (3, XINPUT_GAMEPAD_Y, Y),
+            ] {
+                let mut poller = SlotPoller::new();
+                let mut fake = FakeXInput::with_button(slot, raw_btn);
+                let state = poller.poll(now, &mut fake);
+                assert_eq!(state.buttons, pad_btn);
+                assert_eq!(poller.active_slot(), Some(slot));
+                for earlier in 0..slot {
+                    assert_eq!(fake.calls[earlier], 1);
+                }
+                assert_eq!(fake.calls[slot], 1);
+                for later in (slot + 1)..SLOT_COUNT {
+                    assert_eq!(fake.calls[later], 0);
+                }
+            }
+        }
+
+        #[test]
+        fn sticks_to_active_slot_across_polls_even_if_earlier_slot_connects() {
+            let t0 = Instant::now();
+            let mut poller = SlotPoller::new();
+            let mut fake = FakeXInput::with_button(2, XINPUT_GAMEPAD_X);
+
+            assert_eq!(poller.poll(t0, &mut fake).buttons, X);
+            assert_eq!(poller.active_slot(), Some(2));
+            assert_eq!(fake.calls, [1, 1, 1, 0]);
+
+            // A controller appears in slot 0 and slot 1, and time moves past the retry pause.
+            fake.set_button(0, XINPUT_GAMEPAD_A);
+            fake.set_button(1, XINPUT_GAMEPAD_B);
+            let t1 = t0 + MISSING_PAUSE + MISSING_PAUSE;
+
+            assert_eq!(poller.poll(t1, &mut fake).buttons, X);
+            assert_eq!(poller.active_slot(), Some(2));
+            // Only the active slot 2 was queried on the second poll.
+            assert_eq!(fake.calls, [1, 1, 2, 0]);
+        }
+
+        #[test]
+        fn fails_over_to_another_connected_slot_on_disconnect() {
+            let t0 = Instant::now();
+            let mut poller = SlotPoller::new();
+            let mut fake = FakeXInput::with_button(1, XINPUT_GAMEPAD_B);
+            fake.set_button(3, XINPUT_GAMEPAD_Y);
+
+            // First poll picks slot 1 (first connected) and does not need to probe slots 2 or 3.
+            assert_eq!(poller.poll(t0, &mut fake).buttons, B);
+            assert_eq!(poller.active_slot(), Some(1));
+            assert_eq!(fake.calls, [1, 1, 0, 0]);
+
+            // Slot 1 disconnects before the slot 0 backoff expires: failover skips slot 0 (still
+            // in backoff) and slot 1 (just put into backoff), probes slot 2 (empty) and picks slot 3.
+            fake.disconnect(1);
+            assert_eq!(poller.poll(t0, &mut fake).buttons, Y);
+            assert_eq!(poller.active_slot(), Some(3));
+            assert_eq!(fake.calls, [1, 2, 1, 1]);
+
+            // Next poll sticks to slot 3 without touching the empty slots.
+            assert_eq!(poller.poll(t0, &mut fake).buttons, Y);
+            assert_eq!(fake.calls, [1, 2, 1, 2]);
+
+            // Slot 3 disconnects after the backoff on slot 0 expires, and slot 0 is now connected.
+            fake.disconnect(3);
+            fake.set_button(0, XINPUT_GAMEPAD_A);
+            let t1 = t0 + MISSING_PAUSE;
+            assert_eq!(poller.poll(t1, &mut fake).buttons, A);
+            assert_eq!(poller.active_slot(), Some(0));
+            assert_eq!(fake.calls, [2, 2, 1, 3]);
+        }
+
+        #[test]
+        fn empty_slots_respect_per_slot_retry_backoff() {
+            let t0 = Instant::now();
+            let mut poller = SlotPoller::new();
+            let mut fake = FakeXInput::default();
+
+            assert_eq!(poller.poll(t0, &mut fake), PadState::default());
+            assert_eq!(poller.active_slot(), None);
+            assert_eq!(fake.calls, [1, 1, 1, 1]);
+
+            // Polling again before MISSING_PAUSE makes zero XInput calls.
+            assert_eq!(poller.poll(t0 + MISSING_PAUSE / 2, &mut fake), PadState::default());
+            assert_eq!(fake.calls, [1, 1, 1, 1]);
+
+            // Once MISSING_PAUSE has elapsed, slots are probed again and a newly connected slot is found.
+            fake.set_button(2, XINPUT_GAMEPAD_X);
+            assert_eq!(poller.poll(t0 + MISSING_PAUSE, &mut fake).buttons, X);
+            assert_eq!(poller.active_slot(), Some(2));
+            assert_eq!(fake.calls, [2, 2, 2, 1]);
+        }
     }
 }
