@@ -908,6 +908,12 @@ struct Registry {
     /// every DirectStorage request once stalled the loading of a large world.
     by_address: BTreeMap<u64, Vec<usize>>,
     largest: u64,
+    /// Cached reverse index from mirror tile index to placed texture resources, invalidated when
+    /// `title_mem::mapping_generation()` advances or textures are added or removed.
+    tile_to_textures: HashMap<u32, Vec<usize>>,
+    unmapped_textures: Vec<usize>,
+    index_gen: u64,
+    index_dirty: bool,
     scratch: RegistryScratch,
 }
 
@@ -916,6 +922,7 @@ impl Registry {
         self.remove(res);
         self.by_address.entry(texture.va).or_default().push(res);
         self.largest = self.largest.max(texture.plan.size);
+        self.index_dirty = true;
         if texture.wants_fill() {
             self.pending.insert(res);
             HAS_PENDING_FILLS.store(true, Ordering::Release);
@@ -928,6 +935,7 @@ impl Registry {
     fn remove(&mut self, res: usize) -> bool {
         let Some(texture) = self.textures.remove(&res) else { return false };
         self.pending.remove(&res);
+        self.index_dirty = true;
         if self.pending.is_empty() {
             HAS_PENDING_FILLS.store(false, Ordering::Release);
         }
@@ -969,6 +977,69 @@ impl Registry {
         let mut out = Vec::new();
         self.overlapping_into(start, end, &mut out);
         out
+    }
+
+    /// Rebuilds `tile_to_textures` and `unmapped_textures` from a batch of `(res, va, size)` and
+    /// their mirror tiles.
+    fn rebuild_tile_index(&mut self, items: &[(usize, u64, u64)], tiles_per_item: &[Option<Vec<u32>>], mapping_gen: u64, gen_current: bool) {
+        self.tile_to_textures.clear();
+        self.unmapped_textures.clear();
+        let mut live_matched = 0usize;
+        for (&(res, va, _), maybe_tiles) in items.iter().zip(tiles_per_item) {
+            if self.textures.get(&res).is_none_or(|t| t.va != va) {
+                continue;
+            }
+            live_matched += 1;
+            match maybe_tiles {
+                Some(tiles) => {
+                    for &tile in tiles {
+                        self.tile_to_textures.entry(tile).or_default().push(res);
+                    }
+                }
+                None => self.unmapped_textures.push(res),
+            }
+        }
+        if gen_current && live_matched == self.textures.len() {
+            self.index_gen = mapping_gen;
+            self.index_dirty = false;
+        } else {
+            self.index_dirty = true;
+        }
+    }
+
+    /// Marks textures whose mirror tiles appear in `tiles` using the cached reverse index.
+    fn mark_tiles_from_index(&mut self, tiles: &[u32], report: bool) -> u32 {
+        let mut hit = std::mem::take(&mut self.scratch.overlapping);
+        hit.clear();
+        for &tile in tiles {
+            if let Some(list) = self.tile_to_textures.get(&tile) {
+                hit.extend_from_slice(list);
+            }
+        }
+        hit.sort_unstable();
+        hit.dedup();
+        let mut marked = 0u32;
+        for &res in &hit {
+            if let Some(texture) = self.textures.get_mut(&res) {
+                texture.invalidate();
+                self.pending.insert(res);
+                marked += 1;
+            }
+        }
+        self.scratch.overlapping = hit;
+        if report {
+            let waiting = self.textures.values().filter(|t| t.dirty && t.attempts == 0).count();
+            let filled = self.textures.values().filter(|t| !t.dirty).count() as u32;
+            let unmapped = self.unmapped_textures.len() as u32;
+            let first_unmapped = self.unmapped_textures.first().and_then(|res| self.textures.get(res)).map_or(0, |t| t.va);
+            let untouched = (self.textures.len() as u32).saturating_sub(marked + unmapped);
+            xs_log!(
+                "detile: {} textures, {} pages written: {marked} marked, {waiting} wait for a fill, {untouched} not written ({filled} of them filled), {unmapped} with pages that are not mapped (first at {first_unmapped:#x})",
+                self.textures.len(),
+                tiles.len()
+            );
+        }
+        marked
     }
 }
 
@@ -1141,55 +1212,31 @@ pub fn note_tiles(tiles: &[u32]) {
     if !enabled() || tiles.is_empty() {
         return;
     }
-    let written: HashSet<u32> = tiles.iter().copied().collect();
     let report = probe_line_due();
-    // The spans are tested with the registry lock released, because DirectStorage completions
-    // (`note_write`) and the flushes of other queues wait for it.
-    let (resources, spans): (Vec<usize>, Vec<(u64, u64)>) = with_registry(|r| {
-        r.textures
-            .iter()
-            .filter(|(_, t)| !(t.dirty && t.attempts == 0))
-            .map(|(&res, t)| (res, (t.va, t.plan.size)))
-            .unzip()
-    });
-    if spans.is_empty() && !report {
-        return;
-    }
-    let touched = crate::title_mem::spans_touch(&spans, &written);
-    let marked = with_registry(|r| {
-        let (mut marked, mut filled, mut unmapped, mut untouched) = (0u32, 0u32, 0u32, 0u32);
-        let mut first_unmapped = 0u64;
-        let waiting = if report { r.textures.values().filter(|t| t.dirty && t.attempts == 0).count() } else { 0 };
-        for ((&res, &(va, _)), touch) in resources.iter().zip(&spans).zip(touched) {
-            // A texture released or created again in the meantime is left alone.
-            let Some(texture) = r.textures.get_mut(&res).filter(|t| t.va == va) else { continue };
-            match touch {
-                Some(true) => {
-                    texture.invalidate();
-                    r.pending.insert(res);
-                    marked += 1;
-                }
-                Some(false) => {
-                    untouched += 1;
-                    filled += u32::from(!texture.dirty);
-                }
-                None => {
-                    unmapped += 1;
-                    if first_unmapped == 0 {
-                        first_unmapped = va;
-                    }
-                }
-            }
+    let current_gen = crate::title_mem::mapping_generation();
+    let fast = with_registry(|r| {
+        if r.textures.is_empty() {
+            return Ok(0);
         }
-        if report {
-            xs_log!(
-                "detile: {} textures, {} pages written: {marked} marked, {waiting} wait for a fill, {untouched} not written ({filled} of them filled), {unmapped} with pages that are not mapped (first at {first_unmapped:#x})",
-                r.textures.len(),
-                tiles.len()
-            );
+        if !r.index_dirty && r.index_gen == current_gen {
+            return Ok(r.mark_tiles_from_index(tiles, report));
         }
-        marked
+        let items: Vec<(usize, u64, u64)> = r.textures.iter().map(|(&res, t)| (res, t.va, t.plan.size)).collect();
+        let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
+        Err((items, spans))
     });
+    let marked = match fast {
+        Ok(marked) => marked,
+        Err((items, spans)) => {
+            let build_gen = crate::title_mem::mapping_generation();
+            let mut tiles_out = Vec::new();
+            crate::title_mem::tiles_of_batch(&spans, &mut tiles_out);
+            with_registry(|r| {
+                r.rebuild_tile_index(&items, &tiles_out, build_gen, crate::title_mem::mapping_generation() == build_gen);
+                r.mark_tiles_from_index(tiles, report)
+            })
+        }
+    };
     if marked > 0 && ANNOUNCED.fetch_add(1, Ordering::Relaxed) < 8 {
         xs_log!("detile: {marked} textures whose memory the title wrote ({} pages written) are filled again", tiles.len());
     }
@@ -1630,5 +1677,33 @@ mod tests {
         assert!(!r.pending.contains(&10) && r.pending.contains(&20));
         assert!(r.remove(20));
         assert!(r.pending.is_empty());
+    }
+
+    #[test]
+    fn reverse_tile_index_marks_matching_textures_and_tracks_unmapped() {
+        let mut r = Registry::default();
+        r.insert(1, placed(0x1000, 0x1000));
+        r.insert(2, placed(0x4000, 0x1000));
+        r.insert(3, placed(0x8000, 0x1000));
+        assert!(r.index_dirty);
+
+        let items = vec![(1, 0x1000, 0x1000), (2, 0x4000, 0x1000), (3, 0x8000, 0x1000)];
+        let tiles_per = vec![Some(vec![10, 11]), Some(vec![11, 12]), None];
+        r.rebuild_tile_index(&items, &tiles_per, 7, true);
+        assert!(!r.index_dirty);
+        assert_eq!(r.index_gen, 7);
+        assert_eq!(r.unmapped_textures, vec![3]);
+
+        // Writing tile 99 marks nothing.
+        assert_eq!(r.mark_tiles_from_index(&[99], false), 0);
+        assert!(r.pending.is_empty());
+
+        // Writing tiles 10 and 11 marks textures 1 and 2 once each, leaving 3 untouched.
+        assert_eq!(r.mark_tiles_from_index(&[10, 11], false), 2);
+        assert!(r.pending.contains(&1) && r.pending.contains(&2) && !r.pending.contains(&3));
+
+        // Removing a texture invalidates the cached index.
+        assert!(r.remove(2));
+        assert!(r.index_dirty);
     }
 }

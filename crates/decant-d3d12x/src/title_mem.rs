@@ -47,7 +47,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -68,9 +68,9 @@ pub const POOL_HEAP_BYTES: u64 = HEAP_PAGES as u64 * PAGE;
 
 /// Pages asked of `DecantXmemGpuTakeDirty` in one call.
 const TAKE_PAGES: usize = 65536;
-/// Bound each copy job to 4 MiB and assign at least 8 MiB per copying thread.
-const COPY_CHUNK_PAGES: usize = 64;
-const COPY_THREAD_PAGES: usize = 128;
+/// Bound each copy job to 1 MiB and assign at least 1 MiB per copying thread.
+const COPY_CHUNK_PAGES: usize = 16;
+const COPY_THREAD_PAGES: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
 struct CopyJob {
@@ -93,33 +93,128 @@ fn copy_threads(pages: usize, cores: usize) -> usize {
     (pages / COPY_THREAD_PAGES).max(1).min(cores.max(1))
 }
 
+struct PoolState {
+    jobs_ptr: usize,
+    jobs_len: usize,
+    workers_to_take: usize,
+    active_workers: usize,
+    epoch: u64,
+}
+
+struct PoolShared {
+    state: Mutex<PoolState>,
+    next: std::sync::atomic::AtomicUsize,
+    cv_work: Condvar,
+    cv_done: Condvar,
+}
+
+struct CopyPool {
+    workers: usize,
+    run_lock: Mutex<()>,
+    shared: Arc<PoolShared>,
+}
+
+impl CopyPool {
+    fn new(workers: usize) -> Self {
+        let shared = Arc::new(PoolShared {
+            state: Mutex::new(PoolState { jobs_ptr: 0, jobs_len: 0, workers_to_take: 0, active_workers: 0, epoch: 0 }),
+            next: std::sync::atomic::AtomicUsize::new(0),
+            cv_work: Condvar::new(),
+            cv_done: Condvar::new(),
+        });
+        for i in 0..workers {
+            let shared = Arc::clone(&shared);
+            let _ = std::thread::Builder::new().name(format!("title-mem-copy-{i}")).spawn(move || {
+                let mut seen_gen = 0u64;
+                loop {
+                    let (ptr, len) = {
+                        let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                        while st.epoch == seen_gen || st.workers_to_take == 0 {
+                            st = shared.cv_work.wait(st).unwrap_or_else(|e| e.into_inner());
+                        }
+                        seen_gen = st.epoch;
+                        st.workers_to_take -= 1;
+                        (st.jobs_ptr as *const CopyJob, st.jobs_len)
+                    };
+                    loop {
+                        let idx = shared.next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= len {
+                            break;
+                        }
+                        // SAFETY: `run` keeps the `jobs` slice alive until `active_workers` reaches 0.
+                        let job = unsafe { *ptr.add(idx) };
+                        // SAFETY: caller guarantees live disjoint source and destination ranges.
+                        unsafe { std::ptr::copy_nonoverlapping(job.source as *const u8, job.destination as *mut u8, job.pages * PAGE as usize) };
+                    }
+                    let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.active_workers -= 1;
+                    if st.active_workers == 0 {
+                        shared.cv_done.notify_one();
+                    }
+                }
+            });
+        }
+        Self { workers, run_lock: Mutex::new(()), shared }
+    }
+
+    /// # Safety
+    /// Same safety contract as `execute_copies`.
+    unsafe fn run(&self, jobs: &[CopyJob], threads: usize) {
+        let _run_guard = self.run_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let worker_count = threads.saturating_sub(1).min(self.workers);
+        if worker_count == 0 || jobs.len() <= 1 {
+            for job in jobs {
+                // SAFETY: caller guarantees live disjoint ranges for every job.
+                unsafe { std::ptr::copy_nonoverlapping(job.source as *const u8, job.destination as *mut u8, job.pages * PAGE as usize) };
+            }
+            return;
+        }
+        {
+            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.jobs_ptr = jobs.as_ptr() as usize;
+            st.jobs_len = jobs.len();
+            self.shared.next.store(0, Ordering::Relaxed);
+            st.workers_to_take = worker_count;
+            st.active_workers = worker_count;
+            st.epoch += 1;
+            self.shared.cv_work.notify_all();
+        }
+        loop {
+            let idx = self.shared.next.fetch_add(1, Ordering::Relaxed);
+            if idx >= jobs.len() {
+                break;
+            }
+            let job = jobs[idx];
+            // SAFETY: caller guarantees live disjoint ranges for every job.
+            unsafe { std::ptr::copy_nonoverlapping(job.source as *const u8, job.destination as *mut u8, job.pages * PAGE as usize) };
+        }
+        let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        while st.active_workers > 0 {
+            st = self.shared.cv_done.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+fn copy_pool(cores: usize) -> &'static CopyPool {
+    static POOL: OnceLock<CopyPool> = OnceLock::new();
+    POOL.get_or_init(|| CopyPool::new((cores / 2).clamp(2, 8)))
+}
+
 /// # Safety
 /// Sources must be readable and destinations writable until this function returns.
 /// All destination ranges must be disjoint and must not overlap any source.
 unsafe fn execute_copies(jobs: &[CopyJob], cores: usize) {
     let pages = jobs.iter().map(|job| job.pages).sum();
     let threads = copy_threads(pages, cores).min(jobs.len());
-    let copy = |batch: &[CopyJob]| {
-        for job in batch {
+    if threads <= 1 {
+        for job in jobs {
             // SAFETY: the caller guarantees live disjoint ranges for every job.
             unsafe { std::ptr::copy_nonoverlapping(job.source as *const u8, job.destination as *mut u8, job.pages * PAGE as usize) };
         }
-    };
-    if threads <= 1 {
-        copy(jobs);
         return;
     }
-    std::thread::scope(|scope| {
-        let mut batches = jobs.chunks(jobs.len().div_ceil(threads));
-        let inline = batches.next().unwrap_or_default();
-        for batch in batches {
-            // A failed thread allocation keeps this batch on the submitting thread.
-            if std::thread::Builder::new().spawn_scoped(scope, || copy(batch)).is_err() {
-                copy(batch);
-            }
-        }
-        copy(inline);
-    });
+    // SAFETY: caller guarantees live disjoint ranges for every job.
+    unsafe { copy_pool(cores).run(jobs, threads) };
 }
 
 /// Journal records read in one call.
@@ -132,6 +227,17 @@ const STATS_EVERY: u64 = 100;
 const ZERO_SCAN_TILES: usize = 4096;
 /// Identifies a device's state while a sampler chunk is read outside the state lock.
 static NEXT_STATE: AtomicU64 = AtomicU64::new(1);
+/// Incremented whenever virtual to mirror tile mappings change.
+static MAPPING_GEN: AtomicU64 = AtomicU64::new(1);
+
+fn bump_mapping_gen() {
+    MAPPING_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// Current generation of virtual to mirror tile mappings.
+pub fn mapping_generation() -> u64 {
+    MAPPING_GEN.load(Ordering::Acquire)
+}
 
 /// One complete rotating pass over the mirror tiles.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -472,6 +578,8 @@ impl Drop for State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+/// Serializes `sync` and `device_created` across queues so `execute_copies` runs without holding `STATE`.
+static SYNC_LOCK: Mutex<()> = Mutex::new(());
 /// Pages of commits on demand given to the GPU so far (`State::give`).
 static GIVEN_PAGES: AtomicU64 = AtomicU64::new(0);
 
@@ -717,6 +825,9 @@ impl State {
             UNMAP => Change::Unmap { va: c.va, pages: c.pages },
             _ => return,
         };
+        if matches!(c.kind, RELEASE | MAP | UNMAP) {
+            bump_mapping_gen();
+        }
         if let Some(bytes) = self.mirror.apply(change)
             && REFUSED.fetch_add(1, Ordering::Relaxed) == 0
         {
@@ -763,6 +874,7 @@ impl State {
         records.truncate(written as usize);
         xs_log!("title memory: the journal of xmem.dll overran, starting again from a snapshot of {} records", records.len());
         self.mirror.reset();
+        bump_mapping_gen();
         for c in &records {
             self.apply(c);
         }
@@ -796,11 +908,11 @@ impl State {
         ranges
     }
 
-    /// Copies the pool pages written since the last sync from the read only section views into the
-    /// pool heaps. Returns how many.
-    fn upload(&mut self, api: &Api) -> u64 {
+    /// Collects copy jobs for pool pages written since the last sync, ensuring heaps and sections exist.
+    fn prepare_upload(&mut self, api: &Api, jobs: &mut Vec<CopyJob>) -> u64 {
         let _trace = decant_trace::span("title_mem", "upload");
         let mut total = 0;
+        let mut new_tile = false;
         loop {
             self.dirty.resize(TAKE_PAGES, 0);
             // SAFETY: `dirty` has room for `TAKE_PAGES` entries.
@@ -817,34 +929,21 @@ impl State {
             // A page copied for the first time has bytes now: it gets its mirror tile here (in page order,
             // so consecutive pages get consecutive tiles), and the window shows it from this sync on.
             for &page in &pages {
+                if self.mirror.tile_of(page).is_none() {
+                    new_tile = true;
+                }
                 self.mirror.give_tile(page);
             }
-            let copying = Instant::now();
-            total += {
-                let _copy = decant_trace::span("title_mem", "copy_runs");
-                self.copy_runs(api, &pages)
-            };
-            self.stats.copy_micros += copying.elapsed().as_micros() as u64;
+            self.plan_runs(api, &pages, jobs, &mut total);
             self.dirty = pages;
             if n < TAKE_PAGES {
                 break;
             }
         }
+        if new_tile {
+            bump_mapping_gen();
+        }
         total
-    }
-
-    /// Copies sorted pool pages, consecutive pages of one section with consecutive mirror tiles of one heap
-    /// in bounded copy jobs. A page with no mirror tile (never mapped for the GPU) is left out.
-    fn copy_runs(&mut self, api: &Api, pages: &[u32]) -> u64 {
-        let mut copied = 0;
-        let mut jobs = Vec::new();
-        self.plan_runs(api, pages, &mut jobs, &mut copied);
-        static CORES: OnceLock<usize> = OnceLock::new();
-        let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from));
-        // SAFETY: sorted unique pool pages have unique mirror tiles. Planning keeps each job
-        // inside a live section and heap. The state lock keeps the heaps alive until workers join.
-        unsafe { execute_copies(&jobs, cores) };
-        copied
     }
 
     fn plan_runs(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, copied: &mut u64) {
@@ -909,10 +1008,12 @@ pub unsafe fn device_created(device: *mut c_void) {
         xs_log!("title memory: the queue or the fence of the tile mappings cannot be made, title memory stays off");
         return;
     };
+    let _sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if st.is_some() {
         xs_log!("title memory: a second PC device, the heaps of the first are not used for it");
     }
+    bump_mapping_gen();
     *st = Some(State {
         id: NEXT_STATE.fetch_add(1, Ordering::Relaxed),
         device,
@@ -1047,7 +1148,11 @@ impl State {
             // Pages the title never wrote have no mirror tile and read as zeros. The first `ADDRESS_REACH`
             // bytes of a span the GPU is given get tiles anyway: the GPU may write there (a root UAV, a
             // counter) and read it back later.
+            let prev_tiles = self.mirror.tiles_given();
             self.mirror.give_span(va, len.clamp(1, ADDRESS_REACH));
+            if self.mirror.tiles_given() != prev_tiles {
+                bump_mapping_gen();
+            }
         }
         let placed = self.mirror.translate(va, len)?;
         let w = self.windows.get(placed.buffer)?.as_ref()?;
@@ -1212,57 +1317,81 @@ pub unsafe fn sync(queue: *mut c_void) {
     let _trace = decant_trace::span("title_mem", "sync");
     // SAFETY: by the contract above.
     let Some(queue_ref) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
-    let written = with_state(|st, api| {
-        let started = Instant::now();
-        // The copies first: a page copied for the first time gets its mirror tile there, and the tile
-        // mappings of this same sync show it.
-        let pages = st.upload(api);
-        let tiles = Instant::now();
-        let ranges = st.update_tiles();
-        st.stats.tile_micros += tiles.elapsed().as_micros() as u64;
-        if st.fence_value > 0 && st.waited.get(&(queue as usize)).is_none_or(|&v| v < st.fence_value) {
-            // SAFETY: both objects are live. The queue waits on the GPU, the CPU does not.
-            match unsafe { queue_ref.Wait(&st.map_fence, st.fence_value) } {
-                Ok(()) => {
-                    st.waited.insert(queue as usize, st.fence_value);
+    let _sync_guard = decant_trace::timed_lock("title_mem::SYNC_LOCK", || SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let started = Instant::now();
+    let Some((phase1_id, jobs, pages, written)) = with_state(|st, api| {
+        let mut jobs = Vec::new();
+        let pages = st.prepare_upload(api, &mut jobs);
+        let written = std::mem::take(&mut st.written);
+        (st.id, jobs, pages, written)
+    }) else {
+        return;
+    };
+
+    static CORES: OnceLock<usize> = OnceLock::new();
+    let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let copy_micros = if !jobs.is_empty() {
+        let copying = Instant::now();
+        let _copy = decant_trace::span("title_mem", "copy_runs");
+        // SAFETY: sorted unique pool pages have unique mirror tiles. Planning keeps each job
+        // inside a live section and heap, and SYNC_LOCK keeps `device_created` from replacing heaps.
+        unsafe { execute_copies(&jobs, cores) };
+        copying.elapsed().as_micros() as u64
+    } else {
+        0
+    };
+
+    if let Some(api) = api() {
+        let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
+            st.stats.copy_micros += copy_micros;
+            let tiles = Instant::now();
+            let ranges = st.update_tiles();
+            st.stats.tile_micros += tiles.elapsed().as_micros() as u64;
+            if st.fence_value > 0 && st.waited.get(&(queue as usize)).is_none_or(|&v| v < st.fence_value) {
+                // SAFETY: both objects are live. The queue waits on the GPU, the CPU does not.
+                match unsafe { queue_ref.Wait(&st.map_fence, st.fence_value) } {
+                    Ok(()) => {
+                        st.waited.insert(queue as usize, st.fence_value);
+                    }
+                    Err(e) => xs_log!("title memory: a queue cannot wait for the tile mappings ({e})"),
                 }
-                Err(e) => xs_log!("title memory: a queue cannot wait for the tile mappings ({e})"),
+            }
+            crate::diagnose::removed_after(|| format!("a sync of {pages} pages and {ranges} tile ranges"));
+            if st.last_guard.elapsed() >= GUARD_EVERY {
+                st.last_guard = Instant::now();
+                // SAFETY: the export takes no argument.
+                unsafe { (api.guard_modules)() };
+            }
+            let micros = started.elapsed().as_micros() as u64;
+            let s = &mut st.stats;
+            s.syncs += 1;
+            s.pages += pages;
+            s.ranges += ranges;
+            s.micros += micros;
+            s.worst_micros = s.worst_micros.max(micros);
+            if s.syncs.is_multiple_of(STATS_EVERY) {
+                xs_log!(
+                    "title memory: {} syncs, {} pages copied ({} MiB), {} tile ranges updated, {} us in total ({} us asking for written pages, {} us copying, {} us mapping tiles), {} us at worst, {} slots",
+                    s.syncs,
+                    s.pages,
+                    (s.pages * PAGE) >> 20,
+                    s.ranges,
+                    s.micros,
+                    s.take_micros,
+                    s.copy_micros,
+                    s.tile_micros,
+                    s.worst_micros,
+                    st.mirror.slots().len()
+                );
+                st.stats = Stats { syncs: st.stats.syncs, ..Stats::default() };
             }
         }
-        crate::diagnose::removed_after(|| format!("a sync of {pages} pages and {ranges} tile ranges"));
-        if st.last_guard.elapsed() >= GUARD_EVERY {
-            st.last_guard = Instant::now();
-            // SAFETY: the export takes no argument.
-            unsafe { (api.guard_modules)() };
-        }
-        let micros = started.elapsed().as_micros() as u64;
-        let s = &mut st.stats;
-        s.syncs += 1;
-        s.pages += pages;
-        s.ranges += ranges;
-        s.micros += micros;
-        s.worst_micros = s.worst_micros.max(micros);
-        if s.syncs.is_multiple_of(STATS_EVERY) {
-            xs_log!(
-                "title memory: {} syncs, {} pages copied ({} MiB), {} tile ranges updated, {} us in total ({} us asking for written pages, {} us copying, {} us mapping tiles), {} us at worst, {} slots",
-                s.syncs,
-                s.pages,
-                (s.pages * PAGE) >> 20,
-                s.ranges,
-                s.micros,
-                s.take_micros,
-                s.copy_micros,
-                s.tile_micros,
-                s.worst_micros,
-                st.mirror.slots().len()
-            );
-            st.stats = Stats { syncs: st.stats.syncs, ..Stats::default() };
-        }
-        std::mem::take(&mut st.written)
-    });
+    }
+    drop(_sync_guard);
     // A placed texture whose memory the title wrote is filled again (after this lock is given back:
     // the detile table asks for tiles under its own lock).
-    if let Some(written) = written.filter(|w| !w.is_empty()) {
+    if !written.is_empty() {
         let _note_tiles = decant_trace::span("title_mem", "note_tiles");
         crate::detile::note_tiles(&written);
     }
@@ -1305,6 +1434,23 @@ pub fn tiles_of(va: u64, len: u64) -> Option<Vec<u32>> {
     with_state(|st, _| st.mirror.mirror_tiles(first, pages))?
 }
 
+/// Mirror tiles for each `(va, len)` span under one state lock and one journal drain.
+pub fn tiles_of_batch(spans: &[(u64, u64)], out: &mut Vec<Option<Vec<u32>>>) {
+    out.clear();
+    if spans.is_empty() {
+        return;
+    }
+    let filled = with_state(|st, _| {
+        out.extend(spans.iter().map(|&(va, len)| {
+            let (first, pages) = crate::title_mirror::page_span(va, len);
+            st.mirror.mirror_tiles(first, pages)
+        }));
+    });
+    if filled.is_none() {
+        out.resize(spans.len(), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,17 +1458,17 @@ mod tests {
     #[test]
     fn copy_planning_bounds_chunks_and_thread_counts() {
         assert_eq!(copy_threads(0, 8), 1);
-        assert_eq!(copy_threads(255, 8), 1);
-        assert_eq!(copy_threads(256, 8), 2);
+        assert_eq!(copy_threads(15, 8), 1);
+        assert_eq!(copy_threads(32, 8), 2);
         assert_eq!(copy_threads(4096, 3), 3);
         assert_eq!(copy_threads(4096, 0), 1);
         let mut jobs = Vec::new();
         plan_copy(&mut jobs, 0, 1024, 0);
         assert!(jobs.is_empty());
-        plan_copy(&mut jobs, 0, 1024, 131);
-        assert_eq!(jobs.iter().map(|job| job.pages).collect::<Vec<_>>(), [64, 64, 3]);
+        plan_copy(&mut jobs, 0, 1024, 35);
+        assert_eq!(jobs.iter().map(|job| job.pages).collect::<Vec<_>>(), [16, 16, 3]);
         for (i, job) in jobs.iter().enumerate() {
-            assert_eq!(job.source, i * 64 * PAGE as usize);
+            assert_eq!(job.source, i * 16 * PAGE as usize);
             assert_eq!(job.destination, 1024 + job.source);
         }
     }
@@ -1424,5 +1570,16 @@ mod tests {
         translate_fresh_batch(&[(0x1000, 64), (0x2000, 128)], &mut out);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn mapping_generation_bumps_on_changes_and_sync_lock_does_not_block_translate() {
+        let before = mapping_generation();
+        bump_mapping_gen();
+        assert!(mapping_generation() > before);
+
+        let _sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let done = std::thread::spawn(|| translate(0x1000, 64)).join().unwrap();
+        assert!(done.is_none());
     }
 }
