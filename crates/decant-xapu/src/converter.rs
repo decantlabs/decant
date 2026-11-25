@@ -1,4 +1,4 @@
-//! The pitch converting sample rate converter of the XAPU (`docs/CONSOLE_LIBS.md` 3.4).
+//! The pitch converting sample rate converter of the XAPU (`docs/CONSOLE_LIBS.md`, section 3).
 //!
 //! The console filter is a polyphase converter with unknown coefficients, so this one is a windowed sinc as the specification
 //! allows. Output frame `n` is the band limited input signal read at the time `pos - 5`, so the group delay is 5 frames: at

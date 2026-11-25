@@ -927,7 +927,7 @@ mod platform {
                 unsafe { TerminateProcess(info.hProcess, 0xFFFF_FFFF) };
             }
             // Checked on every pass, not only when the wait gives up: a busy title sends debug events faster
-            // than `wait_ms`, the wait never times out, and the deadline used to pass unnoticed (issue #387).
+            // than `wait_ms`, the wait never times out, and the deadline used to pass unnoticed.
             if timeout.is_some_and(|t| start.elapsed() > t) && !outcome.timed_out {
                 log.line(&format!("{} timeout: the title is stopped", stamp(start)));
                 outcome.timed_out = true;

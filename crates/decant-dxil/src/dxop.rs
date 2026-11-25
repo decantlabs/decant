@@ -1,9 +1,9 @@
 //! The `dx.op` subset used by this crate: class names, opcodes and function attributes.
 //!
 //! Sources: DxilConstants.h `OpCode`, DXIL.rst operation table and hctdb.py (function attribute
-//! of each operation), all public. See specification section 3.1.
+//! of each operation), all public.
 
-/// Function attribute lists of the declarations (specification section 2.4).
+/// Function attribute lists of the declarations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Attr {
     /// `nounwind readnone`

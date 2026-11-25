@@ -122,7 +122,7 @@ pub fn check(entries: &[LayoutEntry], robust: bool) -> Result<(), Exit> {
         if image && e.dim != "2d" && e.dim != "3d" && e.dim != "cube" {
             return Err(unsupported(e, &e.dim));
         }
-        // Review of #45: a float view for an isampler or usampler, a single sample for a
+        // Review note: a float view for an isampler or usampler, a single sample for a
         // sampler2DMS or a sampler without comparison for a sampler2DShadow are invalid uses.
         let sampled = e.kind == "sampled_image" || e.kind == "combined_image";
         if sampled && e.stype != "float" {

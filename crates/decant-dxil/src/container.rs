@@ -1,5 +1,5 @@
 //! The DXBC container: header, parts, the container digest, SFI0, signatures, PSV0, HASH and the
-//! DXIL program header (specification section 4).
+//! DXIL program header.
 //!
 //! The digest function is a copy of `dxbc_checksum` of `d3d12_xs::rts0` (our own code, written
 //! from RFC 1321 and the public description of the DXBC hash). `d3d12-xs` is left untouched for now.
@@ -224,7 +224,7 @@ pub fn psv0_compute(threads: [u32; 3], wave_size: Option<u32>, resources: &[PsvR
 mod tests {
     use super::*;
 
-    /// A straightforward statement of the digest rule of the specification (section 4.7), written
+    /// A straightforward statement of the digest rule of the container format, written
     /// separately from `dxbc_checksum`: last block with the bit count first and `n * 2 + 1` last.
     fn reference_digest(data: &[u8]) -> [u32; 4] {
         let n = data.len();

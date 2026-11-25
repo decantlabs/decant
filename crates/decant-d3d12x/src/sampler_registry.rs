@@ -1,4 +1,4 @@
-//! Immediate samplers of directly translated shaders (issue #172). A console program can build a
+//! Immediate samplers of directly translated shaders. A console program can build a
 //! sampler from four constant words instead of reading it from memory. PC shaders have no such
 //! thing, so the layer gives each distinct set of words an index and keeps the PC sampler at
 //! `SamplerDescriptorHeap[HEAP_BASE + index]` of every shader visible sampler heap. The translator
@@ -162,7 +162,7 @@ impl Decoded {
 /// that was seen. Each distinct one is logged once.
 type Gap = (&'static str, u32);
 
-/// Decodes four console sampler words after `gfx10/image-ops.md` section 6, returning what the
+/// Decodes four console sampler words after the GFX10 sampler word layout, returning what the
 /// description cannot express as well. Pure: nothing is logged.
 pub fn decode_words(words: Words) -> (Decoded, Vec<Gap>) {
     let [w0, w1, w2, w3] = words;

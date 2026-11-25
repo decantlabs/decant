@@ -118,8 +118,8 @@ mod run {
         c.check(failing, "XMemTransferMemory returns 0 with ERROR_CALL_NOT_IMPLEMENTED");
     }
 
-    /// The physical page exports, called as the specification gives them (`docs/CONSOLE_LIBS.md`,
-    /// 5.1): pages are 64 KiB, frame numbers count 4 KiB units (page `i` of the section is frame
+    /// The physical page exports, called as `docs/CONSOLE_LIBS.md` (section 5) describes
+    /// them: pages are 64 KiB, frame numbers count 4 KiB units (page `i` of the section is frame
     /// `(i + 1) * 16`, 0 means none). `XMemVirtualAlloc` with `0x20406000` only reserves the range
     /// the frames are mapped into. This process starts the engine, so the first page is frame 16.
     fn physical_pages(x: &XMem, c: &mut Checks) {

@@ -115,7 +115,7 @@ fn run(layout: &Layout, steps: &[Step; 5]) -> Result<(), String> {
             if let Freshness::Stale(why) = state {
                 println!("cache out of date ({why}): rebuilding {}", layout.spv.display());
                 remove(&layout.spv)?;
-                // Harraken (#144): the adaptation cache goes on every new probe or pack, the container
+                // The adaptation cache goes on every new probe or pack, the container
                 // index only when the pack changed.
                 remove(&layout.adapt)?;
                 create(&layout.adapt)?;

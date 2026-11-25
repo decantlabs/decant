@@ -1,4 +1,4 @@
-//! The 64 KiB tiling of a texture (slot 10 of the texture computer, `docs/CONSOLE_LIBS.md` 1.8): what D3D12's
+//! The 64 KiB tiling of a texture (slot 10 of the texture computer, `docs/CONSOLE_LIBS.md`, section 1): what D3D12's
 //! `GetResourceTiling` reports, over the blocks of a 64 KiB swizzle mode. The mip tail is the packed part: the first block
 //! of each array slice. The standard levels are listed slice after slice. With a tail the console library lists two
 //! slices at most and zeroes every entry after slice 0.

@@ -1,7 +1,7 @@
 //! The mesh stage.
 //!
-//! Measured on the title (24 Nov 2026, all 9,282 mesh programs, see the specification
-//! `gfx10/ngg-and-geometry.md`, "Measured on the title"): every mesh program is one shape. It is a
+//! Measured on the title (24 Nov 2026, all 9,282 mesh programs, measured with the shader
+//! batch tools): every mesh program is one shape. It is a
 //! real mesh shader of 128 threads, two waves of 64 lanes, around a vertex shader body:
 //!
 //! * the thread number is the lane number plus 64 times the wave index, which the program
@@ -844,7 +844,7 @@ DecantOut {}(",
         .split_once(") {")
         .map(|(params, _)| params.to_owned())
         .ok_or_else(|| bug("the thread function has no parameter list"))?;
-    // `uint3 decant_tid : SV_GroupThreadID` is passed on as `decant_tid`.
+    // `uint3 decant_tid: SV_GroupThreadID` is passed on as `decant_tid`.
     let names: Vec<&str> = params
         .split(',')
         .filter_map(|p| p.split(':').next()?.split_whitespace().last())

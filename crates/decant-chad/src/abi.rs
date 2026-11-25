@@ -1,4 +1,4 @@
-//! Constants, result codes and the structures of `chad.dll` (`docs/CONSOLE_LIBS.md` 4.1 and 4.2).
+//! Constants, result codes and the structures of `chad.dll` (`docs/CONSOLE_LIBS.md`, section 4).
 
 pub type Hresult = i32;
 

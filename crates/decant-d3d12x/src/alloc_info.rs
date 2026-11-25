@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn layout_0_is_the_mode_xg_picks() {
-        // XG picks a 4 KiB mode for a 2D texture that is not a target (CONSOLE_LIBS.md vector A).
+        // XG picks a 4 KiB mode for a 2D texture that is not a target.
         let raw = desc(3, 0x1000, 2048, 2048, 12, 98, 0);
         assert_eq!(console_allocation(&raw, false), Some((xg_layout(&raw).0.next_multiple_of(0x1000), 0x1000)));
     }

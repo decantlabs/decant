@@ -1,4 +1,4 @@
-//! The LLVM 3.7 module model and its bitcode encoding (specification section 2): types,
+//! The LLVM 3.7 module model and its bitcode encoding: types,
 //! constants, globals, function declarations, metadata and one function body, numbered and
 //! written with unabbreviated records.
 

@@ -20,10 +20,10 @@ These stay as logging stand ins that return `E_NOTIMPL`, as the specification sa
 * `XGCreateTextureComputerFromDescriptor`: the descriptor is read and validated, but the GFX10 image format table (element size per `IMG_FORMAT`) is not in the specification. Placeholder levels for descriptors whose mip count differs from the allocated count are not modelled either.
 * The computer slots 7 (`GetTexelCoordinate`) and 11 (`GetTextureViewDescriptor`). Slot 10 is `GetResourceTiling` (`decant_texture::xg::resource_tiling`).
 * Depth plus stencil formats (two planes) and the other formats the specification lists as valid but not modelled.
-* Thick 3D layouts of mode 26 with 8 and 16 byte elements: Appendix C has no equation for them.
+* Thick 3D layouts of mode 26 with 8 and 16 byte elements: the address equation data has no row for them.
 * `XGSuggestSwizzleMode(desc, flags, layout)` writes `0x100 | mode` for the description with `Layout` 0. The prototype comes from the logged arguments, no console vector checks it.
 * The 19041 build rules are not implemented, only the 22000 behaviour.
 
 ## Tests
 
-`cargo test -p decant-xg -p decant-texture` runs every vector of section 1.13 through the exports and the computer table (`tests/vectors.rs`), the load of the built DLL (`tests/dll.rs`) and the unit tests of `decant_texture::xg`, among them the comparison of the 2D layouts with `decant_texture::surface::compute` and the check that every address equation is one to one inside its block.
+`cargo test -p decant-xg -p decant-texture` runs every test vector of the library through the exports and the computer table (`tests/vectors.rs`), the load of the built DLL (`tests/dll.rs`) and the unit tests of `decant_texture::xg`, among them the comparison of the 2D layouts with `decant_texture::surface::compute` and the check that every address equation is one to one inside its block.

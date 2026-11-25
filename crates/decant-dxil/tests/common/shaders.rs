@@ -1,4 +1,4 @@
-//! The test shaders of the specification, section 5.2, as IR.
+//! The test shaders, as IR.
 
 use decant_dxil::ir::*;
 

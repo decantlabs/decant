@@ -1,5 +1,5 @@
 //! Test helper (Windows only): validates a container in place through `IDxcValidator` of
-//! `dxil.dll`, the library of the Windows SDK or of a DXC release (specification section 5.1).
+//! `dxil.dll`, the library of the Windows SDK or of a DXC release.
 //!
 //! `dxil.dll` is searched in the environment variable `DECANT_SHADER_DXIL_DLL`, then in
 //! `Windows Kits\10\bin\<version>\x64` (newest version first), then through the normal DLL search path.

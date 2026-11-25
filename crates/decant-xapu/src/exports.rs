@@ -1,4 +1,4 @@
-//! The 6 exports of `xapu.dll`, by name, with the prototypes of `docs/CONSOLE_LIBS.md` 3.1. Windows x64 convention.
+//! The 6 exports of `xapu.dll`, by name, as listed in `docs/CONSOLE_LIBS.md`, section 3. Windows x64 convention.
 #![allow(unsafe_code)]
 
 use decant_log::trace;

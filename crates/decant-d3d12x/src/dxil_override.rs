@@ -222,8 +222,8 @@ pub fn configured_dir() -> Option<PathBuf> {
 }
 
 /// Default largest override file, in bytes (4 MiB). Overrides of 30 to 47 MiB made the Vulkan
-/// driver's shader compiler allocate tens of GiB and the title was killed by the OOM killer
-/// (issue #178); the files that size are rare (28 of 10,394 are at least 4 MiB).
+/// driver's shader compiler allocate tens of GiB and the title was killed by the OOM killer.
+/// The files that size are rare (28 of 10,394 are at least 4 MiB).
 const DEFAULT_MAX_BYTES: u64 = 4 << 20;
 
 /// The size cap from the raw `DECANT_D3D12X_DXIL_OVERRIDE_MAX_BYTES` value (`None` when unset): a
@@ -777,8 +777,7 @@ mod tests {
     #[test]
     fn a_shader_present_only_under_the_legacy_hash_still_hits() {
         // Reproduces the sealed override directory as it actually is: every file there is named
-        // with `legacy_content_hash`, not `content_hash` (see dxil_override.rs module docs and
-        // TRUNK-PORT.md for the run that showed this live).
+        // with `legacy_content_hash`, not `content_hash` (see the module docs of this file).
         let dir = TempDir::new("legacy-hit");
         let original = b"stand-in for the real 5136-byte slot 62 compute shader bytes".to_vec();
         std::fs::write(dir.0.join(legacy_file_name(&original)), b"legacy-keyed override bitcode").unwrap();

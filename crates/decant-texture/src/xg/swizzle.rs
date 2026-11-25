@@ -1,4 +1,4 @@
-//! The swizzle mode the console library suggests for a texture (`docs/CONSOLE_LIBS.md` 1.5).
+//! The swizzle mode the console library suggests for a texture (`docs/CONSOLE_LIBS.md`, section 1).
 
 use super::formats::bits_per_pixel;
 

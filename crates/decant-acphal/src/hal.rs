@@ -1,4 +1,4 @@
-//! The `IAcpHal` object (`docs/CONSOLE_LIBS.md` 2.5): a C++ style object whose first field points at a table of 12 functions.
+//! The `IAcpHal` object (`docs/CONSOLE_LIBS.md`, section 2): a C++ style object whose first field points at a table of 12 functions.
 //!
 //! Commands run synchronously inside `SubmitCommand`: the command is written to the next slot of the command ring in APU heap 1,
 //! executed on the engine state of `shape`, and its slot is released. Messages go to a bounded ring and are dropped when it is full.
@@ -270,7 +270,7 @@ fn traced(counter: &AtomicU32, first: u32) -> Option<u32> {
     (n <= first || n.is_multiple_of(1000)).then_some(n)
 }
 
-/// `SubmitCommand` with a trace line per command (type, id, frame, fence, result): the audio chain trace of issue #397 C.
+/// `SubmitCommand` with a trace line per command (type, id, frame, fence, result): the audio chain trace of the audio chain.
 unsafe extern "system" fn submit_command(this: *mut IAcpHal, kind: u32, id: u64, frame: u32, payload: *const c_void, fence: u32) -> Hresult {
     static CALLS: AtomicU32 = AtomicU32::new(0);
     // SAFETY: the arguments are the caller's, passed on unchanged.

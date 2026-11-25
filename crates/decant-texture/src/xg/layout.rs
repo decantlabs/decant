@@ -1,4 +1,4 @@
-//! Texture layouts of the console library (`docs/CONSOLE_LIBS.md` 1.3 and 1.6): linear and tiled, 1D, 2D, 3D, MSAA, the
+//! Texture layouts of the console library (`docs/CONSOLE_LIBS.md`, section 1): linear and tiled, 1D, 2D, 3D, MSAA, the
 //! CMASK plane, the byte offset of an element and the `XG_RESOURCE_LAYOUT` record.
 
 use super::XgError;
@@ -850,7 +850,7 @@ mod tests {
                 if mode == 24 && bpe != 4 && bpe != 8 {
                     continue;
                 }
-                // Powers of two: `surface::compute` halves a level size rounding down, the console library rounds up (vector AH).
+                // Powers of two: `surface::compute` halves a level size rounding down, the console library rounds up.
                 for (w, h) in [(1u32, 1u32), (16, 16), (16, 64), (64, 64), (256, 8), (256, 256), (1024, 512)] {
                     for (levels, slices) in [(1u32, 1u32), (3, 1), (0, 1), (6, 3), (0, 4)] {
                         let d = TextureDesc { bind_flags: 8, ..desc(Dim::D2, w, h, slices, levels, format, mode) };

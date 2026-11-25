@@ -1,4 +1,4 @@
-//! The pipeline manifest of the direct shader path (issue #172): one line per distinct pipeline
+//! The pipeline manifest of the direct shader path: one line per distinct pipeline
 //! description the title creates, with everything the direct path needs to translate and compile it
 //! later without the game. `decant_shader_warm` reads it and fills the DXIL cache ahead of time, and the
 //! census of the translator (`--pipelines`) reads the stage hashes and the root signatures.

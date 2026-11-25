@@ -1,5 +1,5 @@
 //! `xmem.dll`: the console allocator of Decant, on Windows virtual memory and the process heap.
-//! Replaces the C source `xmem.c` (deleted, #111), with the same exports, calling convention and
+//! Replaces the C source `xmem.c` (deleted), with the same exports, calling convention and
 //! behaviour. The rules (attribute fields, alignment, header) are plain functions here. The
 //! exports and every Windows call are in `exports`, the only module with `unsafe` code.
 //!

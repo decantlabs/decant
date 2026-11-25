@@ -1,4 +1,4 @@
-//! `AcpHal.dll`: the audio control processor library of the console, in Rust (issue #139, `docs/CONSOLE_LIBS.md` section 2).
+//! `AcpHal.dll`: the audio control processor library of the console, in Rust (`docs/CONSOLE_LIBS.md`, section 2).
 //!
 //! It holds the APU heap allocator (`heap`), the SHAPE context arrays with their service thread and engine state (`shape`), the
 //! `IAcpHal` object with its command and message rings (`hal`), the ABI constants and structures (`abi`), the 10 exports

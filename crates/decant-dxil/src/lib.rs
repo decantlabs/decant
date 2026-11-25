@@ -18,7 +18,7 @@ pub mod validate;
 
 use crate::ir::{ResourceClass, ResourceKind, Shader};
 
-/// Whether the 14 fixed metadata kind records are written (specification 2.9).
+/// Whether the 14 fixed metadata kind records are written.
 const WRITE_METADATA_KINDS: bool = true;
 
 /// What can go wrong, with the instruction or value named in the message.
@@ -46,7 +46,7 @@ pub struct BoundResource {
     pub size_bytes: u32,
 }
 
-/// What the layer needs to build or patch the root signature (specification 1.6).
+/// What the layer needs to build or patch the root signature.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BindingReport {
     pub bound: Vec<BoundResource>,

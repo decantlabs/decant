@@ -544,7 +544,7 @@ pub fn render(
         &raw mut features11,
         &raw mut features,
     );
-    // Review of #45: only the structures of the version the card announces are chained.
+    // Review note: only the structures of the version the card announces are chained.
     let vk12 = properties.api_version >= vk::API_VERSION_1_2;
     let vk13 = properties.api_version >= vk::API_VERSION_1_3;
     let mut extensions: Vec<*const std::ffi::c_char> = Vec::new();
@@ -843,7 +843,7 @@ pub fn render(
         .color_blend_state(&blend)
         .layout(layout)
         .render_pass(pass)];
-    // --pipeline-cache (#85): seed a VkPipelineCache from the file (when it exists), pass it to the
+    // --pipeline-cache: seed a VkPipelineCache from the file (when it exists), pass it to the
     // creation, then write it back. The driver really compiles the pipeline (a stronger check than
     // spirv-val alone) and the cache is kept between runs.
     let pipeline_cache = match &run.pipeline_cache_path {

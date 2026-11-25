@@ -1,4 +1,4 @@
-//! The APU heaps (`docs/CONSOLE_LIBS.md` 2.3): host memory the audio processor can address with 32 bit APU addresses.
+//! The APU heaps (`docs/CONSOLE_LIBS.md`, section 2): host memory the audio processor can address with 32 bit APU addresses.
 //!
 //! `Heaps` holds the two public heaps and the small internal one. Each heap is one zeroed host allocation aligned to 64 KiB
 //! whose size is a multiple of 4 KiB, with a best fit free list. All of it is pure Rust on `Heaps`, so tests make as many

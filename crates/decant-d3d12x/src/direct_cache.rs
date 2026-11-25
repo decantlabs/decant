@@ -1,4 +1,4 @@
-//! The disk cache of the direct shader path (issue #172): DXIL compiled from translated HLSL and
+//! The disk cache of the direct shader path: DXIL compiled from translated HLSL and
 //! the stage keys of each pipeline, keyed by everything that decides them.
 //!
 //! A stage key hashes the console bytes of the stage (or the translator's own HLSL key), the root

@@ -1,4 +1,4 @@
-//! Clients, contexts and the DSP work of `chad.dll` (`docs/CONSOLE_LIBS.md` 4.3).
+//! Clients, contexts and the DSP work of `chad.dll` (`docs/CONSOLE_LIBS.md`, section 4).
 //!
 //! Work completes synchronously inside `submit`: the status array shows completed equal to submitted as soon as the call returns.
 #![allow(unsafe_code)]

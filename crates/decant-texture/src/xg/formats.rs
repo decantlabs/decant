@@ -1,4 +1,4 @@
-//! The formats `xg_xs` lays out: element size and block size (`docs/CONSOLE_LIBS.md` 1.2).
+//! The formats `xg_xs` lays out: element size and block size (`docs/CONSOLE_LIBS.md`, section 1).
 
 /// What the layout needs of a format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

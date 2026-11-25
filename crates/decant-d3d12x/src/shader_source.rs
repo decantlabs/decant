@@ -1,4 +1,4 @@
-//! What the direct shader path asks of a translator (issue #172). A [`ShaderSource`] gets the
+//! What the direct shader path asks of a translator. A [`ShaderSource`] gets the
 //! console bytes of every stage of one pipeline, the parsed root signature of that pipeline and the
 //! linkage between its stages, and gives back per stage HLSL with its entry point and target
 //! profile, or a refusal with a reason.

@@ -1,4 +1,4 @@
-//! The 7 exports of `chad.dll`, by name, with the prototypes of `docs/CONSOLE_LIBS.md` 4.1. Windows x64 convention.
+//! The 7 exports of `chad.dll`, by name, as listed in `docs/CONSOLE_LIBS.md`, section 4. Windows x64 convention.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;

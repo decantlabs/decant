@@ -1,4 +1,4 @@
-//! The SHAPE context arrays (`docs/CONSOLE_LIBS.md` 2.4), the service thread that counts audio frames and the engine state the
+//! The SHAPE context arrays (`docs/CONSOLE_LIBS.md`, section 2), the service thread that counts audio frames and the engine state the
 //! `IAcpHal` commands change.
 //!
 //! The service thread counts audio frames and has the XMA engine (`xma`) fill the output rings of the enabled XMA contexts

@@ -1,10 +1,10 @@
 //! The address equations of the console library: the offset inside a block as an exclusive or of coordinate bits.
 //!
 //! The modes without exclusive or (1, 2, 5, 6, 9, 10) and, after `XGSetHardwareVersion(4)`, the modes 21, 22 and 24 to
-//! 27 use the addrlib tables of [`crate::tiling`]. All the others come from the appendices A, B and C of
-//! `docs/CONSOLE_LIBS.md`, which `equations_data.rs` holds as text rows.
+//! 27 use the addrlib tables of [`crate::tiling`]. All the others come from `equations_data.rs`, which holds
+//! them as text rows (see `docs/CONSOLE_LIBS.md`, section 1).
 
-use super::equations_data::{APPENDIX_A, APPENDIX_B, APPENDIX_C};
+use super::equations_data::{GROUP_A, GROUP_B, GROUP_C};
 use crate::tiling::{self, Layout};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +84,7 @@ pub fn equation_2d(mode: u32, bpe: u32, samples: u32, v4: bool) -> Option<Equati
     let mode = mode & 0x1F;
     let lb = bpe.checked_ilog2()? as u8;
     if samples > 1 {
-        let row = APPENDIX_B.iter().find(|r| r.0 == v4 && u32::from(r.1) == mode && r.2 == lb && u32::from(r.3) == samples)?;
+        let row = GROUP_B.iter().find(|r| r.0 == v4 && u32::from(r.1) == mode && r.2 == lb && u32::from(r.3) == samples)?;
         return Equation::parse(row.4);
     }
     match mode {
@@ -92,7 +92,7 @@ pub fn equation_2d(mode: u32, bpe: u32, samples: u32, v4: bool) -> Option<Equati
         2 | 6 | 10 => from_core(mode, bpe as usize, true, 0),
         21 | 22 | 24..=27 if v4 => from_core(mode, bpe as usize, true, 5),
         _ => {
-            let row = APPENDIX_A.iter().find(|r| r.0 == v4 && u32::from(r.1) == mode && r.2 == lb)?;
+            let row = GROUP_A.iter().find(|r| r.0 == v4 && u32::from(r.1) == mode && r.2 == lb)?;
             Equation::parse(row.3)
         }
     }
@@ -101,7 +101,7 @@ pub fn equation_2d(mode: u32, bpe: u32, samples: u32, v4: bool) -> Option<Equati
 /// The equation of a thick 3D mode (5, 9, 17, 21, 25, 26). Mode 26 has no row for 8 and 16 byte elements.
 pub fn equation_3d(mode: u32, bpe: u32, v4: bool) -> Option<Equation> {
     let lb = bpe.checked_ilog2()? as u8;
-    let row = APPENDIX_C.iter().find(|r| r.0 == v4 && u32::from(r.1) == (mode & 0x1F) && r.2 == lb)?;
+    let row = GROUP_C.iter().find(|r| r.0 == v4 && u32::from(r.1) == (mode & 0x1F) && r.2 == lb)?;
     Equation::parse(row.3)
 }
 
@@ -111,11 +111,11 @@ mod tests {
 
     #[test]
     fn rows_parse_and_the_first_bit_follows_the_element_size() {
-        for (v4, mode, lb, row) in APPENDIX_A.iter().copied().chain(APPENDIX_C.iter().copied()) {
+        for (v4, mode, lb, row) in GROUP_A.iter().copied().chain(GROUP_C.iter().copied()) {
             let e = Equation::parse(row).unwrap_or_else(|| panic!("row {mode} {lb}"));
             assert_eq!(e.terms[0].bit, lb, "mode {mode} {lb} v4 {v4}");
         }
-        for (_, mode, lb, samples, row) in APPENDIX_B {
+        for (_, mode, lb, samples, row) in GROUP_B {
             let e = Equation::parse(row).unwrap();
             assert_eq!(e.terms[0].bit, *lb, "mode {mode} {lb} {samples}");
         }
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn a_known_value_of_mode_24() {
-        // 4 byte elements, position (64, 0): bit 10 and bit 12 of the offset (vector AI).
+        // 4 byte elements, position (64, 0): bit 10 and bit 12 of the offset.
         let e = equation_2d(24, 4, 1, false).unwrap();
         assert_eq!(e.eval(64, 0, 0, 0), 0x1400);
         assert_eq!(e.eval(1, 0, 0, 0), 4);

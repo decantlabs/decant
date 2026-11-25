@@ -183,7 +183,7 @@ mod run {
         );
     }
 
-    /// Ticket #82, the race test: eight threads free the same 128 graphics blocks
+    /// The race test: eight threads free the same 128 graphics blocks
     /// at the same instant, 300 rounds. Without the lock around `XMemFreeDefault`, two threads pass
     /// the header check before one clears it, count the block twice (the total no longer comes back
     /// to its base) or touch a page already returned (the process crashes). With the lock, each

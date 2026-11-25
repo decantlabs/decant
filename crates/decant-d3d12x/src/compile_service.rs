@@ -1,4 +1,4 @@
-//! The compile service of the direct shader path (issue #172): translates and compiles the shaders
+//! The compile service of the direct shader path: translates and compiles the shaders
 //! of a pipeline on worker threads. The thread that binds the pipeline can wait for them
 //! ([`Service::wait`]) or come back later.
 //!

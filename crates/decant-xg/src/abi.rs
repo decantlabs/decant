@@ -1,4 +1,4 @@
-//! The binary layout of the descriptions the exports read (`docs/CONSOLE_LIBS.md` 1.3) and the result codes.
+//! The binary layout of the descriptions the exports read (`docs/CONSOLE_LIBS.md`, section 1) and the result codes.
 
 use decant_texture::xg::{Dim, TextureDesc, XgError};
 

@@ -270,7 +270,7 @@ pass_through!(InitializeApiImplEx2, X_INIT_EX2);
 pass_through!(UninitializeApiImpl, X_UNINIT);
 pass_through!(XErrorReport, X_ERRREPORT);
 
-/// `QueryApiImpl(api_id = RCX, riid = RDX, out = R8)`, as measured by ScarlettX on a console
+/// `QueryApiImpl(api_id = RCX, riid = RDX, out = R8)`, as measured on a console
 /// title. The PC runtime exports the same name. The couple `(api_id, riid)` selects the table: the
 /// log names the family from the `api_id` and says whether the riid is a listed version.
 ///

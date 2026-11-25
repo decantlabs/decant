@@ -1,4 +1,4 @@
-//! GPU A/B comparison of shaders (issue #172).
+//! GPU A/B comparison of shaders.
 //!
 //! Shader A and shader B (two DXIL containers, or HLSL that DXC compiles) run on a real D3D12
 //! device with the same generated inputs, and every writable resource is read back and compared:

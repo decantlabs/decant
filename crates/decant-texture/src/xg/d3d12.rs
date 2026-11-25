@@ -1,4 +1,4 @@
-//! `D3D12_RESOURCE_DESC` to an XG description (`docs/CONSOLE_LIBS.md` 1.7).
+//! `D3D12_RESOURCE_DESC` to an XG description (`docs/CONSOLE_LIBS.md`, section 1).
 
 use super::XgError;
 use super::formats::is_depth;

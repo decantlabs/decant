@@ -1,4 +1,4 @@
-//! Headless DXGI output chain: a fallback output for an adapter that has none (issue #70, the
+//! Headless DXGI output chain: a fallback output for an adapter that has none (the
 //! device/adapter/output/factory/present leg of the console boot chain).
 //!
 //! `proxy::pc_adapter` already bridges `IDXGIDevice::GetAdapter`/`GetParent` to the host

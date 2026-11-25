@@ -1,4 +1,4 @@
-//! Connections, streams and the command queue of `xapu.dll` (`docs/CONSOLE_LIBS.md` 3.4).
+//! Connections, streams and the command queue of `xapu.dll` (`docs/CONSOLE_LIBS.md`, section 3).
 //!
 //! Commands run synchronously inside `enqueue`, in the order they arrive, and their results are committed at once, so results
 //! come out in sequence order and the result event is signalled per command. The hardware runs streams in parallel, which a

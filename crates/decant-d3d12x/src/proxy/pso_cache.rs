@@ -18,7 +18,7 @@
 //! The answer is `D3D12_ERROR_DRIVER_VERSION_MISMATCH`, the public D3D12 code for serialized
 //! pipeline data that another driver made, which is what these entries are. It is the answer, not
 //! a gap, so it is logged the first times and not counted in `DECANT_CALLS`. A cache of our own
-//! (issue #165) plugs in at [`cached_pipeline`].
+//! plugs in at [`cached_pipeline`].
 
 use super::*;
 
@@ -50,7 +50,7 @@ impl CacheKind {
     }
 }
 
-/// The hook of a pipeline cache of our own (issue #165): the pipeline object for the title's cache
+/// The hook of a pipeline cache of our own: the pipeline object for the title's cache
 /// entry `entry`, or `None` for a miss. A cache would key the entry by the content of the
 /// serialized data it points to and answer the pipeline (a `lazy_pso` object made from the
 /// description saved by an earlier run). There is none yet, so every entry is a miss.

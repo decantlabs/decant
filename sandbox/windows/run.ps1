@@ -82,4 +82,4 @@ while (Get-Process -Name WindowsSandboxRemoteSession, WindowsSandboxServer -Erro
 Write-Host "`n=== Result ($commit) ==="
 $console = Join-Path $Boot 'logs\decant_launch_console.txt'
 if (Test-Path $console) { Get-Content -LiteralPath $console -Tail 15 } else { Write-Host 'No decant_launch_console.txt: see logs\checks.txt (network guard, GameInput).' }
-Write-Host "Full logs: $(Join-Path $Boot 'logs') (keep them on this machine; quote only the stop on #144)."
+Write-Host "Full logs: $(Join-Path $Boot 'logs') (keep them on this machine and quote only the line where the boot stops)."

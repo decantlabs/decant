@@ -1,4 +1,4 @@
-//! The DXC host of the direct shader path (issue #172): loads `dxcompiler.dll` and `dxil.dll` at
+//! The DXC host of the direct shader path: loads `dxcompiler.dll` and `dxil.dll` at
 //! run time and compiles HLSL to signed DXIL through `IDxcCompiler3`. One loader for the layer
 //! (`d3d12_xs.dll`) and for the tests of the translator (`decant-shader`), so both compile with
 //! the same DXC and the same arguments.

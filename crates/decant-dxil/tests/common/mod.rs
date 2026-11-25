@@ -1,4 +1,4 @@
-//! Shared by the integration tests: the test shaders of the specification (section 5.2) built in
+//! Shared by the integration tests: the test shaders built in
 //! the IR, and the validator check.
 #![allow(dead_code)]
 

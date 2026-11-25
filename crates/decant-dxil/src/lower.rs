@@ -1,5 +1,5 @@
 //! Lowering of the IR to the module of `module.rs`: instruction selection, `dx.op` declarations,
-//! resource handles, DXIL metadata, shader flags (specification sections 2, 3 and 6).
+//! resource handles, DXIL metadata, shader flags.
 
 use std::collections::HashMap;
 

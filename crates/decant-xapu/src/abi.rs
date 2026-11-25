@@ -1,4 +1,4 @@
-//! Constants, result codes and the binary layouts of `xapu.dll` (`docs/CONSOLE_LIBS.md` 3.2 and 3.3).
+//! Constants, result codes and the binary layouts of `xapu.dll` (`docs/CONSOLE_LIBS.md`, section 3).
 
 pub type Hresult = i32;
 /// `XAPU_HANDLE`, pointer sized.

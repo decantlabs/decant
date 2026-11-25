@@ -1,4 +1,4 @@
-//! The direct shader path for pipelines made on first bind (issue #172). When a pipeline of
+//! The direct shader path for pipelines made on first bind. When a pipeline of
 //! `lazy_pso` is bound for the first time, its console shaders go to the translator
 //! (`direct_source`, behind `shader_source`), the HLSL to DXC (`decant-dxc`) on the workers of
 //! `compile_service`, and the DXIL to the disk cache (`direct_cache`).

@@ -1,4 +1,4 @@
-//! The console D3D12 method order, as data (issue #70). The Rust form of the former
+//! The console D3D12 method order, as data. The Rust form of the former
 //! `src/gdk/d3d12x_abi.h`.
 //!
 //! The console device, command list, queue and descriptor heap do not use the PC vtable order

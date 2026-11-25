@@ -1,7 +1,7 @@
 //! Which PC adapter the device of the title is made on. The title passes no adapter (or a console
 //! object we ignore), and `D3D12CreateDevice(NULL)` then takes the Windows default, which on a hybrid
-//! laptop is the integrated GPU (its driver faulted at 3 s in the first run on an RTX 4060 laptop,
-//! issue #195). [`pick`] asks DXGI for the high performance adapter instead.
+//! laptop is the integrated GPU (its driver faulted at 3 s in the first run on an RTX 4060 laptop).
+//! [`pick`] asks DXGI for the high performance adapter instead.
 //!
 //! `DECANT_D3D12X_ADAPTER=<text>` overrides it: a number is an index into the list the DXGI factory
 //! gives (high performance first), anything else picks the first adapter whose description contains

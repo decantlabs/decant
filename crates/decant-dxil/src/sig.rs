@@ -1,6 +1,5 @@
 //! Signatures: the use of input and output elements, the data flow from inputs to outputs for
-//! `dx.viewIdState` and `PSV0`, and the `ISG1`, `OSG1` and graphics `PSV0` parts
-//! (specification sections 1.5, 3.5, 4.4, 4.5 and 6.6).
+//! `dx.viewIdState` and `PSV0`, and the `ISG1`, `OSG1` and graphics `PSV0` parts.
 
 use crate::Error;
 use crate::container::{PsvResource, wr32};

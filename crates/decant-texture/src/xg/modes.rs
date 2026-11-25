@@ -1,5 +1,5 @@
 //! The 32 swizzle mode numbers of the GFX10 `SW_MODE` field and what the console library `xg_xs` accepts for each
-//! (`docs/CONSOLE_LIBS.md` 1.2). Only the low 5 bits of a mode field are used.
+//! (`docs/CONSOLE_LIBS.md`, section 1). Only the low 5 bits of a mode field are used.
 
 use crate::tiling::Mode;
 

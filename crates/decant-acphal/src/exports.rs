@@ -1,4 +1,4 @@
-//! The 10 exports of `AcpHal.dll`, by name, with the prototypes of `docs/CONSOLE_LIBS.md` 2.1. Windows x64 convention.
+//! The 10 exports of `AcpHal.dll`, by name, as listed in `docs/CONSOLE_LIBS.md`, section 2. Windows x64 convention.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;

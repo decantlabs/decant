@@ -3,7 +3,7 @@
 //! The address operands arrive in machine order, one 32 bit pattern each (see `lift::mimg`).
 //! [`Layout`] finds each group in them. Cube images arrive as face coordinates: the direction
 //! `TextureCube` wants is rebuilt from the face and the two coordinates on it
-//! (`decant-specs/gfx10/image-ops.md` 3.5).
+//! (GFX10 image instruction semantics).
 
 use super::{Printer, class_of, mirror_word, refuse};
 use crate::api::{Placement, RegisterClass};

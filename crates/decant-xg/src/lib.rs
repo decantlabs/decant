@@ -1,4 +1,4 @@
-//! `xg_xs.dll`: the texture and resource layout library of the console, in Rust (issue #139, `docs/CONSOLE_LIBS.md` section 1).
+//! `xg_xs.dll`: the texture and resource layout library of the console, in Rust (`docs/CONSOLE_LIBS.md`, section 1).
 //!
 //! Given a texture description it says which GFX10 swizzle mode to use, how large the resource is, where each mip level and
 //! array slice lives and the byte offset of any element. The computation is `decant_texture::xg`, built on the GFX10 tables

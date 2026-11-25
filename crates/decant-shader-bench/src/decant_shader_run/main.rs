@@ -11,7 +11,7 @@
 //! * `--layout`: binds every resource the module declares (see `decant_shader_bench::layout`).
 //! * `--texture-file`: a real RGBA8 texture for the 2D samplers of `--layout`, instead of the pattern.
 //! * `--pipeline-cache <file>`: seeds a `VkPipelineCache` from the file (when it exists) around the
-//!   pipeline creation, then writes it back, as the C++ bench does since #85.
+//!   pipeline creation, then writes it back, as the C++ bench does.
 //! * `--no-robust`: creates the device without `robustBufferAccess` and `robustImageAccess`.
 //!
 //! Inputs made by the bench (nothing comes from the game): three vertices with position

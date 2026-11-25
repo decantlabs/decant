@@ -1,4 +1,4 @@
-//! The console GPU image descriptor (GFX10 `SQ_IMG_RSRC_WORD0` to `WORD7`) as `xg_xs` reads it (`docs/CONSOLE_LIBS.md` 1.9).
+//! The console GPU image descriptor (GFX10 `SQ_IMG_RSRC_WORD0` to `WORD7`) as `xg_xs` reads it (`docs/CONSOLE_LIBS.md`, section 1).
 
 use super::XgError;
 use super::layout::{Dim, TextureDesc};

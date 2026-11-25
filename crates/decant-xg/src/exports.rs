@@ -1,4 +1,4 @@
-//! The 24 exports of `xg_xs.dll`, under the names and with the prototypes of `docs/CONSOLE_LIBS.md` 1.1. All use the Windows x64
+//! The 24 exports of `xg_xs.dll`, under the names listed in `docs/CONSOLE_LIBS.md`, section 1. All use the Windows x64
 //! convention. The computations are in `decant_texture::xg`, the state in `state`, the object in `computer`.
 #![allow(unsafe_code)]
 

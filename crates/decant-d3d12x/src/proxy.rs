@@ -1,4 +1,4 @@
-//! Console ABI proxies over PC D3D12 objects (issue #70). The Rust form of the former
+//! Console ABI proxies over PC D3D12 objects. The Rust form of the former
 //! `src/gdk/d3d12x_proxy.c`.
 //!
 //! A title compiled for the console calls the device, command lists, queues and descriptor heaps
@@ -25,7 +25,7 @@
 //! 25 and 26). Those slots are methods with the console convention that call the PC one.
 //!
 //! Frame pacing (device slots 78 to 80) lives in `frame`. Extension point for the full layer
-//! (Sassy, #70): the tables are data, PresentX goes through `DecantD3D12X_SetPresentHook`, and [`wrap`]
+//! the tables are data, PresentX goes through `DecantD3D12X_SetPresentHook`, and [`wrap`]
 //! is where richer proxies (resources) would plug in. x86 64 only.
 //!
 //! PC methods are called by slot index, so no D3D12 binding is needed. Public PC slots:
@@ -493,9 +493,8 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
 /// S_OK, not E_NOINTERFACE") asserts that is the intended behaviour, not a bug: the console vtable
 /// is PC order for slots 0..43, so a caller asking for the base `ID3D12Device` identity gets back an
 /// object that answers that identity correctly through the console vtable. No switch or code path
-/// in the C layer refuses this id, and no run in `docs/private/research/r21/RESULT.md` records a
-/// crash traced to it. A change here would make this proxy disagree with the project's own tested C
-/// behaviour, so none was made; see the port report for the brief's conflicting claim.
+/// in the C layer refuses this id, and no measured run records a crash traced to it. A change here
+/// would make this proxy disagree with the project's own tested C behaviour, so none was made.
 extern "system" fn query_interface(this: *mut Proxy, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
@@ -2231,8 +2230,8 @@ unsafe fn display_target_bytes(pc: Object, raw: &[u8; 0x38]) -> u64 {
     let mut pc_answer = [0u64; 2];
     // SAFETY: by the contract above, `pc_answer` takes the two words of the result.
     unsafe { method::<AllocInfo>(pc, 25)(pc, pc_answer.as_mut_ptr().cast(), 0, 1, pc_desc.as_ptr().cast()) };
-    // The title gives its display targets one block sized with XG and asserts it is used up
-    // (issue #190): take the console XG footprint, not the PC one.
+    // The title gives its display targets one block sized with XG and asserts it is used up,
+    // so take the console XG footprint, not the PC one.
     let xg = crate::detile_plan::console_footprint(raw, crate::detile::hardware_v4());
     let (xg_size, xg_align) = xg.unwrap_or((0, 0));
     xs_log!(

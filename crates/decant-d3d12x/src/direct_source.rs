@@ -1,4 +1,4 @@
-//! The translator of the direct shader path (issue #172): a [`ShaderSource`] over
+//! The translator of the direct shader path: a [`ShaderSource`] over
 //! `decant_shader::translate`, the clean room translator from console GFX10 code to HLSL.
 //!
 //! Per pipeline:

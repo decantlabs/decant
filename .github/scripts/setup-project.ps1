@@ -41,4 +41,4 @@ foreach ($issue in Read-Issues $Repo) {
         Invoke-Gh @('project','item-add',$num,'--owner',$owner,'--url',$issue.Url)
     }
 }
-Write-Host 'Complete status columns, views, privacy, and field assignments using docs/GITHUB_PROJECT_SETUP.md.'
+Write-Host 'Complete status columns, views, privacy, and field assignments.'

@@ -44,7 +44,7 @@ pub struct RunArgs {
     pub real_w: u32,
     pub real_h: u32,
     /// `--pipeline-cache`: a `VkPipelineCache` file seeded before the pipeline is created and
-    /// written back after (#85), so the driver really compiles the pipeline.
+    /// written back after, so the driver really compiles the pipeline.
     pub pipeline_cache_path: Option<OsString>,
 }
 

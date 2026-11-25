@@ -10,7 +10,7 @@
 //! Unlike the Python, the intermediate files (the layout as JSON, the adapted module before
 //! `decant_shader_locate`, the translation folder) live in a scratch folder of this call only, outside
 //! `VKD3D_DECANT_SHADER_DIR`, removed when the call ends. Two calls running at once, even for the same
-//! hash, no longer share them (review findings 2 and 10 in #19).
+//! hash, no longer share them.
 
 use std::collections::HashMap;
 use std::path::Path;

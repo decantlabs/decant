@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 /// The original module, as SPIR-V assembly text: one entry point that does nothing. Every invalid
 /// variant changes one declaration of it. Kept in the source rather than in a `.spvasm` file,
 /// which the repository check does not admit.
-const MINIMAL: &str = "; A minimal compute module written for the validator exercise of issue 12.
+const MINIMAL: &str = "; A minimal compute module written for the validator exercise.
                OpCapability Shader
                OpMemoryModel Logical GLSL450
                OpEntryPoint GLCompute %main \"main\"

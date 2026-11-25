@@ -1,4 +1,4 @@
-//! Control flow normalisation before lowering (specification section 6.1 and 6.2).
+//! Control flow normalisation before lowering.
 //!
 //! What it does, in order:
 //!

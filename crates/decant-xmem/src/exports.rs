@@ -50,7 +50,7 @@ static ALLOC_COUNT: AtomicI64 = AtomicI64::new(0);
 /// The caller's hooks as addresses, 0 when absent.
 static ALLOC_HOOK: AtomicUsize = AtomicUsize::new(0);
 static FREE_HOOK: AtomicUsize = AtomicUsize::new(0);
-/// Serialises `XMemFreeDefault` (the SRWLOCK of the C version, #82).
+/// Serialises `XMemFreeDefault` (the SRWLOCK of the C version).
 static FREE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn count_allocation(size: usize) {
@@ -176,7 +176,7 @@ pub unsafe extern "system" fn XMemFreeDefault(address: *mut c_void, _attributes:
     if free_engine_range(at) {
         return;
     }
-    // The whole release is one critical section, as in the C version (#82): the header check (readable +
+    // The whole release is one critical section, as in the C version: the header check (readable +
     // magic) and the release. When two threads free the same pointer, the second only enters once
     // the first is done and sees the block gone, so there is no double VirtualFree/HeapFree, no
     // double count, and no access to a page already returned. A compare-and-swap on the magic is

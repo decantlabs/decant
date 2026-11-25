@@ -1,4 +1,4 @@
-//! The process wide state of the library (`docs/CONSOLE_LIBS.md` 1.4): the initialised flag, the hardware version flag and the
+//! The process wide state of the library (`docs/CONSOLE_LIBS.md`, section 1): the initialised flag, the hardware version flag and the
 //! exclusive locking flag with its critical section.
 
 use std::sync::atomic::{AtomicBool, Ordering};

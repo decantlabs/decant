@@ -1,4 +1,4 @@
-//! The texture computer object (`docs/CONSOLE_LIBS.md` 1.8): a COM style object whose first 8 bytes point to a table of 12 function
+//! The texture computer object (`docs/CONSOLE_LIBS.md`, section 1): a COM style object whose first 8 bytes point to a table of 12 function
 //! pointers. Slot 0 is `AddRef`, there is no `QueryInterface`.
 #![allow(unsafe_code)]
 

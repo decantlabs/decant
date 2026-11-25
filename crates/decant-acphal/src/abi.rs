@@ -1,4 +1,4 @@
-//! Result codes, constants and structures of `AcpHal.dll` (`docs/CONSOLE_LIBS.md` 2.2 to 2.5).
+//! Result codes, constants and structures of `AcpHal.dll` (`docs/CONSOLE_LIBS.md`, section 2).
 
 pub type Hresult = i32;
 

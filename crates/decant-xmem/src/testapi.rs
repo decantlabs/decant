@@ -28,7 +28,7 @@ type GpuViewFn = unsafe extern "system" fn(u32, *mut usize, *mut u32, *mut u32) 
 type PrepareFn = unsafe extern "system" fn(usize, usize);
 type GpuWritableFn = unsafe extern "system" fn(usize, usize) -> BOOL;
 
-/// The four physical page exports, with the prototypes of `docs/CONSOLE_LIBS.md` (5.1).
+/// The four physical page exports, as described in `docs/CONSOLE_LIBS.md` (section 5).
 struct Physical {
     allocate: PhysAllocFn,
     map: PhysMapFn,

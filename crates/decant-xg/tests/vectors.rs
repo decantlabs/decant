@@ -1,4 +1,4 @@
-//! Every test vector of `docs/CONSOLE_LIBS.md` 1.13, called through the exports and the texture computer table as a C client does.
+//! Every test vector of the XG library (`docs/CONSOLE_LIBS.md`, section 1), called through the exports and the texture computer table as a C client does.
 #![allow(unsafe_code, clippy::type_complexity)]
 
 mod common;

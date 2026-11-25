@@ -1,4 +1,4 @@
-//! `XGComputeTileShape`: the shape of one 64 KiB tile (`docs/CONSOLE_LIBS.md` 1.10).
+//! `XGComputeTileShape`: the shape of one 64 KiB tile (`docs/CONSOLE_LIBS.md`, section 1).
 
 use super::XgError;
 use super::formats::{Format, classify};

@@ -1,4 +1,4 @@
-//! The device case of the direct shader path (issue #172), a part of `d3d12xs_test`:
+//! The device case of the direct shader path, a part of `d3d12xs_test`:
 //! `d3d12xs_test <d3d12_xs.dll> direct`, run with `DECANT_D3D12X_DIRECT=1`.
 //!
 //! It hands the layer what the title does, through the console slots of the device and list
