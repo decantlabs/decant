@@ -1,9 +1,11 @@
 //! `decant-launch`: stage a GDK package and run its title on Windows with the Decant shims, logging
 //! everything. See `src/gdk/README.md`.
 
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc::{self, Sender};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
@@ -106,14 +108,71 @@ struct RunOptions {
     args: Vec<String>,
 }
 
-/// Writes each line to the console and to the log file.
-struct Both(Option<std::fs::File>);
+/// Writes each line to the console and to the log file on a background thread so debug events do not wait on I/O.
+struct Both {
+    tx: Option<Sender<String>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Both {
+    fn new(file: Option<std::fs::File>) -> Self {
+        Self::with_console(file, true)
+    }
+
+    fn with_console(file: Option<std::fs::File>, console: bool) -> Self {
+        let (tx, rx) = mpsc::channel::<String>();
+        let worker = std::thread::Builder::new()
+            .name("decant-launch-sink".to_owned())
+            .spawn(move || {
+                let mut file_writer = file.map(BufWriter::new);
+                while let Ok(first) = rx.recv() {
+                    let mut batch = Vec::with_capacity(64);
+                    batch.push(first);
+                    while batch.len() < 512 {
+                        match rx.try_recv() {
+                            Ok(next) => batch.push(next),
+                            Err(_) => break,
+                        }
+                    }
+                    if console {
+                        let mut out = BufWriter::new(std::io::stdout().lock());
+                        for line in &batch {
+                            let _ = writeln!(out, "{line}");
+                        }
+                        let _ = out.flush();
+                    }
+                    if let Some(writer) = &mut file_writer {
+                        for line in &batch {
+                            let _ = writeln!(writer, "{line}");
+                        }
+                        let _ = writer.flush();
+                    }
+                }
+                if let Some(writer) = &mut file_writer {
+                    let _ = writer.flush();
+                }
+            })
+            .ok();
+        Self {
+            tx: Some(tx),
+            worker,
+        }
+    }
+}
 
 impl run::Sink for Both {
     fn line(&mut self, text: &str) {
-        println!("{text}");
-        if let Some(file) = &mut self.0 {
-            let _ = writeln!(file, "{text}");
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(text.to_owned());
+        }
+    }
+}
+
+impl Drop for Both {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -163,7 +222,7 @@ fn do_run(package: Option<&std::path::Path>, overlay: &std::path::Path, o: &RunO
     }
     let exe = title_executable(&overlay, o.exe.as_deref())?;
     let log_path = o.log.clone().unwrap_or_else(|| overlay.join("decant_launch.log"));
-    let mut sink = Both(std::fs::File::create(&log_path).ok());
+    let mut sink = Both::new(std::fs::File::create(&log_path).ok());
     run::Sink::line(&mut sink, &format!("decant-launch {}: {} from {}", env!("CARGO_PKG_VERSION"), exe.display(), overlay.display()));
     for line in decant_launch::runtime::report() {
         run::Sink::line(&mut sink, &line);
@@ -197,4 +256,28 @@ fn main() -> ExitCode {
         eprintln!("decant-launch: {e}");
         ExitCode::from(2)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn async_sink_delivers_all_lines_in_order_on_drop() {
+        let path = std::env::temp_dir().join(format!("decant_launch_both_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut sink = Both::with_console(Some(file), false);
+            for i in 0..1000 {
+                run::Sink::line(&mut sink, &format!("line {i}"));
+            }
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1000);
+        assert_eq!(lines.first().copied(), Some("line 0"));
+        assert_eq!(lines.last().copied(), Some("line 999"));
+        let _ = std::fs::remove_file(path);
+    }
 }

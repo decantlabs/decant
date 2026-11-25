@@ -10,13 +10,100 @@ pub mod handles;
 pub mod rate_limit;
 
 use std::ffi::OsString;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use rate_limit::{Call, FilterAction, Limiter, rate_limit_enabled};
 
 static LIMITER: Mutex<Limiter> = Mutex::new(Limiter::new(rate_limit::DEFAULT_WINDOW));
+static SESSION_WRITER: Mutex<Option<SessionWriter>> = Mutex::new(None);
+
+const SESSION_BUFFER_BYTES: usize = 64 * 1024;
+const SESSION_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+
+struct SessionWriter {
+    path: PathBuf,
+    writer: BufWriter<std::fs::File>,
+    last_flush: Instant,
+}
+
+impl SessionWriter {
+    fn open(path: PathBuf) -> Option<Self> {
+        let mut options = std::fs::OpenOptions::new();
+        options.append(true).create(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_SHARE_READ | FILE_SHARE_WRITE, as the C code opened it.
+            options.share_mode(0x1 | 0x2);
+        }
+        let file = options.open(&path).ok()?;
+        Some(Self {
+            path,
+            writer: BufWriter::with_capacity(SESSION_BUFFER_BYTES, file),
+            last_flush: Instant::now(),
+        })
+    }
+
+    fn write_line(&mut self, bytes: &[u8], force_flush: bool) {
+        let _ = self.writer.write_all(bytes);
+        let now = Instant::now();
+        if force_flush || now.duration_since(self.last_flush) >= SESSION_FLUSH_INTERVAL {
+            let _ = self.writer.flush();
+            self.last_flush = now;
+        }
+    }
+
+    fn flush(&mut self) {
+        let _ = self.writer.flush();
+        self.last_flush = Instant::now();
+    }
+}
+
+fn write_session_to_path(path: Option<PathBuf>, message: &str) {
+    let mut guard = SESSION_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(target) = path else {
+        if let Some(mut old) = guard.take() {
+            old.flush();
+        }
+        return;
+    };
+    let reopen = match guard.as_ref() {
+        Some(active) => active.path != target,
+        None => true,
+    };
+    if reopen {
+        if let Some(mut old) = guard.take() {
+            old.flush();
+        }
+        *guard = SessionWriter::open(target);
+    }
+    if let Some(active) = guard.as_mut() {
+        let bytes = session_bytes(message);
+        active.write_line(&bytes, rate_limit::is_error(message));
+    }
+}
+
+fn flush_session_writer() {
+    let mut guard = SESSION_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(active) = guard.as_mut() {
+        active.flush();
+    }
+}
+
+fn reset_session_writer() {
+    let mut guard = SESSION_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut old) = guard.take() {
+        old.flush();
+    }
+}
+
+/// Appends `message` to the cached session writer for `path`, opening or switching files as needed.
+pub fn write_session_path(path: &Path, message: &str) {
+    write_session_to_path(Some(path.to_path_buf()), message);
+}
 
 /// Longest path the C reader accepted, in UTF-16 units without the final zero.
 const MAX_PATH_UNITS: usize = 32767;
@@ -85,20 +172,8 @@ pub fn session_log(message: &str) {
 
 /// Appends `message` directly to the session log without rate limiting.
 pub fn raw_session_log(message: &str) {
-    let Some(path) = session_path(std::env::var_os("DECANT_LOG_PATH"), debugger_enabled()) else {
-        return;
-    };
-    let mut options = std::fs::OpenOptions::new();
-    options.append(true).create(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // FILE_SHARE_READ | FILE_SHARE_WRITE, as the C code opened it.
-        options.share_mode(0x1 | 0x2);
-    }
-    if let Ok(mut file) = options.open(path) {
-        let _ = file.write_all(&session_bytes(message));
-    }
+    let path = session_path(std::env::var_os("DECANT_LOG_PATH"), debugger_enabled());
+    write_session_to_path(path, message);
 }
 
 /// Sends `message` to the debugger when `DECANT_LOG` is set, then to the session log.
@@ -155,7 +230,7 @@ pub fn raw_debug_string(message: &str) {
 #[cfg(not(windows))]
 pub fn raw_debug_string(_message: &str) {}
 
-/// Flushes any pending repeated line summaries to the debug channel and session log.
+/// Flushes any pending repeated line summaries and buffered session log bytes.
 pub fn flush() {
     let items = {
         let mut limiter = LIMITER.lock().unwrap_or_else(|e| e.into_inner());
@@ -167,12 +242,15 @@ pub fn flush() {
             Call::SessionLog => raw_session_log(&summary),
         }
     }
+    flush_session_writer();
 }
 
-/// Resets the rate limiter table.
+/// Resets the rate limiter table and closes any cached session log file after flushing it.
 pub fn reset() {
     let mut limiter = LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     limiter.reset();
+    drop(limiter);
+    reset_session_writer();
 }
 
 /// Registers the shutdown flush from the C runtime startup initializer.
@@ -199,9 +277,14 @@ mod tests {
 
     #[test]
     #[allow(unsafe_code)]
-    fn process_exit_flushes_pending_repeat_summary() {
-        let log_path = std::env::temp_dir().join(format!("decant_log_exit_{}.log", std::process::id()));
+    fn process_exit_flushes_pending_repeat_summary_and_switches_paths_cleanly() {
+        let pid = std::process::id();
+        let log_path = std::env::temp_dir().join(format!("decant_log_exit_{pid}.log"));
+        let path_a = std::env::temp_dir().join(format!("decant_log_switch_a_{pid}.log"));
+        let path_b = std::env::temp_dir().join(format!("decant_log_switch_b_{pid}.log"));
         let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
         unsafe {
             std::env::set_var("DECANT_LOG_PATH", &log_path);
             std::env::set_var("DECANT_LOG_RATE_LIMIT", "1");
@@ -215,7 +298,36 @@ mod tests {
 
         let content = std::fs::read_to_string(&log_path).unwrap();
         assert!(content.lines().any(|line| line == "repeated 3 times"), "{content}");
+
+        write_session_path(&path_a, "first file line 1");
+        write_session_path(&path_a, "first file line 2");
+        write_session_path(&path_b, "second file line 1");
+        flush();
+
+        let content_a = std::fs::read_to_string(&path_a).unwrap();
+        let content_b = std::fs::read_to_string(&path_b).unwrap();
+        assert_eq!(content_a, "first file line 1\r\nfirst file line 2\r\n");
+        assert_eq!(content_b, "second file line 1\r\n");
+
+        unsafe {
+            std::env::set_var("DECANT_LOG_PATH", &path_a);
+        }
+        raw_session_log("first file line 3");
+        unsafe {
+            std::env::set_var("DECANT_LOG_PATH", &path_b);
+        }
+        raw_session_log("second file line 2");
+        flush();
+
+        let content_a = std::fs::read_to_string(&path_a).unwrap();
+        let content_b = std::fs::read_to_string(&path_b).unwrap();
+        assert_eq!(content_a, "first file line 1\r\nfirst file line 2\r\nfirst file line 3\r\n");
+        assert_eq!(content_b, "second file line 1\r\nsecond file line 2\r\n");
+
+        reset();
         let _ = std::fs::remove_file(log_path);
+        let _ = std::fs::remove_file(path_a);
+        let _ = std::fs::remove_file(path_b);
     }
 
     #[test]
