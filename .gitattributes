@@ -1,0 +1,7 @@
+* text=auto
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.sh text eol=lf
+Makefile text eol=lf
+# Patches must keep their exact bytes.
+*.patch -text

@@ -1,0 +1,76 @@
+# Console DirectStorage ABI spec - TEMPLATE: the console interfaces, IIDs to read from the executable.
+#
+# Names and inheritance: the public GDK reference on learn.microsoft.com (anonymous access, outside /nda),
+# pages IDStorageFactoryX/X1/X2, IDStorageFileX, IDStorageQueueX/X1/X2, IDStorageStatusArrayX and
+# DStorageGetFactory (which the current page calls with __uuidof(IDStorageFactoryX2)). Those pages list
+# methods in ALPHABETICAL order, so they give no slot order.
+#
+# Slot order and slot counts: measured on the vtables of the console XCRDAPI.dll of a retail title,
+# facts only, no code: factory 11 slots, file 8, queue 14, status array 6 (IUnknown
+# included). Factory 6 SetCpuAffinity, 7 SetDebugFlags, 8 SetStagingBufferSize. Slots listed "?" exist
+# on the console object but their method is not identified; queue 12 and 13 keep our earlier guess
+# (EnqueueSetEvent, Query1), which has the right slot count but is not confirmed. To re-measure on the
+# executable of a second title.
+#
+# IIDs: The four base IIDs of the first title are in other_title.abi. This template keeps them "unknown" until
+# audit_xbox_imports --dstorage-probe reads the executable's own (a later title may ask for X1 or X2).
+# Until each "iid unknown" is replaced by a GUID, nothing can reach these interfaces and every console
+# IID is refused with E_NOINTERFACE, logged. Format: docs/DSTORAGE_ABI.md.
+abi 1
+# Console queue description: 0x18 bytes; source type at 0, capacity (u16) at 8, priority (i8) at 10,
+# name pointer at 0x10; no Device field (first title).
+queue_desc_capacity_offset 8
+
+interface factory IDStorageFactoryX
+  status template
+  iid unknown IDStorageFactoryX
+  iid unknown IDStorageFactoryX1
+  iid unknown IDStorageFactoryX2
+  method 3 factory.create_queue CreateQueue
+  method 4 factory.open_file OpenFile
+  method 5 factory.create_status_array CreateStatusArray
+  method 6 factory.set_cpu_affinity SetCpuAffinity
+  method 7 factory.set_debug_flags SetDebugFlags
+  method 8 factory.set_staging_buffer_size SetStagingBufferSize
+  # Measured on a retail executable (facts only, not bound yet):
+  # the title creates its queue through slot 10 with a 0x20-byte description (not the 0x18-byte one
+  # above), and also calls slot 9. Shapes to come; until then both stay "?".
+  method 9 ?
+  method 10 ?
+end
+
+interface file IDStorageFileX
+  status template
+  iid unknown IDStorageFileX
+  method 3 ? Close
+  method 4 ? GetHandle
+  method 5 ?
+  method 6 ?
+  method 7 ? GetId
+end
+
+interface queue IDStorageQueueX
+  status template
+  iid unknown IDStorageQueueX
+  iid unknown IDStorageQueueX1
+  iid unknown IDStorageQueueX2
+  method 3 queue.enqueue_request EnqueueRequest
+  method 4 queue.enqueue_status EnqueueStatus
+  method 5 queue.enqueue_signal EnqueueSignal
+  method 6 queue.submit Submit
+  method 7 ? CancelRequestsWithTag
+  method 8 ? Close
+  method 9 ? GetErrorEvent
+  method 10 ? RetrieveErrorRecord
+  method 11 ? Query
+  method 12 queue.enqueue_set_event EnqueueSetEvent
+  method 13 ? Query1
+end
+
+interface status IDStorageStatusArrayX
+  status template
+  iid unknown IDStorageStatusArrayX
+  method 3 status.is_complete IsComplete
+  method 4 status.get_hresult GetHResult
+  method 5 ?
+end

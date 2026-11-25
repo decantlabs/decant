@@ -1,0 +1,23 @@
+[package]
+name = "decant-xapu"
+description = "xapu.dll, the console XAPU library (Opus decoding and pitch converting sample rate conversion) in Rust."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "xapu"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+opus-decoder.workspace = true
+decant-log = { path = "../decant-log" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+
+[dev-dependencies]
+decant-testkit = { path = "../decant-testkit" }
+
+[lints]
+workspace = true

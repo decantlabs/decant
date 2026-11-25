@@ -1,0 +1,12 @@
+[package]
+name = "decant-dxc"
+description = "The one DXC loader of the direct shader path: finds dxcompiler.dll and dxil.dll at run time and compiles HLSL to signed DXIL. Used by d3d12_xs.dll and by the tests of decant-shader."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+[lints]
+workspace = true

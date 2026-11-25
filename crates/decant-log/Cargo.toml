@@ -1,0 +1,12 @@
+[package]
+name = "decant-log"
+description = "Session log shared by the Decant DLLs: DECANT_LOG sends a line to the debugger, DECANT_LOG_PATH appends it to a file."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_Security"] }
+
+[lints]
+workspace = true

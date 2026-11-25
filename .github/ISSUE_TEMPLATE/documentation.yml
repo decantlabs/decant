@@ -1,0 +1,55 @@
+{
+  "name": "Documentation Improvement",
+  "description": "Submit a documentation improvement with sanitized information.",
+  "labels": [
+    "component: documentation"
+  ],
+  "body": [
+    {
+      "type": "markdown",
+      "attributes": {
+        "value": "Synthetic examples only. Review SECURITY.md before submitting."
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_0",
+      "attributes": {
+        "label": "Document and section"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_1",
+      "attributes": {
+        "label": "Current ambiguity"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_2",
+      "attributes": {
+        "label": "Proposed correction"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_3",
+      "attributes": {
+        "label": "Evidence"
+      },
+      "validations": {
+        "required": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+[package]
+name = "decant-xg"
+description = "xg_xs.dll, the console texture and resource layout library (XGComputeOptimalSwizzleMode, XGCreateTextureComputer and the other XG exports) in Rust, on the layout code of decant-texture."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "xg_xs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+decant-texture.workspace = true
+decant-log = { path = "../decant-log" }
+
+[dev-dependencies]
+decant-testkit = { path = "../decant-testkit" }
+
+[lints]
+workspace = true

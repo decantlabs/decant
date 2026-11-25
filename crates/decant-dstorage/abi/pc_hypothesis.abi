@@ -1,0 +1,53 @@
+# Console DirectStorage ABI spec - first hypothesis: the PUBLIC PC interfaces.
+#
+# IIDs and method order are those of the public PC header dstorage.h (Microsoft.Direct3D.DirectStorage
+# 1.3.0). NOT VERIFIED ON CONSOLE: a console title may use other IIDs and another method order
+# (see other_title.abi). Format: docs/DSTORAGE_ABI.md. Slots 0-2 are IUnknown and implicit.
+# queue.enqueue_request reads the console request layout (72 bytes, file object at offset 32),
+# not the PC DSTORAGE_REQUEST.
+abi 1
+queue_desc_capacity_offset 8
+
+interface factory IDStorageFactory
+  status pc-hypothesis
+  iid {6924ea0c-c3cd-4826-b10a-f64f4ed927c1} IDStorageFactory
+  method 3 factory.create_queue
+  method 4 factory.open_file
+  method 5 factory.create_status_array
+  method 6 ? SetDebugFlags
+  method 7 ? SetStagingBufferSize
+end
+
+interface file IDStorageFile
+  status pc-hypothesis
+  iid {5de95e7b-955a-4868-a73c-243b29f4b8da} IDStorageFile
+  method 3 ? Close
+  method 4 ? GetFileInformation
+end
+
+interface queue IDStorageQueue
+  status pc-hypothesis
+  iid {cfdbd83f-9e06-4fda-8ea5-69042137f49b} IDStorageQueue
+  iid {dd2f482c-5eff-41e8-9c9e-d2374b278128} IDStorageQueue1
+  iid {b1c9d643-3a49-44a2-b46f-653649470d18} IDStorageQueue2
+  iid {deb54c52-eca8-46b3-82a7-031b72262653} IDStorageQueue3
+  method 3 queue.enqueue_request
+  method 4 queue.enqueue_status
+  method 5 queue.enqueue_signal
+  method 6 queue.submit
+  method 7 ? CancelRequestsWithTag
+  method 8 ? Close
+  method 9 ? GetErrorEvent
+  method 10 ? RetrieveErrorRecord
+  method 11 ? Query
+  method 12 queue.enqueue_set_event
+  method 13 ? GetCompressionSupport
+  method 14 ? EnqueueRequests
+end
+
+interface status IDStorageStatusArray
+  status pc-hypothesis
+  iid {82397587-7cd5-453b-a02e-31379bd64656} IDStorageStatusArray
+  method 3 status.is_complete
+  method 4 status.get_hresult
+end

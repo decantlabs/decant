@@ -1,0 +1,65 @@
+{
+  "name": "Feature Proposal",
+  "description": "Submit a feature proposal with sanitized information.",
+  "labels": [
+    "enhancement"
+  ],
+  "body": [
+    {
+      "type": "markdown",
+      "attributes": {
+        "value": "Synthetic examples only. Review SECURITY.md before submitting."
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_0",
+      "attributes": {
+        "label": "Objective"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_1",
+      "attributes": {
+        "label": "Use case"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_2",
+      "attributes": {
+        "label": "Proposed behavior"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_3",
+      "attributes": {
+        "label": "Dependencies"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_4",
+      "attributes": {
+        "label": "Acceptance test"
+      },
+      "validations": {
+        "required": true
+      }
+    }
+  ]
+}

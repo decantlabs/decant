@@ -1,0 +1,13 @@
+[package]
+name = "decant-spirv-exercise"
+description = "Validator exercise of issue 12: an original minimal SPIR-V module and invalid variants, checked with a locally installed SPIRV-Tools."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spirv_exercise"
+path = "src/main.rs"
+
+[lints]
+workspace = true

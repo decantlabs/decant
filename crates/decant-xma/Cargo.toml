@@ -1,0 +1,13 @@
+[package]
+name = "decant-xma"
+description = "XMA2 audio decoder in pure Rust: reads 2048 byte packets and gives 16 bit PCM."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[lib]
+name = "decant_xma"
+
+[lints]
+workspace = true

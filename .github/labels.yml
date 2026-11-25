@@ -1,0 +1,164 @@
+[
+  {
+    "name": "component: decant",
+    "color": "2563EB",
+    "category": "component",
+    "description": "Component classification for decant work."
+  },
+  {
+    "name": "component: d3d12x",
+    "color": "2563EB",
+    "category": "component",
+    "description": "Component classification for d3d12x work."
+  },
+  {
+    "name": "component: shaders",
+    "color": "2563EB",
+    "category": "component",
+    "description": "Component classification for shaders work."
+  },
+  {
+    "name": "component: memory",
+    "color": "2563EB",
+    "category": "component",
+    "description": "Component classification for memory work."
+  },
+  {
+    "name": "component: dxr",
+    "color": "2563EB",
+    "category": "component",
+    "description": "Component classification for dxr work."
+  },
+  {
+    "name": "component: upscaling",
+    "color": "2563EB",
+    "category": "component",
+    "description": "Component classification for upscaling work."
+  },
+  {
+    "name": "component: textures",
+    "color": "2563EB",
+    "category": "component",
+    "description": "Component classification for textures work."
+  },
+  {
+    "name": "component: diagnostics",
+    "color": "2563EB",
+    "category": "component",
+    "description": "Component classification for diagnostics work."
+  },
+  {
+    "name": "component: documentation",
+    "color": "2563EB",
+    "category": "component",
+    "description": "Component classification for documentation work."
+  },
+  {
+    "name": "priority: critical",
+    "color": "CB2431",
+    "category": "priority",
+    "description": "Priority classification for critical work."
+  },
+  {
+    "name": "priority: high",
+    "color": "F59E0B",
+    "category": "priority",
+    "description": "Priority classification for high work."
+  },
+  {
+    "name": "priority: medium",
+    "color": "F59E0B",
+    "category": "priority",
+    "description": "Priority classification for medium work."
+  },
+  {
+    "name": "priority: low",
+    "color": "F59E0B",
+    "category": "priority",
+    "description": "Priority classification for low work."
+  },
+  {
+    "name": "difficulty: beginner",
+    "color": "64748B",
+    "category": "difficulty",
+    "description": "Difficulty classification for beginner work."
+  },
+  {
+    "name": "difficulty: intermediate",
+    "color": "64748B",
+    "category": "difficulty",
+    "description": "Difficulty classification for intermediate work."
+  },
+  {
+    "name": "difficulty: advanced",
+    "color": "64748B",
+    "category": "difficulty",
+    "description": "Difficulty classification for advanced work."
+  },
+  {
+    "name": "difficulty: expert",
+    "color": "64748B",
+    "category": "difficulty",
+    "description": "Difficulty classification for expert work."
+  },
+  {
+    "name": "help wanted",
+    "color": "2563EB",
+    "description": "Available for an invited volunteer",
+    "category": "collaboration"
+  },
+  {
+    "name": "good first issue",
+    "color": "2DA44E",
+    "description": "Self-contained entry task",
+    "category": "collaboration"
+  },
+  {
+    "name": "needs testing",
+    "color": "8250DF",
+    "description": "Requires reproducible test evidence",
+    "category": "collaboration"
+  },
+  {
+    "name": "research",
+    "color": "2563EB",
+    "description": "Investigate and document evidence",
+    "category": "collaboration"
+  },
+  {
+    "name": "blocked: executable",
+    "color": "6E7781",
+    "description": "Requires unavailable runtime evidence",
+    "category": "collaboration"
+  },
+  {
+    "name": "blocked: private component",
+    "color": "6E7781",
+    "description": "Requires a withheld component",
+    "category": "collaboration"
+  },
+  {
+    "name": "blocked: title files",
+    "color": "6E7781",
+    "description": "Requires restricted input data",
+    "category": "collaboration"
+  },
+  {
+    "name": "verified",
+    "color": "2DA44E",
+    "description": "Acceptance criteria independently checked",
+    "category": "collaboration"
+  },
+  {
+    "name": "bug",
+    "color": "CB2431",
+    "description": "Observed deviation from expected behavior",
+    "category": "collaboration"
+  },
+  {
+    "name": "enhancement",
+    "color": "E97924",
+    "description": "Extend the usable research subset",
+    "category": "collaboration"
+  }
+]

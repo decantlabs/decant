@@ -1,0 +1,140 @@
+name: Review
+on: [pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: review-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  review:
+    name: Review
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Repository check
+        run: cargo run --locked -p decant-repo-check --bin check_repository
+      - name: Review PR description
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        run: |
+          $body = (Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json).pull_request.body
+          if (!$body -or $body -notmatch '(?im)^(?:Closes|Part of)\s+([\w.-]+/[\w.-]+)?#\d+') { throw 'Link the issue with Closes #n or Part of #n.' }
+      - name: Build native subset and check xmem
+        shell: pwsh
+        run: |
+          cmd /d /c "call build.cmd `"%FFX_API_ROOT%`""
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/loadtest.exe (Resolve-Path build/xmem.dll).Path
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/xmem_abitest.exe (Resolve-Path build/xmem.dll).Path
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/xaudio2test.exe (Resolve-Path build/decant_xaudio2.dll).Path
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/gameinputtest.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/d3d12xs_test.exe (Resolve-Path build/d3d12_xs.dll).Path
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/dstorage_abi_test.exe (Resolve-Path build/dstorage_xs.dll).Path spec a
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/dstoragetest.exe (Resolve-Path build/dstorage_xs.dll).Path
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Write-Host 'GPU execution skipped on hosted runner. Use hardware protocol.'
+  rust:
+    name: Rust workspace
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+  wine:
+    name: GDK DLLs for x86_64-pc-windows-gnu under Wine
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET: x86_64-pc-windows-gnu
+      WINEARCH: win64
+      WINEDEBUG: -all
+      WINEPREFIX: ${{ github.workspace }}/.wine
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install mingw w64 and Wine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 wine64 libvkd3d1 xvfb
+          command -v wine64 || ls /usr/lib/wine
+      - name: Install the pinned toolchain and the gnu target
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add "$TARGET"
+      - name: Build every GDK DLL and test program
+        # Static libgcc and winpthreads, so that no mingw runtime DLL has to sit next to the DLLs.
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --release --locked --target "$TARGET" \
+            -p decant-xmem -p decant-xaudio2 -p decant-xma2 -p decant-xgameruntime \
+            -p decant-dstorage -p decant-dstorage-xcrdapi -p decant-ffx \
+            -p decant-bvh -p decant-d3d12x -p decant-smoketest -p decant-gdk-config
+      - name: Collect the DLLs and test programs
+        run: |
+          mkdir gdk-dlls
+          cp target/$TARGET/release/*.dll target/$TARGET/release/*.exe gdk-dlls/
+          ls -l gdk-dlls
+      - name: Create the Wine prefix
+        run: |
+          xvfb-run -a wine64 wineboot --init
+          wineserver --wait || true
+      - name: Test under Wine
+        working-directory: gdk-dlls
+        # No GPU, no audio device, no title file and no FFmpeg on the hosted runner. What cannot run
+        # there skips itself, as in the Windows job, and says so in its output.
+        run: |
+          fails=0
+          # Windows path of a file of this folder, as Wine sees it (drive Z is the root).
+          win() { printf 'Z:%s' "$(realpath "$1" | sed 's|/|\\|g')"; }
+          t() {
+            name=$1; shift
+            echo "::group::$name"
+            if timeout 120 xvfb-run -a wine64 "$@"; then echo "PASS $name"; else echo "FAIL $name (exit $?)"; fails=$((fails + 1)); fi
+            echo "::endgroup::"
+          }
+          t loadtest loadtest.exe "$(win xmem.dll)"
+          t xmem_abitest xmem_abitest.exe "$(win xmem.dll)"
+          t xaudio2test xaudio2test.exe "$(win decant_xaudio2.dll)"
+          t gameinputtest gameinputtest.exe
+          t d3d12xs_test d3d12xs_test.exe "$(win d3d12_xs.dll)"
+          t dstorage_abi_test dstorage_abi_test.exe "$(win dstorage_xs.dll)" spec a
+          t dstoragetest dstoragetest.exe "$(win dstorage_xs.dll)"
+          t xgameruntime_test xgameruntime_test.exe "$(win xgameruntime.dll)" offline
+          # Without FFmpeg decant_xma2.dll refuses to hand out a decoder and xma2test says so with exit 1.
+          # That refusal is the clean skip: a decoding run needs an LGPL FFmpeg, which is not installed.
+          echo "::group::xma2test"
+          echo RIFF > dummy.xma2.wav
+          out=$(timeout 120 xvfb-run -a wine64 xma2test.exe "$(win decant_xma2.dll)" dummy.xma2.wav) && code=0 || code=$?
+          echo "$out"
+          if [ "$code" = 1 ] && echo "$out" | grep -q 'decoder not loaded'; then echo "PASS xma2test (no FFmpeg, refused cleanly)"; else echo "FAIL xma2test (exit $code)"; fails=$((fails + 1)); fi
+          rm -f dummy.xma2.wav
+          echo "::endgroup::"
+          echo "$fails test program(s) failed"
+          exit "$fails"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: gdk-dlls-x86_64-pc-windows-gnu
+          path: gdk-dlls
+          if-no-files-found: error

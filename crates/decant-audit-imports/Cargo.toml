@@ -1,0 +1,27 @@
+[package]
+name = "decant-audit-imports"
+description = "Rust port of src/audit_imports/audit_xbox_imports.py: lists the imports of a Xbox GDK build and what this PC can resolve."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "audit_xbox_imports"
+path = "src/main.rs"
+
+[[bin]]
+name = "d3d12x_vtprobe"
+path = "src/vtprobe_main.rs"
+
+[dependencies]
+# x86-64 decoder for d3d12x_vtprobe (MIT).
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
+
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Diagnostics_Debug"] }
+
+[lints]
+workspace = true

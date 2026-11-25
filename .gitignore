@@ -1,0 +1,43 @@
+*.bk2
+*.dxbc
+*.fssm
+*.spv
+*.pack
+*.jsonl
+*.ll
+*.exe
+*.dll
+*.obj
+*.pdb
+*.lib
+*.exp
+*.bin
+*.pyc
+*.dmp
+*.log
+*.asm
+build/
+out/
+index/
+runs/
+test/
+rapport/
+adapt_tmp/
+identify_tmp/
+__pycache__/
+settings.json
+decant.ini
+TRI.md
+AUDIT_PUBLICATION.md
+RAPPORT.md
+*.csv
+# Rust build output
+/target/
+# Staging and runtime data written by launch_prep (crate decant-linux, env-overridable defaults)
+/extracted/
+/runtime/
+/install/
+/logs/
+# Sandbox writable state (Wine prefix, session logs)
+/sandbox/prefix/
+/sandbox/logs/

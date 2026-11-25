@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/decant-acphal", "crates/decant-audit-imports", "crates/decant-bcpack", "crates/decant-bvh", "crates/decant-chad", "crates/decant-d3d12x", "crates/decant-dstorage", "crates/decant-dstorage-xcrdapi", "crates/decant-dxc", "crates/decant-dxil", "crates/decant-extract-shaders", "crates/decant-ffx", "crates/decant-gameinput", "crates/decant-gdk-config", "crates/decant-gpu-diag", "crates/decant-launch", "crates/decant-linux", "crates/decant-log", "crates/decant-repo-check", "crates/decant-shader", "crates/decant-shader-ab", "crates/decant-shader-analysis", "crates/decant-shader-batch", "crates/decant-shader-bench", "crates/decant-shader-bridge", "crates/decant-shader-core", "crates/decant-shader-harness", "crates/decant-shader-tools", "crates/decant-smoketest", "crates/decant-spirv-exercise", "crates/decant-stub", "crates/decant-testkit", "crates/decant-texture", "crates/decant-xapu", "crates/decant-xaudio2", "crates/decant-xg", "crates/decant-xgameruntime", "crates/decant-xma", "crates/decant-xma2", "crates/decant-xmem"]
+default-members = ["crates/decant-acphal", "crates/decant-audit-imports", "crates/decant-bcpack", "crates/decant-bvh", "crates/decant-chad", "crates/decant-d3d12x", "crates/decant-dstorage", "crates/decant-dstorage-xcrdapi", "crates/decant-dxc", "crates/decant-dxil", "crates/decant-extract-shaders", "crates/decant-ffx", "crates/decant-gameinput", "crates/decant-gdk-config", "crates/decant-gpu-diag", "crates/decant-launch", "crates/decant-linux", "crates/decant-log", "crates/decant-repo-check", "crates/decant-shader", "crates/decant-shader-ab", "crates/decant-shader-analysis", "crates/decant-shader-batch", "crates/decant-shader-bench", "crates/decant-shader-bridge", "crates/decant-shader-core", "crates/decant-shader-harness", "crates/decant-shader-tools", "crates/decant-smoketest", "crates/decant-spirv-exercise", "crates/decant-stub", "crates/decant-testkit", "crates/decant-texture", "crates/decant-xapu", "crates/decant-xaudio2", "crates/decant-xg", "crates/decant-xgameruntime", "crates/decant-xma", "crates/decant-xma2", "crates/decant-xmem"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+publish = false
+version = "0.4.0"
+rust-version = "1.99"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+sha1 = "0.11"
+tempfile = "3"
+decant-texture = { path = "crates/decant-texture" }
+decant-extract-shaders = { path = "crates/decant-extract-shaders" }
+decant-shader-core = { path = "crates/decant-shader-core" }
+decant-dxc = { path = "crates/decant-dxc" }
+decant-shader = { path = "crates/decant-shader" }
+# BCPack decoder (BC1, BC3, BC4, BC5, BC6H, BC7), our own code with the format's constant tables.
+decant-bcpack = { path = "crates/decant-bcpack" }
+memmap2 = "0.9"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+serde = { version = "1", features = ["derive"] }
+# Windows application icon embedded in decant-launch.exe at build time (MIT).
+serde_json = "1"
+png = "0.18"
+memchr = "2"
+opus-decoder = "=0.1.1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+

@@ -1,0 +1,43 @@
+[package]
+name = "decant-shader-harness"
+description = "The DecantShader on screen test drivers and GPU checks: run_tests, run_vkd3d_test, the shader gallery, pipeline validation, the semantic cases and the translator regression guard."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "decant_shader_run_tests"
+path = "src/bin/decant_shader_run_tests.rs"
+
+[[bin]]
+name = "decant_shader_run_vkd3d_test"
+path = "src/bin/decant_shader_run_vkd3d_test.rs"
+
+[[bin]]
+name = "decant_shader_gallery"
+path = "src/bin/decant_shader_gallery.rs"
+
+[[bin]]
+name = "decant_shader_regress"
+path = "src/bin/decant_shader_regress.rs"
+
+[[bin]]
+name = "decant_shader_pipeline_validate"
+path = "src/bin/decant_shader_pipeline_validate.rs"
+
+[[bin]]
+name = "decant_shader_semantics"
+path = "src/bin/decant_shader_semantics.rs"
+
+[dependencies]
+decant-extract-shaders.workspace = true
+decant-shader-bridge = { path = "../decant-shader-bridge" }
+decant-shader-core.workspace = true
+decant-shader-batch = { path = "../decant-shader-batch" }
+decant-shader-tools = { path = "../decant-shader-tools" }
+serde_json.workspace = true
+decant-spirv-exercise = { path = "../decant-spirv-exercise" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

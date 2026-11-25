@@ -1,0 +1,75 @@
+{
+  "name": "Bug Report",
+  "description": "Submit a bug report with sanitized information.",
+  "labels": [
+    "bug"
+  ],
+  "body": [
+    {
+      "type": "markdown",
+      "attributes": {
+        "value": "Synthetic examples only. Review SECURITY.md before submitting."
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_0",
+      "attributes": {
+        "label": "Component"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_1",
+      "attributes": {
+        "label": "Observed behavior"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_2",
+      "attributes": {
+        "label": "Expected behavior"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_3",
+      "attributes": {
+        "label": "Reproduction steps"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_4",
+      "attributes": {
+        "label": "Version and environment"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_5",
+      "attributes": {
+        "label": "Sanitized logs"
+      },
+      "validations": {
+        "required": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,115 @@
+{
+  "name": "GPU Compatibility Test",
+  "description": "Submit a gpu compatibility test with sanitized information.",
+  "labels": [
+    "needs testing"
+  ],
+  "body": [
+    {
+      "type": "markdown",
+      "attributes": {
+        "value": "Synthetic examples only. Review SECURITY.md before submitting."
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_0",
+      "attributes": {
+        "label": "GPU model"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_1",
+      "attributes": {
+        "label": "Driver version"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_2",
+      "attributes": {
+        "label": "Windows version"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_3",
+      "attributes": {
+        "label": "CPU model"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_4",
+      "attributes": {
+        "label": "RAM"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_5",
+      "attributes": {
+        "label": "Tool version or commit"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_6",
+      "attributes": {
+        "label": "Component"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_7",
+      "attributes": {
+        "label": "Result and exit code"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_8",
+      "attributes": {
+        "label": "Sanitized logs"
+      },
+      "validations": {
+        "required": false
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_9",
+      "attributes": {
+        "label": "Reproduction steps"
+      },
+      "validations": {
+        "required": true
+      }
+    }
+  ]
+}

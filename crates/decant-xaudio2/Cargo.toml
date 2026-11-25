@@ -1,0 +1,28 @@
+[package]
+name = "decant-xaudio2"
+description = "decant_xaudio2.dll, the Decant XAudio2 layer: wraps the PC engine XAudio2_9.dll and handles, counts and logs what only the console has. Rust port of the former src/decant/xaudio2, with its tests xaudio2test and gameinputtest."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "decant_xaudio2"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "xaudio2test"
+path = "src/bin/xaudio2test.rs"
+
+[[bin]]
+name = "gameinputtest"
+path = "src/bin/gameinputtest.rs"
+
+[dependencies]
+decant-log = { path = "../decant-log" }
+decant-testkit = { path = "../decant-testkit" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Media_Audio_XAudio2", "Win32_System_Com", "Win32_System_LibraryLoader"] }
+
+[lints]
+workspace = true

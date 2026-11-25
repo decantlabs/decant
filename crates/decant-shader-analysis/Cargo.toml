@@ -1,0 +1,41 @@
+[package]
+name = "decant-shader-analysis"
+description = "Rust port of the read only shader research tools of src/shaders: signatures, resource lists, FSSM tables and the input convention checks."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "decant_shader_metadata"
+path = "src/bin/decant_shader_metadata.rs"
+
+[[bin]]
+name = "decant_shader_outputs"
+path = "src/bin/decant_shader_outputs.rs"
+
+[[bin]]
+name = "fssm_tables"
+path = "src/bin/fssm_tables.rs"
+
+[[bin]]
+name = "fssm_bindings"
+path = "src/bin/fssm_bindings.rs"
+
+[[bin]]
+name = "decant_shader_vertex_abi"
+path = "src/bin/decant_shader_vertex_abi.rs"
+
+[[bin]]
+name = "decant_shader_pixel_inputs"
+path = "src/bin/decant_shader_pixel_inputs.rs"
+
+[dependencies]
+decant-extract-shaders = { path = "../decant-extract-shaders" }
+serde_json.workspace = true
+regex = "1"
+
+[dev-dependencies]
+flate2.workspace = true
+
+[lints]
+workspace = true

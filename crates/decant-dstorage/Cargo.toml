@@ -1,0 +1,36 @@
+[package]
+name = "decant-dstorage"
+description = "dstorage_xs.dll and xcrdapi.dll, the Decant DirectStorage layer: the console ABI read from a spec file, over PC DirectStorage when it is installed or a CPU fallback otherwise, with BCPack decoded in process. Rust port of the former src/gdk/dstorage, with its tests dstoragetest and dstorage_abi_test."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "dstorage_xs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "dstoragetest"
+path = "src/bin/dstoragetest.rs"
+
+[[bin]]
+name = "dstorage_abi_test"
+path = "src/bin/dstorage_abi_test.rs"
+
+[dependencies]
+decant-log = { path = "../decant-log" }
+decant-testkit = { path = "../decant-testkit" }
+flate2.workspace = true
+decant-bcpack.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory","Win32_System_Pipes", "Win32_System_Threading"] }
+
+[dev-dependencies]
+decant-bcpack = { workspace = true, features = ["encode"] }
+
+[build-dependencies]
+cc = "1"
+
+[lints]
+workspace = true

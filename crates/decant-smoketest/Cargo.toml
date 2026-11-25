@@ -1,0 +1,16 @@
+[package]
+name = "decant-smoketest"
+description = "gdk_smoketest, the port of tests/gdk_smoketest.c: loads every DLL staged next to the xmem.dll and d3d12_xs.dll shims, then runs light functional checks."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gdk_smoketest"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
+
+[lints]
+workspace = true

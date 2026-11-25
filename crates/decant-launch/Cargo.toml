@@ -1,0 +1,55 @@
+[package]
+name = "decant-launch"
+description = "Native Windows launcher for a staged GDK title: stages the package into a writable overlay folder with the Decant shims first, then runs the title under the debugging API and logs every DLL it loads, its debug output and its exceptions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "decant-launch"
+path = "src/main.rs"
+
+# Test helper: asks for xgameruntime.dll the way a GDK title does (see tests/redirect.rs).
+[[bin]]
+name = "load_probe"
+path = "src/load_probe.rs"
+test = false
+
+# Test helper: reads `X:/hello.txt` the way a title does (see tests/game_drive.rs).
+[[bin]]
+name = "drive_probe"
+path = "src/drive_probe.rs"
+test = false
+
+# Test helper: calls the file functions the debugger redirects, under a game drive letter (see tests/file_calls.rs).
+[[bin]]
+name = "file_probe"
+path = "src/file_probe.rs"
+test = false
+
+# Test helper: runs a CLZERO loop on a buffer (see tests/cpu_emulation.rs).
+[[bin]]
+name = "clzero_probe"
+path = "src/clzero_probe.rs"
+test = false
+
+# Test helper: a stand-in title for the debugging switches (see tests/tools.rs).
+[[bin]]
+name = "tools_probe"
+path = "src/tools_probe.rs"
+test = false
+
+[dependencies]
+decant-gdk-config = { path = "../decant-gdk-config" }
+decant-log = { path = "../decant-log" }
+clap.workspace = true
+sha2 = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_Storage_FileSystem", "Win32_System_Kernel", "Win32_System_Services", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Performance"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

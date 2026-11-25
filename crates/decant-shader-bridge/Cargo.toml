@@ -1,0 +1,48 @@
+[package]
+name = "decant-shader-bridge"
+description = "Rust port of the DecantShader bridge tools: decant_shader_identify.py, decant_shader_adapt.py, decant_shader_describe.py, decant_shader_serve.py and decant_shader_adapt_cache.py."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "decant_shader_identify"
+path = "src/bin/decant_shader_identify.rs"
+
+[[bin]]
+name = "decant_shader_adapt"
+path = "src/bin/decant_shader_adapt.rs"
+
+[[bin]]
+name = "decant_shader_describe"
+path = "src/bin/decant_shader_describe.rs"
+
+[[bin]]
+name = "decant_shader_serve"
+path = "src/bin/decant_shader_serve.rs"
+
+[[bin]]
+name = "decant_shader_spv_manifest"
+path = "src/bin/decant_shader_spv_manifest.rs"
+
+[[bin]]
+name = "decant_shader_dxil_cache"
+path = "src/bin/decant_shader_dxil_cache.rs"
+
+[[bin]]
+name = "decant_shader_adapt_cache"
+path = "src/bin/decant_shader_adapt_cache.rs"
+
+[dependencies]
+decant-extract-shaders = { path = "../decant-extract-shaders" }
+decant-shader-core.workspace = true
+decant-dxil = { path = "../decant-dxil" }
+serde.workspace = true
+memchr.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+rspirv = "0.13"
+sha1 = "0.11"
+tempfile = "3"
+
+[lints]
+workspace = true

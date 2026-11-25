@@ -1,0 +1,9 @@
+[package]
+name = "decant-texture"
+description = "Console (GFX10 / RDNA2) texture tiling, surface layout and XG resource layout computation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "decant-shader"
+description = "Direct shader translator: console GFX10 machine code to HLSL in one step, compiled with DXC when the title creates a pipeline. Clean room, see the README."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "decant_shader_direct_census"
+path = "src/bin/decant_shader_direct_census.rs"
+doc = false
+
+[dependencies]
+thiserror.workspace = true
+sha1.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+decant-extract-shaders.workspace = true
+
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+decant-dxc.workspace = true
+tempfile.workspace = true

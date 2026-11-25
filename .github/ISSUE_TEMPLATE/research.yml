@@ -1,0 +1,75 @@
+{
+  "name": "Research Finding",
+  "description": "Submit a research finding with sanitized information.",
+  "labels": [
+    "research"
+  ],
+  "body": [
+    {
+      "type": "markdown",
+      "attributes": {
+        "value": "Synthetic examples only. Review SECURITY.md before submitting."
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_0",
+      "attributes": {
+        "label": "Question"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_1",
+      "attributes": {
+        "label": "Sources and permissions"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_2",
+      "attributes": {
+        "label": "Method"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_3",
+      "attributes": {
+        "label": "Observed evidence"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_4",
+      "attributes": {
+        "label": "Hypotheses"
+      },
+      "validations": {
+        "required": true
+      }
+    },
+    {
+      "type": "textarea",
+      "id": "field_5",
+      "attributes": {
+        "label": "Reproduction and limits"
+      },
+      "validations": {
+        "required": true
+      }
+    }
+  ]
+}

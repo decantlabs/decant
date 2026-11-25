@@ -1,0 +1,19 @@
+[package]
+name = "decant-stub"
+description = "Generates stand in DLLs, as Rust cdylib projects, for console modules a title imports and nothing provides: each export logs its name and returns E_NOTIMPL. Input: the report of audit_xbox_imports."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "decant_stubgen"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

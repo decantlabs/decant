@@ -1,0 +1,42 @@
+[package]
+name = "decant-shader-tools"
+description = "Rust port of more shader research tools of src/shaders/decant_shader: capability count, HLSL probe, translator instrumentation, SPIR-V reflection and the image checks of the bench."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "decant_shader_capabilities"
+path = "src/bin/decant_shader_capabilities.rs"
+
+[[bin]]
+name = "decant_shader_hlsl_probe"
+path = "src/bin/decant_shader_hlsl_probe.rs"
+
+[[bin]]
+name = "decant_shader_instrument"
+path = "src/bin/decant_shader_instrument.rs"
+
+[[bin]]
+name = "aco_opcode_crosscheck"
+path = "src/bin/aco_opcode_crosscheck.rs"
+
+[[bin]]
+name = "spirv_reflect"
+path = "src/bin/spirv_reflect.rs"
+
+[[bin]]
+name = "check_blit"
+path = "src/bin/check_blit.rs"
+
+[[bin]]
+name = "check_texture"
+path = "src/bin/check_texture.rs"
+
+[dependencies]
+decant-shader-analysis = { path = "../decant-shader-analysis" }
+decant-shader-core = { path = "../decant-shader-core" }
+regex = "1"
+
+[lints]
+workspace = true

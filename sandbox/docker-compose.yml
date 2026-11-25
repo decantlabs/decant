@@ -1,0 +1,41 @@
+# Air-gapped sandbox for testing GDK applications
+# SECURITY: completely network-isolated, read-only package mount
+services:
+  sandbox:
+    build:
+      context: .
+      args:
+        UID: ${DECANT_UID:-1000}
+        GID: ${DECANT_GID:-1000}
+    container_name: decant-sandbox
+    # CRITICAL: no network at all
+    network_mode: "none"
+    # No capabilities beyond what Wine needs
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_PTRACE  # for Wine debugging only
+    # Read-only game data, writable prefix and logs
+    volumes:
+      # Game data: READ-ONLY
+      - ${DECANT_PACKAGE_DIR:?Set DECANT_PACKAGE_DIR}:/data/game:ro
+      # Shims and Wine tests from `make -C src/gdk all tests`: READ-ONLY
+      - ../build/gdk:/data/stubs:ro
+      # Wine prefix: writable but contained
+      - ./prefix:/home/runner/.wine
+      # Logs output
+      - ./logs:/data/logs
+    # Resource limits
+    mem_limit: 16g
+    cpus: 8
+    # No privileged mode
+    privileged: false
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    # Don't restart on crash
+    restart: "no"
+    # Virtual display for Wine
+    command: ["bash", "-c", "Xvfb :99 -screen 0 1920x1080x24 & sleep 2 && bash"]
+    stdin_open: true
+    tty: true

@@ -1,0 +1,6 @@
+# Static C runtime for every Windows (MSVC) binary of the workspace, also when it is built with a
+# plain `cargo build` (build.cmd sets the same flag in RUSTFLAGS, which replaces this setting).
+# A clean Windows (Windows Sandbox, a player's machine) has no VC++ redistributable: decant-launch.exe,
+# which build.cmd does not build, failed there with STATUS_DLL_NOT_FOUND (vcruntime140.dll).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

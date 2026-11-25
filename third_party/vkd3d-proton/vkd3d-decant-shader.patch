@@ -1,0 +1,84 @@
+diff --git a/libs/vkd3d-shader/dxil.c b/libs/vkd3d-shader/dxil.c
+index dd91f3a..c1fc28e 100644
+--- a/libs/vkd3d-shader/dxil.c
++++ b/libs/vkd3d-shader/dxil.c
+@@ -23,8 +23,10 @@
+ #include "vkd3d_shader_private.h"
+ #include "vkd3d_utf8.h"
+ #include "vkd3d_string.h"
++#include "vkd3d_platform.h"
+ #include <inttypes.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <dxil_spirv_c.h>
+ 
+ static bool dxil_match_shader_visibility(enum vkd3d_shader_visibility visibility,
+@@ -1508,6 +1510,59 @@ static int vkd3d_dxil_converter_set_options(dxil_spv_converter converter,
+     return VKD3D_OK;
+ }
+ 
++/* DecantShader: optional bridge for console (Xbox Scarlett) shader containers, which carry no DXIL bytecode.
++ * When VKD3D_DECANT_SHADER_DIR is set, the container and the Vulkan interface vkd3d-proton chose for it (set and
++ * binding of every register) are written to that directory as <hash>.dxbc and <hash>.layout, then the command in
++ * VKD3D_DECANT_SHADER_COMMAND, if any, is run with the hash as its argument. That command is expected to drop a
++ * <hash>.spv module into VKD3D_SHADER_OVERRIDE, which the regular override path below then picks up.
++ * Nothing changes when the variable is unset. */
++static void vkd3d_decant_shader_hook(vkd3d_shader_hash_t hash, const struct vkd3d_shader_code *dxbc,
++        const struct vkd3d_shader_interface_info *info)
++{
++    char command[2 * VKD3D_PATH_MAX + 64];
++    char path[VKD3D_PATH_MAX + 64];
++    char dir[VKD3D_PATH_MAX];
++    unsigned int i;
++    FILE *f;
++
++    if (!vkd3d_get_env_var("VKD3D_DECANT_SHADER_DIR", dir, sizeof(dir)))
++        return;
++
++    snprintf(path, sizeof(path), "%s/%016"PRIx64".dxbc", dir, hash);
++    if ((f = fopen(path, "wb")))
++    {
++        fwrite(dxbc->code, 1, dxbc->size, f);
++        fclose(f);
++    }
++
++    snprintf(path, sizeof(path), "%s/%016"PRIx64".layout", dir, hash);
++    if (!(f = fopen(path, "w")))
++        return;
++    fprintf(f, "stage %u\n", (unsigned int)info->stage);
++    fprintf(f, "flags %u\n", info->flags);
++    for (i = 0; i < info->binding_count; i++)
++    {
++        const struct vkd3d_shader_resource_binding *b = &info->bindings[i];
++        fprintf(f, "binding %u %u %u %u %u %u %u %u %u %u\n", (unsigned int)b->type, b->register_space,
++                b->register_index, b->register_count, b->descriptor_table, b->descriptor_offset,
++                (unsigned int)b->shader_visibility, b->flags, b->binding.set, b->binding.binding);
++    }
++    for (i = 0; i < info->push_constant_buffer_count; i++)
++    {
++        const struct vkd3d_shader_push_constant_buffer *p = &info->push_constant_buffers[i];
++        fprintf(f, "push %u %u %u %u %u\n", p->register_space, p->register_index,
++                (unsigned int)p->shader_visibility, p->offset, p->size);
++    }
++    fclose(f);
++
++    if (vkd3d_get_env_var("VKD3D_DECANT_SHADER_COMMAND", path, sizeof(path)))
++    {
++        snprintf(command, sizeof(command), "%s %016"PRIx64, path, hash);
++        if (system(command) != 0)
++            WARN("DecantShader command failed for shader %016"PRIx64".\n", hash);
++    }
++}
++
+ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+         struct vkd3d_shader_code *spirv,
+         struct vkd3d_shader_code_debug *spirv_debug,
+@@ -1538,6 +1593,8 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
+     memset(&spirv->meta, 0, sizeof(spirv->meta));
+     spirv->meta.hash = hash;
+ 
++    vkd3d_decant_shader_hook(hash, dxbc, shader_interface_info);
++
+     /* Cannot replace mesh shaders until we have reflected the IO layout. */
+     if (shader_interface_info->stage != VK_SHADER_STAGE_MESH_BIT_EXT &&
+             vkd3d_shader_replace(hash, &spirv->code, &spirv->size))

@@ -1,0 +1,23 @@
+[package]
+name = "decant-acphal"
+description = "AcpHal.dll, the console audio control processor library (APU heaps, SHAPE contexts, the IAcpHal object) in Rust."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "AcpHal"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+decant-log = { path = "../decant-log" }
+decant-xma = { path = "../decant-xma" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Threading", "Win32_System_Variant"] }
+
+[dev-dependencies]
+decant-testkit = { path = "../decant-testkit" }
+
+[lints]
+workspace = true

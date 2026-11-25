@@ -1,0 +1,24 @@
+[package]
+name = "decant-bvh"
+description = "decant_bvh.dll (also built as XboxBvhBuilder.dll, the stand in for the package class), the Decant DXR build interface (DecantPrebuild, DecantBuild) on native D3D12 objects. Rust port of the former src/decant/decant_bvh.cpp, with its test decant_bvh_test."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "decant_bvh"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "decant_bvh_test"
+path = "src/bin/decant_bvh_test.rs"
+
+[dependencies]
+decant-testkit = { path = "../decant-testkit" }
+decant-log = { path = "../decant-log" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_Foundation"] }
+
+[lints]
+workspace = true

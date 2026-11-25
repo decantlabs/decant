@@ -1,0 +1,24 @@
+[package]
+name = "decant-ffx"
+description = "decant_ffx.dll, the Decant FidelityFX shim: forwards the five ffx* calls to the PC backend named by DECANT_FFX_BACKEND. Rust port of the former src/decant/ffx_shim.c, with its test ffxtest."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "decant_ffx"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "ffxtest"
+path = "src/bin/ffxtest.rs"
+
+[dependencies]
+decant-testkit = { path = "../decant-testkit" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Environment"] }
+windows = { version = "0.62", features = ["Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D12"] }
+
+[lints]
+workspace = true

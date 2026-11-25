@@ -1,0 +1,62 @@
+# Console DirectStorage ABI spec of another retail title, as measured on its console XCRDAPI.dll.
+# Kept to compare with the first title (retail_title.abi). Only names and facts are recorded here:
+# interface IDs, method order, slot counts, the queue description offset.
+#
+# What is confirmed on that title (Series):
+#   - the four IIDs below are the ones it passes at run time to DStorageGetFactory (it asks for
+#     the base IDStorageFactoryX, not X1 or X2), OpenFile, CreateQueue and CreateStatusArray;
+#   - slot counts read on the vtables of the console XCRDAPI.dll: factory 11, file 8, queue 14,
+#     status array 6 (IUnknown included); slots marked "?" exist but are not identified.
+# On console these interfaces come from XCRDAPI.dll (DStorageGetFactory), not from a DLL named
+# dstorage_xs. The same layout was measured on several other titles, a later title may ask for X1 or X2,
+# whose IIDs are unknown. Format: docs/DSTORAGE_ABI.md.
+abi 1
+# Console queue description: 0x18 bytes, capacity (u16) at 8.
+queue_desc_capacity_offset 8
+
+interface factory IDStorageFactoryX
+  status other_title
+  iid {fb3b54ac-bf82-463a-b777-73195837864d} IDStorageFactoryX
+  method 3 factory.create_queue
+  method 4 factory.open_file
+  method 5 factory.create_status_array
+  method 6 factory.set_cpu_affinity SetCpuAffinity
+  method 7 factory.set_debug_flags SetDebugFlags
+  method 8 factory.set_staging_buffer_size SetStagingBufferSize
+  method 9 ?
+  method 10 ?
+end
+
+interface file IDStorageFileX
+  status other_title
+  iid {43704f9f-27c6-4a9f-8815-d16527894df4} IDStorageFileX
+  method 3 ? Close
+  method 4 ? GetHandle
+  method 5 ?
+  method 6 ?
+  method 7 ? GetId
+end
+
+interface queue IDStorageQueueX
+  status other_title
+  iid {a3f6649a-8c2c-4b3a-8b6e-10186a04b9bc} IDStorageQueueX
+  method 3 queue.enqueue_request
+  method 4 queue.enqueue_status
+  method 5 queue.enqueue_signal
+  method 6 queue.submit
+  method 7 ? CancelRequestsWithTag
+  method 8 ? Close
+  method 9 ? GetErrorEvent
+  method 10 ? RetrieveErrorRecord
+  method 11 ? Query
+  method 12 ?
+  method 13 ?
+end
+
+interface status IDStorageStatusArrayX
+  status other_title
+  iid {cd66d752-2786-44f7-9070-e2a6fdad3f1b} IDStorageStatusArrayX
+  method 3 status.is_complete
+  method 4 status.get_hresult
+  method 5 ?
+end

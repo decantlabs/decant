@@ -1,0 +1,21 @@
+[package]
+name = "decant-extract-shaders"
+description = "Finds console shader containers in files by their own headers and isolates the console GPU code of every shader."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "extract_shaders"
+path = "src/main.rs"
+
+[dependencies]
+memchr.workspace = true
+memmap2.workspace = true
+flate2.workspace = true
+
+[lints]
+workspace = true

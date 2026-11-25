@@ -1,0 +1,22 @@
+[package]
+name = "decant-repo-check"
+description = "Repository checks in Rust: tracked paths and text before review (was scripts/check_repository.py), and the third party manifest and patches (was scripts/third_party.py)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "check_repository"
+path = "src/bin/check_repository.rs"
+
+[[bin]]
+name = "third_party"
+path = "src/bin/third_party.rs"
+
+[dependencies]
+regex = "1"
+serde_json = { workspace = true, features = ["preserve_order"] }
+decant-shader-core = { path = "../decant-shader-core" }
+
+[lints]
+workspace = true

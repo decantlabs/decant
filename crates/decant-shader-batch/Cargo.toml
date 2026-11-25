@@ -1,0 +1,43 @@
+[package]
+name = "decant-shader-batch"
+description = "Rust ports of the shader batch and replay tools: decant_shader_batch.py, decant_shader_summary.py and decant_shader_one.py."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "decant_shader_batch"
+path = "src/bin/decant_shader_batch.rs"
+
+[[bin]]
+name = "decant_shader_summary"
+path = "src/bin/decant_shader_summary.rs"
+
+[[bin]]
+name = "decant_shader_one"
+path = "src/bin/decant_shader_one.rs"
+
+[[bin]]
+name = "decant_shader_cache"
+path = "src/bin/decant_shader_cache.rs"
+
+[[bin]]
+name = "decant_shader_player_cache"
+path = "src/bin/decant_shader_player_cache.rs"
+
+[dependencies]
+decant-extract-shaders.workspace = true
+decant-shader-core.workspace = true
+serde_json.workspace = true
+regex = "1.13"
+sha2 = "0.11"
+
+# The memory ceiling of `process::run_limited` (a job object per program).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,406 @@
+//! Which pool pages the GPU mirror of `d3d12_xs.dll` has to copy again. Plain safe code: the
+//! transitions answer which title view pages must change protection, the engine makes the calls.
+//!
+//! A page is `Dirty` (the mirror may be stale, every read write view is read write) or `Clean` (the
+//! mirror equals the page, every view of it whose title protection is read write is `PAGE_READONLY`
+//! so that the next write faults and is seen). Views the title made read only are never touched.
+//!
+//! A page written again and again soon after each copy (a video decoder writes every plane page once a
+//! frame) would fault once per frame. After `HOT_FAULTS` such faults in a row it is held like a page a
+//! kernel write may reach: unprotected and copied at every sync for `HOT_HOLD`, then protected again.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use crate::pages::PAGE_BYTES;
+
+/// How long a page that a kernel write may still reach (`prepare`) stays unprotected.
+pub const IO_HOLD: Duration = Duration::from_secs(2);
+/// How long a page stays open for a write that ends when a call returns (`Engine::begin_write`) at most,
+/// should the call never come back.
+pub const CALL_HOLD: Duration = Duration::from_secs(600);
+
+/// A write fault this soon after the page was made clean counts as a quick one.
+pub const HOT_WINDOW: Duration = Duration::from_millis(250);
+/// Quick faults in a row that make a page hot.
+pub const HOT_FAULTS: u8 = 3;
+/// How long a hot page stays unprotected and is copied at every sync.
+pub const HOT_HOLD: Duration = Duration::from_secs(8);
+
+/// One title view page of a pool page: its address and whether the title protection is read write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Alias {
+    addr: usize,
+    rw: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct Track {
+    /// Per pool page: the mirror equals the page and the read write views are protected.
+    clean: Vec<bool>,
+    /// Per pool page: it is in `pending`.
+    queued: Vec<bool>,
+    aliases: HashMap<u32, Vec<Alias>>,
+    held: HashMap<u32, Instant>,
+    /// When `take` last made the page clean, and the quick faults in a row since (`HOT_WINDOW`).
+    cleaned: HashMap<u32, (Instant, u8)>,
+    /// The dirty pages that have a view, waiting for `take`.
+    pending: Vec<u32>,
+    /// Per pool page: `take` saw it committed. A pool page is never decommitted, so the question is
+    /// asked once per page (a `VirtualQuery` each time took 5 to 7 s of every 200 syncs while a retail title
+    /// loads its world, most of it for held pages taken at every sync).
+    committed: Vec<bool>,
+}
+
+/// The pages of `addrs` (title view page addresses) as runs `(start, bytes)`, adjacent pages merged.
+pub fn runs(mut addrs: Vec<usize>) -> Vec<(usize, usize)> {
+    addrs.sort_unstable();
+    addrs.dedup();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for a in addrs {
+        match out.last_mut() {
+            Some((start, bytes)) if *start + *bytes == a => *bytes += PAGE_BYTES,
+            _ => out.push((a, PAGE_BYTES)),
+        }
+    }
+    out
+}
+
+impl Track {
+    /// A tracker over `pages` pool pages, none of them mapped.
+    pub fn new(pages: usize) -> Track {
+        Track { clean: vec![false; pages], queued: vec![false; pages], committed: vec![false; pages], ..Track::default() }
+    }
+
+    /// The pool grew to `pages` pages.
+    pub fn grow(&mut self, pages: usize) {
+        self.clean.resize(pages, false);
+        self.queued.resize(pages, false);
+        self.committed.resize(pages, false);
+    }
+
+    /// The addresses of the read write views of `page`.
+    fn rw(&self, page: u32) -> Vec<usize> {
+        self.aliases.get(&page).map(|v| v.iter().filter(|a| a.rw).map(|a| a.addr).collect()).unwrap_or_default()
+    }
+
+    /// Makes the page dirty and queues it when it has a view. Returns the read write views to make
+    /// read write again when it was clean.
+    fn dirty(&mut self, page: u32) -> Vec<usize> {
+        let i = page as usize;
+        let was_clean = std::mem::replace(&mut self.clean[i], false);
+        if !self.queued[i] && self.aliases.contains_key(&page) {
+            self.queued[i] = true;
+            self.pending.push(page);
+        }
+        if was_clean { self.rw(page) } else { Vec::new() }
+    }
+
+    /// The bytes of the page changed outside its views: the allocator handed it out, or the engine
+    /// wrote it through the pool.
+    pub fn on_changed(&mut self, page: u32) -> Vec<usize> {
+        self.dirty(page)
+    }
+
+    /// A view of the page appeared at `addr`, with the title protection `rw` (a new map counts as a write).
+    pub fn on_map(&mut self, page: u32, addr: usize, rw: bool) -> Vec<usize> {
+        self.aliases.entry(page).or_default().push(Alias { addr, rw });
+        self.dirty(page)
+    }
+
+    /// The view of the page at `addr` is gone.
+    pub fn on_unmap(&mut self, page: u32, addr: usize) {
+        if let Some(v) = self.aliases.get_mut(&page) {
+            v.retain(|a| a.addr != addr);
+            if v.is_empty() {
+                self.aliases.remove(&page);
+                self.held.remove(&page);
+                self.cleaned.remove(&page);
+            }
+        }
+    }
+
+    /// A write faulted on a read write view of the page at `now`. `Some(views)` when the page was clean:
+    /// those views become read write again and the page is dirty. `None` when it was dirty already (another
+    /// thread won the race, the faulting write may simply run again). The `HOT_FAULTS`th quick fault in a
+    /// row makes the page hot: held for `HOT_HOLD`.
+    pub fn on_fault(&mut self, page: u32, now: Instant) -> Option<Vec<usize>> {
+        if !self.clean[page as usize] {
+            return None;
+        }
+        if let Some((at, quick)) = self.cleaned.get_mut(&page) {
+            *quick = if now.saturating_duration_since(*at) < HOT_WINDOW { *quick + 1 } else { 0 };
+            if *quick >= HOT_FAULTS {
+                *quick = 0;
+                self.held.insert(page, now + HOT_HOLD);
+            }
+        }
+        Some(self.dirty(page))
+    }
+
+    /// Whether the page is held now (a kernel write may reach it, or it is hot).
+    pub fn is_held(&self, page: u32, now: Instant) -> bool {
+        self.held.get(&page).is_some_and(|&until| now < until)
+    }
+
+    /// A kernel write may land in the page: it is dirty, unprotected and held for `IO_HOLD`. Returns the
+    /// views to make read write again.
+    pub fn prepare(&mut self, page: u32, now: Instant) -> Vec<usize> {
+        self.prepare_until(page, now + IO_HOLD)
+    }
+
+    /// As `prepare`, held until `until` (a longer hold already there stays).
+    pub fn prepare_until(&mut self, page: u32, until: Instant) -> Vec<usize> {
+        if self.aliases.contains_key(&page) {
+            let held = self.held.entry(page).or_insert(until);
+            *held = (*held).max(until);
+        }
+        self.dirty(page)
+    }
+
+    /// The write a long hold was for ended at `now`: the page is held for `IO_HOLD` from now. That
+    /// shortens a `CALL_HOLD` (any hold that ends later than the longest other one, `HOT_HOLD`) and
+    /// keeps a hot or kernel write hold that ends later.
+    pub fn hold_from(&mut self, page: u32, now: Instant) {
+        if let Some(until) = self.held.get_mut(&page) {
+            let end = now + IO_HOLD;
+            if *until > now + HOT_HOLD.max(IO_HOLD) || *until < end {
+                *until = end;
+            }
+        }
+    }
+
+    /// The dirty pages waiting for `take`.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether the page has a view with a read write title protection.
+    pub fn writable(&self, page: u32) -> bool {
+        self.aliases.get(&page).is_some_and(|v| v.iter().any(|a| a.rw))
+    }
+
+    /// The dirty pages with a view, at most `cap`, for the caller to copy. Each page that is not held is
+    /// marked clean and its read write views are returned to be protected, before the caller copies. A
+    /// page without a view stays dirty and unprotected, and is dropped from the queue until a view appears.
+    /// A page for which `committed` is false was never touched: it holds zeros as its mirror does, so it is
+    /// clean without a copy and without protection (it cannot be protected), and its first access, which
+    /// commits it, makes it dirty (`on_fault`).
+    pub fn take(&mut self, now: Instant, cap: usize, committed: impl Fn(u32) -> bool) -> (Vec<u32>, Vec<usize>) {
+        let mut taken = Vec::new();
+        let mut protect = Vec::new();
+        let pending = std::mem::take(&mut self.pending);
+        let mut keep = Vec::new();
+        for page in pending {
+            let i = page as usize;
+            if taken.len() >= cap {
+                keep.push(page);
+            } else if !self.aliases.contains_key(&page) {
+                self.queued[i] = false;
+            } else if !self.committed[i] && !committed(page) {
+                self.clean[i] = true;
+                self.queued[i] = false;
+            } else if self.held.get(&page).is_some_and(|&until| now < until) {
+                self.committed[i] = true;
+                taken.push(page);
+                keep.push(page);
+            } else {
+                self.committed[i] = true;
+                self.held.remove(&page);
+                protect.extend(self.rw(page));
+                let quick = self.cleaned.get(&page).map_or(0, |&(_, q)| q);
+                self.cleaned.insert(page, (now, quick));
+                self.clean[i] = true;
+                self.queued[i] = false;
+                taken.push(page);
+            }
+        }
+        self.pending = keep;
+        (taken, protect)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const P: usize = PAGE_BYTES;
+
+    fn track() -> Track {
+        Track::new(16)
+    }
+
+    fn all(_: u32) -> bool {
+        true
+    }
+
+    #[test]
+    fn a_page_seen_committed_is_not_asked_about_again() {
+        let mut t = track();
+        t.on_map(3, 0x10_0000, true);
+        let asked = std::cell::Cell::new(0);
+        let committed = |_: u32| {
+            asked.set(asked.get() + 1);
+            true
+        };
+        assert_eq!(t.take(Instant::now(), 16, committed).0, [3]);
+        t.on_changed(3);
+        assert_eq!(t.take(Instant::now(), 16, committed).0, [3]);
+        assert_eq!(asked.get(), 1, "the second take knows the page is committed");
+    }
+
+    #[test]
+    fn a_new_map_is_dirty_and_taken_once() {
+        let mut t = track();
+        t.on_changed(3);
+        t.on_map(3, 0x10_0000, true);
+        let now = Instant::now();
+        let (pages, protect) = t.take(now, 100, all);
+        assert_eq!(pages, [3]);
+        assert_eq!(protect, [0x10_0000], "the read write view is protected");
+        assert_eq!(t.take(now, 100, all), (vec![], vec![]), "clean pages are not returned again");
+    }
+
+    #[test]
+    fn every_read_write_alias_is_protected_and_a_fault_on_one_unprotects_all() {
+        let mut t = track();
+        t.on_map(2, 0x10_0000, true);
+        t.on_map(2, 0x20_0000, true);
+        t.on_map(2, 0x30_0000, false);
+        let (_, mut protect) = t.take(Instant::now(), 10, all);
+        protect.sort_unstable();
+        assert_eq!(protect, [0x10_0000, 0x20_0000], "the read only view is never touched");
+        let mut open = t.on_fault(2, Instant::now()).unwrap();
+        open.sort_unstable();
+        assert_eq!(open, [0x10_0000, 0x20_0000]);
+        assert_eq!(t.on_fault(2, Instant::now()), None, "a second fault on a dirty page has nothing to do");
+        assert_eq!(t.take(Instant::now(), 10, all).0, [2], "the page is back in the dirty list");
+    }
+
+    #[test]
+    fn a_new_alias_of_a_clean_page_opens_the_others() {
+        let mut t = track();
+        t.on_map(1, 0x10_0000, true);
+        t.take(Instant::now(), 10, all);
+        let mut open = t.on_map(1, 0x20_0000, true);
+        open.sort_unstable();
+        assert_eq!(open, [0x10_0000, 0x20_0000]);
+        assert_eq!(t.take(Instant::now(), 10, all).0, [1]);
+    }
+
+    #[test]
+    fn a_page_without_a_view_stays_dirty_and_is_taken_after_its_map() {
+        let mut t = track();
+        assert!(t.on_changed(4).is_empty());
+        assert_eq!(t.take(Instant::now(), 10, all), (vec![], vec![]));
+        t.on_map(4, 0x10_0000, true);
+        assert_eq!(t.take(Instant::now(), 10, all).0, [4]);
+        t.on_unmap(4, 0x10_0000);
+        t.on_changed(4);
+        assert_eq!(t.take(Instant::now(), 10, all).0, Vec::<u32>::new(), "no view left");
+        assert!(!t.writable(4));
+    }
+
+    #[test]
+    fn a_held_page_is_returned_each_time_and_protected_only_after_the_hold() {
+        let mut t = track();
+        t.on_map(5, 0x10_0000, true);
+        let now = Instant::now();
+        t.take(now, 10, all);
+        assert_eq!(t.prepare(5, now), [0x10_0000], "the clean page is opened");
+        let (pages, protect) = t.take(now, 10, all);
+        assert_eq!((pages, protect), (vec![5], vec![]));
+        assert_eq!(t.take(now + Duration::from_secs(1), 10, all), (vec![5], vec![]), "still held");
+        let (pages, protect) = t.take(now + IO_HOLD, 10, all);
+        assert_eq!((pages, protect), (vec![5], vec![0x10_0000]), "the hold ended, the page is protected again");
+        assert_eq!(t.take(now + IO_HOLD, 10, all).0, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn the_cap_leaves_the_rest_for_the_next_call_and_growth_keeps_states() {
+        let mut t = track();
+        for p in 0..4u32 {
+            t.on_map(p, 0x10_0000 + p as usize * P, true);
+        }
+        let now = Instant::now();
+        assert_eq!(t.take(now, 3, all).0, [0, 1, 2]);
+        t.grow(64);
+        t.on_map(40, 0x90_0000, true);
+        assert_eq!(t.take(now, 3, all).0, [3, 40]);
+        assert_eq!(t.on_fault(0, Instant::now()).map(|v| v.len()), Some(1), "page 0 kept its clean state over the growth");
+    }
+
+    #[test]
+    fn a_page_never_committed_is_clean_without_a_copy_until_its_first_access() {
+        let mut t = track();
+        t.on_map(6, 0x10_0000, true);
+        t.on_map(7, 0x20_0000, true);
+        let now = Instant::now();
+        let (pages, protect) = t.take(now, 10, |page| page == 7);
+        assert_eq!((pages, protect), (vec![7], vec![0x20_0000]), "the untouched page is neither copied nor protected");
+        assert_eq!(t.take(now, 10, all).0, Vec::<u32>::new(), "and not queued again");
+        assert_eq!(t.on_fault(6, Instant::now()), Some(vec![0x10_0000]), "its first access makes it dirty");
+        assert_eq!(t.take(now, 10, all).0, [6]);
+    }
+
+    #[test]
+    fn a_page_written_soon_after_each_copy_becomes_hot_and_stays_open_for_the_hold() {
+        let mut t = track();
+        t.on_map(8, 0x10_0000, true);
+        t.on_map(8, 0x20_0000, true);
+        let mut now = Instant::now();
+        t.take(now, 10, all);
+        for round in 1..HOT_FAULTS {
+            now += Duration::from_millis(30);
+            assert!(t.on_fault(8, now).is_some());
+            let (pages, protect) = t.take(now, 10, all);
+            assert_eq!((pages, protect.len()), (vec![8], 2), "quick fault {round}: copied and protected again");
+        }
+        now += Duration::from_millis(30);
+        assert!(t.on_fault(8, now).is_some());
+        assert!(t.is_held(8, now), "the third quick fault in a row makes it hot");
+        for _ in 0..3 {
+            now += Duration::from_millis(30);
+            assert_eq!(t.take(now, 10, all), (vec![8], vec![]), "a hot page is copied at every sync and stays writable");
+        }
+        let (pages, protect) = t.take(now + HOT_HOLD, 10, all);
+        assert_eq!((pages, protect.len()), (vec![8], 2), "after the hold it is protected again");
+    }
+
+    #[test]
+    fn a_slow_fault_does_not_count_towards_hot() {
+        let mut t = track();
+        t.on_map(9, 0x10_0000, true);
+        let mut now = Instant::now();
+        t.take(now, 10, all);
+        for _ in 0..10 {
+            now += HOT_WINDOW + Duration::from_millis(1);
+            assert!(t.on_fault(9, now).is_some());
+            assert!(!t.is_held(9, now), "a page written now and then stays tracked by faults");
+            t.take(now, 10, all);
+        }
+    }
+
+    #[test]
+    fn a_page_of_a_blocking_read_stays_open_until_the_read_returns() {
+        let mut t = track();
+        let now = Instant::now();
+        t.on_map(5, 0x10_0000, true);
+        t.take(now, 10, all);
+        assert_eq!(t.prepare_until(5, now + CALL_HOLD), [0x10_0000], "the clean page is opened");
+        let late = now + IO_HOLD * 5;
+        assert_eq!(t.take(late, 10, all), (vec![5], vec![]), "a read longer than IO_HOLD keeps it open and copied");
+        t.hold_from(5, late);
+        assert_eq!(t.take(late + IO_HOLD / 2, 10, all), (vec![5], vec![]), "held for IO_HOLD after the read");
+        assert_eq!(t.take(late + IO_HOLD, 10, all), (vec![5], vec![0x10_0000]), "then copied once more and protected");
+        t.prepare(5, late);
+        t.hold_from(5, late);
+        assert!(t.is_held(5, late + IO_HOLD / 2), "a short hold is not cut by the end of another read");
+    }
+
+    #[test]
+    fn runs_merge_adjacent_pages() {
+        assert_eq!(runs(vec![0x30_0000, 0x10_0000, 0x10_0000 + P, 0x10_0000]), [(0x10_0000, 2 * P), (0x30_0000, P)]);
+        assert!(runs(vec![]).is_empty());
+    }
+}

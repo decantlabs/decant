@@ -1,0 +1,91 @@
+# Console DirectStorage ABI spec for a retail Scarlett title.
+#
+# MEASURED on the title executable (audit_xbox_imports --dstorage-probe, then disassembled and run offline):
+#   - one import from XCRDAPI.dll, DStorageGetFactory, and one call site, in a function local static
+#     initializer;
+#   - the IID it passes is {62959d11-d45f-4884-a0a3-f7862ea243ae}, the out pointer is a global. The
+#     factory IID is not the base IID of another title measured earlier (see other_title.abi);
+#   - it needs out != null and S_OK, then calls factory vtable byte offset 0x40 (slot 8) with the single
+#     argument 0x2000000 (32 MiB) and traps on a negative HRESULT;
+#   - the executable also carries the other title's IIDs for IDStorageFileX and IDStorageStatusArrayX, so
+#     those two interfaces are the same on both titles. The other title's IDStorageQueueX IID is not in
+#     the executable.
+#   - QUEUE CREATION, disassembled: it loads the factory from the same global, calls factory vtable byte
+#     offset 0x50 (slot 10) as (factory, desc, riid, out), riid = {3c02cb0c-c050-4195-99a1-a1ce94ba33c5},
+#     out = a field of the title's own queue object, and traps on a negative HRESULT. The 0x20-byte
+#     description is built on the stack: +0 u64 source type (0 or 1), +8 u16 capacity, +0xa i8 priority
+#     (0 to 2), +0x10 pointer to a name string, +0x18 u64 constant 1, the bytes between are not written.
+#     This matches the other title's 0x18-byte layout with one extra u64 at +0x18 (CreateQueue1).
+#     Capacity at +8 is also measured by an independent Linux run, which also saw +0x18 equal to 1 and
+#     that mapping slot 10 to CreateQueue lets the title go past DirectStorage.
+#   - the queue object (IID above) is then used through: slot 3 (byte offset 0x18) with one argument, a
+#     0x38 byte request built on the stack (+0 flags, +8 u64, +0x20 file object, +0x28 offset, so the
+#     console request layout of DecantConsoleRead, source file at 32) and slot 8 (byte offset 0x40) with no
+#     argument, result ignored, in the title's queue teardown. Slot 3 is therefore EnqueueRequest and
+#     slot 8 is Close as on the other title. Other queue slots were not found called near the creation code.
+#   - the same title code calls factory slot 4 (byte offset 0x20) as (factory, path, riid, out) with a
+#     file IID: OpenFile, as on the other title.
+#   - slot 9 of the factory is not called anywhere near these functions, what it is stays unknown.
+#
+# HYPOTHESIS (not measured on this title):
+#   - slot 8 is SetStagingBufferSize(UINT32 sizeBytes): that is slot 8 on the other title's console
+#     XCRDAPI.dll and the argument is a 32 MiB size. Accepted and logged, nothing to size in this engine;
+#   - the label IDStorageFactoryX for this IID is a guess: it may be the X1 or X2 revision, whose
+#     slots 3 to 8 we assume equal to the other title's;
+#   - slots 3 to 7 follow the other title, since this one is not seen using them yet;
+#   - slot 10 reads only the capacity at +8, the engine ignores source type, priority, name and the +0x18
+#     constant (their meaning, for example that 1 means a second revision flag, is not confirmed);
+#   - slot 9 stays "?" (logged, E_NOTIMPL);
+#   - the queue slots 4 to 7 and 9 to 13 follow the other title's console order (other_title.abi) and are
+#     not seen used by this title yet. Slot 3 and slot 8 are measured, see above.
+# Format: docs/DSTORAGE_ABI.md. Order and counts are in console_hypothesis.abi and other_title.abi.
+abi 1
+# Console queue description: capacity (u16) at 8. the title passes 0x20 bytes, measured: capacity at +8.
+queue_desc_capacity_offset 8
+
+interface factory IDStorageFactoryX
+  status title_measured_iid
+  iid {62959d11-d45f-4884-a0a3-f7862ea243ae} IDStorageFactoryX_title
+  method 3 factory.create_queue CreateQueue
+  method 4 factory.open_file OpenFile
+  method 5 factory.create_status_array CreateStatusArray
+  method 6 factory.set_cpu_affinity SetCpuAffinity
+  method 7 factory.set_debug_flags SetDebugFlags
+  method 8 factory.set_staging_buffer_size SetStagingBufferSize
+  method 9 ?
+  method 10 factory.create_queue CreateQueue1
+end
+
+interface file IDStorageFileX
+  status other_title_iid_present_in_exe
+  iid {43704f9f-27c6-4a9f-8815-d16527894df4} IDStorageFileX
+  method 3 ? Close
+  method 4 ? GetHandle
+  method 5 ?
+  method 6 ?
+  method 7 ? GetId
+end
+
+interface queue IDStorageQueueX
+  status title_measured_iid
+  iid {3c02cb0c-c050-4195-99a1-a1ce94ba33c5} IDStorageQueueX_title
+  method 3 queue.enqueue_request EnqueueRequest
+  method 4 queue.enqueue_status EnqueueStatus
+  method 5 queue.enqueue_signal EnqueueSignal
+  method 6 queue.submit Submit
+  method 7 ? CancelRequestsWithTag
+  method 8 ? Close
+  method 9 ? GetErrorEvent
+  method 10 ? RetrieveErrorRecord
+  method 11 ? Query
+  method 12 queue.enqueue_set_event EnqueueSetEvent
+  method 13 ? Query1
+end
+
+interface status IDStorageStatusArrayX
+  status other_title_iid_present_in_exe
+  iid {cd66d752-2786-44f7-9070-e2a6fdad3f1b} IDStorageStatusArrayX
+  method 3 status.is_complete IsComplete
+  method 4 status.get_hresult GetHResult
+  method 5 ?
+end

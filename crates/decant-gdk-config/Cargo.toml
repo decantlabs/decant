@@ -1,0 +1,13 @@
+[package]
+name = "decant-gdk-config"
+description = "Rust port of the former src/gdk/gdk_config_reader.cpp: reads MicrosoftGame.config and checks the PE headers of a staged title executable."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gdk_config_reader"
+path = "src/main.rs"
+
+[lints]
+workspace = true
