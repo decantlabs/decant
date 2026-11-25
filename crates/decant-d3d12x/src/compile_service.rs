@@ -27,6 +27,13 @@
 //! the default `-O3`. Both store under the same stage key, so an offline `-O3` blob is taken first.
 //! A live service also refuses a stage above its HLSL limit that has no DXIL yet, with its size in
 //! the log, instead of holding a worker for many minutes.
+//!
+//! The stages of one pipeline compile one after the other on its worker, except on a machine with
+//! cores to spare: [`Service::set_stage_slots`] (by default a quarter of the cores) lets a worker
+//! compile the other stages of a graphics or mesh pipeline on short lived helper threads, so the
+//! vertex and the pixel stage of a cold pipeline overlap. A helper only starts when a slot is free,
+//! else the worker compiles that stage itself, so the slots bound the extra threads of the whole
+//! service.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -220,6 +227,8 @@ struct Shared {
     live_limit: AtomicUsize,
     /// The last summary line logged.
     last_summary: Mutex<String>,
+    /// Helper threads that may compile stages beside the workers, free now.
+    stage_slots: AtomicUsize,
 }
 
 /// The HLSL of every stage of a queued pipeline and its stage keys, made on a precompile worker.
@@ -285,6 +294,7 @@ impl Service {
             live: AtomicBool::new(false),
             live_limit: AtomicUsize::new(usize::MAX),
             last_summary: Mutex::new(String::new()),
+            stage_slots: AtomicUsize::new(std::thread::available_parallelism().map_or(1, |cores| cores.get() / 4)),
         });
         let rx = Arc::new(Mutex::new(rx));
         for i in 0..settings.threads.max(1) {
@@ -308,6 +318,12 @@ impl Service {
     pub fn set_live(&self, max_hlsl_bytes: usize) {
         self.shared.live_limit.store(max_hlsl_bytes, Ordering::Relaxed);
         self.shared.live.store(true, Ordering::Relaxed);
+    }
+
+    /// Sets how many helper threads may compile stages beside the workers, `0` for none. Slots in
+    /// use keep running, the new number applies to the stages that start after.
+    pub fn set_stage_slots(&self, slots: usize) {
+        self.shared.stage_slots.store(slots, Ordering::Relaxed);
     }
 
     /// The state of the pipeline the caller knows as `id` (its address). `build` gives its input
@@ -717,7 +733,8 @@ impl Shared {
                 ));
             }
         }
-        let result = stages.iter().zip(keys).zip(&pipeline.stages).map(|((stage, key), input)| {
+        let parts: Vec<_> = stages.iter().zip(keys).zip(&pipeline.stages).collect();
+        let result = self.map_stages(&parts, |&((stage, key), input)| {
             let cell = self.stages.lock().unwrap_or_else(|e| e.into_inner()).entry(*key).or_default().clone();
             let mut fresh = false;
             let result = cell.get_or_init(|| {
@@ -731,7 +748,7 @@ impl Shared {
                 let first = msg.lines().next().unwrap_or("");
                 Refusal::new("dxc error", format!("{} {key:032x}: {first}", input.kind.short()))
             })
-        }).collect::<Result<Vec<_>, _>>();
+        }).into_iter().collect::<Result<Vec<_>, _>>();
         // With a disk cache the files keep the results. Leave cells still in use to their owners.
         if self.cache.is_some() {
             let mut map = self.stages.lock().unwrap_or_else(|e| e.into_inner());
@@ -751,6 +768,52 @@ impl Shared {
             (self.log)(&format!("direct shaders: pipeline {pipeline_key:032x} ready in {} ms ({})", started.elapsed().as_millis(), self.counters.summary()));
         }
         Poll::Ready(out)
+    }
+
+    /// Takes one helper thread slot, `false` when none is free.
+    fn take_stage_slot(&self) -> bool {
+        self.stage_slots.try_update(Ordering::AcqRel, Ordering::Acquire, |free| free.checked_sub(1)).is_ok()
+    }
+
+    /// Runs `work` for every item and gives the answers in the order of the items. The first item
+    /// and every item that finds no free slot run on the calling worker, the others on helper
+    /// threads that give their slot back when they end.
+    fn map_stages<T: Sync, R: Send>(&self, items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+        let mut answers: Vec<Option<R>> = Vec::new();
+        answers.resize_with(items.len(), || None);
+        std::thread::scope(|scope| {
+            let mut helpers = Vec::new();
+            for (at, item) in items.iter().enumerate().skip(1) {
+                if !self.take_stage_slot() {
+                    continue;
+                }
+                let work = &work;
+                let spawned = std::thread::Builder::new().name("decant-direct-stage".into()).stack_size(32 << 20).spawn_scoped(scope, move || {
+                    let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(item)));
+                    self.stage_slots.fetch_add(1, Ordering::AcqRel);
+                    answer
+                });
+                match spawned {
+                    Ok(handle) => helpers.push((at, handle)),
+                    Err(_) => {
+                        self.stage_slots.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+            }
+            let handled: Vec<usize> = helpers.iter().map(|(at, _)| *at).collect();
+            for (at, item) in items.iter().enumerate() {
+                if !handled.contains(&at) {
+                    answers[at] = Some(work(item));
+                }
+            }
+            for (at, handle) in helpers.drain(..) {
+                match handle.join() {
+                    Ok(Ok(answer)) => answers[at] = Some(answer),
+                    Ok(Err(panic)) | Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+        });
+        answers.into_iter().flatten().collect()
     }
 
     /// The DXIL of one stage: from disk when another run compiled it, else compiled and stored.
@@ -1227,5 +1290,107 @@ pub(crate) mod tests {
         let third = pipeline(&[(StageKind::Vertex, b"a vs, other tail"), (StageKind::Pixel, b"p ps, other tail")]);
         assert!(matches!(poll_until_final(&service, 3, &third), Poll::Ready(_)));
         assert_eq!(compiler.calls.load(Ordering::SeqCst), 4);
+    }
+
+    /// A compiler that counts the compiles running at once. With `meet` each compile waits up to
+    /// 2 seconds for another one to run beside it, else it takes 40 ms. HLSL with `PANIC` panics.
+    #[derive(Default)]
+    struct OverlapCompiler {
+        meet: bool,
+        running: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl Compiler for OverlapCompiler {
+        fn version(&self) -> String {
+            "overlap 1".to_string()
+        }
+
+        fn compile(&self, hlsl: &str, _entry: &str, profile: &str, _args: &[String]) -> Result<Vec<u8>, String> {
+            assert!(!hlsl.contains("PANIC"), "compiler panic for the test");
+            self.peak.fetch_max(self.running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            if self.meet {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while self.running.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            Ok([b"DXBC".as_slice(), profile.as_bytes()].concat())
+        }
+    }
+
+    fn graphics() -> Pipeline {
+        pipeline(&[(StageKind::Vertex, b"vs overlap"), (StageKind::Pixel, b"ps overlap")])
+    }
+
+    #[test]
+    fn the_stages_of_one_pipeline_compile_side_by_side_when_a_slot_is_free() {
+        let compiler = Arc::new(OverlapCompiler { meet: true, ..Default::default() });
+        let service = Service::new(Arc::new(FixedSource::simple()), compiler.clone(), Settings::quiet(1));
+        service.set_stage_slots(1);
+        let graphics = graphics();
+        match poll_until_final(&service, 1, &graphics) {
+            Poll::Ready(dxil) => assert_eq!(dxil.iter().map(|d| d.to_vec()).collect::<Vec<_>>(), [b"DXBCvs_6_0".to_vec(), b"DXBCps_6_0".to_vec()], "the order of the stages is kept"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(compiler.peak.load(Ordering::SeqCst), 2, "the vertex and pixel stage ran together");
+        assert_eq!(service.shared.stage_slots.load(Ordering::SeqCst), 1, "the slot came back");
+        assert_eq!(service.counters().compiled.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn without_a_free_slot_one_worker_compiles_its_stages_one_after_the_other() {
+        let compiler = Arc::new(OverlapCompiler::default());
+        let service = Service::new(Arc::new(FixedSource::simple()), compiler.clone(), Settings::quiet(1));
+        service.set_stage_slots(0);
+        assert!(matches!(poll_until_final(&service, 1, &graphics()), Poll::Ready(_)));
+        assert_eq!(compiler.peak.load(Ordering::SeqCst), 1);
+        assert_eq!(service.shared.stage_slots.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_slots_bound_the_helpers_of_the_whole_service() {
+        // Two workers with two pipelines of two stages each and one slot: at most 3 compiles at once.
+        let compiler = Arc::new(OverlapCompiler::default());
+        let service = Service::new(Arc::new(FixedSource::simple()), compiler.clone(), Settings::quiet(2));
+        service.set_stage_slots(1);
+        let first = pipeline(&[(StageKind::Vertex, b"vs one"), (StageKind::Pixel, b"ps one")]);
+        let second = pipeline(&[(StageKind::Vertex, b"vs two"), (StageKind::Pixel, b"ps two")]);
+        assert_eq!(service.poll(1, || Ok(first.clone())), Poll::Pending);
+        assert_eq!(service.poll(2, || Ok(second.clone())), Poll::Pending);
+        assert!(service.wait_idle(Duration::from_secs(10)));
+        assert!(compiler.peak.load(Ordering::SeqCst) <= 3, "peak {}", compiler.peak.load(Ordering::SeqCst));
+        assert!(matches!(service.poll(1, || panic!("built once")), Poll::Ready(_)));
+        assert!(matches!(service.poll(2, || panic!("built once")), Poll::Ready(_)));
+        assert_eq!(service.shared.stage_slots.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_failing_or_panicking_helper_gives_a_refusal_and_its_slot_back() {
+        let mut source = FixedSource::simple();
+        source.stages.push((StageKind::Geometry, StageHlsl { hlsl: "PANIC".into(), entry: "main".into(), profile: "gs_6_0".into(), args: Vec::new() }));
+        let service = Service::new(Arc::new(source), Arc::new(OverlapCompiler::default()), Settings::quiet(1));
+        service.set_stage_slots(1);
+        let panicking = pipeline(&[(StageKind::Vertex, b"vs first"), (StageKind::Geometry, b"gs second")]);
+        let answer = poll_until_final(&service, 1, &panicking);
+        assert!(matches!(&answer, Poll::Refused(reason) if reason.starts_with("translator panic")), "{answer:?}");
+        assert_eq!(service.shared.stage_slots.load(Ordering::SeqCst), 1, "the slot came back after the panic");
+        // The worker lives on and compiles the next pipeline.
+        assert!(matches!(poll_until_final(&service, 2, &graphics()), Poll::Ready(_)));
+    }
+
+    #[test]
+    fn a_dxc_error_in_a_helper_stage_refuses_the_pipeline_like_before() {
+        let mut source = FixedSource::simple();
+        source.stages.push((StageKind::Geometry, StageHlsl { hlsl: "FAIL".into(), entry: "main".into(), profile: "gs_6_0".into(), args: Vec::new() }));
+        let service = Service::new(Arc::new(source), Arc::new(FakeCompiler::default()), Settings::quiet(1));
+        service.set_stage_slots(1);
+        let failing = pipeline(&[(StageKind::Vertex, b"vs first"), (StageKind::Geometry, b"gs second")]);
+        assert!(matches!(poll_until_final(&service, 1, &failing), Poll::Refused(r) if r.starts_with("dxc error (gs ")));
+        assert_eq!(service.counters().dxc_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(service.shared.stage_slots.load(Ordering::SeqCst), 1);
     }
 }
