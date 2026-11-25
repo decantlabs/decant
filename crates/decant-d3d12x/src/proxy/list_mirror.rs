@@ -764,6 +764,9 @@ macro_rules! root_signature_method {
             if window_service::active() {
                 window_service::note_signature(this as usize, $bind, signature as usize);
             }
+            if $bind == Bind::Compute {
+                crate::indirect_clamp::note_compute_rs(this as usize, signature as usize);
+            }
             // SAFETY: `this` is a live list proxy; the PC slot takes the root signature.
             unsafe {
                 let pc = (*this).pc;
@@ -786,6 +789,9 @@ macro_rules! root_table_method {
             if user_mirror::active() {
                 user_mirror::with_shadow(this as usize, |s| s.set_table($bind, index, handle));
             }
+            if $bind == Bind::Compute {
+                crate::indirect_clamp::note_compute_table(this as usize, index, handle);
+            }
             // SAFETY: `this` is a live list proxy; the PC slot takes (index, handle).
             unsafe {
                 let pc = (*this).pc;
@@ -804,6 +810,9 @@ macro_rules! root_constant_method {
         pub(super) extern "system" fn $name(this: *mut Proxy, index: u32, value: u32, offset: u32) {
             if user_mirror::active() {
                 user_mirror::with_shadow(this as usize, |s| s.set_constants($bind, index, offset, &[value]));
+            }
+            if $bind == Bind::Compute {
+                crate::indirect_clamp::note_compute_constants(this as usize, index, offset, &[value]);
             }
             // SAFETY: `this` is a live list proxy; the PC slot takes (index, value, offset).
             unsafe {
@@ -825,10 +834,15 @@ const MAX_CONSTANTS: u32 = 64;
 macro_rules! root_constants_method {
     ($name:ident, $pc:literal, $bind:expr) => {
         pub(super) extern "system" fn $name(this: *mut Proxy, index: u32, count: u32, data: *const u32, offset: u32) {
-            if user_mirror::active() && !data.is_null() && count <= MAX_CONSTANTS {
+            if (user_mirror::active() || ($bind == Bind::Compute && crate::indirect_clamp::enabled())) && !data.is_null() && count <= MAX_CONSTANTS {
                 // SAFETY: the caller passes `count` readable dwords.
                 let values: Vec<u32> = (0..count as usize).map(|i| unsafe { data.add(i).read_unaligned() }).collect();
-                user_mirror::with_shadow(this as usize, |s| s.set_constants($bind, index, offset, &values));
+                if user_mirror::active() {
+                    user_mirror::with_shadow(this as usize, |s| s.set_constants($bind, index, offset, &values));
+                }
+                if $bind == Bind::Compute {
+                    crate::indirect_clamp::note_compute_constants(this as usize, index, offset, &values);
+                }
             }
             // SAFETY: `this` is a live list proxy; the PC slot takes (index, count, data, offset).
             unsafe {

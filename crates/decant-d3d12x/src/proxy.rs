@@ -457,6 +457,7 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
             crate::cbv_copies::forget(this as usize);
             crate::flicker_probe::forget(this as usize);
             crate::uav_barrier_merge::reset(this as usize);
+            crate::indirect_clamp::list_forget(this as usize);
             crate::present::list_reset(proxy.pc as usize);
         }
         if proxy.kind == Kind::Resource as i32 {
@@ -841,6 +842,7 @@ unsafe fn create_list(this: *mut Proxy, mask: u32, kind: u32, alloc: Object, pso
         let hr = give(hr, l, kind, out);
         if hr >= 0 && !(*out).is_null() {
             crate::upload_mem::with(|m| m.set_allocator(*out as usize, alloc as usize));
+            crate::indirect_clamp::list_reset(*out as usize, pso as usize);
         }
         hr
     }
@@ -3078,36 +3080,28 @@ extern "system" fn dev_create_placed_resource(this: *mut Proxy, heap: Object, of
     }
 }
 
-/// The `D3D12_INDIRECT_ARGUMENT_TYPE` of the console only `DispatchX` argument, which has no PC
-/// equivalent.
-const INDIRECT_ARGUMENT_DISPATCH_X: u32 = 105;
-
-/// The PC `D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH` that a `DispatchX` argument is made.
-const PC_INDIRECT_ARGUMENT_DISPATCH: u32 = 2;
-
-/// Console slot 41: CreateCommandSignature. The console only `DispatchX` indirect argument type
-/// (105) is rewritten in the title's description to the PC `Dispatch` type (2), then the PC call
-/// is made with the root signature unwrapped.
+/// Console slot 41: CreateCommandSignature, translating console `DispatchX` (105) to PC
+/// `Dispatch` (2), forwarding `root_sig` only when root-modifying args exist, and registering
+/// single-action signatures for `indirect_clamp`.
 extern "system" fn dev_create_command_signature(this: *mut Proxy, desc: *const u8, root_sig: Object, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
-    if out.is_null() {
+    if out.is_null() || desc.is_null() {
         return E_POINTER;
     }
-    // SAFETY: `this` is a live proxy; `desc` is {NumArgumentDescs: u32, ArgumentDescs: *const
-    // ArgDesc, ByteStride: u32} by the console calling convention, each ArgDesc at least 4 bytes.
+    // SAFETY: `this` is a live proxy; `desc` is a readable 24-byte D3D12_COMMAND_SIGNATURE_DESC.
     unsafe {
         let pc = (*this).pc;
-        let count = std::ptr::read_unaligned::<u32>(desc.cast()) as usize;
-        let first: *mut u8 = std::ptr::read_unaligned(desc.add(8).cast());
-        let step = std::ptr::read_unaligned::<u32>(desc.add(16).cast()) as usize;
-        for index in 0..count {
-            let type_field = first.add(index * step).cast::<u32>();
-            if std::ptr::read_unaligned(type_field) == INDIRECT_ARGUMENT_DISPATCH_X {
-                std::ptr::write_unaligned(type_field, PC_INDIRECT_ARGUMENT_DISPATCH);
+        let translated = crate::indirect_clamp::translate_command_signature_desc(desc);
+        let root_sig = if translated.needs_root { unwrap(root_sig) } else { std::ptr::null_mut() };
+        let mut r: Object = std::ptr::null_mut();
+        let hr = method::<CreateCommandSignature>(pc, 41)(pc, translated.desc.as_ptr().cast(), root_sig, riid, &mut r);
+        if hr >= 0 {
+            if let Some(spec) = translated.spec {
+                crate::indirect_clamp::register_signature(r as usize, spec);
             }
+            *out = r;
+        } else {
+            *out = std::ptr::null_mut();
         }
-        let mut made: Object = std::ptr::null_mut();
-        let hr = method::<CreateCommandSignature>(pc, 41)(pc, desc.cast(), unwrap(root_sig), riid, &mut made);
-        *out = if hr >= 0 { made } else { std::ptr::null_mut() };
         hr
     }
 }
@@ -3701,6 +3695,7 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
         crate::detile::list_reset(pc as usize);
         crate::present::list_reset(pc as usize);
         let pso = bound_at_reset(this, pso);
+        crate::indirect_clamp::list_reset(key, pso as usize);
         crate::rt_diag::list_reset(key, pso as usize);
         let allocator = unwrap(allocator);
         crate::upload_mem::with(|m| m.set_allocator(key, allocator as usize));
@@ -4579,6 +4574,7 @@ extern "system" fn list_set_pipeline_state(this: *mut Proxy, pso: Object) {
         };
         crate::rt_diag::pipeline_set(this as usize, pso as usize);
         crate::kind_check::bound(this as usize, pso as usize);
+        crate::indirect_clamp::note_pso(this as usize, pso as usize);
         method::<unsafe extern "system" fn(Object, Object)>(pc, 25)(pc, pso);
     }
 }
@@ -4641,26 +4637,49 @@ extern "system" fn list_execute_indirect(this: *mut Proxy, sig: Object, max: u32
         if crate::pso_diag::skip(this as usize) {
             return;
         }
+        let pc_sig = unwrap(sig);
+        let pc_arg = unwrap(arg);
+        let pc_count = unwrap(count);
+        // Clamp BEFORE `list_mirror::prepare` so restoring the title's compute state does not
+        // clobber mirror/window-service root bindings prepared for this call.
+        let clamped = crate::indirect_clamp::try_clamp(this as usize, pc, pc_sig, max, pc_arg, arg_off, pc_count, count_off);
         list_mirror::prepare(this, crate::user_mirror::Bind::Graphics);
         list_mirror::prepare(this, crate::user_mirror::Bind::Compute);
         crate::rt_diag::count(&crate::rt_diag::INDIRECT);
         crate::uav_barrier_merge::mark_pending(this as usize);
-        let pc_arg = unwrap(arg);
-        let pc_count = unwrap(count);
         type GetListType = unsafe extern "system" fn(Object) -> u32;
         const D3D12_COMMAND_LIST_TYPE_BUNDLE: u32 = 1;
         let record_barriers = method::<GetListType>(pc, 8)(pc) != D3D12_COMMAND_LIST_TYPE_BUNDLE;
-        let (before, after) = if record_barriers {
-            indirect_argument_barriers(pc_arg as u64, needs_indirect_barrier(pc_arg), pc_count as u64, needs_indirect_barrier(pc_count))
+        if let Some(call) = clamped {
+            // The clamp shader already left the scratch buffer in INDIRECT_ARGUMENT state, so
+            // only the count buffer (passed through unclamped) may still need its barrier.
+            let (before, after) = if record_barriers {
+                indirect_argument_barriers(0, false, pc_count as u64, needs_indirect_barrier(pc_count))
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            if !before.is_empty() {
+                method::<Barriers>(pc, 26)(pc, before.len() as u32, before.as_ptr().cast());
+            }
+            let scratch_raw = windows::core::Interface::as_raw(&call.scratch);
+            method::<ExecuteIndirect>(pc, 59)(pc, pc_sig, max, scratch_raw, 0, pc_count, count_off);
+            if !after.is_empty() {
+                method::<Barriers>(pc, 26)(pc, after.len() as u32, after.as_ptr().cast());
+            }
+            crate::indirect_clamp::finish_clamp(pc, call);
         } else {
-            (Vec::new(), Vec::new())
-        };
-        if !before.is_empty() {
-            method::<Barriers>(pc, 26)(pc, before.len() as u32, before.as_ptr().cast());
-        }
-        method::<ExecuteIndirect>(pc, 59)(pc, unwrap(sig), max, pc_arg, arg_off, pc_count, count_off);
-        if !after.is_empty() {
-            method::<Barriers>(pc, 26)(pc, after.len() as u32, after.as_ptr().cast());
+            let (before, after) = if record_barriers {
+                indirect_argument_barriers(pc_arg as u64, needs_indirect_barrier(pc_arg), pc_count as u64, needs_indirect_barrier(pc_count))
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            if !before.is_empty() {
+                method::<Barriers>(pc, 26)(pc, before.len() as u32, before.as_ptr().cast());
+            }
+            method::<ExecuteIndirect>(pc, 59)(pc, pc_sig, max, pc_arg, arg_off, pc_count, count_off);
+            if !after.is_empty() {
+                method::<Barriers>(pc, 26)(pc, after.len() as u32, after.as_ptr().cast());
+            }
         }
     }
 }
