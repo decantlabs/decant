@@ -46,6 +46,9 @@ struct PrecompileArgs {
     /// Direct shader disk cache folder (default: DECANT_D3D12X_DIRECT_CACHE or %LOCALAPPDATA%\Decant\direct-dxil).
     #[arg(long)]
     cache: Option<PathBuf>,
+    /// Driver PSO cache folder (default: DECANT_D3D12X_PSO_CACHE or %LOCALAPPDATA%\Decant\pso-library).
+    #[arg(long = "pso-cache")]
+    pso_cache: Option<PathBuf>,
     /// Pipeline manifest file (default: %LOCALAPPDATA%\Decant\<title-id>\manifest.txt when present).
     #[arg(long)]
     manifest: Option<PathBuf>,
@@ -199,6 +202,7 @@ fn do_precompile(a: &PrecompileArgs) -> Result<(), String> {
         package: a.package.clone(),
         overlay: a.overlay.clone(),
         cache: a.cache.clone(),
+        pso_cache: a.pso_cache.clone(),
         manifest: a.manifest.clone(),
         threads: a.threads,
         ui: a.ui,
@@ -215,6 +219,7 @@ fn do_run(package: Option<&std::path::Path>, overlay: &std::path::Path, o: &RunO
             package: package.map(PathBuf::from),
             overlay: Some(overlay.clone()),
             cache: None,
+            pso_cache: None,
             manifest: None,
             threads: None,
             ui: o.precompile_ui,

@@ -3,7 +3,7 @@
 //! and optionally shows a lightweight native Win32 progress window.
 
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,6 +26,7 @@ pub struct PrecompileConfig {
     pub package: Option<PathBuf>,
     pub overlay: Option<PathBuf>,
     pub cache: Option<PathBuf>,
+    pub pso_cache: Option<PathBuf>,
     pub manifest: Option<PathBuf>,
     pub threads: Option<usize>,
     pub ui: bool,
@@ -40,7 +41,7 @@ pub enum PrecompileOutcome {
     Warmed(Option<Progress>),
 }
 
-/// Structured progress reported by `decant_shader_warm --progress`.
+/// Structured progress reported by `decant_shader_warm --progress` during Stage 1 DXIL warming.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Progress {
     pub done: usize,
@@ -51,15 +52,55 @@ pub struct Progress {
     pub failed: u64,
 }
 
-/// Parses one `PROGRESS <done>/<total> ready=<n> compiled=<n> cache_hits=<n> failed=<n>` line.
-pub fn parse_progress_line(line: &str) -> Option<Progress> {
+/// Structured progress reported by `decant_shader_warm --warm-pso --progress` during Stage 2 PSO warming.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PsoProgress {
+    pub done: usize,
+    pub total: usize,
+    pub warm: u64,
+    pub hits: u64,
+    pub stored: u64,
+    pub failed: u64,
+    pub skipped: u64,
+}
+
+/// Progress update emitted by `decant_shader_warm --progress` for either Stage 1 or Stage 2.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProgressUpdate {
+    Dxil(Progress),
+    Pso(PsoProgress),
+}
+
+impl ProgressUpdate {
+    pub fn done(&self) -> usize {
+        match self {
+            Self::Dxil(p) => p.done,
+            Self::Pso(p) => p.done,
+        }
+    }
+
+    pub fn total(&self) -> usize {
+        match self {
+            Self::Dxil(p) => p.total,
+            Self::Pso(p) => p.total,
+        }
+    }
+}
+
+fn parse_progress_header<'a>(line: &'a str, tag: &str) -> Option<(usize, usize, impl Iterator<Item = &'a str>)> {
     let mut parts = line.split_whitespace();
-    if parts.next()? != "PROGRESS" {
+    if parts.next()? != tag {
         return None;
     }
     let (done_str, total_str) = parts.next()?.split_once('/')?;
     let done = done_str.parse::<usize>().ok()?;
     let total = total_str.parse::<usize>().ok()?;
+    Some((done, total, parts))
+}
+
+/// Parses one `PROGRESS <done>/<total> ready=<n> compiled=<n> cache_hits=<n> failed=<n>` line.
+pub fn parse_progress_line(line: &str) -> Option<Progress> {
+    let (done, total, parts) = parse_progress_header(line, "PROGRESS")?;
     let mut progress = Progress { done, total, ready: 0, compiled: 0, cache_hits: 0, failed: 0 };
     for token in parts {
         let Some((key, value)) = token.split_once('=') else { continue };
@@ -75,22 +116,80 @@ pub fn parse_progress_line(line: &str) -> Option<Progress> {
     Some(progress)
 }
 
-/// Formats one console progress bar line for `p`.
-pub fn format_console_bar(p: &Progress, width: usize) -> String {
+/// Parses one `PROGRESS_PSO <done>/<total> pso_warm=<n> pso_hits=<n> pso_stored=<n> pso_failed=<n> pso_skipped=<n>` line.
+pub fn parse_pso_progress_line(line: &str) -> Option<PsoProgress> {
+    let (done, total, parts) = parse_progress_header(line, "PROGRESS_PSO")?;
+    let mut progress = PsoProgress { done, total, warm: 0, hits: 0, stored: 0, failed: 0, skipped: 0 };
+    for token in parts {
+        let Some((key, value)) = token.split_once('=') else { continue };
+        let Ok(n) = value.parse::<u64>() else { continue };
+        match key {
+            "pso_warm" => progress.warm = n,
+            "pso_hits" => progress.hits = n,
+            "pso_stored" => progress.stored = n,
+            "pso_failed" => progress.failed = n,
+            "pso_skipped" => progress.skipped = n,
+            _ => {}
+        }
+    }
+    Some(progress)
+}
+
+/// Parses either a Stage 1 `PROGRESS` line or a Stage 2 `PROGRESS_PSO` line.
+pub fn parse_progress_update(line: &str) -> Option<ProgressUpdate> {
+    if let Some(p) = parse_progress_line(line) {
+        return Some(ProgressUpdate::Dxil(p));
+    }
+    parse_pso_progress_line(line).map(ProgressUpdate::Pso)
+}
+
+fn render_bar(done: usize, total: usize, width: usize) -> (String, usize) {
     let width = width.max(10);
-    let pct = (p.done.min(p.total) * 100).checked_div(p.total).unwrap_or(100);
-    let filled = (p.done.min(p.total) * width).checked_div(p.total).unwrap_or(width);
+    let pct = (done.min(total) * 100).checked_div(total).unwrap_or(100);
+    let filled = (done.min(total) * width).checked_div(total).unwrap_or(width);
     let mut bar = String::with_capacity(width);
     for i in 0..width {
         if i < filled {
             bar.push('=');
-        } else if i == filled && p.done < p.total {
+        } else if i == filled && done < total {
             bar.push('>');
         } else {
             bar.push(' ');
         }
     }
+    (bar, pct)
+}
+
+/// Formats one console progress bar line for `p`.
+pub fn format_console_bar(p: &Progress, width: usize) -> String {
+    let (bar, pct) = render_bar(p.done, p.total, width);
     format!("[{bar}] {pct:>3}% ({}/{}) ready={} compiled={} hits={} failed={}", p.done, p.total, p.ready, p.compiled, p.cache_hits, p.failed)
+}
+
+/// Formats one console progress bar line for Stage 2 PSO prewarming.
+pub fn format_pso_console_bar(p: &PsoProgress, width: usize) -> String {
+    let (bar, pct) = render_bar(p.done, p.total, width);
+    format!(
+        "[{bar}] {pct:>3}% PSO ({}/{}) warm={} hits={} stored={} failed={} skipped={}",
+        p.done, p.total, p.warm, p.hits, p.stored, p.failed, p.skipped
+    )
+}
+
+/// Formats the status label shown inside the Win32 progress window.
+pub fn format_progress_label(update: &ProgressUpdate) -> String {
+    let done = update.done();
+    let total = update.total();
+    let pct = (done.min(total) * 100).checked_div(total).unwrap_or(100);
+    match update {
+        ProgressUpdate::Dxil(p) => format!(
+            "Stage 1/2 DXIL: {} / {} ({pct}%)  [ready: {}, hits: {}, compiled: {}]",
+            p.done, p.total, p.ready, p.cache_hits, p.compiled
+        ),
+        ProgressUpdate::Pso(p) => format!(
+            "Stage 2/2 PSO: {} / {} ({pct}%)  [warm: {}, hits: {}, stored: {}, skipped: {}]",
+            p.done, p.total, p.warm, p.hits, p.stored, p.skipped
+        ),
+    }
 }
 
 /// Resolves `%LOCALAPPDATA%\Decant\<title-id>\manifest.txt` from `title_folder\MicrosoftGame.config`.
@@ -261,8 +360,8 @@ pub fn find_shader_warm() -> Option<PathBuf> {
     None
 }
 
-/// Resolves the manifest path and shader archives from `cfg` without running `decant_shader_warm`.
-pub fn resolve_inputs(cfg: &PrecompileConfig) -> Result<(Option<PathBuf>, Vec<PathBuf>), String> {
+/// Resolves the manifest path and shader archives from `cfg` using an explicit `local_appdata` folder.
+pub fn resolve_inputs_with(cfg: &PrecompileConfig, local_appdata: Option<&OsStr>) -> Result<(Option<PathBuf>, Vec<PathBuf>), String> {
     let manifest = match &cfg.manifest {
         Some(path) => {
             if !path.is_file() {
@@ -270,10 +369,11 @@ pub fn resolve_inputs(cfg: &PrecompileConfig) -> Result<(Option<PathBuf>, Vec<Pa
             }
             Some(path.clone())
         }
-        None => {
-            let candidates = [cfg.package.as_deref(), cfg.overlay.as_deref()];
-            candidates.into_iter().flatten().find_map(per_title_manifest_path).filter(|p| p.is_file())
-        }
+        None => [cfg.package.as_deref(), cfg.overlay.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|dir| per_title_manifest_path_with(dir, local_appdata))
+            .find(|p| p.is_file()),
     };
 
     let mut archives = BTreeSet::new();
@@ -283,6 +383,43 @@ pub fn resolve_inputs(cfg: &PrecompileConfig) -> Result<(Option<PathBuf>, Vec<Pa
         }
     }
     Ok((manifest, archives.into_iter().collect()))
+}
+
+/// Resolves the manifest path and shader archives from `cfg` without running `decant_shader_warm`.
+pub fn resolve_inputs(cfg: &PrecompileConfig) -> Result<(Option<PathBuf>, Vec<PathBuf>), String> {
+    resolve_inputs_with(cfg, std::env::var_os("LOCALAPPDATA").as_deref())
+}
+
+/// Builds the argument list passed to `decant_shader_warm`.
+///
+/// Passes `--warm-pso` (and optional `--pso-cache`) whenever a manifest is present so DXIL
+/// translation and headless D3D12 PSO prewarming both run before the title starts.
+pub fn build_warm_args(
+    cache: &Path,
+    manifest: Option<&Path>,
+    archives: &[PathBuf],
+    threads: Option<usize>,
+    pso_cache: Option<&Path>,
+) -> Vec<OsString> {
+    let mut args = vec![OsString::from("--cache"), cache.as_os_str().to_owned(), OsString::from("--progress")];
+    if let Some(m) = manifest {
+        args.push(OsString::from("--manifest"));
+        args.push(m.as_os_str().to_owned());
+        args.push(OsString::from("--warm-pso"));
+        if let Some(pc) = pso_cache {
+            args.push(OsString::from("--pso-cache"));
+            args.push(pc.as_os_str().to_owned());
+        }
+    }
+    for a in archives {
+        args.push(OsString::from("--shaders"));
+        args.push(a.as_os_str().to_owned());
+    }
+    if let Some(t) = threads {
+        args.push(OsString::from("--threads"));
+        args.push(OsString::from(t.to_string()));
+    }
+    args
 }
 
 /// Returns true when `decant_shader_warm` output indicates that 0 pipelines were selected.
@@ -308,16 +445,7 @@ pub fn precompile(cfg: &PrecompileConfig) -> Result<PrecompileOutcome, String> {
         .ok_or_else(|| "decant_shader_warm not found beside decant-launch or on PATH (build with cargo build -p decant-d3d12x --bin decant_shader_warm)".to_owned())?;
 
     let mut cmd = Command::new(&warm_exe);
-    cmd.arg("--cache").arg(&cache).arg("--progress");
-    if let Some(m) = &manifest {
-        cmd.arg("--manifest").arg(m);
-    }
-    for a in &archives {
-        cmd.arg("--shaders").arg(a);
-    }
-    if let Some(threads) = cfg.threads {
-        cmd.arg("--threads").arg(threads.to_string());
-    }
+    cmd.args(build_warm_args(&cache, manifest.as_deref(), &archives, cfg.threads, cfg.pso_cache.as_deref()));
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| format!("failed to start {}: {e}", warm_exe.display()))?;
@@ -331,26 +459,41 @@ pub fn precompile(cfg: &PrecompileConfig) -> Result<PrecompileOutcome, String> {
     let ui_window = if cfg.ui { ui::ProgressWindow::spawn("Decant Shader Precompile") } else { None };
     let is_tty = std::io::stdout().is_terminal();
     let mut last_progress: Option<Progress> = None;
+    let mut last_was_dxil = false;
+    let mut saw_tty_bar = false;
     let mut stdout_lines: Vec<String> = Vec::new();
 
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-        if let Some(progress) = parse_progress_line(&line) {
-            let bar = format_console_bar(&progress, 28);
+        if let Some(update) = parse_progress_update(&line) {
+            let bar = match &update {
+                ProgressUpdate::Dxil(p) => {
+                    last_progress = Some(p.clone());
+                    last_was_dxil = true;
+                    format_console_bar(p, 28)
+                }
+                ProgressUpdate::Pso(p) => {
+                    if is_tty && last_was_dxil {
+                        println!();
+                    }
+                    last_was_dxil = false;
+                    format_pso_console_bar(p, 28)
+                }
+            };
             if is_tty {
                 print!("\r{bar}");
                 let _ = std::io::stdout().flush();
+                saw_tty_bar = true;
             } else {
                 println!("{bar}");
             }
             if let Some(win) = &ui_window {
-                win.update(&progress);
+                win.update(&update);
             }
-            last_progress = Some(progress);
         } else {
             stdout_lines.push(line);
         }
     }
-    if is_tty && last_progress.is_some() {
+    if is_tty && saw_tty_bar {
         println!();
     }
 
@@ -395,7 +538,7 @@ mod ui {
 
     const SS_LEFT: u32 = 0;
 
-    use super::Progress;
+    use super::{format_progress_label, ProgressUpdate};
 
     const WM_APP_UPDATE: u32 = WM_APP + 1;
     const WM_APP_CLOSE: u32 = WM_APP + 2;
@@ -403,7 +546,7 @@ mod ui {
     struct SharedState {
         label_hwnd: isize,
         bar_hwnd: isize,
-        progress: Option<Progress>,
+        progress: Option<ProgressUpdate>,
     }
 
     pub struct ProgressWindow {
@@ -425,15 +568,13 @@ mod ui {
                     if let Ok(guard) = state_mutex.lock()
                         && let Some(p) = &guard.progress
                     {
-                        let pct = (p.done.min(p.total) * 100).checked_div(p.total).unwrap_or(100);
-                        let text = wide(&format!(
-                            "Precompiling shaders: {} / {} ({pct}%)  [ready: {}, hits: {}, compiled: {}]",
-                            p.done, p.total, p.ready, p.cache_hits, p.compiled
-                        ));
+                        let text = wide(&format_progress_label(p));
+                        let total = p.total().max(1);
+                        let done = p.done().min(p.total());
                         unsafe {
                             SetWindowTextW(guard.label_hwnd as HWND, text.as_ptr());
-                            SendMessageW(guard.bar_hwnd as HWND, PBM_SETRANGE32, 0, p.total.max(1) as LPARAM);
-                            SendMessageW(guard.bar_hwnd as HWND, PBM_SETPOS, p.done.min(p.total), 0);
+                            SendMessageW(guard.bar_hwnd as HWND, PBM_SETRANGE32, 0, total as LPARAM);
+                            SendMessageW(guard.bar_hwnd as HWND, PBM_SETPOS, done, 0);
                         }
                     }
                 }
@@ -584,7 +725,7 @@ mod ui {
             Some(Self { hwnd, state, thread: Some(thread) })
         }
 
-        pub fn update(&self, progress: &Progress) {
+        pub fn update(&self, progress: &ProgressUpdate) {
             if let Ok(mut guard) = self.state.lock() {
                 guard.progress = Some(progress.clone());
             }
@@ -615,7 +756,7 @@ mod ui {
 
 #[cfg(not(windows))]
 mod ui {
-    use super::Progress;
+    use super::ProgressUpdate;
 
     pub struct ProgressWindow;
 
@@ -623,7 +764,7 @@ mod ui {
         pub fn spawn(_title: &str) -> Option<Self> {
             None
         }
-        pub fn update(&self, _progress: &Progress) {}
+        pub fn update(&self, _progress: &ProgressUpdate) {}
         pub fn close(self) {}
     }
 }
@@ -758,11 +899,106 @@ mod tests {
             package: Some(pkg),
             overlay: None,
             cache: Some(temp.path().join("cache")),
+            pso_cache: None,
             manifest: None,
             threads: None,
             ui: false,
         })
         .unwrap();
         assert_eq!(outcome, PrecompileOutcome::Skipped);
+    }
+
+    #[test]
+    fn manifest_discovery_finds_per_title_and_explicit_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let pkg = temp.path().join("pkg");
+        let overlay = temp.path().join("overlay");
+        let local = temp.path().join("localappdata");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::create_dir_all(&overlay).unwrap();
+        write_config(&pkg, "12AB34CD");
+
+        let cfg = PrecompileConfig {
+            package: Some(pkg.clone()),
+            overlay: Some(overlay),
+            ..Default::default()
+        };
+        let (found_missing, _) = resolve_inputs_with(&cfg, Some(local.as_os_str())).unwrap();
+        assert_eq!(found_missing, None);
+
+        let recorded = local.join("Decant").join("12AB34CD").join("manifest.txt");
+        std::fs::create_dir_all(recorded.parent().unwrap()).unwrap();
+        std::fs::write(&recorded, "R 1\n").unwrap();
+
+        let (found_recorded, _) = resolve_inputs_with(&cfg, Some(local.as_os_str())).unwrap();
+        assert_eq!(found_recorded, Some(recorded));
+
+        let explicit = temp.path().join("custom_manifest.txt");
+        std::fs::write(&explicit, "R 1\n").unwrap();
+        let explicit_cfg = PrecompileConfig {
+            package: Some(pkg),
+            manifest: Some(explicit.clone()),
+            ..Default::default()
+        };
+        let (found_explicit, _) = resolve_inputs_with(&explicit_cfg, Some(local.as_os_str())).unwrap();
+        assert_eq!(found_explicit, Some(explicit));
+    }
+
+    #[test]
+    fn warm_args_include_warm_pso_only_when_manifest_present() {
+        let cache = PathBuf::from("cache_dir");
+        let archives = vec![PathBuf::from("shaders_a.pack")];
+
+        let corpus_only = build_warm_args(&cache, None, &archives, Some(4), Some(Path::new("pso_dir")));
+        let corpus_strs: Vec<_> = corpus_only.iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(corpus_strs, vec!["--cache", "cache_dir", "--progress", "--shaders", "shaders_a.pack", "--threads", "4"]);
+
+        let manifest = PathBuf::from("manifest.txt");
+        let with_manifest = build_warm_args(&cache, Some(&manifest), &archives, None, Some(Path::new("pso_dir")));
+        let manifest_strs: Vec<_> = with_manifest.iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            manifest_strs,
+            vec![
+                "--cache",
+                "cache_dir",
+                "--progress",
+                "--manifest",
+                "manifest.txt",
+                "--warm-pso",
+                "--pso-cache",
+                "pso_dir",
+                "--shaders",
+                "shaders_a.pack",
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_update_parses_dxil_and_pso_stages_and_formats_labels() {
+        let dxil_line = "PROGRESS 15/30 ready=14 compiled=4 cache_hits=10 failed=1";
+        let dxil = parse_progress_update(dxil_line).unwrap();
+        assert_eq!(
+            dxil,
+            ProgressUpdate::Dxil(Progress { done: 15, total: 30, ready: 14, compiled: 4, cache_hits: 10, failed: 1 })
+        );
+        let dxil_label = format_progress_label(&dxil);
+        assert!(dxil_label.contains("Stage 1/2 DXIL: 15 / 30 (50%)"), "{dxil_label}");
+
+        let pso_line = "PROGRESS_PSO 8/16 pso_warm=6 pso_hits=2 pso_stored=4 pso_failed=1 pso_skipped=1";
+        let pso = parse_progress_update(pso_line).unwrap();
+        assert_eq!(
+            pso,
+            ProgressUpdate::Pso(PsoProgress { done: 8, total: 16, warm: 6, hits: 2, stored: 4, failed: 1, skipped: 1 })
+        );
+        let pso_bar = match &pso {
+            ProgressUpdate::Pso(p) => format_pso_console_bar(p, 10),
+            ProgressUpdate::Dxil(_) => unreachable!(),
+        };
+        assert!(pso_bar.contains(" 50% PSO (8/16)"), "{pso_bar}");
+        assert!(pso_bar.contains("warm=6 hits=2 stored=4 failed=1 skipped=1"), "{pso_bar}");
+
+        let pso_label = format_progress_label(&pso);
+        assert!(pso_label.contains("Stage 2/2 PSO: 8 / 16 (50%)"), "{pso_label}");
+        assert_eq!(parse_progress_update("decant_shader_warm: unrelated"), None);
     }
 }
