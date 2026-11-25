@@ -34,7 +34,7 @@ pub struct PrecompileConfig {
 /// Outcome of a precompile step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrecompileOutcome {
-    /// No manifest and no shader archives were found, so nothing was run.
+    /// No manifest and no shader archives were found, or no warmable pipelines were selected, so nothing was warmed.
     Skipped,
     /// `decant_shader_warm` ran and completed with optional final progress counters.
     Warmed(Option<Progress>),
@@ -285,6 +285,11 @@ pub fn resolve_inputs(cfg: &PrecompileConfig) -> Result<(Option<PathBuf>, Vec<Pa
     Ok((manifest, archives.into_iter().collect()))
 }
 
+/// Returns true when `decant_shader_warm` output indicates that 0 pipelines were selected.
+pub fn is_zero_pipelines_selected(lines: &[String]) -> bool {
+    lines.iter().any(|line| line.to_ascii_lowercase().contains("0 pipelines selected"))
+}
+
 /// Runs shader precompilation according to `cfg`.
 pub fn precompile(cfg: &PrecompileConfig) -> Result<PrecompileOutcome, String> {
     if cfg.package.is_none() && cfg.overlay.is_none() && cfg.manifest.is_none() {
@@ -326,6 +331,7 @@ pub fn precompile(cfg: &PrecompileConfig) -> Result<PrecompileOutcome, String> {
     let ui_window = if cfg.ui { ui::ProgressWindow::spawn("Decant Shader Precompile") } else { None };
     let is_tty = std::io::stdout().is_terminal();
     let mut last_progress: Option<Progress> = None;
+    let mut stdout_lines: Vec<String> = Vec::new();
 
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
         if let Some(progress) = parse_progress_line(&line) {
@@ -340,6 +346,8 @@ pub fn precompile(cfg: &PrecompileConfig) -> Result<PrecompileOutcome, String> {
                 win.update(&progress);
             }
             last_progress = Some(progress);
+        } else {
+            stdout_lines.push(line);
         }
     }
     if is_tty && last_progress.is_some() {
@@ -353,6 +361,10 @@ pub fn precompile(cfg: &PrecompileConfig) -> Result<PrecompileOutcome, String> {
     }
 
     if !status.success() {
+        if is_zero_pipelines_selected(&stderr_lines) || is_zero_pipelines_selected(&stdout_lines) {
+            println!("decant-launch: no warmable pipelines selected yet, skipping precompile");
+            return Ok(PrecompileOutcome::Skipped);
+        }
         let tail: Vec<&str> = stderr_lines.iter().rev().take(5).map(String::as_str).collect();
         let detail = if tail.is_empty() {
             format!("exit status {status}")
@@ -688,6 +700,41 @@ mod tests {
                 root.join("Shaders"),
             ]
         );
+    }
+
+    #[test]
+    fn archive_discovery_ignores_shader_named_metadata_and_code_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(root.join("data").join("shader_notes.txt"), b"note").unwrap();
+        std::fs::write(root.join("data").join("shader_config.json"), b"{}").unwrap();
+        std::fs::write(root.join("data").join("shader_helper.dll"), b"mz").unwrap();
+        std::fs::write(root.join("data").join("bundle.fssm"), b"fssm").unwrap();
+        std::fs::write(root.join("data").join("main.cso"), b"cso").unwrap();
+
+        let found = discover_shader_archives(root);
+        assert_eq!(
+            found,
+            vec![
+                root.join("data").join("bundle.fssm"),
+                root.join("data").join("main.cso"),
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_pipelines_selected_helper_detects_blocked_output() {
+        assert!(!is_zero_pipelines_selected(&[]));
+        assert!(!is_zero_pipelines_selected(&[
+            "decant_shader_warm: corpus mode keys will not match".to_owned(),
+            "BLOCKED: DXC did not load".to_owned(),
+        ]));
+        assert!(is_zero_pipelines_selected(&[
+            "decant_shader_warm: scanning archives".to_owned(),
+            "BLOCKED: 0 pipelines selected".to_owned(),
+        ]));
+        assert!(is_zero_pipelines_selected(&["blocked: 0 PIPELINES SELECTED".to_owned()]));
     }
 
     #[test]
