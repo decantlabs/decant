@@ -42,8 +42,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use windows::Win32::Foundation::CloseHandle;
@@ -90,7 +90,7 @@ fn round_up(value: u64, multiple: u64) -> u64 {
     value.div_ceil(multiple) * multiple
 }
 
-// ---- system DLL entry points and shader ----
+// ==== system DLL entry points and shader ====
 
 /// An export of a system DLL, looked up at run time because the DLL is not linked.
 ///
@@ -145,7 +145,7 @@ fn compile_detile_shader() -> Option<Vec<u8>> {
     }
 }
 
-// ---- resources and barriers ----
+// ==== resources and barriers ====
 
 fn buffer_resource(width: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
     D3D12_RESOURCE_DESC {
@@ -204,25 +204,64 @@ enum Leg {
     Leave,
 }
 
-/// The barriers for one texture around the copy. `states` holds one state for all subresources or
-/// one per subresource. Subresources that are in `COPY_DEST` already need nothing.
-fn copy_barriers(texture: &ID3D12Resource, states: &[u32], leg: Leg) -> Vec<D3D12_RESOURCE_BARRIER> {
+/// Appends the barriers for one texture around the copy into `out`. `states` holds one state for all
+/// subresources or one per subresource. Subresources that are in `COPY_DEST` already need nothing.
+fn append_copy_barriers(out: &mut Vec<D3D12_RESOURCE_BARRIER>, texture: &ID3D12Resource, states: &[u32], leg: Leg) {
     let ends = |state: u32| if leg == Leg::Enter { (state, COPY_DEST) } else { (COPY_DEST, state) };
     if states.len() <= 1 {
         let (from, to) = ends(states.first().copied().unwrap_or(0));
-        return if from == to { Vec::new() } else { vec![state_change(texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to)] };
+        if from != to {
+            out.push(state_change(texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to));
+        }
+        return;
     }
-    let mut barriers = Vec::new();
     for (index, &state) in states.iter().enumerate() {
         let (from, to) = ends(state);
         if from != to {
-            barriers.push(state_change(texture, index as u32, from, to));
+            out.push(state_change(texture, index as u32, from, to));
         }
     }
+}
+
+/// The barriers for one texture around the copy. `states` holds one state for all subresources or
+/// one per subresource. Subresources that are in `COPY_DEST` already need nothing.
+fn copy_barriers(texture: &ID3D12Resource, states: &[u32], leg: Leg) -> Vec<D3D12_RESOURCE_BARRIER> {
+    let mut barriers = Vec::new();
+    append_copy_barriers(&mut barriers, texture, states, leg);
     barriers
 }
 
-// ---- the work of one flush ----
+// ==== the work of one flush ====
+
+/// The most cached footprint layouts kept by a detiler before clearing on the next miss.
+const FOOTPRINT_CACHE_LIMIT: usize = 4096;
+
+/// Identifies a PC texture geometry and the console plan layout it is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FootprintKey {
+    width: u64,
+    height: u32,
+    slices: u16,
+    mips: u16,
+    format: i32,
+    bytes_per_element: u32,
+}
+
+/// Copyable footprints and staging byte requirement for one texture geometry.
+type CachedFootprint = (Arc<[D3D12_PLACED_SUBRESOURCE_FOOTPRINT]>, u64);
+type FootprintCache = HashMap<FootprintKey, Result<CachedFootprint, String>>;
+
+/// Reusable buffers used while preparing and grouping a flush.
+#[derive(Default)]
+struct DetileScratch {
+    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    rows: Vec<u32>,
+    row_bytes: Vec<u64>,
+    costs: Vec<(u64, usize)>,
+    batches: Vec<Range<usize>>,
+    barriers: Vec<D3D12_RESOURCE_BARRIER>,
+    bases: Vec<u64>,
+}
 
 /// One texture to detile.
 pub struct Job<'a> {
@@ -237,43 +276,94 @@ pub struct Job<'a> {
 /// A job together with the copy footprints of its PC texture.
 struct Prepared<'a> {
     job: &'a Job<'a>,
-    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    footprints: Arc<[D3D12_PLACED_SUBRESOURCE_FOOTPRINT]>,
     staging_bytes: u64,
 }
 
-/// Checks that the PC texture has the layout of the console plan and asks the device for the copy
-/// footprints of all its subresources.
-fn prepare<'a>(device: &ID3D12Device, job: &'a Job<'a>) -> Result<Prepared<'a>, String> {
+/// Checks that the PC texture has the layout of the console plan and returns the copy footprints of
+/// all its subresources, reusing cached footprints when the geometry was already validated.
+fn prepare_cached<'a>(
+    device: &ID3D12Device,
+    cache: &mut FootprintCache,
+    scratch: &mut DetileScratch,
+    job: &'a Job<'a>,
+) -> Result<Prepared<'a>, String> {
     // SAFETY: a live resource.
     let desc = unsafe { job.texture.GetDesc() };
     let (mips, slices) = (job.plan.mips.len() as u32, job.plan.slices);
     if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || u32::from(desc.MipLevels) != mips || u32::from(desc.DepthOrArraySize) != slices {
         return Err(format!("the PC texture ({} mips, {} slices) does not match the console layout ({mips}, {slices})", desc.MipLevels, desc.DepthOrArraySize));
     }
+    let key = FootprintKey {
+        width: desc.Width,
+        height: desc.Height,
+        slices: desc.DepthOrArraySize,
+        mips: desc.MipLevels,
+        format: desc.Format.0,
+        bytes_per_element: job.plan.bytes_per_element,
+    };
+    if let Some(cached) = cache.get(&key) {
+        let (footprints, staging_bytes) = cached.as_ref().map_err(Clone::clone)?;
+        return Ok(Prepared { job, footprints: Arc::clone(footprints), staging_bytes: *staging_bytes });
+    }
     let count = (mips * slices) as usize;
-    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count];
-    let (mut rows, mut row_bytes, mut total) = (vec![0u32; count], vec![0u64; count], 0u64);
+    scratch.footprints.clear();
+    scratch.footprints.resize(count, D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default());
+    scratch.rows.clear();
+    scratch.rows.resize(count, 0);
+    scratch.row_bytes.clear();
+    scratch.row_bytes.resize(count, 0);
+    let mut total = 0u64;
     // SAFETY: every output array holds `count` entries.
-    unsafe { device.GetCopyableFootprints(&desc, 0, count as u32, 0, Some(footprints.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut total)) };
+    unsafe {
+        device.GetCopyableFootprints(
+            &desc,
+            0,
+            count as u32,
+            0,
+            Some(scratch.footprints.as_mut_ptr()),
+            Some(scratch.rows.as_mut_ptr()),
+            Some(scratch.row_bytes.as_mut_ptr()),
+            Some(&mut total),
+        )
+    };
     let element_bytes = u64::from(job.plan.bytes_per_element);
     for (mip, level) in job.plan.mips.iter().enumerate() {
         let console_row = u64::from(level.width_elements) * element_bytes;
-        if rows[mip] != level.height_elements || row_bytes[mip] != console_row {
-            return Err(format!("mip {mip}: the PC rows ({} of {} bytes) differ from the console elements ({} of {console_row})", rows[mip], row_bytes[mip], level.height_elements));
+        if scratch.rows[mip] != level.height_elements || scratch.row_bytes[mip] != console_row {
+            let err = format!(
+                "mip {mip}: the PC rows ({} of {} bytes) differ from the console elements ({} of {console_row})",
+                scratch.rows[mip], scratch.row_bytes[mip], level.height_elements
+            );
+            if cache.len() >= FOOTPRINT_CACHE_LIMIT {
+                cache.clear();
+            }
+            cache.insert(key, Err(err.clone()));
+            return Err(err);
         }
     }
     let staging_bytes = round_up(total, 512);
     if staging_bytes > LIST_STAGING_LIMIT {
-        return Err(format!("{staging_bytes} bytes of staging are too many"));
+        let err = format!("{staging_bytes} bytes of staging are too many");
+        if cache.len() >= FOOTPRINT_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, Err(err.clone()));
+        return Err(err);
     }
+    let footprints: Arc<[D3D12_PLACED_SUBRESOURCE_FOOTPRINT]> = Arc::from(scratch.footprints.as_slice());
+    if cache.len() >= FOOTPRINT_CACHE_LIMIT {
+        cache.clear();
+    }
+    cache.insert(key, Ok((Arc::clone(&footprints), staging_bytes)));
     Ok(Prepared { job, footprints, staging_bytes })
 }
 
-/// Splits jobs in order into batches. A batch is closed when adding the next job would pass the
-/// staging target or the dispatch slots, but a batch always holds at least one job. `costs` holds
-/// `(staging bytes, dispatches)` per job.
-fn group_batches(costs: &[(u64, usize)]) -> Vec<Range<usize>> {
-    let mut batches = Vec::new();
+/// Splits jobs in order into batches in `batches`. A batch is closed when adding the next job would
+/// pass the staging target or the dispatch slots, but a batch always holds at least one job. `costs`
+/// holds `(staging bytes, dispatches)` per job.
+fn group_batches_into(costs: &[(u64, usize)], batches: &mut Vec<Range<usize>>) {
+    batches.clear();
     let (mut start, mut bytes, mut dispatches) = (0, 0u64, 0usize);
     for (index, &(job_bytes, job_dispatches)) in costs.iter().enumerate() {
         if index > start && (bytes + job_bytes > BATCH_STAGING_TARGET || dispatches + job_dispatches > DISPATCH_SLOTS) {
@@ -286,6 +376,14 @@ fn group_batches(costs: &[(u64, usize)]) -> Vec<Range<usize>> {
     if start < costs.len() {
         batches.push(start..costs.len());
     }
+}
+
+/// Splits jobs in order into batches. A batch is closed when adding the next job would pass the
+/// staging target or the dispatch slots, but a batch always holds at least one job. `costs` holds
+/// `(staging bytes, dispatches)` per job.
+fn group_batches(costs: &[(u64, usize)]) -> Vec<Range<usize>> {
+    let mut batches = Vec::new();
+    group_batches_into(costs, &mut batches);
     batches
 }
 
@@ -359,6 +457,10 @@ pub struct Detiler {
     /// another, and a busy frame looked finished.
     queues: HashMap<usize, QueueFence>,
     frames: Vec<Frame>,
+    /// Cached copyable footprints by PC resource geometry and element byte width.
+    footprint_cache: FootprintCache,
+    /// Scratch buffers reused across flushes and batches.
+    scratch: DetileScratch,
 }
 
 // SAFETY: D3D12 objects are free threaded, and the mapped pointer is only used under the table lock.
@@ -397,7 +499,15 @@ impl Detiler {
             let created: windows::core::Result<ID3D12PipelineState> = device.CreateComputePipelineState(&pipeline_desc);
             drop(ManuallyDrop::into_inner(pipeline_desc.pRootSignature));
             match created {
-                Ok(pipeline) => Some(Detiler { device: device.clone(), signature, pipeline, queues: HashMap::new(), frames: Vec::new() }),
+                Ok(pipeline) => Some(Detiler {
+                    device: device.clone(),
+                    signature,
+                    pipeline,
+                    queues: HashMap::new(),
+                    frames: Vec::new(),
+                    footprint_cache: HashMap::new(),
+                    scratch: DetileScratch::default(),
+                }),
                 Err(e) => {
                     xs_log!("detile: the pipeline cannot be created ({e})");
                     None
@@ -429,12 +539,18 @@ impl Detiler {
         }
     }
 
-    /// The index of a frame the GPU has finished with. A new frame is made when all are busy.
-    fn idle_frame(&mut self) -> Option<usize> {
+    /// The index of a frame the GPU has finished with, preferring one whose staging buffer already
+    /// holds `needed` bytes so staging buffers do not grow unnecessarily across frames. A new frame
+    /// is made when all are busy.
+    fn idle_frame(&mut self, needed: u64) -> Option<usize> {
         let queues = &self.queues;
         // SAFETY: the fences are live.
         let completed = |queue: usize| queues.get(&queue).map_or(0, |q| unsafe { q.fence.GetCompletedValue() });
-        if let Some(index) = first_finished(self.frames.iter().map(|f| (f.queue, f.done_at)), completed) {
+        if let Some(index) = best_finished(
+            self.frames.iter().map(|f| (f.queue, f.done_at, f.staging.as_ref().map_or(0, |(_, s)| *s))),
+            needed,
+            completed,
+        ) {
             self.frames[index].held.clear();
             return Some(index);
         }
@@ -470,8 +586,8 @@ impl Detiler {
     /// Records one batch on a free frame, executes it on `queue` and signals the queue's fence.
     /// Whether the batch was submitted.
     fn run_batch(&mut self, queue: &ID3D12CommandQueue, batch: &[Prepared<'_>]) -> bool {
-        let Some(index) = self.idle_frame() else { return false };
         let total: u64 = batch.iter().map(|p| p.staging_bytes).sum();
+        let Some(index) = self.idle_frame(total) else { return false };
         // The frame leaves the vector while it is recorded, because recording also needs `self`.
         let mut frame = self.frames.swap_remove(index);
         let submitted = self.ensure_staging(&mut frame, total) && self.record(&mut frame, queue, batch);
@@ -497,24 +613,36 @@ impl Detiler {
             let list = &frame.list;
             list.SetComputeRootSignature(&self.signature);
             list.SetPipelineState(&self.pipeline);
-            let mut entering = vec![state_change(&staging, 0, 0, uav_state())];
+            self.scratch.barriers.clear();
+            self.scratch.barriers.push(state_change(&staging, 0, 0, uav_state()));
             for p in batch {
-                entering.extend(copy_barriers(&p.job.texture, p.job.states, Leg::Enter));
+                append_copy_barriers(&mut self.scratch.barriers, &p.job.texture, p.job.states, Leg::Enter);
             }
-            list.ResourceBarrier(&entering);
-            let Some(bases) = dispatch_all(list, frame.params.GetGPUVirtualAddress(), frame.params_ptr, staging.GetGPUVirtualAddress(), batch) else { return false };
+            list.ResourceBarrier(&self.scratch.barriers);
+            if !dispatch_all(
+                list,
+                frame.params.GetGPUVirtualAddress(),
+                frame.params_ptr,
+                staging.GetGPUVirtualAddress(),
+                batch,
+                &mut self.scratch.bases,
+            ) {
+                return false;
+            }
             list.ResourceBarrier(&[state_change(&staging, 0, uav_state(), copy_source_state())]);
-            copy_rows(list, &staging, batch, &bases);
-            let mut leaving = vec![state_change(&staging, 0, copy_source_state(), 0)];
+            copy_rows(list, &staging, batch, &self.scratch.bases);
+            self.scratch.barriers.clear();
+            self.scratch.barriers.push(state_change(&staging, 0, copy_source_state(), 0));
             for p in batch {
-                leaving.extend(copy_barriers(&p.job.texture, p.job.states, Leg::Leave));
+                append_copy_barriers(&mut self.scratch.barriers, &p.job.texture, p.job.states, Leg::Leave);
             }
-            list.ResourceBarrier(&leaving);
+            list.ResourceBarrier(&self.scratch.barriers);
             if list.Close().is_err() {
                 return false;
             }
             let Ok(command_list) = list.cast::<ID3D12CommandList>() else { return false };
-            frame.held = batch.iter().map(|p| p.job.texture.clone()).collect();
+            frame.held.clear();
+            frame.held.extend(batch.iter().map(|p| p.job.texture.clone()));
             queue.ExecuteCommandLists(&[Some(command_list)]);
             crate::diagnose::removed_after(|| format!("a detile list of {} textures", batch.len()));
             frame.queue = key;
@@ -534,11 +662,19 @@ impl Detiler {
     /// result says per job whether it was submitted. A job whose texture does not match its layout
     /// is skipped and logged. With `wait` the call returns when the GPU is done.
     pub fn run(&mut self, queue: &ID3D12CommandQueue, jobs: &[Job<'_>], wait: bool) -> Vec<bool> {
-        let mut submitted = vec![false; jobs.len()];
+        let mut submitted = Vec::new();
+        self.run_into(queue, jobs, wait, &mut submitted);
+        submitted
+    }
+
+    /// As [`Detiler::run`], writing the per job outcomes into `submitted` to reuse its allocation.
+    pub fn run_into(&mut self, queue: &ID3D12CommandQueue, jobs: &[Job<'_>], wait: bool, submitted: &mut Vec<bool>) {
+        submitted.clear();
+        submitted.resize(jobs.len(), false);
         let mut prepared = Vec::with_capacity(jobs.len());
         let mut origin = Vec::with_capacity(jobs.len());
         for (index, job) in jobs.iter().enumerate() {
-            match prepare(&self.device, job) {
+            match prepare_cached(&self.device, &mut self.footprint_cache, &mut self.scratch, job) {
                 Ok(p) => {
                     prepared.push(p);
                     origin.push(index);
@@ -551,18 +687,21 @@ impl Detiler {
                 }
             }
         }
-        let costs: Vec<(u64, usize)> = prepared.iter().map(|p| (p.staging_bytes, p.job.plan.mips.len())).collect();
-        for range in group_batches(&costs) {
+        self.scratch.costs.clear();
+        self.scratch.costs.extend(prepared.iter().map(|p| (p.staging_bytes, p.job.plan.mips.len())));
+        let mut batches = std::mem::take(&mut self.scratch.batches);
+        group_batches_into(&self.scratch.costs, &mut batches);
+        for range in &batches {
             if self.run_batch(queue, &prepared[range.clone()]) {
-                for &index in &origin[range] {
+                for &index in &origin[range.clone()] {
                     submitted[index] = true;
                 }
             }
         }
+        self.scratch.batches = batches;
         if wait {
             self.wait_idle();
         }
-        submitted
     }
 
     /// Frames made so far, queues they ran on and the staging bytes they hold.
@@ -589,22 +728,35 @@ impl Detiler {
     }
 }
 
-/// Records one dispatch per mip level of every job in the batch. Returns the staging offset each
-/// job starts at, or `None` when the batch needs more dispatches than the list has slots.
+/// Records one dispatch per mip level of every job in the batch and writes the staging offset each
+/// job starts at into `bases`. Returns `false` when the batch needs more dispatches than the list
+/// has slots.
 ///
 /// # Safety
 /// `params_ptr` is the mapped start of an upload buffer of `DISPATCH_SLOTS * PARAM_BYTES` bytes at
 /// GPU address `params_va`, and `list` is open.
-unsafe fn dispatch_all(list: &ID3D12GraphicsCommandList, params_va: u64, params_ptr: *mut u8, staging_va: u64, batch: &[Prepared<'_>]) -> Option<Vec<u64>> {
+unsafe fn dispatch_all(
+    list: &ID3D12GraphicsCommandList,
+    params_va: u64,
+    params_ptr: *mut u8,
+    staging_va: u64,
+    batch: &[Prepared<'_>],
+    bases: &mut Vec<u64>,
+) -> bool {
     let (mut base, mut slot) = (0u64, 0usize);
-    let mut bases = Vec::with_capacity(batch.len());
+    bases.clear();
+    bases.reserve(batch.len());
+    // SAFETY: `list` is open.
+    unsafe { list.SetComputeRootUnorderedAccessView(2, staging_va) };
     for p in batch {
         bases.push(base);
         let plan = p.job.plan;
         let mip_count = plan.mips.len();
+        // SAFETY: `list` is open.
+        unsafe { list.SetComputeRootShaderResourceView(1, p.job.src_gpu) };
         for (mip, level) in plan.mips.iter().enumerate() {
             if slot >= DISPATCH_SLOTS {
-                return None;
+                return false;
             }
             let footprint = &p.footprints[mip];
             let slice_stride = if plan.slices > 1 { p.footprints[mip + mip_count].Offset - footprint.Offset } else { 0 };
@@ -613,15 +765,13 @@ unsafe fn dispatch_all(list: &ID3D12GraphicsCommandList, params_va: u64, params_
             unsafe {
                 std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), params_ptr.add(slot * PARAM_BYTES), PARAM_BYTES);
                 list.SetComputeRootConstantBufferView(0, params_va + (slot * PARAM_BYTES) as u64);
-                list.SetComputeRootShaderResourceView(1, p.job.src_gpu);
-                list.SetComputeRootUnorderedAccessView(2, staging_va);
                 list.Dispatch(groups_across(plan, level), level.height_elements.div_ceil(8), plan.slices);
             }
             slot += 1;
         }
         base += p.staging_bytes;
     }
-    Some(bases)
+    true
 }
 
 /// Records the copies from the staging buffer into every subresource of every job.
@@ -657,12 +807,50 @@ fn first_finished(frames: impl Iterator<Item = (usize, u64)>, completed: impl Fn
     frames.enumerate().find(|&(_, (queue, done_at))| done_at == 0 || (done_at != u64::MAX && completed(queue) >= done_at)).map(|(index, _)| index)
 }
 
-// ---- the registry of placed textures ----
+/// Chooses an idle frame, given as `(queue, done at, staging capacity)`, whose queue fence
+/// (`completed`) has reached `done at`. Prefers the smallest idle frame that already fits `needed`
+/// bytes so a batch avoids reallocating a small buffer, else the largest idle frame.
+fn best_finished(frames: impl Iterator<Item = (usize, u64, u64)>, needed: u64, completed: impl Fn(usize) -> u64) -> Option<usize> {
+    let mut best_fit: Option<(usize, u64)> = None;
+    let mut best_any: Option<(usize, u64)> = None;
+    for (index, (queue, done_at, cap)) in frames.enumerate() {
+        let is_idle = done_at == 0 || (done_at != u64::MAX && completed(queue) >= done_at);
+        if !is_idle {
+            continue;
+        }
+        if cap >= needed {
+            if best_fit.is_none_or(|(_, best_cap)| cap < best_cap) {
+                best_fit = Some((index, cap));
+            }
+        } else if best_any.is_none_or(|(_, best_cap)| cap > best_cap) {
+            best_any = Some((index, cap));
+        }
+    }
+    best_fit.or(best_any).map(|(index, _)| index)
+}
+
+// ==== the registry of placed textures ====
+
+/// Fast path flag indicating whether at least one registered texture may want a fill.
+static HAS_PENDING_FILLS: AtomicBool = AtomicBool::new(false);
+
+/// Scratch buffers owned by [`Registry`] and reused across flushes, transitions, writes and tile
+/// notifications to avoid per call heap allocations.
+#[derive(Default)]
+struct RegistryScratch {
+    ready: Vec<(usize, u64)>,
+    exhausted: Vec<usize>,
+    resources: Vec<Option<ID3D12Resource>>,
+    job_res: Vec<usize>,
+    outcome: Vec<bool>,
+    overlapping: Vec<usize>,
+    changes: Vec<(usize, u32, u32)>,
+}
 
 /// A placed texture the layer fills.
 struct Placed {
     va: u64,
-    plan: Plan,
+    plan: Arc<Plan>,
     /// PC allocation size, for the informational owner statistics.
     bytes: u64,
     /// The states of the title's submitted work, one for all subresources or one each.
@@ -689,18 +877,23 @@ impl Placed {
     fn invalidate(&mut self) {
         self.dirty = true;
         self.attempts = 0;
+        HAS_PENDING_FILLS.store(true, Ordering::Release);
     }
 }
 
 #[derive(Default)]
 struct Registry {
     textures: BTreeMap<usize, Placed>,
+    /// Resources that currently want a fill (`Placed::wants_fill`), so a flush visits only dirty
+    /// textures instead of scanning the whole table.
+    pending: HashSet<usize>,
     /// Transitions noted per PC command list as `(resource, subresource, state after)`.
     noted: HashMap<usize, Vec<(usize, u32, u32)>>,
     detiler: Option<Detiler>,
     unavailable: bool,
     /// Kinds of textures and refusal reasons logged so far, to log each once.
-    logged: HashSet<String>,
+    logged: HashSet<(u32, u32)>,
+    logged_refused: HashSet<String>,
     flushes: u64,
     detiled: u64,
     /// Textures put off because their span got pages whose mappings are not applied yet.
@@ -710,6 +903,7 @@ struct Registry {
     /// every DirectStorage request once stalled the loading of a large world.
     by_address: BTreeMap<u64, Vec<usize>>,
     largest: u64,
+    scratch: RegistryScratch,
 }
 
 impl Registry {
@@ -717,6 +911,10 @@ impl Registry {
         self.remove(res);
         self.by_address.entry(texture.va).or_default().push(res);
         self.largest = self.largest.max(texture.plan.size);
+        if texture.wants_fill() {
+            self.pending.insert(res);
+            HAS_PENDING_FILLS.store(true, Ordering::Release);
+        }
         crate::mem_owners::add(crate::mem_owners::Kind::DetileTexture, crate::mem_owners::Segment::Local, 1, texture.bytes);
         self.textures.insert(res, texture);
     }
@@ -724,6 +922,10 @@ impl Registry {
     /// Drops `res`. Whether it was held.
     fn remove(&mut self, res: usize) -> bool {
         let Some(texture) = self.textures.remove(&res) else { return false };
+        self.pending.remove(&res);
+        if self.pending.is_empty() {
+            HAS_PENDING_FILLS.store(false, Ordering::Release);
+        }
         crate::mem_owners::remove(crate::mem_owners::Kind::DetileTexture, crate::mem_owners::Segment::Local, 1, texture.bytes);
         if let Some(at_address) = self.by_address.get_mut(&texture.va) {
             at_address.retain(|&r| r != res);
@@ -734,13 +936,34 @@ impl Registry {
         true
     }
 
+    /// Marks `res` dirty and adds it to `pending`.
+    fn invalidate_res(&mut self, res: usize) -> bool {
+        if let Some(texture) = self.textures.get_mut(&res) {
+            texture.invalidate();
+            self.pending.insert(res);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Fills `out` with the resources whose memory overlaps `[start, end)`.
+    fn overlapping_into(&self, start: u64, end: u64, out: &mut Vec<usize>) {
+        out.clear();
+        for (_, resources) in self.by_address.range(start.saturating_sub(self.largest)..end) {
+            for &res in resources {
+                if self.textures.get(&res).is_some_and(|t| start < t.va.saturating_add(t.plan.size)) {
+                    out.push(res);
+                }
+            }
+        }
+    }
+
     /// The resources whose memory overlaps `[start, end)`.
     fn overlapping(&self, start: u64, end: u64) -> Vec<usize> {
-        self.by_address
-            .range(start.saturating_sub(self.largest)..end)
-            .flat_map(|(_, resources)| resources.iter().copied())
-            .filter(|res| self.textures.get(res).is_some_and(|t| start < t.va.saturating_add(t.plan.size)))
-            .collect()
+        let mut out = Vec::new();
+        self.overlapping_into(start, end, &mut out);
+        out
     }
 }
 
@@ -818,11 +1041,10 @@ pub fn register(res: usize, va: u64, raw: &[u8; 0x38], state: u32, bytes: u64) {
         return;
     }
     let v4 = hardware_v4();
-    match detile_plan::plan(raw, v4) {
+    match detile_plan::plan_shared(raw, v4) {
         Ok(plan) => with_registry(|r| {
             let format = le_u32(raw, 0x20);
-            let kind = format!("format {format} mode {}", plan.mode);
-            if r.logged.len() < 64 && r.logged.insert(kind) {
+            if r.logged.len() < 64 && r.logged.insert((format, plan.mode)) {
                 let width = u64::from_le_bytes(raw[0x10..0x18].try_into().unwrap_or_default());
                 xs_log!(
                     "detile: a texture to detile, ok format {format} mode {} {width}x{} mips {} slices {} v4 {v4} at {va:#x}, {} bytes",
@@ -836,8 +1058,9 @@ pub fn register(res: usize, va: u64, raw: &[u8; 0x38], state: u32, bytes: u64) {
             r.insert(res, Placed { va, plan, bytes, states: vec![state], dirty: true, attempts: 0 });
         }),
         Err(why) => with_registry(|r| {
-            let reason = why.split(':').next().unwrap_or("").to_string();
-            if r.logged.len() < 64 && r.logged.insert(format!("refused {reason}")) {
+            let reason = why.split(':').next().unwrap_or("");
+            if r.logged_refused.len() < 64 && !r.logged_refused.contains(reason) {
+                r.logged_refused.insert(reason.to_string());
                 xs_log!("detile: a placed texture at {va:#x} is not detiled: {why}");
             }
         }),
@@ -881,11 +1104,12 @@ pub fn note_write(va: u64, len: u64) {
     }
     let end = va.saturating_add(len);
     with_registry(|r| {
-        for res in r.overlapping(va, end) {
-            if let Some(texture) = r.textures.get_mut(&res) {
-                texture.invalidate();
-            }
+        let mut hit = std::mem::take(&mut r.scratch.overlapping);
+        r.overlapping_into(va, end, &mut hit);
+        for &res in &hit {
+            r.invalidate_res(res);
         }
+        r.scratch.overlapping = hit;
     });
 }
 
@@ -916,18 +1140,28 @@ pub fn note_tiles(tiles: &[u32]) {
     let report = probe_line_due();
     // The spans are tested with the registry lock released, because DirectStorage completions
     // (`note_write`) and the flushes of other queues wait for it.
-    let spans: Vec<(usize, u64, u64)> = with_registry(|r| r.textures.iter().filter(|(_, t)| !(t.dirty && t.attempts == 0)).map(|(&res, t)| (res, t.va, t.plan.size)).collect());
-    let touched = crate::title_mem::spans_touch(&spans.iter().map(|&(_, va, size)| (va, size)).collect::<Vec<_>>(), &written);
+    let (resources, spans): (Vec<usize>, Vec<(u64, u64)>) = with_registry(|r| {
+        r.textures
+            .iter()
+            .filter(|(_, t)| !(t.dirty && t.attempts == 0))
+            .map(|(&res, t)| (res, (t.va, t.plan.size)))
+            .unzip()
+    });
+    if spans.is_empty() && !report {
+        return;
+    }
+    let touched = crate::title_mem::spans_touch(&spans, &written);
     let marked = with_registry(|r| {
         let (mut marked, mut filled, mut unmapped, mut untouched) = (0u32, 0u32, 0u32, 0u32);
         let mut first_unmapped = 0u64;
-        let waiting = r.textures.values().filter(|t| t.dirty && t.attempts == 0).count();
-        for (&(res, va, _), touch) in spans.iter().zip(touched) {
+        let waiting = if report { r.textures.values().filter(|t| t.dirty && t.attempts == 0).count() } else { 0 };
+        for ((&res, &(va, _)), touch) in resources.iter().zip(&spans).zip(touched) {
             // A texture released or created again in the meantime is left alone.
             let Some(texture) = r.textures.get_mut(&res).filter(|t| t.va == va) else { continue };
             match touch {
                 Some(true) => {
                     texture.invalidate();
+                    r.pending.insert(res);
                     marked += 1;
                 }
                 Some(false) => {
@@ -975,9 +1209,9 @@ pub fn note_transitions(list: usize, transitions: &[(usize, u32, u32)]) {
         return;
     }
     with_registry(|r| {
-        let ours: Vec<_> = transitions.iter().filter(|(res, _, _)| r.textures.contains_key(res)).copied().collect();
-        if !ours.is_empty() {
-            r.noted.entry(list).or_default().extend(ours);
+        let mut iter = transitions.iter().filter(|(res, _, _)| r.textures.contains_key(res)).copied().peekable();
+        if iter.peek().is_some() {
+            r.noted.entry(list).or_default().extend(iter);
         }
     });
 }
@@ -985,8 +1219,8 @@ pub fn note_transitions(list: usize, transitions: &[(usize, u32, u32)]) {
 /// PC list `list` starts a new recording, so the transitions noted for it are dropped.
 pub fn list_reset(list: usize) {
     with_registry(|r| {
-        if !r.noted.is_empty() {
-            r.noted.remove(&list);
+        if let Some(entries) = r.noted.get_mut(&list) {
+            entries.clear();
         }
     });
 }
@@ -995,7 +1229,8 @@ pub fn list_reset(list: usize) {
 /// texture with `count` subresources. All equal states collapse to a single entry.
 pub fn apply_transition(states: &mut Vec<u32>, count: usize, sub: u32, after: u32) {
     if sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || (count <= 1 && sub == 0) {
-        *states = vec![after];
+        states.clear();
+        states.push(after);
         return;
     }
     let index = sub as usize;
@@ -1003,7 +1238,8 @@ pub fn apply_transition(states: &mut Vec<u32>, count: usize, sub: u32, after: u3
         return;
     }
     if states.len() != count {
-        *states = vec![states[0]; count];
+        let initial = states.first().copied().unwrap_or(0);
+        states.resize(count, initial);
     }
     states[index] = after;
     if states.iter().all(|&s| s == after) {
@@ -1014,17 +1250,27 @@ pub fn apply_transition(states: &mut Vec<u32>, count: usize, sub: u32, after: u3
 /// The PC lists `lists` were submitted in this order, so the textures now are in the states that
 /// the transitions of those lists left them in.
 pub fn submitted(lists: &[usize]) {
+    if lists.is_empty() {
+        return;
+    }
     with_registry(|r| {
         if r.noted.is_empty() {
             return;
         }
-        let changes: Vec<(usize, u32, u32)> = lists.iter().filter_map(|list| r.noted.get(list)).flatten().copied().collect();
-        for (res, sub, after) in changes {
+        let mut changes = std::mem::take(&mut r.scratch.changes);
+        changes.clear();
+        for list in lists {
+            if let Some(entries) = r.noted.get(list) {
+                changes.extend_from_slice(entries);
+            }
+        }
+        for &(res, sub, after) in &changes {
             if let Some(texture) = r.textures.get_mut(&res) {
                 let count = (texture.plan.mips.len() as u32 * texture.plan.slices) as usize;
                 apply_transition(&mut texture.states, count, sub, after);
             }
         }
+        r.scratch.changes = changes;
     });
 }
 
@@ -1034,17 +1280,20 @@ pub fn submitted(lists: &[usize]) {
 /// # Safety
 /// `queue` is a live PC command queue.
 pub unsafe fn flush(queue: *mut c_void) {
-    if !enabled() {
+    if !enabled() || !HAS_PENDING_FILLS.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: by the contract of this function.
+    let Some(queue) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
+    // SAFETY: a live queue.
+    if unsafe { queue.GetDesc() }.Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
         return;
     }
     with_registry(|r| {
-        if r.unavailable || !r.textures.values().any(Placed::wants_fill) {
-            return;
-        }
-        // SAFETY: by the contract of this function.
-        let Some(queue) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
-        // SAFETY: a live queue.
-        if unsafe { queue.GetDesc() }.Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        if r.unavailable || r.pending.is_empty() {
+            if r.pending.is_empty() {
+                HAS_PENDING_FILLS.store(false, Ordering::Release);
+            }
             return;
         }
         if !crate::title_mem::enabled() {
@@ -1063,11 +1312,26 @@ pub unsafe fn flush(queue: *mut c_void) {
         }
         let started = Instant::now();
         let tuning = tuning();
-        // Pick the dirty textures that have a GPU address by now.
-        let mut ready: Vec<(usize, u64)> = Vec::new();
+        let mut ready = std::mem::take(&mut r.scratch.ready);
+        ready.clear();
+        let mut resources = std::mem::take(&mut r.scratch.resources);
+        resources.clear();
+        let mut job_res = std::mem::take(&mut r.scratch.job_res);
+        job_res.clear();
+        let mut outcome = std::mem::take(&mut r.scratch.outcome);
+        outcome.clear();
+
+        // Pick the dirty textures that have a GPU address by now, only visiting `pending`.
         let mut unreachable = 0u32;
-        for (&res, texture) in r.textures.iter_mut() {
+        let mut exhausted = std::mem::take(&mut r.scratch.exhausted);
+        exhausted.clear();
+        for &res in &r.pending {
+            let Some(texture) = r.textures.get_mut(&res) else {
+                exhausted.push(res);
+                continue;
+            };
             if !texture.wants_fill() {
+                exhausted.push(res);
                 continue;
             }
             match crate::title_mem::translate_fresh(texture.va, texture.plan.size) {
@@ -1077,44 +1341,70 @@ pub unsafe fn flush(queue: *mut c_void) {
                 None => {
                     texture.attempts += 1;
                     unreachable += 1;
+                    if !texture.wants_fill() {
+                        exhausted.push(res);
+                    }
                 }
             }
+        }
+        for &res in &exhausted {
+            r.pending.remove(&res);
+        }
+        r.scratch.exhausted = exhausted;
+        if r.pending.is_empty() {
+            HAS_PENDING_FILLS.store(false, Ordering::Release);
         }
         if unreachable > 0 && r.flushes < 4 {
             xs_log!("detile: {unreachable} textures have no GPU address for their memory yet");
         }
         if ready.is_empty() {
+            r.scratch.ready = ready;
+            r.scratch.resources = resources;
+            r.scratch.job_res = job_res;
+            r.scratch.outcome = outcome;
             return;
         }
-        let resources: Vec<Option<ID3D12Resource>> = ready
-            .iter()
-            .map(|&(res, _)| {
-                let raw = res as *mut c_void;
-                // SAFETY: the registry holds the entry, so the title still owns the resource (it is forgotten before it is released).
-                unsafe { ID3D12Resource::from_raw_borrowed(&raw) }.cloned()
-            })
-            .collect();
+        ready.sort_unstable_by_key(|&(res, _)| res);
+        resources.extend(ready.iter().map(|&(res, _)| {
+            let raw = res as *mut c_void;
+            // SAFETY: the registry holds the entry, so the title still owns the resource (it is forgotten before it is released).
+            unsafe { ID3D12Resource::from_raw_borrowed(&raw) }.cloned()
+        }));
         let mut jobs: Vec<Job<'_>> = Vec::with_capacity(ready.len());
-        let mut job_res: Vec<usize> = Vec::with_capacity(ready.len());
         for (&(res, gpu), resource) in ready.iter().zip(&resources) {
             if let (Some(texture), Some(placed)) = (resource, r.textures.get(&res)) {
                 jobs.push(Job { texture: texture.clone(), src_gpu: gpu, plan: &placed.plan, states: &placed.states });
                 job_res.push(res);
             }
         }
-        let Some(detiler) = r.detiler.as_mut() else { return };
-        let outcome = detiler.run(queue, &jobs, tuning.wait_each_flush);
+        let Some(detiler) = r.detiler.as_mut() else {
+            drop(jobs);
+            r.scratch.ready = ready;
+            r.scratch.resources = resources;
+            r.scratch.job_res = job_res;
+            r.scratch.outcome = outcome;
+            return;
+        };
+        detiler.run_into(queue, &jobs, tuning.wait_each_flush, &mut outcome);
         let (frames, queues, staging) = detiler.footprint();
         drop(jobs);
         let mut filled_bytes = 0u64;
-        for (res, ok) in job_res.iter().zip(outcome) {
-            if let Some(texture) = r.textures.get_mut(res) {
+        for (&res, &ok) in job_res.iter().zip(&outcome) {
+            if let Some(texture) = r.textures.get_mut(&res) {
                 texture.settle(ok);
+                if !texture.wants_fill() {
+                    r.pending.remove(&res);
+                }
                 if ok {
                     filled_bytes += texture.plan.size;
                     r.detiled += 1;
                 }
+            } else {
+                r.pending.remove(&res);
             }
+        }
+        if r.pending.is_empty() {
+            HAS_PENDING_FILLS.store(false, Ordering::Release);
         }
         r.flushes += 1;
         if r.flushes <= 10 || r.flushes.is_multiple_of(100) {
@@ -1129,6 +1419,11 @@ pub unsafe fn flush(queue: *mut c_void) {
                 staging >> 20
             );
         }
+        resources.clear();
+        r.scratch.ready = ready;
+        r.scratch.resources = resources;
+        r.scratch.job_res = job_res;
+        r.scratch.outcome = outcome;
     });
 }
 
@@ -1141,7 +1436,7 @@ mod tests {
     }
 
     fn placed(va: u64, size: u64) -> Placed {
-        Placed { va, plan: flat_plan(size), bytes: size, states: vec![0], dirty: false, attempts: 0 }
+        Placed { va, plan: Arc::new(flat_plan(size)), bytes: size, states: vec![0], dirty: false, attempts: 0 }
     }
 
     #[test]
@@ -1247,6 +1542,7 @@ mod tests {
             with_registry(|r| match r.textures.get_mut(&res) {
                 Some(t) if t.wants_fill() => {
                     t.settle(true);
+                    r.pending.remove(&res);
                     1
                 }
                 _ => 0,
@@ -1274,5 +1570,44 @@ mod tests {
         assert!(!texture.wants_fill());
         texture.invalidate();
         assert!(texture.wants_fill());
+    }
+
+    #[test]
+    fn best_finished_prefers_the_smallest_idle_frame_that_already_fits_needed_staging() {
+        let completed = |queue: usize| if queue == 1 { 5 } else { 0 };
+        let frames = [(1, 2, 8 << 20), (1, 3, 64 << 20), (1, 4, 32 << 20), (2, 1, 16 << 20)];
+        assert_eq!(best_finished(frames.into_iter(), 20 << 20, completed), Some(2), "32 MiB fits 20 MiB with less slack than 64 MiB");
+        assert_eq!(best_finished(frames.into_iter(), 8 << 20, completed), Some(0), "exact 8 MiB match");
+        assert_eq!(best_finished(frames.into_iter(), 128 << 20, completed), Some(1), "none fits so the largest idle frame is chosen");
+        assert_eq!(best_finished([(2, 1, 16 << 20), (1, u64::MAX, 32 << 20)].into_iter(), 8 << 20, completed), None);
+    }
+
+    #[test]
+    fn group_batches_into_reuses_the_batch_buffer_and_respects_both_limits() {
+        let mut batches = Vec::with_capacity(16);
+        batches.push(99..100);
+        let target = BATCH_STAGING_TARGET;
+        let slots = DISPATCH_SLOTS;
+        group_batches_into(&[(target / 4, 10), (target / 4, slots - 5), (target / 2, 5), (target, 1)], &mut batches);
+        assert_eq!(batches, [0..1, 1..3, 3..4]);
+        let cap = batches.capacity();
+        group_batches_into(&[], &mut batches);
+        assert!(batches.is_empty() && batches.capacity() == cap);
+    }
+
+    #[test]
+    fn pending_set_tracks_dirty_textures_through_inserts_writes_and_removals() {
+        let mut r = Registry::default();
+        let mut dirty_one = placed(0x1000, 0x1000);
+        dirty_one.dirty = true;
+        r.insert(10, dirty_one);
+        r.insert(20, placed(0x4000, 0x1000));
+        assert!(r.pending.contains(&10) && !r.pending.contains(&20));
+        assert!(r.invalidate_res(20));
+        assert!(r.pending.contains(&20));
+        assert!(r.remove(10));
+        assert!(!r.pending.contains(&10) && r.pending.contains(&20));
+        assert!(r.remove(20));
+        assert!(r.pending.is_empty());
     }
 }

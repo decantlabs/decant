@@ -15,11 +15,29 @@
 //! (also arrays and cube maps), textures the GPU writes (render target, depth, unordered access),
 //! thick 3D modes, formats the XG layout does not model, and textures of 4 GiB or more.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use decant_texture::xg::d3d12::{D3d12ResourceDesc, texture_desc_from_d3d12};
 use decant_texture::xg::{Dim, compute_layout};
 
 /// D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ALLOW_DEPTH_STENCIL and ALLOW_UNORDERED_ACCESS: the GPU writes the texture.
 pub const GPU_WRITTEN_FLAGS: u32 = 0x1 | 0x2 | 0x4;
+
+/// The most entries a planner or footprint cache keeps before it clears on the next miss.
+const CACHE_LIMIT: usize = 4096;
+
+/// The key of a layout query: the 0x38 bytes of the console description with `Alignment` cleared
+/// (bytes 8 to 16, which `D3d12ResourceDesc::from_bytes` ignores) and the hardware version flag.
+type PlanKey = ([u8; 0x38], bool);
+type PlanCache = HashMap<PlanKey, Result<Arc<Plan>, String>>;
+type FootprintCache = HashMap<PlanKey, Option<(u64, u64)>>;
+
+fn plan_key(raw: &[u8; 0x38], v4: bool) -> PlanKey {
+    let mut canonical = *raw;
+    canonical[8..16].fill(0);
+    (canonical, v4)
+}
 
 /// One mip level, field for field what the shader reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,9 +98,7 @@ impl Plan {
     }
 }
 
-/// The plan of the texture whose console description is `raw` (the 0x38 bytes the title passed), laid
-/// out with the hardware version `v4`. The error is the reason for refusing it.
-pub fn plan(raw: &[u8; 0x38], v4: bool) -> Result<Plan, String> {
+fn compute_plan(raw: &[u8; 0x38], v4: bool) -> Result<Plan, String> {
     let d = D3d12ResourceDesc::from_bytes(raw);
     if d.dimension != 3 {
         return Err(format!("dimension {} is not a 2D texture", d.dimension));
@@ -140,13 +156,55 @@ pub fn plan(raw: &[u8; 0x38], v4: bool) -> Result<Plan, String> {
     })
 }
 
-/// The bytes and alignment the console's XG layout gives the resource whose console description is
-/// `raw`, laid out with the hardware version `v4`. The PC footprint (`GetResourceAllocationInfo`)
-/// differs: the title sizes its display-target block with XG and asserts the block is used up.
-pub fn console_footprint(raw: &[u8; 0x38], v4: bool) -> Option<(u64, u64)> {
+/// Shared plan of the texture whose console description is `raw` (the 0x38 bytes the title passed),
+/// laid out with the hardware version `v4`. Plans are cached by canonical description so repeated
+/// placements and views of the same texture geometry share one allocation without recomputing XG
+/// equations.
+pub fn plan_shared(raw: &[u8; 0x38], v4: bool) -> Result<Arc<Plan>, String> {
+    static CACHE: OnceLock<Mutex<PlanCache>> = OnceLock::new();
+    let key = plan_key(raw, v4);
+    let mutex = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = mutex.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() {
+        return hit;
+    }
+    let computed = compute_plan(&key.0, v4).map(Arc::new);
+    let mut guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= CACHE_LIMIT {
+        guard.clear();
+    }
+    guard.insert(key, computed.clone());
+    computed
+}
+
+/// The plan of the texture whose console description is `raw` (the 0x38 bytes the title passed), laid
+/// out with the hardware version `v4`. The error is the reason for refusing it.
+pub fn plan(raw: &[u8; 0x38], v4: bool) -> Result<Plan, String> {
+    plan_shared(raw, v4).map(|p| (*p).clone())
+}
+
+fn compute_console_footprint(raw: &[u8; 0x38], v4: bool) -> Option<(u64, u64)> {
     let desc = texture_desc_from_d3d12(&D3d12ResourceDesc::from_bytes(raw)).ok()?;
     let layout = compute_layout(&desc, v4).ok()?;
     (layout.layout.size_bytes != 0).then_some((layout.layout.size_bytes, layout.layout.base_alignment_bytes))
+}
+
+/// The bytes and alignment the console's XG layout gives the resource whose console description is
+/// `raw`, laid out with the hardware version `v4`. The PC footprint (`GetResourceAllocationInfo`)
+/// differs: the title sizes its display target block with XG and asserts the block is used up.
+pub fn console_footprint(raw: &[u8; 0x38], v4: bool) -> Option<(u64, u64)> {
+    static CACHE: OnceLock<Mutex<FootprintCache>> = OnceLock::new();
+    let key = plan_key(raw, v4);
+    let mutex = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&hit) = mutex.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return hit;
+    }
+    let computed = compute_console_footprint(&key.0, v4);
+    let mut guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= CACHE_LIMIT {
+        guard.clear();
+    }
+    guard.insert(key, computed);
+    computed
 }
 
 #[cfg(test)]
@@ -248,5 +306,19 @@ mod tests {
         let mut msaa = raw(64, 64, 1, 1, 28, 0, 0);
         msaa[0x24..0x28].copy_from_slice(&4u32.to_le_bytes());
         assert!(plan(&msaa, false).unwrap_err().contains("samples"));
+    }
+
+    #[test]
+    fn shared_plans_and_footprints_reuse_cached_entries_across_alignments() {
+        let mut a = raw(256, 256, 1, 9, 98, 0, 0);
+        a[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+        let mut b = a;
+        b[8..16].copy_from_slice(&0x10000u64.to_le_bytes());
+        let plan_a = plan_shared(&a, false).expect("a plan");
+        let plan_b = plan_shared(&b, false).expect("a plan");
+        assert!(Arc::ptr_eq(&plan_a, &plan_b), "identical geometry with different alignment hints shares the same plan");
+        let plan_v4 = plan_shared(&a, true).expect("a v4 plan");
+        assert_eq!(plan_a.size, plan_v4.size);
+        assert_eq!(console_footprint(&a, false), console_footprint(&b, false));
     }
 }
