@@ -488,7 +488,7 @@ fn take_stats(pages: usize, protected: usize, pending: usize, queries: usize, ti
 
 /// The last region `VirtualQuery` described, so that the next pages in it are not queried again: a region
 /// is a run of pages with the same state, and `take_dirty` asked for each 64 KiB page on its own (a call
-/// per page, 16 microseconds each under the lock while the world loaded, runs of 25 Nov).
+/// per page, microseconds each under the lock while a large world loaded).
 #[derive(Default)]
 struct CommittedRuns {
     start: usize,
@@ -614,7 +614,7 @@ impl Drop for Locked<'_> {
 }
 
 /// The most pages one section of a growth holds: 2 GiB, the size D3D12 was seen to open as a
-/// GPU heap (a 6.4 GiB section was refused).
+/// GPU heap (a section of several GiB was refused).
 pub const MAX_SECTION_PAGES: usize = (2usize << 30) / PAGE_BYTES;
 
 /// Commits of `commit_region` lie below this address when Windows has room there: the page table of
@@ -805,7 +805,7 @@ impl Engine {
     }
 
     /// Grows the pool by `extra` pages of normal pages, in sections of at most `MAX_SECTION_PAGES`:
-    /// D3D12 opens a section of 2 GiB as a heap for the GPU but refused a page pool of 6.4 GiB
+    /// D3D12 opens a section of 2 GiB as a heap for the GPU but refused a page pool of several GiB
     /// as one section (E_INVALIDARG), so a larger growth becomes several sections.
     fn grow(&self, st: &mut State, extra: usize) -> Result<(), EngineError> {
         let mut left = extra;
@@ -1723,7 +1723,7 @@ impl Engine {
 
     /// As `prepare_write` for a write that ends when a call returns (a `ReadFile` without
     /// `OVERLAPPED`): the pages stay open until [`Engine::end_write`], however long the call takes. A
-    /// read of 271 MB took longer than `track::IO_HOLD` in a retail title: its
+    /// read of hundreds of MB took longer than `track::IO_HOLD` in a retail title: its
     /// pages were protected again under the kernel's write, it failed with `ERROR_NOACCESS` every time
     /// and the title stopped at its boot.
     pub fn begin_write(&self, address: usize, len: usize) {
@@ -2654,7 +2654,7 @@ mod tests {
     }
 
     /// A commit larger than the free run of a section takes a run that goes on into a new section, mapped
-    /// as one view per section (an arena of 0x89700000 bytes is larger than a section of 2 GiB).
+    /// as one view per section (an arena above 2 GiB is larger than a section of 2 GiB).
     #[test]
     fn a_commit_region_may_cross_into_a_new_section() {
         let step = crate::pages::GROW_STEP_PAGES;

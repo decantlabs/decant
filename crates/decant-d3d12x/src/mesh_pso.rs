@@ -1,5 +1,5 @@
 //! Mesh pipelines (console device slot 86 with a mesh shader in its stream). The title creates about
-//! 3,000 of them while it boots.
+//! of them while it boots.
 //!
 //! Our description of a mesh pipeline is a plain `D3D12_GRAPHICS_PIPELINE_STATE_DESC` (no vertex,
 //! hull, domain or geometry shader, the pixel shader at its usual place, the fixed function state as

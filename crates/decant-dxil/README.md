@@ -183,15 +183,15 @@ through the FSSM binding table and the `.src` file, places them (`Bindings`), re
 line, names the vertex and pixel interface with the console semantics and the registers of the
 console signature, imports, writes and checks the container with dxil.dll. It prints how many
 modules each stage carries and the refusals by cause. Measured on the whole cache of a retail title's
-shader corpus (every vertex and pixel module, 2,292 of the 2,689 compute shaders):
+shader corpus (every vertex and pixel module, most of the compute shaders):
 
-| Stage | Modules | Carried | Main refusals |
+| Stage | Modules | Share carried | Main refusals |
 |---|---|---|---|
-| vertex | 2,222 | 2,097 | several immediate samplers 88, signature overlaps 23 |
-| pixel | 11,998 | 7,054 | several immediate samplers 3,755, a buffer the expression elides 580, 64 bit texels 416 |
-| compute | 2,292 | 1,244 | several immediate samplers 782, two resources at one register 151 |
+| vertex | about 2,000 | 94 percent | several immediate samplers, signature overlaps |
+| pixel | about 12,000 | 59 percent | several immediate samplers, a buffer the expression elides, 64 bit texels |
+| compute | most | 54 percent | several immediate samplers, two resources at one register |
 
-(Before the user data mirror: vertex 1,052, pixel 2,346, compute 89.) The registers and their spaces come from the console container itself: its `PSV0` part lists every resource
+The registers and their spaces come from the console container itself: its `PSV0` part lists every resource
 with class, register range, register space and kind (the records the Direct3D debug layer reads at pipeline
 creation). `decant_shader_dxil_cache` matches each identified register (`t11`, `b27`) to a record of the same class, the
 right kind of resource (buffer, texture, sampler) first, and takes the space from it. A register that two
@@ -246,17 +246,17 @@ stages, interpolation functions (`InterpolateAt...`), view id.
 `decant_shader_spv_measure <folder> [--limit N] [--examples K] [--dump <folder>]` imports, writes and
 validates (with dxil.dll) every `*.spv` under a folder and prints how many pass and the failures by
 cause. The modules are only read. Measured on the compute modules of the translation of a retail title's
-shader corpus (2,292 modules of the 2,689 compute shaders):
+shader corpus (most of the compute shaders):
 
-| Step | Modules |
+| Step | Share of the modules |
 |---|---|
-| translated by the probe | 2,292 |
-| imported | 1,410 |
-| written as a container | 1,347 |
-| accepted by the validator of dxil.dll | 1,347 |
+| translated by the probe | 100 percent |
+| imported | 61 percent |
+| written as a container | 59 percent |
+| accepted by the validator of dxil.dll | 59 percent |
 
-Failures: dynamic descriptor array index 805, a type mismatch of `OpNot` on 64 bit values 63 (fixed in
-the next version), 8 and 16 bit integers 53, `OpImageTexelPointer` 20, 64 bit float 4. Every
+Failures, most to least common: dynamic descriptor array index, a type mismatch of `OpNot` on 64 bit values (fixed in
+the next version), 8 and 16 bit integers, `OpImageTexelPointer`, 64 bit float. Every
 container that was written validates. `tests/spirv.rs` runs three hand written modules on a device
 and compares with a Rust reference (a loop through function variables, a function call, a workgroup
 array with a barrier, a switch, and device addresses).

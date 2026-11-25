@@ -20,8 +20,8 @@ pub const ATTR_DESCRIPTOR_HEAP: u64 = 4 | (1 << 14) | (0x80 << 16) | (16 << 24) 
 pub const ATTR_DISPLAY_TARGET: u64 = (2 << 14) | (0x80 << 16) | (16 << 24) | (1 << 29);
 
 /// PC D3D12 Tier 2/3 hard cap for shader-visible CBV/SRV/UAV descriptor heaps (`1,000,000`).
-/// A retail title asks for `1,245,184` on the console. That fails on Windows PC D3D12 with
-/// `E_INVALIDARG`, also on a Tier 3 RTX 3090 (24 Nov 2026). Such a heap is paged ([`Pager`]).
+/// A retail title asks for more than a million slots on the console. That fails on Windows PC D3D12 with
+/// `E_INVALIDARG`, also on a Tier 3 RTX 3090. Such a heap is paged ([`Pager`]).
 pub const PC_MAX_SHADER_VISIBLE_VIEW_DESCRIPTORS: u32 = 1_000_000;
 
 /// One registered descriptor heap mapped to a range of title memory.
@@ -674,9 +674,9 @@ pub struct Paged {
 /// ([`move_table`]), used as a ring. A moved table must outlive the lists that read it, which may
 /// run up to [`KEEP_PRESENTS`] presents later. With 1024 slots the ring came round within one or
 /// two presents (measured on RADV for the unpaged heap, and on Windows as `came round` in the
-/// menus of a retail title) and the text of the menus lost letters. 16384 slots (256
+/// menus of a title) and the text lost letters. 16384 slots (256
 /// tables) last some 16 to 32 presents, and of a heap clamped to 1,000,000 slots they leave the
-/// pager 240 pages of 4096 slots, above the 221 the menus and the loading view use at their peak.
+/// pager 240 pages of 4096 slots, above the peak the menus of a retail title use.
 pub const MOVED_SLOTS: u32 = 16384;
 
 /// The extra host slots a view heap that is not paged gets for its ring of moved tables: 1024
@@ -1458,10 +1458,10 @@ mod tests {
 
     #[test]
     fn the_ring_of_moved_tables_leaves_the_pager_its_peak_pages() {
-        // A retail title on Windows: the view heap is clamped from 1,245,184 to 1,000,000 slots, and the menus
-        // and the loading view use 221 host pages at their peak (measured).
-        let pager = super::Pager::new(1_245_184, 1_000_000 - super::MOVED_SLOTS);
-        assert!(pager.host_pages() >= 221, "{} host pages", pager.host_pages());
+        // A view heap of 1,200,000 slots on Windows is clamped to 1,000,000 slots, and the menus
+        // use a few hundred host pages at their peak.
+        let pager = super::Pager::new(1_200_000, 1_000_000 - super::MOVED_SLOTS);
+        assert!(pager.host_pages() >= 200, "{} host pages", pager.host_pages());
         let tail = 1_000_000 - pager.host_pages() * super::PAGE;
         assert!(tail >= super::MOVED_SLOTS && tail / 64 >= 256, "a tail of {tail} slots");
     }

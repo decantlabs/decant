@@ -532,7 +532,7 @@ pub type DispatchX = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
 fn a_structured_view_above_the_first_page_of_a_paged_heap_has_its_row_at_the_host_slot_the_heap_map_names() {
     use crate::title_heap::{PAGE, UNMAPPED};
     // The title's view heap: more slots than the PC takes shader visible, so it is paged.
-    const TITLE_SLOTS: u32 = 1_245_184;
+    const TITLE_SLOTS: u32 = 1_200_000;
     const SLOT: u32 = 3 * PAGE + 7;
     for (name, device) in devices() {
         println!("paged view heap on {name}");

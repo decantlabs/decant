@@ -1,7 +1,7 @@
 //! The mesh stage.
 //!
-//! Measured on the title (24 Nov 2026, all 9,282 mesh programs, measured with the shader
-//! batch tools): every mesh program is one shape. It is a
+//! Measured on a retail title (all mesh programs, measured with the shader batch tools): every
+//! mesh program is one shape. It is a
 //! real mesh shader of 128 threads, two waves of 64 lanes, around a vertex shader body:
 //!
 //! * the thread number is the lane number plus 64 times the wave index, which the program

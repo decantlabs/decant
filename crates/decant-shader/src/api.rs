@@ -69,9 +69,9 @@ impl Stage {
     }
 
     /// The first user data register of the stage, as a machine register. Measured on the
-    /// title's containers (24 Nov 2026): compute programs start at `s4`, vertex and pixel
+    /// title's containers: compute programs start at `s4`, vertex and pixel
     /// programs at `s8`, mesh and geometry programs at `s16` (every binding record of the
-    /// 9,282 mesh and 195 geometry programs names a register 8 below the one the code loads
+    /// mesh and geometry programs names a register 8 below the one the code loads
     /// from). The archive holds no hull, domain or amplification program.
     pub fn first_user_sgpr(self) -> u8 {
         match self {
@@ -224,8 +224,8 @@ pub struct ParamExport {
 }
 
 /// One record of the pixel input table of an FSSM block: hardware attribute `attr` carries the
-/// input element in signature register `register`. Measured on all 12,101 pixel programs of the
-/// title (24 Nov 2026).
+/// input element in signature register `register`. Measured on all pixel programs of the
+/// title.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PixelInput {
     /// The attribute number the interpolation instructions name.
@@ -354,7 +354,7 @@ pub struct RootSignature {
 ///   * **Buffer views are raw views.** A console buffer descriptor has a base, a stride, a
 ///     count and a format, and the instruction decides whether it reads raw dwords or decoded
 ///     elements. One PC view cannot serve both, and a structured buffer read on PC uses the
-///     declared stride or the stride of the view depending on the driver (measured, 24 Nov
+///     declared stride or the stride of the view depending on the driver (measured
 ///     2026). So the layer creates every structured AND every typed buffer view of the title as
 ///     a raw view over the same bytes, and the row is: dword 0 the element size in bytes (the
 ///     stride), dword 1 the element count, dword 2 the DXGI format number of the title's view

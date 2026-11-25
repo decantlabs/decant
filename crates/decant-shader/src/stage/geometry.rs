@@ -1,8 +1,8 @@
 //! The geometry stage. Hull and domain programs come here too and are refused: the title's
 //! archive has none.
 //!
-//! Measured on the title (24 Nov 2026, all 195 geometry programs, measured with the shader
-//! batch tools): one shape. The program is the geometry
+//! Measured on a retail title (all geometry programs, measured with the shader batch tools):
+//! one shape. The program is the geometry
 //! part alone, one lane for one input primitive, and it talks to the stages around it through
 //! the local data share:
 //!

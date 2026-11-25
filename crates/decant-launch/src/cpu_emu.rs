@@ -8,7 +8,7 @@
 //!
 //! * CLZERO (`0f 01 fc`, optional `67` prefix that makes the address EAX) zeroes the 64 byte line that
 //!   holds the address in RAX. The loop `clzero; add rax,0x40; cmp rax,<reg>; jb back` is recognised
-//!   and done in a single step ([`match_loop`]). A retail title clears a 0xDAC0 byte block with five
+//!   and done in a single step ([`match_loop`]). A retail title clears a block of tens of KiB with five
 //!   such loops in a row, each against a different limit register.
 //! * MONITORX (`0f 01 fa`) and MWAITX (`0f 01 fb`) do nothing, which the architecture allows for MWAITX.
 //! * RDPRU (`0f 01 fd`): ECX 0 reads MPERF and ECX 1 reads APERF. Both are answered from

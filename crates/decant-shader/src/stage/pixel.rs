@@ -1,15 +1,15 @@
 //! The pixel stage.
 //!
-//! Facts measured on the title's 12,101 pixel programs (24 Nov 2026), the basis of this file:
+//! Facts measured on the title's pixel programs, the basis of this file:
 //!
 //! * **Attributes.** The FSSM block of every pixel container holds 32 records of 8 bytes at byte
 //!   0x138 (`api::PixelInput`): attribute `k` of the interpolation instructions starts with
 //!   signature register `register`. More 16 bit registers can follow in the same attribute
-//!   ([`walk`]). With that layout every interpolation read of 12,093 programs lies inside the
+//!   ([`walk`]). With that layout every interpolation read of nearly all programs lies inside the
 //!   declared mask of its register. Six programs read a padding half past a 16 bit element,
 //!   which reads zero here, and two read a register the console split into a flat and an
 //!   interpolated attribute (refused as `stage:attr-unknown`). The older rule "attribute `k` is the register of rank `k` among the registers with a
-//!   non zero read mask" holds for 7,722 programs only: the console compiler gives attributes
+//!   non zero read mask" holds for a part of the programs only: the console compiler gives attributes
 //!   to some registers whose read mask is zero, and packs two 16 bit registers into one
 //!   attribute. That rule is kept as the fallback for programs without a container (packs and
 //!   the tests), with adjacent 16 bit registers paired.
@@ -29,18 +29,18 @@
 //!   elements) and perspective at the pixel centre (79,577). An attribute whose record is flat
 //!   (flag 0x01) becomes a `nointerpolation` member.
 //! * **Entry registers.** The barycentric pair is always perspective centre in `v0`, `v1`, and
-//!   it is allocated even when the program interpolates nothing (1,841 programs). Then follow
+//!   it is allocated even when the program interpolates nothing (a number of programs). Then follow
 //!   the components of `SV_Position` the program reads (by the read mask, x to w), then the
-//!   front face. The layout was checked against the registers read before written in 10,157
-//!   programs, the rest are artefacts of that linear scan. The front face register is non zero
+//!   front face. The layout was checked against the registers read before written in
+//!   most programs, the rest are artefacts of that linear scan. The front face register is non zero
 //!   for a front face (programs test it with `v_cmp_lg_u32 0`), here 0 or all bits. The
 //!   position w register holds 1/w, while Direct3D's `SV_Position.w` is w.
 //! * **Exports.** Every colour export of the title is compressed (16 bit formats): two halves
 //!   per register, red and green in the first, blue and alpha in the second. A float target
 //!   gets half floats (FP16), an integer target 16 bit integers. Export target `n` is the `n`-th
 //!   colour target the program writes, in ascending index (the hardware compacts the targets:
-//!   221 programs write for example SV_Target0 and SV_Target2 with targets 0 and 1). Target 8
-//!   carries the depth in channel 0 (1,171 programs, `SV_Depth` or a conservative form), the
+//!   some programs write for example SV_Target0 and SV_Target2 with targets 0 and 1). Target 8
+//!   carries the depth in channel 0 (some programs, `SV_Depth` or a conservative form), the
 //!   stencil reference in 1 and the coverage in 2. Target 9 is the null target the kill exit
 //!   uses. With the valid mask bit an export also carries EXEC as the kill mask: a lane that is
 //!   not active there is a discarded pixel.
@@ -176,7 +176,7 @@ pub(super) struct Walked {
 /// with a record opens a packed slot. A 16 bit register without a record goes into the open
 /// packed slot at the next whole channel, its components rounded up to whole channels, while
 /// it fits in four channels. The open packed slot stays open across 32 bit registers. With this
-/// layout every interpolation read of 12,093 of the 12,101 pixel programs lies inside the
+/// layout every interpolation read of nearly all pixel programs lies inside the
 /// declared mask of its register.
 pub(super) fn walk(registers: impl IntoIterator<Item = Walked>) -> Vec<Place> {
     let mut out = Vec::new();

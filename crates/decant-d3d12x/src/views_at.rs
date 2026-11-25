@@ -163,7 +163,7 @@ pub struct ViewEntry {
 }
 
 /// Memory the textures of views at an address may take when the card says nothing (MiB). A run
-/// that took 6086 MiB (40,000 textures) died at 755 s of a lack of memory.
+/// that took several GiB for tens of thousands of textures died of a lack of memory.
 pub const DEFAULT_VIEW_TEX_MIB: u64 = 14 * 1024;
 /// A texture is given back only when no view of its address was made for this many presents ...
 pub const MIN_IDLE_PRESENTS: u64 = 600;
@@ -671,10 +671,10 @@ mod tests {
     #[test]
     fn page_pools_deduplicate_and_reuse_slots() {
         let mut p = PagePools::default();
-        assert_eq!(p.register(0xDD47_70000, 99776), 0);
-        assert_eq!(p.register(0xDD47_70000, 99776), 0);
+        assert_eq!(p.register(0xDD47_70000, 100000), 0);
+        assert_eq!(p.register(0xDD47_70000, 100000), 0);
         assert_eq!(p.register(0xEE00_00000, 128), 1);
-        assert!(p.unregister(0xDD47_70000, 99776));
+        assert!(p.unregister(0xDD47_70000, 100000));
         assert_eq!(p.register(0xFF00_00000, 64), 0);
     }
 }

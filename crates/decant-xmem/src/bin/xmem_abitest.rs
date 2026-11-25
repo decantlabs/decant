@@ -92,7 +92,7 @@ mod run {
         if !home.is_null() {
             x.free(home, 0);
         }
-        const ARENA_SIZE: usize = 0x4940_0000;
+        const ARENA_SIZE: usize = 0x4000_0000;
         let arena = x.virtual_alloc(std::ptr::null_mut(), ARENA_SIZE, 0x2000_3000, 0x183);
         let writable = !arena.is_null() && protection_of(arena) == PAGE_READWRITE;
         c.check(writable, "XMemVirtualAlloc: 0x183 becomes PAGE_READWRITE for the committed arena");
@@ -286,8 +286,8 @@ mod run {
         x.free_pages(1, Some(&one));
     }
 
-    /// The title asks for far more physical memory than the first pool of 1 GiB (it asked for 99776
-    /// pages, 6 GiB, in one call). The pool grows: 1.25 GiB are allocated, mapped over one
+    /// The title asks for far more physical memory than the first pool of 1 GiB (it asked for 100000
+    /// than 6 GiB in one call). The pool grows: 1.25 GiB are allocated, mapped over one
     /// placeholder, written at both ends and at the page where the first 1 GiB ends, then unmapped
     /// and freed. Only the touched pages use memory.
     fn beyond_the_first_pool(x: &XMem, c: &mut Checks) {
@@ -326,14 +326,14 @@ mod run {
         x.free(area, 0);
     }
 
-    /// The title's sequence: a plain `MEM_RESERVE` of 0x185c00000 bytes (`0x20402000`, protection
-    /// 0x23) is a target for physical pages, as on the console. 99776 pages are allocated, mapped
+    /// The title's sequence: a plain `MEM_RESERVE` of 0x190000000 bytes (`0x20402000`, protection
+    /// 0x23) is a target for physical pages, as on the console. 100000 pages are allocated, mapped
     /// into the start of it, written at both ends, unmapped and freed. A commit inside such a
     /// range works, and `XMemFree` gives the whole reservation back.
     fn plain_reserve_takes_pages(x: &XMem, c: &mut Checks) {
         const P: usize = 0x1_0000;
-        const WHOLE: usize = 0x1_85c0_0000;
-        const PAGES: usize = 99776;
+        const WHOLE: usize = 0x1_9000_0000;
+        const PAGES: usize = 100000;
         const PLAIN_RESERVE: u32 = 0x2040_2000;
         const PLAIN_COMMIT: u32 = 0x2040_3000;
         const PAGES_64K: u64 = 0x2040_0000;
@@ -341,12 +341,12 @@ mod run {
             return;
         }
         let area = x.virtual_alloc(std::ptr::null_mut(), WHOLE, PLAIN_RESERVE, 0x23);
-        c.check(!area.is_null() && (area as usize).is_multiple_of(P) && protection_of(area) == 0, &format!("XMemVirtualAlloc 0x20402000, 0x23: 0x185c00000 bytes are reserved, nothing committed ({area:p}, protection {}, error {})", protection_of(area), x.last_error()));
+        c.check(!area.is_null() && (area as usize).is_multiple_of(P) && protection_of(area) == 0, &format!("XMemVirtualAlloc 0x20402000, 0x23: 0x190000000 bytes are reserved, nothing committed ({area:p}, protection {}, error {})", protection_of(area), x.last_error()));
         if area.is_null() {
             return;
         }
         let (ok, count, frames, error) = x.allocate_pages(PAGES_64K, PAGES);
-        c.check(ok && count == PAGES, &format!("XMemAllocatePhysicalPages: 99776 pages (error {error})"));
+        c.check(ok && count == PAGES, &format!("XMemAllocatePhysicalPages: 100000 pages (error {error})"));
         if ok {
             let (mapped, error) = x.map_pages(area, PAGES, Some(&frames));
             c.check(mapped == area, &format!("XMemMapPhysicalPages: the pages map into the start of the plain reservation (error {error})"));

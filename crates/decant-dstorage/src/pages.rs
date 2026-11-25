@@ -66,7 +66,7 @@ impl PagePool for XmemPool {
 /// may pass an array on its stack), where the bytes start in the first page, and the array itself.
 ///
 /// The title enqueues a read before it has put the frames into its array: at enqueue every entry is 0
-/// (no frame, measured on all 1113 page destinations of a run of 24 Nov), and the frames are there
+/// (no frame, measured on every page destination of a title run), and the frames are there
 /// by the time the read runs. So a snapshot with a 0 entry is taken again from the array when the
 /// bytes are written ([`PageTarget::frames_now`]).
 pub struct PageTarget {

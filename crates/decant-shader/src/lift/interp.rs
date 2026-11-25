@@ -6,7 +6,7 @@
 //! M0. In HLSL the interpolated value is simply the input, so the second step writes the input
 //! and the first step writes a value nothing reads.
 //!
-//! Measured on the title's 12,101 pixel programs: every ordinary input is either perspective
+//! Measured on the title's pixel programs: every ordinary input is either perspective
 //! interpolated at the pixel centre or flat (the interpolation modes of `PSV0`), and every
 //! weight pair is `v0`, `v1`. So the weights carry no information the translation needs.
 //!

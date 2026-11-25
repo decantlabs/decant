@@ -1188,7 +1188,7 @@ pub fn show_pages(to: u64, from: u64, pages: u32) -> Option<bool> {
 
 /// For each span `(va, len)` of `spans`: whether one of its pages shows a mirror tile of `written`,
 /// `None` when its pages are not all mapped in one reservation. One lock for all spans: the detile
-/// table asked `tiles_of` once per texture at every sync, 30,000 times while a retail title loads its world,
+/// table asked `tiles_of` once per texture at every sync, tens of thousands of times while a title loads its world,
 /// and held its own lock meanwhile.
 pub fn spans_touch(spans: &[(u64, u64)], written: &HashSet<u32>) -> Vec<Option<bool>> {
     with_state(|st, _| {

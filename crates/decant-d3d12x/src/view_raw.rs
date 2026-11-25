@@ -3,7 +3,7 @@
 //! A console buffer descriptor carries its record stride, and the machine computes
 //! `index * stride + offset` itself. On PC a structured buffer read uses the stride the shader
 //! declares on some drivers (WARP, vkd3d-proton) and the stride of the view on others (measured on
-//! an RTX 3090, 24 Nov 2026). And a console program may read one buffer both with format loads and
+//! an RTX 3090). And a console program may read one buffer both with format loads and
 //! with dword loads, which no single typed PC view serves. The translated shaders (and the old
 //! override shaders, which declare every buffer a `ByteAddressBuffer`) therefore read buffers raw and
 //! do the arithmetic and the format conversion themselves, with the element size, count and format
@@ -90,7 +90,7 @@ pub enum Outcome {
     /// than 2^32 dwords): the description is unchanged.
     Kept(Records),
     /// A buffer view of no elements, which the console takes and the PC runtime calls invalid and
-    /// removes the device for (world load, run world-debug2 of 24 Nov: a raw UAV with
+    /// removes the device for (a world load: a raw UAV with
     /// `NumElements` 0). The description is now that of a null view: the caller passes no resource,
     /// so the slot reads zeros and drops writes, as an empty view does.
     Empty,
@@ -181,7 +181,7 @@ pub fn make_raw(desc: &mut [u8; DESC_BYTES], kind: ViewKind) -> Outcome {
 
 /// Cuts the buffer view `desc` (as it goes to the PC) to a buffer of `width` bytes: elements past
 /// the end are left out (the console reads them as zeros, the PC runtime removes the device on a
-/// view that does not fit: run early-debug of 25 Nov, a raw SRV one dword longer than its
+/// view that does not fit: a raw SRV one dword longer than its
 /// buffer). Whether the view still has elements; with none it must become a null view ([`make_raw`]
 /// makes the description of one from a view of no elements). A view that is no buffer view, or
 /// whose element size is unknown, is left as it is.

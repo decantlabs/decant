@@ -13,14 +13,14 @@ Valid does not mean correct. A module can pass every structural check and still 
 
 ## Results
 
-The figures below were measured on the shader corpus of a retail title (26,503 programs), with the SPIR-V based translator that preceded `decant-shader`.
+The figures below were measured on the shader corpus of a retail title (tens of thousands of programs), with the SPIR-V based translator that preceded `decant-shader`.
 
 | Check | Result |
 |---|---|
-| Instruction decoding | 26,502 of 26,503 programs decoded |
+| Instruction decoding | all programs but one decoded |
 | Opcode tables against Mesa's ACO GFX10 numbering | 659 identical, 67 the same instruction under its GFX10 name, 0 mismatches |
-| Instructions reached in the corpus | 44,327,613, none unrecognised |
-| Structural validation with `spirv-val` (Vulkan 1.2, `VK_KHR_maintenance8` assumed) | 26,503 of 26,503: pixel 12,101, mesh 9,282, compute 2,689, vertex 2,236, geometry 195 |
+| Instructions reached in the corpus | tens of millions, none unrecognised |
+| Structural validation with `spirv-val` (Vulkan 1.2, `VK_KHR_maintenance8` assumed) | every decoded program, on every stage (pixel, mesh, compute, vertex, geometry) |
 | Modules that use a fallback instead of a proof | 22 (a null texture descriptor or a fixed sampler) |
 | Modules that read memory by address | about 47 percent, including every mesh shader |
 | Execution on a real GPU against an independent result | simple reference shaders conform on direct Vulkan and through Direct3D 12 and vkd3d-proton, plus a few real shaders on real decoded textures |

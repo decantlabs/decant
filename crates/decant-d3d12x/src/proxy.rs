@@ -2565,7 +2565,7 @@ fn shift_buffer_view(view: &mut [u8; 0x28], uav: bool, byte_off: u64, va: u64) -
     let first = u64::from_le_bytes(view[first_at..first_at + 8].try_into().unwrap_or_default());
     let shifted = first.saturating_add(byte_off / u64::from(element));
     // The PC runtime takes no buffer view whose elements lie past 2^32 elements of its buffer: it
-    // calls the view invalid and removes the device. That happened with a view 50 GiB into the window,
+    // calls the view invalid and removes the device. That happened with a view tens of GiB into the window,
     // which the page mapping copies of its queue made reachable. Such a view is left out. The
     // elements are counted in the 4 byte ones of the raw view a structured one becomes (`view_raw`).
     let count = u64::from(le_u32(view, first_at + 8));
@@ -2710,7 +2710,7 @@ const IID_RESOURCE: GUID = GUID::from_u128(0x696442be_a72e_4059_bc79_5b5c98040fa
 /// The PC texture for a shader resource view at `va` with the texture description `rdesc`, when no
 /// placed resource starts there. On the console a view at an address needs no resource object, and
 /// the title keeps small textures in its own memory that way (for example the gradient textures of a
-/// loading screen UI, `R16G16B16A16_FLOAT`, in its arena pages). Their views were skipped, so the
+/// title screen UI, `R16G16B16A16_FLOAT`, in its arena pages). Their views were skipped, so the
 /// table slot kept stale bytes and the UI shapes that sample them drew nothing over a black frame.
 /// The texture is made once per address and description, registered at `va`, and `detile` fills it
 /// from the title's bytes as for a placed texture. `None` for a placed resource at `va` (the caller

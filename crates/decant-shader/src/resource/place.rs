@@ -5,7 +5,7 @@
 //!   with the slot from the byte offset in the machine code. It is never declared at the register
 //!   of a table range. A console table is indexed by the offset the program uses. A PC table is
 //!   laid out by its ranges, in their order when the offsets are appended, and the two disagree.
-//!   Measured in the game (24 Nov 2026): the table of the user interface pipeline is `t2` then
+//!   Measured in a retail title: the table of the user interface pipeline is `t2` then
 //!   `b0`, the title writes the constant buffer of `b0` at slot 0, and a shader that declares
 //!   `b0` reads slot 1 and draws nothing, while the heap read at slot 0 shows the picture. The
 //!   title also pairs programs with root signatures that lack their registers altogether.

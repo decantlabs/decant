@@ -8,7 +8,7 @@
 //! the shader reads and never looks at a slot without a tag. A slot of zero words therefore keeps
 //! whatever view the host slot held before (a texture, a constant buffer view of an older table), and
 //! the shader reads it as the kind it declares: on the AMD Linux driver a data read at address 0 that
-//! ends in a ring timeout (run 9115, the 128 thread pass dispatched 32x1x1).
+//! ends in a ring timeout.
 //!
 //! Before the sync of a draw or dispatch, for each table offset the bound pipeline's shaders declare
 //! (`kind_check`, kept per pipeline whether or not the check is on) whose title words are all zero,

@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn a_run_may_cross_a_section_boundary() {
-        // A commit larger than a section (a title asks for 0x89700000 bytes, a section holds 2 GiB) is one run.
+        // A commit larger than a section (a title asks for an arena above 2 GiB, a section holds 2 GiB) is one run.
         let mut pages = PageAllocator::new(3);
         pages.grow(3);
         let all = pages.allocate(6).unwrap();
@@ -437,8 +437,8 @@ mod tests {
     #[test]
     fn growth_is_rounded_up_to_a_step_within_the_room() {
         let gib = 1u64 << 30;
-        // 99776 wanted, 1920 free: 97856 missing, 24 steps of 4096 are 98304.
-        assert_eq!(growth(16384, 1920, 99776, 40 * gib), Growth::Add(98304));
+        // 100000 wanted, 1920 free: 98080 missing, 24 steps of 4096 are 98304.
+        assert_eq!(growth(16384, 1920, 100000, 40 * gib), Growth::Add(98304));
         assert_eq!(growth(16384, 0, 1, 40 * gib), Growth::Add(GROW_STEP_PAGES));
         // Room for 5000 pages (320 MB above the headroom): the step is cut to the room.
         let commit = HEADROOM_BYTES + 5000 * PAGE_BYTES as u64;

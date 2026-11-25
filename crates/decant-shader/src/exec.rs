@@ -7,7 +7,7 @@
 //! outside the wave intrinsics.
 //!
 //! What this file decides is where a scalar register holds a mask. Measured on the title's
-//! programs (24 Nov 2026): the wave size differs per program. A 64 lane program keeps a mask in
+//! programs: the wave size differs per program. A 64 lane program keeps a mask in
 //! a register pair and combines masks with the `_b64` instructions. A 32 lane program keeps it
 //! in ONE register and uses the same `_b32` instructions for masks and for numbers. The compiler
 //! also reuses a register for a mask in one place and for a number in another, and uses VCC as a

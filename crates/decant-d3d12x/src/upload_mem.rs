@@ -19,8 +19,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The size of an owner's first chunk when the request is small. Every command allocator the title
-/// records with holds at least one chunk until it is reset. A retail title keeps about 216 of them, most for
-/// the 16 bytes of a user data mirror, where chunks of 4 MiB held 864 MiB and 1 MiB held 216 MiB.
+/// records with holds at least one chunk until it is reset. A retail title keeps many of them, most for
+/// the 16 bytes of a user data mirror, where chunks of 4 MiB held hundreds of MiB.
 pub const FIRST_CHUNK_BYTES: usize = 64 << 10;
 /// The ceiling for automatic chunk growth when an owner needs more small blocks.
 pub const CHUNK_BYTES: usize = 1 << 20;

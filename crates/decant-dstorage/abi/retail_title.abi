@@ -1,15 +1,15 @@
 # Console DirectStorage ABI spec for a retail Scarlett title.
 #
-# MEASURED on the title executable (audit_xbox_imports --dstorage-probe, then disassembled and run offline):
-#   - one import from XCRDAPI.dll, DStorageGetFactory, and one call site, in a function local static
-#     initializer;
-#   - the IID it passes is {62959d11-d45f-4884-a0a3-f7862ea243ae}, the out pointer is a global. The
-#     factory IID is not the base IID of another title measured earlier (see other_title.abi);
+# MEASURED on a retail title (audit_xbox_imports --dstorage-probe, then disassembled and run offline):
+#   - one import from XCRDAPI.dll, DStorageGetFactory, called once from
+#     its startup code;
+#   - the IID it passes, {62959d11-d45f-4884-a0a3-f7862ea243ae}, is the console runtime IID of the factory interface in this revision. The
+#     factory IID is not the base IID measured on a different console runtime revision (see other_title.abi);
 #   - it needs out != null and S_OK, then calls factory vtable byte offset 0x40 (slot 8) with the single
 #     argument 0x2000000 (32 MiB) and traps on a negative HRESULT;
-#   - the executable also carries the other title's IIDs for IDStorageFileX and IDStorageStatusArrayX, so
-#     those two interfaces are the same on both titles. The other title's IDStorageQueueX IID is not in
-#     the executable.
+#   - the same title also uses the IIDs of the other revision for IDStorageFileX and IDStorageStatusArrayX, so
+#     those two interfaces are the same on both titles. The other revision's IDStorageQueueX IID was not seen in
+#     that title.
 #   - QUEUE CREATION, disassembled: it loads the factory from the same global, calls factory vtable byte
 #     offset 0x50 (slot 10) as (factory, desc, riid, out), riid = {3c02cb0c-c050-4195-99a1-a1ce94ba33c5},
 #     out = a field of the title's own queue object, and traps on a negative HRESULT. The 0x20-byte
