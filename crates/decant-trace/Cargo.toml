@@ -1,0 +1,28 @@
+[package]
+name = "decant-trace"
+description = "Low overhead thread local tracing for the Decant layers: Perfetto JSON traces behind DECANT_TRACE, optional Tracy forwarding, and the decant_trace_summary analyzer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "decant_trace_summary"
+path = "src/bin/decant_trace_summary.rs"
+
+[features]
+# Forwards spans, plots and frame marks to the Tracy profiler. Needs a C++ compiler to build.
+tracy = ["dep:tracy-client"]
+
+[dependencies]
+serde_json.workspace = true
+tracy-client = { workspace = true, optional = true, features = ["enable"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+# atexit is the one unsafe call, see lib.rs.
+unsafe_code = "allow"
