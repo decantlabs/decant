@@ -15,13 +15,23 @@
 //! folder, `0` switches the library off. Inside it, one folder per context key holds one file
 //! per pipeline key.
 //!
-//! * The context key hashes the adapter LUID, the PCI identity of the adapter, the user mode
-//!   driver version, the translator hash and the format version of this module. A blob of another
-//!   adapter, driver or translator lives in another folder and is never read.
+//! * The context key hashes the PCI identity of the adapter (vendor, device, subsystem and
+//!   revision), the user mode driver version, the translator hash and the format version of this
+//!   module. A blob of another kind of adapter, another driver or another translator lives in
+//!   another folder and is never read.
+//! * The adapter LUID is not part of the context key. Windows assigns a new LUID to an adapter on
+//!   every boot, so a key with it would leave the library empty after each reboot. Two adapters
+//!   of the same PCI identity on the same driver share one folder, which is safe because the driver
+//!   blob depends on the kind of adapter and the driver, not on the one card.
 //! * The pipeline key hashes the description with its pointers left out, the bytes of every
 //!   compiled stage and the direct pipeline key (console stages, root signature layout, linkage).
-//!   Graphics pipelines with stream output and mesh pipelines get no key: their PC description
-//!   holds state behind pointers that the key cannot see, or no `CachedPSO` field.
+//!   Graphics pipelines with stream output get no key: their PC description holds state behind
+//!   pointers that the key cannot see.
+//! * Mesh pipelines get no key and no `CachedPSO` field. The PC runtime takes them only as a
+//!   pipeline stream, and `mesh_pso::pc_stream` writes that stream without a `CACHED_PSO`
+//!   subobject. A stored blob could never reach the runtime, so the library would store a blob on
+//!   every run and never save a compile. Mesh pipelines can join once the stream carries the
+//!   `CachedPSO` field of their description.
 //! * A file is `<pipeline key as 32 lower case hex digits>.pso` with a 64 byte header (magic
 //!   `SXPL`, format version, context key, pipeline key, blob length, 128 bit FNV 1a of the blob)
 //!   followed by the blob. A file whose header, length or checksum does not match is ignored, and
@@ -41,8 +51,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::direct_cache::Fnv128;
 
-/// Bumped when the layout of the keys or of the files changes.
-const FORMAT: u32 = 1;
+/// Bumped when the layout of the keys or of the files changes. Version 2 left the adapter LUID out
+/// of the context key.
+const FORMAT: u32 = 2;
 const MAGIC: &[u8; 4] = b"SXPL";
 const HEADER: usize = 64;
 /// The largest blob stored. Driver blobs measured on desktop drivers are far below this.
@@ -55,11 +66,16 @@ const GRAPHICS_DESC_SIZE: usize = crate::stream_pso::GRAPHICS_DESC_SIZE;
 /// Size of `D3D12_COMPUTE_PIPELINE_STATE_DESC`, from the public d3d12.h.
 const COMPUTE_DESC_SIZE: usize = 0x38;
 
+/// Size of our mesh description (`mesh_pso`).
+const MESH_DESC_SIZE: usize = crate::mesh_pso::MESH_DESC_SIZE;
+
 /// Where the `D3D12_CACHED_PIPELINE_STATE` (blob pointer, blob size) of a description lies.
 pub fn cached_field(desc_len: usize) -> Option<usize> {
     match desc_len {
         GRAPHICS_DESC_SIZE => Some(0x278),
         COMPUTE_DESC_SIZE => Some(0x20),
+        // The PC stream of a mesh pipeline carries no cached blob (see the module comment).
+        MESH_DESC_SIZE => None,
         _ => None,
     }
 }
@@ -97,6 +113,7 @@ fn masked_ranges(desc_len: usize) -> &'static [(usize, usize)] {
 /// `stages` the compiled bytes of its stages in order, `identity` the direct pipeline key (console
 /// stages, root signature layout and linkage). `None` for a pipeline the library does not keep.
 pub fn pipeline_key(desc: &[u8], stages: &[&[u8]], identity: u128) -> Option<u128> {
+    // Only descriptions with a `CachedPSO` field are keyed, which leaves mesh pipelines out.
     cached_field(desc.len())?;
     // Stream output declarations live behind pointers: not keyed, not kept.
     if desc.len() == GRAPHICS_DESC_SIZE && u32::from_le_bytes(desc[0x60..0x64].try_into().ok()?) != 0 {
@@ -118,7 +135,8 @@ pub fn pipeline_key(desc: &[u8], stages: &[&[u8]], identity: u128) -> Option<u12
 /// The adapter and driver a blob is valid for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdapterIdentity {
-    /// The adapter LUID, low part in the low 32 bits.
+    /// The adapter LUID, low part in the low 32 bits. It names the adapter for this boot only and
+    /// is left out of [`context_key`].
     pub luid: u64,
     pub vendor_id: u32,
     pub device_id: u32,
@@ -128,10 +146,12 @@ pub struct AdapterIdentity {
     pub driver_version: u64,
 }
 
-/// The key of the folder that holds the blobs of one adapter, driver and translator.
+/// The key of the folder that holds the blobs of one kind of adapter, driver and translator. It
+/// stays the same across reboots: only the PCI identity and the driver version of the adapter
+/// count, never its LUID.
 pub fn context_key(adapter: &AdapterIdentity, translator: &str) -> u128 {
     let mut h = Fnv128::default();
-    h.field(b"decant pso library context").field(&FORMAT.to_le_bytes()).field(&adapter.luid.to_le_bytes());
+    h.field(b"decant pso library context").field(&FORMAT.to_le_bytes());
     for word in [adapter.vendor_id, adapter.device_id, adapter.subsys_id, adapter.revision] {
         h.field(&word.to_le_bytes());
     }
@@ -427,7 +447,6 @@ mod tests {
         let base = context_key(&adapter(), "translator a");
         assert_eq!(base, context_key(&adapter(), "translator a"), "stable for the same inputs");
         let changed = [
-            AdapterIdentity { luid: 2, ..adapter() },
             AdapterIdentity { vendor_id: 0x1002, ..adapter() },
             AdapterIdentity { device_id: 1, ..adapter() },
             AdapterIdentity { subsys_id: 1, ..adapter() },
@@ -438,6 +457,51 @@ mod tests {
             assert_ne!(context_key(&other, "translator a"), base, "{other:?}");
         }
         assert_ne!(context_key(&adapter(), "translator b"), base);
+    }
+
+    #[test]
+    fn the_context_key_ignores_the_luid_windows_assigns_on_each_boot() {
+        let base = context_key(&adapter(), "translator a");
+        for luid in [0, 1, 0x0000_0001_0000_ABCE, 0x0000_0000_0001_2F40, u64::MAX] {
+            assert_eq!(context_key(&AdapterIdentity { luid, ..adapter() }, "translator a"), base, "luid {luid:#x}");
+        }
+        let elsewhere = AdapterIdentity { luid: 0x0000_0000_0000_9999, driver_version: 1, ..adapter() };
+        assert_ne!(context_key(&elsewhere, "translator a"), base, "a new driver still counts with a new luid");
+    }
+
+    #[test]
+    fn a_blob_stored_before_a_reboot_is_found_after_it() {
+        let dir = TempDir::new("pso-library-reboot");
+        let before = Library::new(dir.0.clone(), "t");
+        let folder = before.open(|| Some(adapter())).unwrap().dir().to_path_buf();
+        before.keep(7, b"driver blob before the reboot").unwrap();
+
+        // The next boot gives the same adapter another LUID.
+        let after = Library::new(dir.0.clone(), "t");
+        let reopened = after.open(|| Some(AdapterIdentity { luid: 0x0000_0000_0002_1F7C, ..adapter() })).unwrap();
+        assert_eq!(reopened.dir(), folder, "the same folder");
+        assert_eq!(after.lookup(7).as_deref(), Some(&b"driver blob before the reboot"[..]));
+        assert_eq!(after.counts().hits.load(Ordering::Relaxed), 1);
+
+        let updated = Library::new(dir.0.clone(), "t");
+        updated.open(|| Some(AdapterIdentity { luid: 0x0000_0000_0003_0001, driver_version: 2, ..adapter() })).unwrap();
+        assert_eq!(updated.lookup(7), None, "a driver update starts a new folder");
+    }
+
+    #[test]
+    fn mesh_pipelines_get_no_key_and_no_cached_field() {
+        use crate::mesh_pso::{AS_AT, MS_AT};
+        assert_eq!(cached_field(MESH_DESC_SIZE), None, "the PC mesh stream carries no cached blob");
+        // A mesh description as `mesh_pso` lays it out: the graphics part, then the amplification
+        // and the mesh shader.
+        let mut mesh = vec![0u8; MESH_DESC_SIZE];
+        mesh[..GRAPHICS_DESC_SIZE].copy_from_slice(&graphics(0x11, 1));
+        for at in [AS_AT, MS_AT] {
+            mesh[at..at + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+            mesh[at + 8..at + 16].copy_from_slice(&64u64.to_le_bytes());
+        }
+        let stages: [&[u8]; 3] = [b"DXIL amplification", b"DXIL mesh", b"DXIL pixel"];
+        assert_eq!(pipeline_key(&mesh, &stages, 7), None);
     }
 
     #[test]
@@ -453,7 +517,6 @@ mod tests {
         let mut streamed = graphics(0x11, 1);
         streamed[0x60] = 1;
         assert_eq!(pipeline_key(&streamed, &stages, 7), None, "stream output is not kept");
-        assert_eq!(pipeline_key(&[0; crate::mesh_pso::MESH_DESC_SIZE], &stages, 7), None, "mesh is not kept");
 
         let mut compute = vec![0x55u8; COMPUTE_DESC_SIZE];
         compute[0x18..0x1C].copy_from_slice(&1u32.to_le_bytes());
