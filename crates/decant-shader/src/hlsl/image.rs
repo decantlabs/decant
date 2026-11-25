@@ -5,7 +5,7 @@
 //! `TextureCube` wants is rebuilt from the face and the two coordinates on it
 //! (GFX10 image instruction semantics).
 
-use super::{Printer, class_of, mirror_word, refuse};
+use super::{Printer, class_of, mirror_word, nonuniform_index, refuse};
 use crate::api::{Placement, RegisterClass};
 use crate::ir::{
     Desc, Expr, Guard, ImageAtomic, ImageKind, ImageOp, Origin, Resource, ResourceUse, SampleLod,
@@ -688,13 +688,15 @@ impl Printer<'_> {
         // that holds the index of a descriptor the program chose.
         let heap = match (op.image, self.res(op.image).placement) {
             (_, Some(Placement::HeapAtMirror { dword, slot, .. })) => {
-                format!("ResourceDescriptorHeap[{} + {slot}u]", mirror_word(dword))
+                let idx = nonuniform_index(&format!("{} + {slot}u", mirror_word(dword)));
+                format!("ResourceDescriptorHeap[{idx}]")
             }
             (Desc::Res(id), Some(Placement::HeapAtConsoleIndex { .. })) => {
                 let index = self
                     .host_slot(id)
                     .ok_or_else(|| refuse("image-atomic-placement", op.pc))?;
-                format!("ResourceDescriptorHeap[{index}]")
+                let idx = nonuniform_index(&index);
+                format!("ResourceDescriptorHeap[{idx}]")
             }
             _ => return Err(refuse("image-atomic-placement", op.pc)),
         };

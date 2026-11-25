@@ -963,11 +963,11 @@ mod by_heap_index {
             resource(false, Some(4)),
         );
         assert!(
-            text.contains("ByteAddressBuffer con_t_2 = ResourceDescriptorHeap[s4];"),
+            text.contains("ByteAddressBuffer con_t_2 = ResourceDescriptorHeap[NonUniformResourceIndex(s4)];"),
             "{text}"
         );
         assert!(
-            text.contains("ByteAddressBuffer con_t_4 = ResourceDescriptorHeap[s4];"),
+            text.contains("ByteAddressBuffer con_t_4 = ResourceDescriptorHeap[NonUniformResourceIndex(s4)];"),
             "{text}"
         );
         assert!(text.contains("con_t_4.Load((decant_a4 + 4u))"), "{text}");
@@ -1022,7 +1022,7 @@ mod by_heap_index {
             resource(false, Some(3)),
         );
         assert!(
-            text.contains("ByteAddressBuffer con_t_2 = ResourceDescriptorHeap[s4];"),
+            text.contains("ByteAddressBuffer con_t_2 = ResourceDescriptorHeap[NonUniformResourceIndex(s4)];"),
             "{text}"
         );
         assert!(
@@ -1051,12 +1051,12 @@ mod by_heap_index {
             resource(true, None),
         );
         assert!(
-            text.contains("RWByteAddressBuffer con_u_2 = ResourceDescriptorHeap[s4];"),
+            text.contains("RWByteAddressBuffer con_u_2 = ResourceDescriptorHeap[NonUniformResourceIndex(s4)];"),
             "{text}"
         );
         assert!(text.contains("con_u_2.Store(decant_a2 + 4u, v9);"), "{text}");
         assert!(
-            text.contains("RWByteAddressBuffer con_u_4 = ResourceDescriptorHeap[s4];"),
+            text.contains("RWByteAddressBuffer con_u_4 = ResourceDescriptorHeap[NonUniformResourceIndex(s4)];"),
             "{text}"
         );
         assert!(
@@ -1077,7 +1077,7 @@ mod by_heap_index {
         };
         let text = print(vec![read], resource(false, Some(4)));
         assert!(
-            text.contains("ByteAddressBuffer con_t_1 = ResourceDescriptorHeap[s4];"),
+            text.contains("ByteAddressBuffer con_t_1 = ResourceDescriptorHeap[NonUniformResourceIndex(s4)];"),
             "{text}"
         );
         assert!(
@@ -1103,7 +1103,7 @@ fn atomics_on_a_typed_view_work_on_the_dword_of_the_element() {
     );
     let text = hlsl(&p, WithShadow);
     for needle in [
-        "RWByteAddressBuffer heap_u_s8_1 = ResourceDescriptorHeap[decant_mirror[2].x + 1u];",
+        "RWByteAddressBuffer heap_u_s8_1 = ResourceDescriptorHeap[NonUniformResourceIndex(decant_mirror[2].x + 1u)];",
         "uint decant_a1 = decant_i1 * decant_row1.x + decant_view_offset((decant_mirror[2].x + 1u));",
         "    if (decant_row1.x != 0u && decant_i1 < decant_row1.y) {",
         "heap_u_s8_1.InterlockedOr(decant_a6, v10, decant_o6);",

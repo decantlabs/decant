@@ -115,7 +115,7 @@ fn a_table_descriptor_becomes_a_byte_address_buffer_for_every_form() {
                 let text = &stage.hlsl;
                 assert!(
                     text.contains(
-                        "ByteAddressBuffer heap_t_s4_1 = ResourceDescriptorHeap[decant_mirror[1].x + 1u];"
+                        "ByteAddressBuffer heap_t_s4_1 = ResourceDescriptorHeap[NonUniformResourceIndex(decant_mirror[1].x + 1u)];"
                     ),
                     "{text}"
                 );

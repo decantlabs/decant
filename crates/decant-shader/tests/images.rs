@@ -320,13 +320,28 @@ fn an_atomic_reads_an_integer_view_of_the_same_slot() {
     let t = hlsl(&pixel(&regs(2, false), op));
     has(
         &t,
-        "RWTexture2D<uint> decant_t1_u = ResourceDescriptorHeap[decant_mirror[2].x + 1u];",
+        "RWTexture2D<uint> decant_t1_u = ResourceDescriptorHeap[NonUniformResourceIndex(decant_mirror[2].x + 1u)];",
     );
     has(
         &t,
         "InterlockedMax(decant_t1_u[uint2(uint(int(v2)), uint(int(v3)))], uint(v10), decant_t1_o);",
     );
     has(&t, "v10 = uint(decant_t1_o);");
+}
+
+/// A mirror-held heap index is read at run time, so every heap read built from a register or the
+/// mirror carries `NonUniformResourceIndex`, on the texture side as well as the sampler side.
+#[test]
+fn a_sample_of_a_mirror_held_texture_wraps_the_heap_index() {
+    let p = pixel(
+        &regs(1, false),
+        img(Op::image_sample, 1, 0xf),
+    );
+    let t = hlsl(&p);
+    has(
+        &t,
+        "Texture2D<float4> heap_t_s8_1 = ResourceDescriptorHeap[NonUniformResourceIndex(decant_mirror[2].x + 1u)];",
+    );
 }
 
 #[test]
@@ -442,9 +457,9 @@ fn an_image_and_a_sampler_taken_by_heap_indices_are_made_at_the_use() {
     // The resources are made right before the sample, from those registers.
     has(
         &t,
-        "Texture2D<float4> con_t_1 = ResourceDescriptorHeap[s4];",
+        "Texture2D<float4> con_t_1 = ResourceDescriptorHeap[NonUniformResourceIndex(s4)];",
     );
-    has(&t, "SamplerState con_s_3 = SamplerDescriptorHeap[s0];");
+    has(&t, "SamplerState con_s_3 = SamplerDescriptorHeap[NonUniformResourceIndex(s0)];");
     has(
         &t,
         "con_t_1.Sample(con_s_3, float2(asfloat(v2), asfloat(v3)))",
@@ -465,19 +480,19 @@ fn every_image_dimension_is_made_from_a_heap_index() {
             &regs(coords, true),
             img(Op::image_sample_lz, dim, 0xf),
         ));
-        has(&t, &format!("{ty} con_t_1 = ResourceDescriptorHeap[s4];"));
+        has(&t, &format!("{ty} con_t_1 = ResourceDescriptorHeap[NonUniformResourceIndex(s4)];"));
     }
     // A multisample image is loaded, not sampled.
     let t = hlsl(&bindless(&regs(3, false), img(Op::image_load, 6, 0xf)));
     has(
         &t,
-        "Texture2DMS<float4> con_t_1 = ResourceDescriptorHeap[s4];",
+        "Texture2DMS<float4> con_t_1 = ResourceDescriptorHeap[NonUniformResourceIndex(s4)];",
     );
     // A store types the image as writable.
     let t = hlsl(&bindless(&regs(2, false), img(Op::image_store, 1, 0xf)));
     has(
         &t,
-        "RWTexture2D<float4> con_u_1 = ResourceDescriptorHeap[s4];",
+        "RWTexture2D<float4> con_u_1 = ResourceDescriptorHeap[NonUniformResourceIndex(s4)];",
     );
 }
 
@@ -488,7 +503,7 @@ fn an_atomic_on_an_image_taken_by_a_heap_index_views_the_same_slot() {
     let t = hlsl(&bindless(&regs(2, false), op));
     has(
         &t,
-        "RWTexture2D<uint> decant_t1_u = ResourceDescriptorHeap[s4];",
+        "RWTexture2D<uint> decant_t1_u = ResourceDescriptorHeap[NonUniformResourceIndex(s4)];",
     );
     has(
         &t,

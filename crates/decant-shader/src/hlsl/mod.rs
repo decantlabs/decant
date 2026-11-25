@@ -136,6 +136,13 @@ fn mirror_word(k: u8) -> String {
     )
 }
 
+/// Wraps a heap index that is read at run time (from a register or the mirror), so the shader
+/// compiler does not assume that every lane of a wave picks the same descriptor. A compile-time
+/// constant index (a literal slot number) needs no wrap.
+fn nonuniform_index(index: &str) -> String {
+    format!("NonUniformResourceIndex({index})")
+}
+
 struct Printer<'a> {
     cx: &'a Context<'a>,
     func: &'a Function,
@@ -215,7 +222,8 @@ impl Printer<'_> {
                 } else {
                     "ResourceDescriptorHeap"
                 };
-                self.line(&format!("{ty} {local} = {heap}[{}];", var_name(*index)));
+                let idx = nonuniform_index(&var_name(*index));
+                self.line(&format!("{ty} {local} = {heap}[{idx}];"));
                 local
             }
             _ => r.name.clone(),
@@ -927,11 +935,8 @@ pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
                 } else {
                     "ResourceDescriptorHeap"
                 };
-                heap_locals.push(format!(
-                    "{ty} {} = {heap}[{} + {slot}u];",
-                    r.name,
-                    mirror_word(*dword)
-                ));
+                let idx = nonuniform_index(&format!("{} + {slot}u", mirror_word(*dword)));
+                heap_locals.push(format!("{ty} {} = {heap}[{idx}];", r.name));
             }
             // A resource whose heap index is in a register is made at each use
             // (`Printer::use_resource`): by the image and buffer statements, and by an

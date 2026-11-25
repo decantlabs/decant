@@ -286,7 +286,7 @@ fn a_table_buffer_is_read_from_the_heap_even_when_a_range_names_it() {
     );
     assert!(
         s.hlsl.contains(
-            "ConstantBuffer<decant_words> heap_b_s8_0 = ResourceDescriptorHeap[decant_mirror[2].x + 0u];"
+            "ConstantBuffer<decant_words> heap_b_s8_0 = ResourceDescriptorHeap[NonUniformResourceIndex(decant_mirror[2].x + 0u)];"
         ),
         "{}",
         s.hlsl
@@ -429,7 +429,7 @@ fn a_table_slot_the_root_signature_lacks_is_read_from_the_heap_through_the_mirro
     assert_eq!(host.samplers(), [words]);
     assert!(
         s.hlsl.contains(
-            "Texture2D<float4> heap_t_s8_1 = ResourceDescriptorHeap[decant_mirror[2].x + 1u];"
+            "Texture2D<float4> heap_t_s8_1 = ResourceDescriptorHeap[NonUniformResourceIndex(decant_mirror[2].x + 1u)];"
         ),
         "{}",
         s.hlsl
