@@ -3804,15 +3804,17 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
             }
             if i > start {
                 execute_closed(pc, &mapped[start..i]);
-            }
-            for w in &waits {
-                if !crate::cpu_writes::wait_until(w, crate::list_sync::WAIT_TIMEOUT) {
-                    static N: AtomicI32 = AtomicI32::new(0);
-                    if log_due(&N) {
-                        xs_log!("console list: a memory wait at {:#x} ({} bytes, comparison {}, value {:#x}, mask {:#x}) timed out, the list runs anyway", w.va, w.width, w.comparison, w.value, w.mask);
-                    }
+                // flush the writes already submitted now, not held back behind this list's own
+                // unmet waits (the submission thread must stay free to submit other queues)
+                let done = crate::list_sync::cpu_writes_of(&keys[start..i]);
+                if !done.is_empty() {
+                    crate::cpu_writes::after(pc, done);
                 }
             }
+            // the GPU queue itself waits for these (via its own fence); a synchronous CPU wait
+            // here would block the one thread that submits every queue, including the producing
+            // queue's own list this wait is waiting on
+            crate::cpu_writes::defer_waits(pc, &waits);
             start = i;
         }
         if start < mapped.len() || mapped.is_empty() {
@@ -3824,13 +3826,15 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
         crate::rt_diag::executed(&keys);
         // the lists' bottom-of-pipe writes into title memory: done once the GPU has finished this
         if !keys.is_empty() {
-            let writes = crate::list_sync::cpu_writes_of(&keys);
+            let writes = crate::list_sync::cpu_writes_of(&keys[start..]);
             static N: AtomicI32 = AtomicI32::new(0);
             if log_due(&N) {
                 let waits: usize = keys.iter().map(|&k| crate::list_sync::waits_of(k).len()).sum();
                 xs_log!("console queue: {} lists, {} CPU writes, {waits} waits recorded on them", keys.len(), writes.len());
             }
-            crate::cpu_writes::after(pc, writes);
+            if !writes.is_empty() {
+                crate::cpu_writes::after(pc, writes);
+            }
         }
         if tracked {
             crate::retire::submitted(pc);
@@ -4116,6 +4120,8 @@ extern "system" fn queue_present_x(this: *mut Proxy, plane_count: u32, planes: *
     heap_pages::present();
     crate::flicker_probe::present();
     crate::retire::present();
+    // a deferred memory wait a writer never answered must not hang the GPU past its frame
+    crate::cpu_writes::release_all_waits();
     let hook = PRESENT_HOOK.load(Ordering::SeqCst);
     if hook != 0 {
         // SAFETY: the hook was installed through `DecantD3D12X_SetPresentHook` with this signature.
