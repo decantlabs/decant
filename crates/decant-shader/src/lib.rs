@@ -169,9 +169,9 @@ fn translate_stage(
         ),
         // IEEE strictness: the translation relies on exact float results and on not a number
         // behaving as on the console. Denormals are flushed to zero: no program of the title
-        // sets the denormal bits of the mode register, and 12,441 programs of every stage use
+        // sets the denormal bits of the mode register, and many programs of every stage use
         // the output modifier, which the hardware only honours with 32 bit denormals flushed
-        // (measured on the corpus, 24 Nov 2026). The pipeline's own float mode is not in the
+        // (measured on the corpus). The pipeline's own float mode is not in the
         // code, so this is an inference until the container field is found.
         dxc_args: vec!["-Gis".to_owned(), "-denorm".to_owned(), "ftz".to_owned()],
         resources,

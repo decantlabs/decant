@@ -243,8 +243,8 @@ struct Running {
 }
 
 /// How long a binding thread waits for a translation before the pipeline is left out for now
-/// (`DECANT_D3D12X_DIRECT_TRANSLATE_WAIT_MS`, default 2000). Some world compute shaders of the title took
-/// longer than 18 s (run world-waits2 of 25 Nov): the title thread that bound them held the frame,
+/// (`DECANT_D3D12X_DIRECT_TRANSLATE_WAIT_MS`, default 2000). Some compute shaders of a title took
+/// longer than 18 s: the title thread that bound them held the frame,
 /// and after about 35 s without a frame the title ended itself.
 fn translate_wait() -> std::time::Duration {
     static MS: OnceLock<u64> = OnceLock::new();

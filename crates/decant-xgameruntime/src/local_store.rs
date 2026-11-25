@@ -1,7 +1,7 @@
 //! Offline XStore table: `api_id = {0DD112AC-7C24-448C-B92B-3960FB5BD30C}`, interface
 //! `{B09D803C-2414-4A05-82C6-66DFDC9E9A44}` plus the later interfaces that extend it. The PC runtime
 //! does not know our local user handle (`XStoreCreateContext` failed with `0x8924010C` in the runs
-//! of 24 Nov), so this table answers like an offline console for a retail title the user owns.
+//! ), so this table answers like an offline console for a retail title the user owns.
 //! Nothing is bought, no store service is contacted and no purchase is faked.
 //!
 //! Behaviour:

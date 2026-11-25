@@ -30,7 +30,7 @@
 //! * The fused multiply add (`v_fma_f32`, `v_fmac_f32`, `fmaak`, `fmamk`, the mixed forms) uses
 //!   HLSL `mad`. DXC turns it into `dx.op.fmad`, which a driver may fuse or not, so the last bit
 //!   can differ from the console where the driver does not fuse. A device test reports which.
-//!   An exact form needs doubles (lead decision, 24 Nov: not worth their cost). Every fused
+//!   An exact form needs doubles (a design decision: not worth their cost). Every fused
 //!   multiply add goes through [`FMA`], the one place to change.
 //! * The unfused `v_mad_f32` family flushes denormal inputs, its product and its result
 //!   explicitly, as the hardware does whatever MODE says.

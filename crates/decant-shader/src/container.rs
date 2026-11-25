@@ -158,7 +158,7 @@ pub fn binding_table(fssm: &[u8]) -> Vec<TableBinding> {
 }
 
 /// The thread group size in a `PSV0` part: three dwords at bytes 36, 40 and 44 of the runtime
-/// information, when it is at least 48 bytes long (all 2,689 compute containers of the title
+/// information, when it is at least 48 bytes long (all compute containers of the title
 /// have 52).
 pub fn threads(psv: &[u8]) -> Option<[u32; 3]> {
     if u32_at(psv, 0)? < 48 {
@@ -315,8 +315,8 @@ pub fn program(blob: &[u8], name: &str) -> Result<StageProgram, Refusal> {
         } else {
             [0; 3]
         },
-        // Measured on all 2,689 compute programs: the dword at 0x10C is not zero in exactly the
-        // 485 programs with local data share instructions, and never below the highest constant
+        // Measured on all compute programs: the dword at 0x10C is not zero in exactly the
+        // the programs with local data share instructions, and never below the highest constant
         // offset they use. The five mesh programs with such memory agree with their `PSV0`.
         lds_bytes: u32_at(&fssm, 0x10C).unwrap_or(0),
         geometry: if stage == Stage::Geometry {

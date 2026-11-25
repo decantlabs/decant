@@ -2,7 +2,7 @@
 //! `DeserializeGraphicsPipelineStateX` (57) and
 //! `DeserializeComputePipelineStateX` (67), `(cache entry, riid, out)`. The title ships a pipeline
 //! cache in the console driver's serialized form and tries every entry of it while it boots (measured:
-//! 25,450 graphics and 2,689 compute entries).
+//! tens of thousands of graphics and compute entries).
 //!
 //! What the title does with the answer (measured on the title executable):
 //! * 57 is called from a loop over the cache entries (exe+0x2477578). On success the pipeline goes

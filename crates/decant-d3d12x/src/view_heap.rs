@@ -1,6 +1,6 @@
 //! Heaps for the textures of views at an address (`proxy::view_texture`). The title makes hundreds
 //! of small textures a second that way while its world loads (measured: 16 by 4 `R16G16B16A16_FLOAT`,
-//! 512 bytes), and a committed PC texture takes 64 KiB at least, so 16,000 of them took 1 GiB. Here
+//! 512 bytes), and a committed PC texture takes 64 KiB at least, so thousands of them took GiBs. Here
 //! each one is placed in a heap of [`HEAP_BYTES`] at the small texture alignment of 4 KiB when the
 //! runtime allows it (64 KiB else). The space is handed out in order and not given back: a texture
 //! of this kind goes only when no slot holds its view any more, which is rare. A heap stays for the

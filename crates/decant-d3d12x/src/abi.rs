@@ -89,7 +89,7 @@ pub fn pc_resource_desc(desc: &mut [u8; 0x38]) {
     }
     // The packed 16 bit formats B5G6R5 (85), B5G5R5A1 (86) and B4G4R4A4 (115) have no typed
     // unordered access support on PC, so the flag is dropped and the render target use stays. A
-    // retail title was seen creating a 2560x1440 B5G5R5A1 target with that flag and trapping on the
+    // retail title was seen creating a large B5G5R5A1 target with that flag and trapping on the
     // refusal.
     if matches!(format, 85 | 86 | 115) {
         flags &= !0x4;
@@ -566,7 +566,7 @@ pub const DMA_LIST_RULES: &[SlotRule] = &[
 mod tests {
     use super::*;
 
-    /// The desc a retail title stops on: a 768x768 cube R16_TYPELESS target with depth, unordered access
+    /// The desc a retail title stops on: a square cube R16_TYPELESS target with depth, unordered access
     /// and console flags (0x80300006), as `pc_resource_desc` leaves it.
     fn cube_depth_desc() -> [u8; 0x38] {
         let mut d = [0u8; 0x38];

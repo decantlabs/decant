@@ -91,7 +91,7 @@ const MAX_PAGES: usize = 256;
 
 /// The PC address for a root view the title sets at PC list slot `pc_slot` to title address `va`,
 /// with the zeroed fallback buffer for an address no PC resource holds (an address no PC resource
-/// holds is an invalid call on native D3D12, which removes the device; run 47). 0 stays 0.
+/// holds is an invalid call on native D3D12, which removes the device). 0 stays 0.
 ///
 /// # Safety
 /// `list` is a live PC command list.

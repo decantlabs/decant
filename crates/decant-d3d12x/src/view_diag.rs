@@ -17,7 +17,7 @@ use std::sync::Mutex;
 pub struct View {
     /// The PC resource, 0 for a null view or a constant buffer view. Only a number: the resource
     /// may be released long before a draw is described (a GetDesc on it then crashed the title in
-    /// its world load, run play-owner2 of 24 Nov), so its shape is taken when the view is made.
+    /// its world load), so its shape is taken when the view is made.
     pub res: usize,
     /// Width, height, format and flags of `res` when the view was made, zeros for none.
     pub shape: (u64, u32, u32, u32),

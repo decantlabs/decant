@@ -810,7 +810,7 @@ mod platform {
     /// The title runs under this debugger, so Windows gives every heap of it the debug heap
     /// (`NtGlobalFlag` checks, no low fragmentation heap) unless `_NO_DEBUG_HEAP=1` is set: then
     /// every allocation of the layer's shader translator waited on the heap lock (a retail title, one
-    /// run of 25 Nov: a translation that takes 21 ms alone took 1315 ms in the title).
+    /// run: a translation that takes a few ms alone took a hundred times longer in the title).
     /// It is set unless the environment names it already (`_NO_DEBUG_HEAP=0` keeps the debug heap).
     fn environment(extra: &[(String, String)]) -> Vec<u16> {
         let mut vars: Vec<(String, String)> = std::env::vars_os().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect();

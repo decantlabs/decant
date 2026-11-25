@@ -10,7 +10,7 @@
 //! export table of the container (`StageProgram::param_exports`, FSSM byte 0x1DC) names the
 //! signature register that opens each slot. Further 16 bit registers follow in the open packed
 //! slot by the rule both sides share (`pixel::walk`): two 16 bit registers can share a slot,
-//! and two elements can share a register (694 of the 2,236 vertex programs). Component `c` of
+//! and two elements can share a register (a share of the vertex programs). Component `c` of
 //! a register goes to the element of that register whose mask has bit `c`, and since struct
 //! members are as wide as their register up to their last component, the member component is
 //! `c`. A packed 16 bit register takes half `start + c` of the slot. A 16 bit register that is

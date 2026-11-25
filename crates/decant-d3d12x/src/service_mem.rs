@@ -193,7 +193,7 @@ pub unsafe fn current(list: *mut c_void) -> Option<Snapshot> {
         rescan = true;
         // Slots of title memory the page table covers come first: the table only maps console pages below
         // 16 GiB, so a window over slots above it gives the translated shaders nothing by address (a
-        // run of 24 Nov: a 3.7 GiB reservation high up took the window from the arenas below 16 GiB).
+        // run: a reservation of several GiB high up took the window from the arenas below 16 GiB).
         let slots = crate::title_mem::extents().map(|(_, e)| e).unwrap_or_default();
         let reach = (TABLE_PAGES as u64) << PAGE_SHIFT;
         let covered: Vec<Extent> = slots.iter().filter(|e| e.va.saturating_add(e.bytes) <= reach).map(|e| Extent { gpu: e.gpu, bytes: e.bytes }).collect();

@@ -1,7 +1,7 @@
 //! The compute stage: the registers a compute program finds at entry, and what it owes at the
 //! end.
 //!
-//! Entry state, measured on the 2,689 compute programs of the title (24 Nov 2026):
+//! Entry state, measured on the compute programs of the title:
 //!
 //! * `v0`, `v1`, `v2` hold the thread id in the group, x, y and z. Programs read `v0` alone,
 //!   `v0` and `v1`, or all three, following the dimensions of their thread group.
@@ -14,8 +14,8 @@
 //!   the same.
 //!
 //! The thread group size comes from `PSV0` (`StageProgram::threads`), the size of the group
-//! shared memory from the FSSM block (`StageProgram::lds_bytes`): measured on the 2,689 compute
-//! programs, it is not zero in exactly the 485 programs with LDS instructions, never below the
+//! shared memory from the FSSM block (`StageProgram::lds_bytes`): measured on the compute
+//! programs, it is not zero in exactly the programs with LDS instructions, never below the
 //! highest constant offset they use, and at most 32 KiB.
 //!
 //! Group shared memory (`ds_*`) is `crate::lift::ds`. A compute program has no exports.

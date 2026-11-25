@@ -123,7 +123,7 @@ pub fn wrap_bare_dxil(part: &[u8]) -> Vec<u8> {
 /// Reads an override for `original` from `dir`. `None` (use the title's own bytecode unchanged)
 /// when `original` is empty, the file does not exist, cannot be read, or reads empty. Logs a miss
 /// once per distinct content hash (hash, byte length, directory, I/O error kind): a silent miss
-/// left run 9004/9005's cause unknown when the C layer, with the same override directory, hit on
+/// left a miss unexplained when the C layer, with the same override directory, hit on
 /// the same shader.
 pub fn lookup_in(dir: &Path, original: &[u8]) -> Option<Vec<u8>> {
     find_in(dir, original).map(|(bytes, _)| bytes)

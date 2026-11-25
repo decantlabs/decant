@@ -63,7 +63,7 @@ const COPY_DEST: u32 = 0x400;
 const LIST_STAGING_LIMIT: u64 = 256 << 20;
 /// How many staging bytes a batch collects before it is submitted, unless a single texture needs
 /// more. Every list keeps its staging buffer for later batches, and a limit of 256 MiB left 2.8 GiB
-/// held by 15 lists.
+/// held by the lists.
 const BATCH_STAGING_TARGET: u64 = 32 << 20;
 /// Dispatches (parameter blocks) that fit in one list.
 const DISPATCH_SLOTS: usize = 1024;
@@ -706,7 +706,7 @@ struct Registry {
     /// Textures put off because their span got pages whose mappings are not applied yet.
     deferred: u64,
     /// Resources by title address, and the largest span of any of them. A write finds the textures
-    /// it overlaps without scanning the whole table. Scanning 30,000 textures under the lock for
+    /// it overlaps without scanning the whole table. Scanning tens of thousands of textures under the lock for
     /// every DirectStorage request once stalled the loading of a large world.
     by_address: BTreeMap<u64, Vec<usize>>,
     largest: u64,

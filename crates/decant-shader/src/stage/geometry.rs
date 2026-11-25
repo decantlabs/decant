@@ -1,7 +1,7 @@
 //! The geometry stage. Hull and domain programs come here too and are refused: the title's
 //! archive has none.
 //!
-//! Measured on the title (24 Nov 2026, all 195 geometry programs, see the specification
+//! Measured on the title (all geometry programs, see the specification
 //! `gfx10/ngg-and-geometry.md`, "Measured on the title"): one shape. The program is the geometry
 //! part alone, one lane for one input primitive, and it talks to the stages around it through
 //! the local data share:

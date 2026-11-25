@@ -1,5 +1,5 @@
 //! The flicker probe behind `DECANT_D3D12X_FLICKER_PROBE`. It tells apart two causes of a picture that
-//! changes from one frame to the next (the loading view showed its two figures swapping sides): a
+//! changes from one frame to the next: a
 //! descriptor that is rewritten before the GPU has read it, and title memory that a sync copies into
 //! the GPU mirror while a list that reads it still runs.
 //!
@@ -43,7 +43,7 @@ use windows::core::Interface;
 
 use crate::log::xs_log;
 
-/// Slots looked at per table. The artwork draws of the loading view read offsets 0 to 3.
+/// Slots looked at per table. The draws of a retail title read offsets 0 to 3.
 const TABLE_SLOTS: u32 = 8;
 /// Slot reads kept per list, and draws whose target is kept.
 const MAX_SLOTS: usize = 8192;

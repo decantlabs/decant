@@ -1,6 +1,6 @@
 //! The mesh stage.
 //!
-//! Measured on the title (24 Nov 2026, all 9,282 mesh programs, see the specification
+//! Measured on the title (all mesh programs, see the specification
 //! `gfx10/ngg-and-geometry.md`, "Measured on the title"): every mesh program is one shape. It is a
 //! real mesh shader of 128 threads, two waves of 64 lanes, around a vertex shader body:
 //!

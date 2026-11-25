@@ -7,7 +7,7 @@
 //! descriptor a branch picks is still known as a whole. The states are computed to a fixed point
 //! first (loops), then one pass rewrites the statements with them.
 //!
-//! Where a descriptor comes from (measured on the title's 26,503 programs, see the design
+//! Where a descriptor comes from (measured on the programs of the title, see the design
 //! document, "Resources"):
 //!
 //! * A scalar load whose base is (user data `K`, constant 0) reads the table `K` points at. A
@@ -539,7 +539,7 @@ impl Tracer<'_> {
                 Some(Sym::Lane)
             }
             // The compiler builds constants whose set bits are at the top by reversing a small
-            // number (the instruction s_brev_b32): 2,078 programs make a sampler word that way.
+            // number (the instruction s_brev_b32): some programs make a sampler word that way.
             Expr::Call(h, args) if h.name == "decant_brev" && args.len() == 1 => {
                 match self.eval(state, &args[0], at)? {
                     Sym::Const(v) => Some(Sym::Const(v.reverse_bits())),

@@ -37,7 +37,7 @@ pub struct Field {
     /// (`Input::Attr.chan`, `OutputRef.chan`), the printer subtracts `first_comp`.
     pub comps: u8,
     /// The first component of the register that belongs to the element. Two elements can
-    /// share one register (694 vertex, 2,770 mesh and 4,385 pixel programs of the title have
+    /// share one register (programs of every stage of the title have
     /// such a signature): the first has components x and y, the second starts at z.
     pub first_comp: u8,
     /// The interpolation modifier printed before the type, with its trailing space:
