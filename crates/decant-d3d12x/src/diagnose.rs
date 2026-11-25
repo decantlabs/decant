@@ -121,6 +121,28 @@ fn op_name(op: D3D12_AUTO_BREADCRUMB_OP) -> String {
     }
 }
 
+/// Formats one faulting command list line for DRED diagnostics.
+fn format_fault_list(
+    list: Option<usize>,
+    name: &str,
+    queue: Option<usize>,
+    done: u32,
+    total: u32,
+    around: &[String],
+    active_pso: Option<&crate::pso_diag::ActivePso>,
+) -> String {
+    let list_ptr = list.map(|p| p as *const c_void);
+    let queue_ptr = queue.map(|p| p as *const c_void);
+    let base = format!(
+        "list {list_ptr:?} {name:?} on queue {queue_ptr:?}: stopped at operation {done} of {total} (ops around it: {})",
+        around.join(" ")
+    );
+    match active_pso {
+        Some(pso) => format!("{base}, active {}", pso.format_summary()),
+        None => base,
+    }
+}
+
 fn report(device: &ID3D12Device, reason: u32) {
     xs_log!("diagnose: the PC device was removed, reason 0x{reason:08X}");
     // SAFETY: DRED queries on the removed device; the returned structures live as long as it does.
@@ -154,13 +176,18 @@ fn report(device: &ID3D12Device, reason: u32) {
                         let at = from + k;
                         format!("{}{}", if at == done as usize { ">" } else { "" }, op_name(*op))
                     }).collect();
-                    xs_log!(
-                        "diagnose: list {:?} {name:?} on queue {:?}: stopped at operation {done} of {} (ops around it: {})",
-                        n.pCommandList.as_ref().map(|l| l.as_raw()),
-                        n.pCommandQueue.as_ref().map(|q| q.as_raw()),
+                    let list_ptr = n.pCommandList.as_ref().map(|l| l.as_raw() as usize);
+                    let active = list_ptr.and_then(crate::pso_diag::active_pso);
+                    let line = format_fault_list(
+                        list_ptr,
+                        &name,
+                        n.pCommandQueue.as_ref().map(|q| q.as_raw() as usize),
+                        done,
                         n.BreadcrumbCount,
-                        around.join(" ")
+                        &around,
+                        active.as_ref(),
                     );
+                    xs_log!("diagnose: {line}");
                     shown += 1;
                 }
                 node = n.pNext;
@@ -199,5 +226,48 @@ fn report(device: &ID3D12Device, reason: u32) {
         xs_log!("diagnose: {}", crate::detile::summary());
         let (heaps, placed) = crate::view_heap::usage();
         xs_log!("diagnose: view texture heaps {heaps} with {} MiB placed", placed >> 20);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pso_diag::ActivePso;
+
+    #[test]
+    fn format_fault_list_includes_active_pipeline_and_shader_hashes() {
+        let around = vec![
+            op_name(D3D12_AUTO_BREADCRUMB_OP(15)),
+            format!(">{}", op_name(D3D12_AUTO_BREADCRUMB_OP(5))),
+        ];
+        let active = ActivePso {
+            number: Some(42),
+            pso: 0x5555,
+            shaders: String::from("VS 1111222233334444 hit, PS 5555666677778888 miss"),
+            missing: false,
+        };
+
+        let line = format_fault_list(
+            Some(0x1000),
+            "main",
+            Some(0x2000),
+            12,
+            20,
+            &around,
+            Some(&active),
+        );
+
+        assert!(line.contains("stopped at operation 12 of 20"));
+        assert!(line.contains("ResourceBarrier >ExecuteIndirect"));
+        assert!(line.contains("active pipeline 42 [VS 1111222233334444 hit, PS 5555666677778888 miss]"));
+    }
+
+    #[test]
+    fn format_fault_list_without_active_pipeline_omits_suffix() {
+        let around = vec![format!(">{}", op_name(D3D12_AUTO_BREADCRUMB_OP(6)))];
+        let line = format_fault_list(Some(0x3000), "", Some(0x4000), 0, 1, &around, None);
+
+        assert!(line.contains("stopped at operation 0 of 1 (ops around it: >Dispatch)"));
+        assert!(!line.contains("active"));
     }
 }
