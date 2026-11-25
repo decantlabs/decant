@@ -37,6 +37,11 @@ pub fn reads(e: &Expr, f: &mut impl FnMut(Var)) {
             reads(b, f);
         }
         Expr::Call(_, args) => args.iter().for_each(|a| reads(a, f)),
+        Expr::BvhWord(op, _) => op
+            .descriptor
+            .iter()
+            .chain(&op.address)
+            .for_each(|a| reads(a, f)),
         Expr::Load(l) => {
             reads(&l.offset, f);
             // The base registers: an address pair or the four descriptor words.

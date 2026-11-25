@@ -90,6 +90,16 @@ impl Display for Input {
 impl Display for Expr {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Expr::BvhWord(op, word) => write!(
+                f,
+                "bvh{}[{}] descriptor[{}] address[{}] a16={} pc={}",
+                if op.wide { "64" } else { "" },
+                word,
+                joined(&op.descriptor),
+                joined(&op.address),
+                op.encoding.a16,
+                op.pc
+            ),
             Expr::U32(v) if *v < 10 => write!(f, "{v}"),
             Expr::U32(v) => write!(f, "{v:#x}"),
             Expr::U64(v) => write!(f, "{v:#x}L"),

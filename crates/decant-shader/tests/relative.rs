@@ -48,8 +48,8 @@ fn loop_bounds_both_relative_moves_and_preserves_an_aliased_source() {
 }
 
 #[test]
-fn unknown_or_out_of_range_m0_is_refused() {
-    for offset in [s(0), int(-2), lit(256)] {
+fn out_of_range_m0_is_refused() {
+    for offset in [int(-2), lit(256)] {
         let mut asm = Asm::new();
         asm.push(sop1(Op::s_mov_b32, M0, offset))
             .push(vop1(Op::v_movrels_b32, v(2), v(1)));
@@ -61,7 +61,8 @@ fn unknown_or_out_of_range_m0_is_refused() {
 #[test]
 #[ignore = "needs DECANT_SHADER_CORPUS and DXC"]
 fn bc_compression_corpus_compiles() {
-    let path = std::env::var_os("DECANT_SHADER_CORPUS").expect("set DECANT_SHADER_CORPUS to the archive");
+    let path =
+        std::env::var_os("DECANT_SHADER_CORPUS").expect("set DECANT_SHADER_CORPUS to the archive");
     let dxc = common::find_dxc().expect("DXC");
     let hashes = [0x9cde95cb518ed7c3, 0xacaa614050409d4f, 0x37e70e7affa8e849];
     let selection = Selection {
@@ -92,4 +93,23 @@ fn bc_compression_corpus_compiles() {
         .unwrap_or_else(|err| panic!("{}: {err}", entry.name));
         println!("compiled {} ({:016x})", entry.name, entry.hash);
     }
+}
+
+#[test]
+fn dynamic_m0_covers_signed_offsets_and_saves_an_aliased_source() {
+    let mut asm = Asm::new();
+    asm.push(sop1(Op::s_mov_b32, M0, s(0)))
+        .push(vop1(Op::v_movreld_b32, v(5), v(5)))
+        .push(vop1(Op::v_movrels_b32, v(2), v(5)));
+    let text = lift_program(&compute(asm)).unwrap().to_string();
+    assert!(text.contains("@exec t0 = v5"), "{text}");
+    assert!(
+        text.contains("@exec v0 = ((m0 == 0xfffffffb) ? t0 : v0)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("@exec v255 = ((m0 == 0xfa) ? t0 : v255)"),
+        "{text}"
+    );
+    assert!(text.contains("((5 + m0) <u 0x100)"), "{text}");
 }

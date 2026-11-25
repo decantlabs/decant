@@ -44,7 +44,7 @@ pub use api::*;
 pub use refusal::{Refusal, RefusalKind};
 
 /// Changes whenever the translation of any program can change. Part of the cache key.
-pub const TRANSLATOR_VERSION: u32 = 4;
+pub const TRANSLATOR_VERSION: u32 = 5;
 
 /// The program of the stage that feeds the pixel stage, when the pipeline has one.
 fn before_pixel(stages: &[StageProgram]) -> Option<&StageProgram> {
@@ -73,7 +73,9 @@ pub fn lift_program(program: &StageProgram) -> Result<ir::Function, Refusal> {
     if blocks.iter().flatten().any(|stmt| {
         matches!(stmt, ir::Stmt::Set { value: ir::Expr::Call(h, _), .. }
             if std::ptr::eq(*h, &lift::wave::DPP_ADD)
-                || std::ptr::eq(*h, &lift::wave::PERMLANE))
+                || std::ptr::eq(*h, &lift::wave::PERMLANE)
+                || std::ptr::eq(*h, &lift::wave::BPERMUTE)
+                || std::ptr::eq(*h, &lift::wave::DPP8_MOV))
     }) {
         lift::wave::check_dpp_context(&graph, &masks)?;
     }
@@ -89,6 +91,24 @@ pub fn lift_program(program: &StageProgram) -> Result<ir::Function, Refusal> {
     })
 }
 
+/// Native node results cannot be replaced by a full RayQuery traversal.
+pub(crate) fn refuse_unlowered_bvh(func: &ir::Function) -> Result<(), Refusal> {
+    let mut pc = None;
+    hlsl::expr::for_each_expr(func, &mut |expr| {
+        if let ir::Expr::BvhWord(op, _) = expr {
+            pc.get_or_insert(op.pc);
+        }
+    });
+    if let Some(pc) = pc {
+        return Err(Refusal::new(
+            RefusalKind::Resource("bvh-node-backend"),
+            "native BVH node intersection requires a compatible node memory backend",
+        )
+        .at(pc));
+    }
+    Ok(())
+}
+
 fn translate_stage(
     program: &StageProgram,
     before: Option<&StageProgram>,
@@ -97,6 +117,7 @@ fn translate_stage(
     host: &dyn Host,
 ) -> Result<TranslatedStage, Refusal> {
     let mut func = lift_program(program)?;
+    refuse_unlowered_bvh(&func)?;
     stage::prepare(program, &mut func)?;
     resource::trace(&mut func, program)?;
     // A read at an address in vector registers that the resource pass did not resolve.

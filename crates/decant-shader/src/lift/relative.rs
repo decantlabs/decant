@@ -1,4 +1,4 @@
-//! Relative VGPR moves over the finite set of M0 values reaching each instruction.
+//! Relative VGPR moves with finite M0 analysis and a complete register fallback.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
@@ -196,11 +196,17 @@ pub(super) fn lift(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
         return Err(operand::form(insn, "relative-vgpr"));
     };
     let unknown = || operand::form(insn, "relative-m0-range");
-    let offsets = cx
-        .relative
-        .get(&insn.pc)
-        .and_then(Option::as_ref)
-        .ok_or_else(unknown)?;
+    let dynamic;
+    let offsets = match cx.relative.get(&insn.pc).and_then(Option::as_ref) {
+        Some(offsets) => offsets,
+        None => {
+            // Enumerate every signed offset that reaches an architectural VGPR.
+            dynamic = (0..=255u32)
+                .map(|reg| reg.wrapping_sub(u32::from(base)))
+                .collect::<BTreeSet<_>>();
+            &dynamic
+        }
+    };
     let registers = offsets
         .iter()
         .map(|&offset| {
@@ -216,7 +222,19 @@ pub(super) fn lift(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
         return Ok(true);
     }
     if read {
-        cx.set_lane(operand::var(insn, insn.dst)?, relative_read(&registers));
+        let dst = operand::var(insn, insn.dst)?;
+        let valid = Expr::bin(
+            Bin::ULt,
+            Expr::bin(Bin::Add, Expr::U32(u32::from(base)), Expr::Var(Var::M0)),
+            Expr::U32(256),
+        );
+        let value = relative_read(&registers);
+        let value = if cx.relative.get(&insn.pc).and_then(Option::as_ref).is_some() {
+            value
+        } else {
+            Expr::select(valid, value, Expr::Var(dst))
+        };
+        cx.set_lane(dst, value);
     } else {
         let source = operand::bits(insn, 0)?;
         if let [(_, reg)] = registers.as_slice() {

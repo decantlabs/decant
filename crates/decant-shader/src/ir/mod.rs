@@ -209,9 +209,23 @@ pub struct Load {
     pub pc: u32,
 }
 
+/// One node intersection in the native BVH format, before backend lowering.
+/// Address words hold the node pointer, extent, origin, direction and inverse direction.
+/// A16 packs the six direction components into three words.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BvhIntersect {
+    pub wide: bool,
+    pub descriptor: Vec<Expr>,
+    pub address: Vec<Expr>,
+    pub encoding: crate::decode::Mimg,
+    pub pc: u32,
+}
+
 /// An expression. It has no side effect.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Expr {
+    /// One of the four native result words of a node intersection.
+    BvhWord(Box<BvhIntersect>, u8),
     U32(u32),
     U64(u64),
     Bool(bool),
@@ -272,7 +286,8 @@ impl Expr {
 
     pub fn ty(&self) -> Ty {
         match self {
-            Expr::U32(_)
+            Expr::BvhWord(..)
+            | Expr::U32(_)
             | Expr::UserData(_)
             | Expr::Load(_)
             | Expr::BufferWord { .. }

@@ -15,6 +15,7 @@
 #[cfg(test)]
 mod bounded_tests;
 pub mod buf;
+mod bvh;
 pub mod ds;
 pub mod exp;
 pub mod interp;
@@ -122,7 +123,7 @@ pub fn lift(cx: &mut Lifter, insn: &Insn) -> Result<(), Refusal> {
         Format::Vintrp => interp::lift(cx, insn)?,
         Format::Ds => ds::lift(cx, insn)?,
         Format::Mubuf | Format::Mtbuf => buf::lift(cx, insn)?,
-        Format::Mimg => mimg::lift(cx, insn)?,
+        Format::Mimg => bvh::lift(cx, insn)? || mimg::lift(cx, insn)?,
         Format::Exp => exp::lift(cx, insn)?,
         Format::Global => smem::lift_global(cx, insn)?,
         Format::Flat | Format::Scratch => false,
