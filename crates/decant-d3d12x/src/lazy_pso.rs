@@ -28,6 +28,11 @@
 //! behaviour. Graphics and mesh binds are not changed: their first bind already waits at most 50 ms
 //! and is paid from the frame budget (`DECANT_D3D12X_FRAME_WAIT_MS`). A bind that was cut short is
 //! counted and logged (`async bind: ...`), so a run shows how much work was left out.
+//!
+//! The waits of all cold async compute binds in one frame also share a budget,
+//! `DECANT_D3D12X_ASYNC_BIND_FRAME_MS` (default 16, `0` does not wait at all). `PresentX` refills it
+//! (`direct_pso::refill_frame_budget`). Once it is spent, a cold async bind returns at once, so
+//! thousands of cold pipelines in one frame cost no more than the budget.
 
 #![allow(unsafe_code)]
 
@@ -394,6 +399,13 @@ fn capped_wait(cap: Option<Duration>, is_compute: bool, allowed: Duration) -> (D
     }
 }
 
+/// How long a bind may wait when the async bind mode is `on` and `left` is what is left of the
+/// frame budget. Only a compute bind that may wait at all is limited. The second value tells whether
+/// the budget shortened the wait.
+fn budgeted_wait(on: bool, is_compute: bool, allowed: Duration, left: Duration) -> (Duration, bool) {
+    if on && is_compute && allowed > left { (left, true) } else { (allowed, false) }
+}
+
 /// Binds the async bind mode left without their pipeline. Every one is counted, the first 16 and
 /// then the powers of two are logged.
 static ASYNC_LEFT_OUT: AtomicU64 = AtomicU64::new(0);
@@ -447,9 +459,14 @@ static MAKER_JOBS: LazyLock<(Mutex<MakerQueues>, Condvar)> = LazyLock::new(Defau
 /// Signalled whenever a worker has finished a pipeline.
 static MAKER_FINISHED: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
+/// Maker workers on a host with `cores` cores: half of them, 2 to 16.
+fn default_maker_count(cores: usize) -> usize {
+    (cores / 2).clamp(2, 16)
+}
+
 fn maker_thread_count() -> usize {
     let configured = std::env::var("DECANT_D3D12X_PSO_MAKERS").ok().and_then(|text| text.parse::<usize>().ok()).filter(|&n| n > 0);
-    configured.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |cores| (cores.get() / 2).clamp(2, 8)))
+    configured.unwrap_or_else(|| default_maker_count(std::thread::available_parallelism().map_or(4, |cores| cores.get())))
 }
 
 /// Starts the maker workers on first use and returns how many run.
@@ -619,9 +636,15 @@ pub unsafe fn resolve(object: *mut c_void) -> Option<*mut c_void> {
     let is_compute = lazy.recipe.owned.desc().len() == COMPUTE_DESC_SIZE;
     let first_bind = !lazy.waited.swap(true, Ordering::Relaxed);
     let allowed = crate::direct_pso::bind_wait(is_compute, first_bind, &lazy.late);
-    let (allowed, capped) = capped_wait(async_bind_cap(), is_compute, allowed);
+    let cap = async_bind_cap();
+    let (allowed, capped) = capped_wait(cap, is_compute, allowed);
+    let (allowed, over_budget) = budgeted_wait(cap.is_some(), is_compute, allowed, crate::direct_pso::async_frame_left());
+    let capped = capped || over_budget;
     let begun = Instant::now();
     let made = resolve_within(object as usize, lazy, is_compute, allowed);
+    if cap.is_some() && is_compute && !allowed.is_zero() {
+        crate::direct_pso::spend_async_wait(begun.elapsed());
+    }
     if capped && made.is_null() && lazy.made.get().is_none() {
         note_async_left_out(lazy.number, begun.elapsed());
     }
@@ -1060,6 +1083,26 @@ mod tests {
         }
         let (allowed, _) = capped_wait(Some(Duration::from_millis(15)), true, Duration::ZERO);
         assert_eq!(resolve_within(object as usize, lazy, true, allowed), 0x5100_0002 as *mut c_void);
+    }
+
+    #[test]
+    fn maker_workers_scale_with_the_cores() {
+        assert_eq!(default_maker_count(1), 2, "never below 2");
+        assert_eq!(default_maker_count(8), 4);
+        assert_eq!(default_maker_count(24), 12);
+        assert_eq!(default_maker_count(1000), 16, "never above 16");
+    }
+
+    #[test]
+    fn the_async_frame_budget_limits_only_a_cold_compute_wait() {
+        let ms = Duration::from_millis;
+        assert_eq!(budgeted_wait(true, true, ms(20), ms(16)), (ms(16), true));
+        assert_eq!(budgeted_wait(true, true, ms(20), ms(5)), (ms(5), true));
+        assert_eq!(budgeted_wait(true, true, ms(20), Duration::ZERO), (Duration::ZERO, true), "a spent budget does not wait");
+        assert_eq!(budgeted_wait(true, true, ms(10), ms(16)), (ms(10), false), "a wait inside the budget is kept");
+        assert_eq!(budgeted_wait(true, true, Duration::ZERO, Duration::ZERO), (Duration::ZERO, false), "a late pipeline stays at zero");
+        assert_eq!(budgeted_wait(true, false, ms(50), Duration::ZERO), (ms(50), false), "graphics and mesh keep their own budget");
+        assert_eq!(budgeted_wait(false, true, ms(5000), Duration::ZERO), (ms(5000), false), "off changes nothing");
     }
 
     #[test]

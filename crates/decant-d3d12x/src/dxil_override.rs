@@ -194,17 +194,19 @@ fn find_capped(dir: &Path, original: &[u8], cap: u64) -> Option<(Vec<u8>, u64)> 
 static LOGGED_MISSES: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Logs a DXIL-override miss the first time this content hash is seen; returns whether this call
-/// is the one that logged it (`false` on every later call for the same hash). The log line itself
-/// (`crate::log`) exists only on Windows (`d3d12_xs.dll`'s own log); this module stays buildable
-/// and testable on any host, so the dedupe tracking runs everywhere and only the line it would
-/// print is Windows-only.
+/// is the one that logged it (`false` on every later call for the same hash). Nothing is logged and
+/// the hash is not remembered when `dir` is `None`, because with no override directory configured
+/// every shader is a miss and the line says nothing. The log line itself (`crate::log`) exists only
+/// on Windows (`d3d12_xs.dll`'s own log). This module stays buildable and testable on any host, so
+/// the dedupe tracking runs everywhere and only the line it would print is Windows-only.
 fn log_miss_once(hash: u64, len: usize, dir: Option<&Path>, err: Option<io::ErrorKind>) -> bool {
+    let Some(dir) = dir else { return false };
     let newly_logged = LOGGED_MISSES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(hash);
     #[cfg(windows)]
     if newly_logged {
         crate::log::xs_log!(
             "DXIL override miss, hash={hash:016x}, size {len}, dir {}, {}",
-            dir.map_or_else(|| "unset".to_string(), |d| d.display().to_string()),
+            dir.display(),
             err.map_or_else(|| "no such file".to_string(), |kind| format!("{kind:?}"))
         );
     }
@@ -243,16 +245,14 @@ fn max_bytes() -> u64 {
 }
 
 /// Looks up an override for `original` under the configured directory. `None` (pass the original
-/// bytecode through unchanged) when overrides are off or there is no match. Logs a miss (once per
-/// distinct hash) when overrides are off too, same as [`lookup_in`]'s miss log, dir "unset".
+/// bytecode through unchanged) when overrides are off or there is no match. A miss is logged (once
+/// per distinct hash) only when a directory is configured. With overrides off nothing is logged.
 pub fn lookup(original: &[u8]) -> Option<Vec<u8>> {
     match configured_dir() {
         Some(dir) => lookup_in(&dir, original),
         None => {
             if !original.is_empty() {
-                let hash = content_hash(original);
-                dump_miss_to(dump_dir().as_deref(), hash, original);
-                log_miss_once(hash, original.len(), None, None);
+                dump_miss_to(dump_dir().as_deref(), content_hash(original), original);
             }
             None
         }
@@ -1019,13 +1019,23 @@ mod tests {
     fn a_miss_logs_once_per_distinct_content_hash() {
         let original = b"a shader this test never saw an override for".to_vec();
         let hash = content_hash(&original);
-        let first = log_miss_once(hash, original.len(), None, None);
-        let second = log_miss_once(hash, original.len(), None, None);
+        let dir = Path::new("overrides");
+        let first = log_miss_once(hash, original.len(), Some(dir), None);
+        let second = log_miss_once(hash, original.len(), Some(dir), None);
         assert!(first, "the first report of a hash logs it");
         assert!(!second, "the same hash again does not log a second time");
         let other = b"a different shader, a different hash".to_vec();
         assert_ne!(hash, content_hash(&other));
-        assert!(log_miss_once(content_hash(&other), other.len(), None, None), "a new hash still logs");
+        assert!(log_miss_once(content_hash(&other), other.len(), Some(dir), None), "a new hash still logs");
+    }
+
+    #[test]
+    fn a_miss_with_no_override_directory_is_not_logged() {
+        let original = b"a shader looked up while overrides are off".to_vec();
+        let hash = content_hash(&original);
+        assert!(!log_miss_once(hash, original.len(), None, None), "an unset directory logs nothing");
+        assert!(!LOGGED_MISSES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&hash), "and remembers nothing");
+        assert!(log_miss_once(hash, original.len(), Some(Path::new("overrides")), None), "a configured directory still logs the hash");
     }
 
     #[test]

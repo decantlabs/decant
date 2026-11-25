@@ -30,9 +30,13 @@
 //!   driver pipeline before being marked late (default 5000, `0` does not wait).
 //! * `DECANT_D3D12X_FRAME_WAIT_MS=<ms>` is the total per-frame wait budget across cold graphics and
 //!   mesh binds (default 500, `0` does not wait).
-//! * `DECANT_D3D12X_PRECOMPILE_THREADS=<n>` sets the queue worker count (default 4, 0 off).
+//! * `DECANT_D3D12X_ASYNC_BIND_FRAME_MS=<ms>` is the total per-frame wait budget across cold compute
+//!   binds in the async bind mode of `lazy_pso` (default 16, `0` does not wait at all). `PresentX`
+//!   refills it. Once it is spent, cold async binds return at once.
+//! * `DECANT_D3D12X_PRECOMPILE_THREADS=<n>` sets the queue worker count (default two thirds of the
+//!   cores, 4 to 32, 0 off).
 //! * `DECANT_D3D12X_DIRECT_THREADS=<n>` sets the worker count for binds that bypass the queue
-//!   (default a quarter of the cores, 1 to 4).
+//!   (default half of the cores, 2 to 16).
 //! * `DECANT_D3D12X_MAX_LIVE_HLSL_BYTES=<n>` is the largest stage HLSL compiled live (default 8 MiB,
 //!   `0` no limit). A larger stage without cached DXIL is refused with its size in the log.
 //! * `DECANT_D3D12X_PSO_CACHE=<dir>` is the library of driver compiled pipeline states
@@ -86,6 +90,9 @@ const FIRST_BIND_WAIT: Duration = Duration::from_millis(50);
 /// Frame wait budget when `DECANT_D3D12X_FRAME_WAIT_MS` is not set.
 const DEFAULT_FRAME_WAIT_MS: u64 = 500;
 
+/// Async bind frame budget when `DECANT_D3D12X_ASYNC_BIND_FRAME_MS` is not set.
+const DEFAULT_ASYNC_FRAME_MS: u64 = 16;
+
 /// Compute wait when `DECANT_D3D12X_COMPUTE_WAIT_MS` is not set.
 const DEFAULT_COMPUTE_WAIT_MS: u64 = 5000;
 
@@ -95,12 +102,30 @@ const SUMMARY_PERIOD: Duration = Duration::from_secs(15);
 /// Microseconds that cold graphics and mesh binds have waited since the last present.
 static FRAME_SPENT_US: AtomicU64 = AtomicU64::new(0);
 
+/// Microseconds that cold async compute binds have waited since the last present.
+static ASYNC_SPENT_US: AtomicU64 = AtomicU64::new(0);
+
 /// The translator hash of this build, part of every cache key.
 const TRANSLATOR_HASH: &str = env!("DECANT_DIRECT_TRANSLATOR_HASH");
 
+/// Workers for binds that bypass the queue on a host with `cores` cores: half of them, 2 to 16.
+fn default_threads(cores: usize) -> usize {
+    (cores / 2).clamp(2, 16)
+}
+
+/// Workers of the precompile queue on a host with `cores` cores: two thirds of them, 4 to 32.
+fn default_precompile_threads(cores: usize) -> usize {
+    (cores * 2 / 3).clamp(4, 32)
+}
+
+/// The core count of the host, 4 when it cannot be read.
+fn host_cores() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+
 fn threads() -> usize {
     let configured = std::env::var("DECANT_D3D12X_DIRECT_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0);
-    configured.unwrap_or_else(|| (std::thread::available_parallelism().map_or(4, |n| n.get()) / 4).clamp(1, 4))
+    configured.unwrap_or_else(|| default_threads(host_cores()))
 }
 
 /// The live HLSL limit for the value of `DECANT_D3D12X_MAX_LIVE_HLSL_BYTES`: 8 MiB when unset or not
@@ -207,7 +232,7 @@ fn precompile_threads() -> usize {
             return 0;
         }
         std::env::var("DECANT_D3D12X_PRECOMPILE_THREADS").ok()
-            .and_then(|value| value.parse::<usize>().ok()).unwrap_or(4).min(64)
+            .and_then(|value| value.parse::<usize>().ok()).unwrap_or_else(|| default_precompile_threads(host_cores())).min(64)
     })
 }
 
@@ -243,7 +268,13 @@ fn log_library_if_changed() {
 }
 
 pub(crate) fn note_present() {
+    refill_frame_budget();
+}
+
+/// Refills the wait budgets of the frame, for graphics and mesh binds and for async compute binds.
+pub(crate) fn refill_frame_budget() {
     FRAME_SPENT_US.store(0, Ordering::Relaxed);
+    ASYNC_SPENT_US.store(0, Ordering::Relaxed);
 }
 
 pub(crate) fn current_service() -> Option<&'static Service> {
@@ -385,14 +416,33 @@ pub(crate) fn bind_wait(is_compute: bool, first: bool, late: &AtomicBool) -> Dur
 
 /// What is left of this frame's wait budget for graphics and mesh binds.
 pub(crate) fn frame_budget_left() -> Duration {
-    let spent = Duration::from_micros(FRAME_SPENT_US.load(Ordering::Relaxed));
-    frame_wait_budget().saturating_sub(spent)
+    budget_left(&FRAME_SPENT_US, frame_wait_budget())
 }
 
 /// Takes `elapsed` from this frame's wait budget.
 pub(crate) fn spend_frame_wait(elapsed: Duration) {
+    spend(&FRAME_SPENT_US, elapsed);
+}
+
+/// What is left of this frame's wait budget for cold async compute binds.
+pub(crate) fn async_frame_left() -> Duration {
+    budget_left(&ASYNC_SPENT_US, async_frame_budget())
+}
+
+/// Takes `elapsed` from this frame's async compute wait budget.
+pub(crate) fn spend_async_wait(elapsed: Duration) {
+    spend(&ASYNC_SPENT_US, elapsed);
+}
+
+/// What is left of `budget` after the microseconds in `spent`.
+fn budget_left(spent: &AtomicU64, budget: Duration) -> Duration {
+    budget.saturating_sub(Duration::from_micros(spent.load(Ordering::Relaxed)))
+}
+
+/// Adds `elapsed` to the microseconds in `spent`.
+fn spend(spent: &AtomicU64, elapsed: Duration) {
     let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-    FRAME_SPENT_US.fetch_add(micros, Ordering::Relaxed);
+    spent.fetch_add(micros, Ordering::Relaxed);
 }
 
 /// Counts a bind that went on without its pipeline, and logs only the first one of each object.
@@ -463,6 +513,13 @@ pub(crate) fn compute_wait() -> Duration {
 fn frame_wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| wait_from(std::env::var("DECANT_D3D12X_FRAME_WAIT_MS").ok().as_deref(), DEFAULT_FRAME_WAIT_MS))
+}
+
+/// The wait budget of one frame for cold async compute binds (`DECANT_D3D12X_ASYNC_BIND_FRAME_MS`,
+/// default 16 ms, `0` does not wait, read once).
+fn async_frame_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| wait_from(std::env::var("DECANT_D3D12X_ASYNC_BIND_FRAME_MS").ok().as_deref(), DEFAULT_ASYNC_FRAME_MS))
 }
 
 /// A wait given in milliseconds by a setting, `default_ms` when it is missing or not a number.
@@ -729,6 +786,49 @@ mod tests {
         assert_eq!(bind_wait(false, true, &late), Duration::ZERO, "exhausted frame budget caps graphics waits");
         note_present();
         assert_eq!(bind_wait(false, true, &late), FIRST_BIND_WAIT.min(frame_wait_budget()), "present resets budget");
+    }
+
+    #[test]
+    fn worker_defaults_scale_with_the_cores() {
+        assert_eq!(default_precompile_threads(1), 4, "never below 4");
+        assert_eq!(default_precompile_threads(6), 4);
+        assert_eq!(default_precompile_threads(12), 8);
+        assert_eq!(default_precompile_threads(24), 16);
+        assert_eq!(default_precompile_threads(1000), 32, "never above 32");
+        assert_eq!(default_threads(1), 2, "never below 2");
+        assert_eq!(default_threads(8), 4);
+        assert_eq!(default_threads(24), 12);
+        assert_eq!(default_threads(1000), 16, "never above 16");
+    }
+
+    #[test]
+    fn the_async_frame_budget_is_16_ms_unless_set() {
+        let budget = |setting| wait_from(setting, DEFAULT_ASYNC_FRAME_MS);
+        assert_eq!(budget(None), Duration::from_millis(16));
+        assert_eq!(budget(Some("0")), Duration::ZERO, "0 does not wait at all");
+        assert_eq!(budget(Some(" 40 ")), Duration::from_millis(40));
+        assert_eq!(budget(Some("soon")), Duration::from_millis(16));
+    }
+
+    #[test]
+    fn a_spent_budget_stays_empty_until_it_is_refilled() {
+        let spent = AtomicU64::new(0);
+        let budget = Duration::from_millis(16);
+        assert_eq!(budget_left(&spent, budget), budget);
+        spend(&spent, Duration::from_millis(5));
+        assert_eq!(budget_left(&spent, budget), Duration::from_millis(11));
+        spend(&spent, Duration::from_millis(20));
+        assert_eq!(budget_left(&spent, budget), Duration::ZERO, "overspending leaves nothing, not a wrap");
+        assert_eq!(budget_left(&spent, Duration::ZERO), Duration::ZERO, "a zero budget never waits");
+    }
+
+    #[test]
+    fn a_present_refills_the_async_budget() {
+        // The statics are shared with the other tests, so this test only uses the async one.
+        spend_async_wait(async_frame_budget());
+        assert_eq!(async_frame_left(), Duration::ZERO);
+        refill_frame_budget();
+        assert_eq!(async_frame_left(), async_frame_budget());
     }
 
     #[test]
