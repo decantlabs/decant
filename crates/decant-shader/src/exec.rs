@@ -2010,3 +2010,66 @@ pub fn analyse(cfg: &Cfg) -> Result<Masks, Refusal> {
         (wide, Err(_)) => wide.map(|(m, _)| m),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asm::*;
+
+    fn analyse_asm(mut a: Asm) -> (crate::cfg::Cfg, Masks) {
+        a.push(sopp(Op::s_endpgm, 0));
+        let graph = crate::cfg::build(&a.finish()).unwrap();
+        let masks = analyse(&graph).unwrap();
+        (graph, masks)
+    }
+
+    /// In a 64 lane program, `s_mov_b32` reads a 32 bit scalar as numeric data. When the source
+    /// only ever holds a live 64 lane mask word, refusing `mask-as-data` keeps the scalar lifter
+    /// from reading an unwritten `Var::S` instead of `Var::Mask`. Supporting that pattern needs
+    /// explicit mask word lifting in `lift::wave`.
+    #[test]
+    fn move_b32_of_live_64_lane_mask_word_is_refused_as_mask_as_data() {
+        let mut a = Asm::new();
+        a.push(sop1(Op::s_mov_b64, s(26), EXEC));
+        a.push(sop1(Op::s_mov_b32, s(40), s(26)));
+        let (graph, masks) = analyse_asm(a);
+        let mov = graph.insns().find(|i| i.op == Op::s_mov_b32).unwrap();
+        masks.enter(mov.pc);
+        assert_eq!(masks.refusal(), Some("mask-as-data"));
+    }
+
+    #[test]
+    fn move_b32_allows_register_when_numeric_path_also_reaches_source() {
+        let mut a = Asm::new();
+        let numeric = a.label();
+        let join = a.label();
+        a.push(sopc(Op::s_cmp_eq_u32, s(0), int(0)));
+        a.branch(Op::s_cbranch_scc1, numeric);
+        a.push(sop1(Op::s_mov_b64, s(26), EXEC));
+        a.branch(Op::s_branch, join);
+        a.bind(numeric);
+        a.push(sop1(Op::s_mov_b32, s(26), int(7)));
+        a.bind(join);
+        a.push(sop1(Op::s_mov_b32, s(40), s(26)));
+        let (graph, masks) = analyse_asm(a);
+        for insn in graph.insns() {
+            masks.enter(insn.pc);
+            assert_eq!(masks.refusal(), None, "{insn}");
+        }
+    }
+
+    #[test]
+    fn move_b32_propagates_32_lane_mask_cleanly() {
+        let mut a = Asm::new();
+        a.push(sop1(Op::s_mov_b32, s(26), EXEC));
+        a.push(sop1(Op::s_mov_b32, s(40), s(26)));
+        a.push(sop1(Op::s_mov_b32, EXEC, s(40)));
+        let (graph, masks) = analyse_asm(a);
+        assert_eq!(masks.lanes(), 32);
+        let mov = graph.insns().nth(1).unwrap();
+        masks.enter(mov.pc);
+        assert!(masks.reads_mask(26));
+        assert!(masks.writes_mask(40));
+        assert_eq!(masks.refusal(), None);
+    }
+}
