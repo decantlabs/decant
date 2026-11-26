@@ -822,6 +822,12 @@ pub unsafe extern "system" fn DecantXmemGpuChanges(after: u64, out: *mut GpuChan
     TRUE
 }
 
+/// Outside the console API: returns the current GPU journal sequence number without locking.
+#[unsafe(no_mangle)]
+pub extern "system" fn DecantXmemJournalSeq() -> u64 {
+    Engine::started().map_or(0, Engine::journal_seq)
+}
+
 /// Outside the console API: every live reservation and view as `RESERVE` and `MAP` records, and the
 /// sequence number they are valid for. FALSE when `cap` is too small, then `*written` is the count needed.
 ///

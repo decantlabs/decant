@@ -3159,4 +3159,31 @@ mod tests {
         e.release(area).unwrap();
         e.free_pages(&frames).unwrap();
     }
+
+    #[test]
+    fn journal_seq_tracks_mapping_events_and_stays_constant_when_idle() {
+        let Some(e) = held(|| Engine::load_limited(4, 4)) else { return };
+        let s0 = e.journal_seq();
+        let frames = e.allocate_pages(1).unwrap();
+        assert_eq!(e.journal_seq(), s0, "allocate_pages does not emit a journal event");
+
+        let area = e.reserve(0, 2 * P, PAGE_READWRITE).unwrap();
+        let s1 = e.journal_seq();
+        assert!(s1 > s0);
+
+        e.map_frames(area, &frames).unwrap();
+        let s2 = e.journal_seq();
+        assert!(s2 > s1);
+
+        e.unmap_pages(area, 1).unwrap();
+        let s3 = e.journal_seq();
+        assert!(s3 > s2);
+
+        e.release(area).unwrap();
+        let s4 = e.journal_seq();
+        assert!(s4 > s3);
+
+        e.free_pages(&frames).unwrap();
+        assert_eq!(e.journal_seq(), s4, "free_pages does not emit a journal event");
+    }
 }
