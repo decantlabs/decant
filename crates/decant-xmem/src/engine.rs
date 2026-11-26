@@ -598,6 +598,7 @@ type RunSnapshot = (usize, usize, u64, Vec<u64>);
 struct ProtectSync {
     locks: Vec<Mutex<()>>,
     gens: Vec<AtomicU64>,
+    in_flight_rw: Vec<AtomicU64>,
     pending: AtomicBool,
 }
 
@@ -605,11 +606,13 @@ impl Default for ProtectSync {
     fn default() -> Self {
         let mut locks = Vec::with_capacity(PROTECT_STRIPES);
         let mut gens = Vec::with_capacity(PROTECT_STRIPES);
+        let mut in_flight_rw = Vec::with_capacity(PROTECT_STRIPES);
         for _ in 0..PROTECT_STRIPES {
             locks.push(Mutex::new(()));
             gens.push(AtomicU64::new(0));
+            in_flight_rw.push(AtomicU64::new(0));
         }
-        Self { locks, gens, pending: AtomicBool::new(false) }
+        Self { locks, gens, in_flight_rw, pending: AtomicBool::new(false) }
     }
 }
 
@@ -705,12 +708,45 @@ impl ProtectSync {
         runs
     }
 
-    fn protect_runs_checked(&self, runs: Vec<RunSnapshot>, protect: u32, want_clean: bool, dirty: &Mutex<Dirty>) {
+    fn snapshot_rw_runs(&self, addrs: Vec<usize>) -> Vec<RunSnapshot> {
+        let runs = self.snapshot_runs(addrs);
+        for &(_, _, mut mask, _) in &runs {
+            while mask != 0 {
+                let s = mask.trailing_zeros() as usize;
+                self.in_flight_rw[s].fetch_add(1, Ordering::Release);
+                mask &= mask - 1;
+            }
+        }
+        runs
+    }
+
+    fn release_in_flight_rw(&self, mut mask: u64) {
+        while mask != 0 {
+            let s = mask.trailing_zeros() as usize;
+            self.in_flight_rw[s].fetch_sub(1, Ordering::Release);
+            mask &= mask - 1;
+        }
+    }
+
+    fn wait_in_flight_rw(&self, mut mask: u64) {
+        while mask != 0 {
+            let s = mask.trailing_zeros() as usize;
+            while self.in_flight_rw[s].load(Ordering::Acquire) != 0 {
+                std::hint::spin_loop();
+            }
+            mask &= mask - 1;
+        }
+    }
+
+    fn protect_runs_checked(&self, runs: Vec<RunSnapshot>, protect: u32, want_clean: bool, release_rw: bool, dirty: &Mutex<Dirty>) {
         for (start, bytes, mask, expected_gens) in runs {
             let guards = self.lock_mask(mask);
             if self.gens_match(mask, &expected_gens) {
                 Engine::protect_range(start, bytes, protect);
                 drop(guards);
+                if release_rw {
+                    self.release_in_flight_rw(mask);
+                }
                 continue;
             }
             drop(guards);
@@ -746,15 +782,18 @@ impl ProtectSync {
                 }
                 pending_addrs = retry;
             }
+            if release_rw {
+                self.release_in_flight_rw(mask);
+            }
         }
     }
 
     fn protect_rw_runs(&self, runs: Vec<RunSnapshot>, dirty: &Mutex<Dirty>) {
-        self.protect_runs_checked(runs, PAGE_READWRITE, false, dirty);
+        self.protect_runs_checked(runs, PAGE_READWRITE, false, true, dirty);
     }
 
     fn protect_ro_runs(&self, runs: Vec<RunSnapshot>, dirty: &Mutex<Dirty>) {
-        self.protect_runs_checked(runs, PAGE_READONLY, true, dirty);
+        self.protect_runs_checked(runs, PAGE_READONLY, true, false, dirty);
     }
 
     fn ensure_rw(&self, page: usize) -> bool {
@@ -1233,7 +1272,7 @@ impl Engine {
                         protect_sync.set_pending(true);
                     }
                 }
-                protect_sync.snapshot_runs(open)
+                protect_sync.snapshot_rw_runs(open)
             };
             protect_sync.protect_rw_runs(chunks, &dirty_state);
         }
@@ -1851,7 +1890,7 @@ impl Engine {
                 }
             }
             protect_sync.bump_addrs(&open);
-            let chunks = protect_sync.snapshot_runs(open);
+            let chunks = protect_sync.snapshot_rw_runs(open);
             protect_sync.set_pending(false);
             dirty.track = None;
             self.tracking.store(false, Ordering::Release);
@@ -1911,7 +1950,7 @@ impl Engine {
             let is_held = track.is_held(index, now);
             let chunks = open.map(|addrs| {
                 self.protect_sync.bump_addrs(&addrs);
-                self.protect_sync.snapshot_runs(addrs)
+                self.protect_sync.snapshot_rw_runs(addrs)
             });
             if track.pending_len() > 0 {
                 self.protect_sync.set_pending(true);
@@ -1983,7 +2022,7 @@ impl Engine {
                 track.mark_committed(index as u32);
                 if let Some(addrs) = track.on_fault(index as u32, Instant::now()) {
                     protect_sync.bump_addrs(&addrs);
-                    chunks = Some(protect_sync.snapshot_runs(addrs));
+                    chunks = Some(protect_sync.snapshot_rw_runs(addrs));
                 }
                 if track.pending_len() > 0 {
                     protect_sync.set_pending(true);
@@ -2249,10 +2288,14 @@ impl Engine {
             return;
         }
         let until = Instant::now() + track::io_hold_for(total_bytes);
-        Self::commit_and_prepare_until(&st, indices, until);
+        let mut wait_mask = 0u64;
+        for &(address, len) in runs {
+            wait_mask |= ProtectSync::stripe_mask(address, len);
+        }
+        Self::commit_and_prepare_until(&st, indices, until, wait_mask);
     }
 
-    fn commit_and_prepare_until(st: &State, indices: Vec<u32>, until: Instant) {
+    fn commit_and_prepare_until(st: &State, indices: Vec<u32>, until: Instant, wait_mask: u64) {
         let dirty_state = Arc::clone(&st.dirty);
         let protect_sync = Arc::clone(&st.protect_sync);
         let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2278,9 +2321,10 @@ impl Engine {
                 protect_sync.set_pending(true);
             }
         }
-        let chunks = protect_sync.snapshot_runs(open);
+        let chunks = protect_sync.snapshot_rw_runs(open);
         drop(dirty_guard);
         protect_sync.protect_rw_runs(chunks, &dirty_state);
+        protect_sync.wait_in_flight_rw(wait_mask);
     }
 
     /// Commits and pins the writable view pages in `[address, address + len)` open for an active
@@ -2350,10 +2394,15 @@ impl Engine {
                 protect_sync.set_pending(true);
             }
         }
-        let chunks = protect_sync.snapshot_runs(open);
+        let chunks = protect_sync.snapshot_rw_runs(open);
         drop(dirty_guard);
         drop(st);
+        let mut wait_mask = 0u64;
+        for &(address, len) in runs {
+            wait_mask |= ProtectSync::stripe_mask(address, len);
+        }
         protect_sync.protect_rw_runs(chunks, &dirty_state);
+        protect_sync.wait_in_flight_rw(wait_mask);
         true
     }
 
@@ -2447,7 +2496,7 @@ impl Engine {
         if indices.is_empty() {
             return;
         }
-        Self::commit_and_prepare_until(&st, indices, until);
+        Self::commit_and_prepare_until(&st, indices, until, ProtectSync::stripe_mask(address, len));
     }
 
     /// The first page of `[address, address + len)` the kernel cannot write now, with what the engine
@@ -3907,5 +3956,40 @@ mod tests {
         assert_eq!(runs[0].1, 32 * P);
         assert_eq!(runs[0].2.count_ones(), 32);
         assert_eq!(runs[0].3.len(), 32);
+    }
+
+    #[test]
+    fn begin_io_write_waits_for_in_flight_protect_rw_on_same_stripe() {
+        let Some(e) = held(|| Engine::load_limited(4, 4)) else { return };
+        e.set_tracking(true);
+        let area = e.reserve(0, P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(1).unwrap();
+        e.map_frames(area, &frames).unwrap();
+        write(area, 0, 1);
+        assert_eq!(e.take_dirty(10).len(), 1);
+        assert!(!accessible(area, true));
+
+        // Simulate another thread (e.g. on_write_fault) having marked the page dirty under `dirty`
+        // and not yet finished VirtualProtect(PAGE_READWRITE) on that stripe.
+        let chunks = {
+            let mut dirty = e.dirty.lock().unwrap();
+            let open = dirty.track.as_mut().unwrap().on_fault(page_of(frames[0]), Instant::now()).unwrap();
+            e.protect_sync.bump_addrs(&open);
+            e.protect_sync.snapshot_rw_runs(open)
+        };
+        let e_ref = &e;
+        std::thread::scope(|s| {
+            let opener = s.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                e_ref.protect_sync.protect_rw_runs(chunks, &e_ref.dirty);
+            });
+            assert!(e_ref.begin_io_write_checked(area, P));
+            assert!(accessible(area, true), "begin_io_write returned before in-flight PAGE_READWRITE completed");
+            e_ref.finish_io_write(area, P);
+            opener.join().unwrap();
+        });
+
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
     }
 }
