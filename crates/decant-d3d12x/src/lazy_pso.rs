@@ -422,12 +422,28 @@ static REFUSED: AtomicU64 = AtomicU64::new(0);
 /// The wait cap of the async bind mode when `DECANT_D3D12X_ASYNC_BIND_WAIT_MS` is not set.
 const DEFAULT_ASYNC_BIND_WAIT_MS: u64 = 20;
 
+fn parse_flag(setting: Option<&str>) -> bool {
+    setting.map(str::trim).is_some_and(|mode| !mode.is_empty() && !matches!(mode.to_ascii_lowercase().as_str(), "0" | "off" | "false"))
+}
+
 /// The wait cap of the async bind mode for the values of `DECANT_D3D12X_ASYNC_BIND` and
 /// `DECANT_D3D12X_ASYNC_BIND_WAIT_MS`. `None` when the mode is off: unset, empty, `0`, `off` or
 /// `false`. A wait that is not a number gives the default.
 fn parse_async_bind(mode: Option<&str>, wait_ms: Option<&str>) -> Option<Duration> {
-    let on = mode.map(str::trim).is_some_and(|mode| !mode.is_empty() && !matches!(mode.to_ascii_lowercase().as_str(), "0" | "off" | "false"));
-    on.then(|| Duration::from_millis(wait_ms.and_then(|text| text.trim().parse().ok()).unwrap_or(DEFAULT_ASYNC_BIND_WAIT_MS)))
+    parse_flag(mode).then(|| Duration::from_millis(wait_ms.and_then(|text| text.trim().parse().ok()).unwrap_or(DEFAULT_ASYNC_BIND_WAIT_MS)))
+}
+
+/// Whether `DECANT_D3D12X_ASYNC_BIND_ALL` extends async bind capping and background submission to
+/// graphics and mesh pipelines in addition to compute. Read once.
+fn async_bind_all() -> bool {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    *ALL.get_or_init(|| {
+        let on = parse_flag(std::env::var("DECANT_D3D12X_ASYNC_BIND_ALL").ok().as_deref());
+        if on {
+            xs_log!("lazy pso: async bind all on, graphics and mesh binds also use the async bind cap");
+        }
+        on
+    })
 }
 
 /// The wait cap of the async bind mode, `None` when it is off. Read once.
@@ -445,20 +461,24 @@ fn async_bind_cap() -> Option<Duration> {
     })
 }
 
+/// Whether async bind caps and frame budgets apply to this pipeline.
+fn async_applies(async_all: bool, is_compute: bool) -> bool {
+    is_compute || async_all
+}
+
 /// How long a bind may wait when `allowed` is what the usual rules give and `cap` is the async bind
-/// cap. Only a compute bind is capped. The second value tells whether the cap shortened the wait.
-fn capped_wait(cap: Option<Duration>, is_compute: bool, allowed: Duration) -> (Duration, bool) {
+/// cap. The second value tells whether the cap shortened the wait.
+fn capped_wait(cap: Option<Duration>, apply: bool, allowed: Duration) -> (Duration, bool) {
     match cap {
-        Some(cap) if is_compute && allowed > cap => (cap, true),
+        Some(cap) if apply && allowed > cap => (cap, true),
         _ => (allowed, false),
     }
 }
 
 /// How long a bind may wait when the async bind mode is `on` and `left` is what is left of the
-/// frame budget. Only a compute bind that may wait at all is limited. The second value tells whether
-/// the budget shortened the wait.
-fn budgeted_wait(on: bool, is_compute: bool, allowed: Duration, left: Duration) -> (Duration, bool) {
-    if on && is_compute && allowed > left { (left, true) } else { (allowed, false) }
+/// frame budget. The second value tells whether the budget shortened the wait.
+fn budgeted_wait(on: bool, apply: bool, allowed: Duration, left: Duration) -> (Duration, bool) {
+    if on && apply && allowed > left { (left, true) } else { (allowed, false) }
 }
 
 /// Binds the async bind mode left without their pipeline. Every one is counted, the first 16 and
@@ -698,15 +718,16 @@ pub unsafe fn resolve(object: *mut c_void) -> Option<*mut c_void> {
         return Some(made as *mut c_void);
     }
     let is_compute = lazy.recipe.is_compute;
+    let apply_async = async_applies(async_bind_all(), is_compute);
     let first_bind = !lazy.waited.swap(true, Ordering::Relaxed);
     let allowed = crate::direct_pso::bind_wait(is_compute, first_bind, &lazy.late);
     let cap = async_bind_cap();
-    let (allowed, capped) = capped_wait(cap, is_compute, allowed);
-    let (allowed, over_budget) = budgeted_wait(cap.is_some(), is_compute, allowed, crate::direct_pso::async_frame_left());
+    let (allowed, capped) = capped_wait(cap, apply_async, allowed);
+    let (allowed, over_budget) = budgeted_wait(cap.is_some(), apply_async, allowed, crate::direct_pso::async_frame_left());
     let capped = capped || over_budget;
     let begun = Instant::now();
-    let made = resolve_within(object as usize, lazy, is_compute, allowed);
-    if cap.is_some() && is_compute && !allowed.is_zero() {
+    let made = resolve_within(object as usize, lazy, is_compute, apply_async, allowed);
+    if cap.is_some() && apply_async && !allowed.is_zero() {
         crate::direct_pso::spend_async_wait(begun.elapsed());
     }
     if capped && made.is_null() && lazy.made.get().is_none() {
@@ -717,9 +738,9 @@ pub unsafe fn resolve(object: *mut c_void) -> Option<*mut c_void> {
 
 /// Makes the pipeline of `lazy` ready, waiting at most `allowed` for it. Null when it is not
 /// ready in time.
-fn resolve_within(object: usize, lazy: &'static Lazy, is_compute: bool, allowed: Duration) -> *mut c_void {
+fn resolve_within(object: usize, lazy: &'static Lazy, is_compute: bool, apply_async: bool, allowed: Duration) -> *mut c_void {
     let begun = Instant::now();
-    let waits = is_compute && !allowed.is_zero();
+    let waits = apply_async && !allowed.is_zero();
     let _hold = waits.then(crate::watchdog_hold::hold_bind);
     // Waits of graphics and mesh binds come out of the frame budget, compute waits do not.
     let charge_frame = || {
@@ -1074,7 +1095,7 @@ mod tests {
         let lazy: &'static Lazy = unsafe { &*object.cast::<Lazy>() };
 
         let begun = Instant::now();
-        assert!(resolve_within(object as usize, lazy, true, Duration::from_millis(25)).is_null());
+        assert!(resolve_within(object as usize, lazy, true, true, Duration::from_millis(25)).is_null());
         assert!(begun.elapsed() < Duration::from_millis(400), "the bind did not wait for the gate");
         assert!(lazy.making.load(Ordering::Acquire));
         assert!(lazy.late.load(Ordering::Acquire));
@@ -1139,7 +1160,7 @@ mod tests {
         let (allowed, capped) = capped_wait(Some(Duration::from_millis(15)), true, Duration::from_secs(5));
         assert!(capped);
         let begun = Instant::now();
-        assert!(resolve_within(object as usize, lazy, true, allowed).is_null());
+        assert!(resolve_within(object as usize, lazy, true, true, allowed).is_null());
         assert!(begun.elapsed() < Duration::from_millis(1000), "the bind did not wait for the slow compile");
         assert!(lazy.late.load(Ordering::Acquire), "the pipeline is late, later binds do not wait");
         assert!(lazy.making.load(Ordering::Acquire), "a worker has the job");
@@ -1153,7 +1174,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let (allowed, _) = capped_wait(Some(Duration::from_millis(15)), true, Duration::ZERO);
-        assert_eq!(resolve_within(object as usize, lazy, true, allowed), 0x5100_0002 as *mut c_void);
+        assert_eq!(resolve_within(object as usize, lazy, true, true, allowed), 0x5100_0002 as *mut c_void);
+    }
+
+    #[test]
+    fn async_bind_all_caps_graphics_and_mesh_binds_too() {
+        let cap = Some(Duration::from_millis(20));
+        let long = Duration::from_millis(500);
+        assert_eq!(capped_wait(cap, async_applies(false, false), long), (long, false));
+        assert_eq!(capped_wait(cap, async_applies(true, false), long), (Duration::from_millis(20), true));
+        assert_eq!(capped_wait(Some(Duration::ZERO), async_applies(true, false), long), (Duration::ZERO, true));
+        assert_eq!(budgeted_wait(true, async_applies(true, false), Duration::from_millis(20), Duration::ZERO), (Duration::ZERO, true));
+        assert!(parse_flag(Some("1")));
+        assert!(!parse_flag(Some("0")));
+        assert!(!parse_flag(None));
     }
 
     #[test]
