@@ -1715,6 +1715,8 @@ fn drain_journal(api: &Api, cursor: &mut DrainCursor) -> DrainBatch {
 static LAST_JOURNAL_SEQ: AtomicU64 = AtomicU64::new(u64::MAX);
 /// True once `DecantXmemGpuTrack(1)` has been enabled, so `with_state` can skip `DRAIN_LOCK`.
 static TRACKING_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// True when `Mirror` has added slots whose window buffers have not been confirmed built yet.
+static MISSING_WINDOWS: AtomicBool = AtomicBool::new(false);
 
 fn journal_unchanged(api: &Api) -> bool {
     if !TRACKING_ACTIVE.load(Ordering::Acquire) {
@@ -2257,6 +2259,7 @@ pub unsafe fn device_created(device: *mut c_void) {
     bump_mapping_gen();
     bump_unmap_gen();
     LAST_JOURNAL_SEQ.store(u64::MAX, Ordering::Release);
+    MISSING_WINDOWS.store(false, Ordering::Release);
     let id = NEXT_STATE.fetch_add(1, Ordering::Relaxed);
     ACTIVE_STATE_ID.store(id, Ordering::Release);
     *st = Some(State {
@@ -2412,6 +2415,130 @@ fn ensure_heaps_outside_state(state_id: u64, indices: &[u32]) {
     }
 }
 
+fn ensure_missing_windows() {
+    if !MISSING_WINDOWS.load(Ordering::Acquire) {
+        return;
+    }
+    let missing = {
+        let guard = STATE.read().unwrap_or_else(PoisonError::into_inner);
+        guard.as_ref().and_then(State::missing_window_sizes)
+    };
+    if let Some((state_id, device, start_idx, sizes)) = missing {
+        ensure_windows_outside_state(state_id, &device, start_idx, &sizes);
+    }
+    let still_missing = {
+        let guard = STATE.read().unwrap_or_else(PoisonError::into_inner);
+        guard.as_ref().and_then(State::missing_window_sizes).is_some()
+    };
+    if !still_missing {
+        MISSING_WINDOWS.store(false, Ordering::Release);
+    }
+}
+
+/// Drains any new `xmem.dll` journal records into `STATE` and drops `DRAIN_LOCK` immediately after
+/// applying them, before window creation or any caller work runs.
+fn sync_journal_and_windows(api: &Api) -> bool {
+    let active_id = ACTIVE_STATE_ID.load(Ordering::Acquire);
+    if active_id == 0 {
+        return false;
+    }
+    if journal_unchanged(api) {
+        ensure_missing_windows();
+        return true;
+    }
+    let missing = {
+        let mut cursor = decant_trace::timed_lock("title_mem::DRAIN_LOCK", || DRAIN_LOCK.lock().unwrap_or_else(PoisonError::into_inner));
+        let active_id = ACTIVE_STATE_ID.load(Ordering::Acquire);
+        if active_id == 0 {
+            return false;
+        }
+        if !cursor.tracking {
+            cursor.tracking = true;
+            // SAFETY: the export takes a flag.
+            unsafe { (api.track)(1) };
+            TRACKING_ACTIVE.store(true, Ordering::Release);
+            xs_log!("title memory: xmem.dll tracks written pages now, every mapped page is copied at the first sync");
+        }
+        if cursor.state_id == active_id && journal_unchanged(api) {
+            None
+        } else {
+            let batch = drain_journal(api, &mut cursor);
+            let skip_state_write = matches!(batch, DrainBatch::Unchanged)
+                && cursor.state_id == active_id
+                && LAST_JOURNAL_SEQ.load(Ordering::Acquire) != u64::MAX;
+            if skip_state_write {
+                None
+            } else {
+                let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
+                let Some(st) = guard.as_mut() else {
+                    return false;
+                };
+                st.tracking = true;
+                match batch {
+                    DrainBatch::Unchanged => {
+                        if cursor.state_id != st.id {
+                            st.drain(api);
+                            cursor.state_id = st.id;
+                            cursor.seq = st.seq;
+                            cursor.last_journal_seq = st.last_journal_seq;
+                        }
+                    }
+                    DrainBatch::Changes { state_id, seq, journal_seq } if st.id == state_id => {
+                        for c in &cursor.records {
+                            if c.seq > st.seq {
+                                st.apply(c);
+                            }
+                        }
+                        st.seq = st.seq.max(seq);
+                        st.last_journal_seq = journal_seq;
+                        if let Some(jseq) = journal_seq {
+                            LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
+                        }
+                    }
+                    DrainBatch::Snapshot { state_id, seq, journal_seq } if st.id == state_id => {
+                        xs_log!("title memory: the journal of xmem.dll overran, starting again from a snapshot of {} records", cursor.records.len());
+                        st.mirror.reset();
+                        bump_mapping_gen();
+                        bump_unmap_gen();
+                        for c in &cursor.records {
+                            st.apply(c);
+                        }
+                        st.seq = seq;
+                        st.last_journal_seq = journal_seq;
+                        if let Some(jseq) = journal_seq {
+                            LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
+                        }
+                    }
+                    DrainBatch::Changes { .. } | DrainBatch::Snapshot { .. } => {
+                        st.drain(api);
+                        cursor.state_id = st.id;
+                        cursor.seq = st.seq;
+                        cursor.last_journal_seq = st.last_journal_seq;
+                    }
+                }
+                let missing = st.missing_window_sizes();
+                if missing.is_some() {
+                    MISSING_WINDOWS.store(true, Ordering::Release);
+                }
+                missing
+            }
+        }
+    };
+    if let Some((state_id, device, start_idx, sizes)) = missing {
+        ensure_windows_outside_state(state_id, &device, start_idx, &sizes);
+        let still_missing = {
+            let guard = STATE.read().unwrap_or_else(PoisonError::into_inner);
+            guard.as_ref().and_then(State::missing_window_sizes).is_some()
+        };
+        if !still_missing {
+            MISSING_WINDOWS.store(false, Ordering::Release);
+        }
+    } else {
+        ensure_missing_windows();
+    }
+    true
+}
+
 /// Runs `f` on the state, with the exports of `xmem.dll`, once tracking is on and the journal is read.
 /// `None` when the module is off, has no device or `xmem.dll` is not there.
 fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
@@ -2419,96 +2546,40 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
         return None;
     }
     let api = api()?;
-    if ACTIVE_STATE_ID.load(Ordering::Acquire) == 0 {
+    if !sync_journal_and_windows(api) {
         return None;
     }
-    if journal_unchanged(api) {
-        let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
-        let st = guard.as_mut()?;
-        if st.last_journal_seq.is_some() {
-            st.tracking = true;
-            return Some(f(st, api));
-        }
-    }
-    let mut cursor = decant_trace::timed_lock("title_mem::DRAIN_LOCK", || DRAIN_LOCK.lock().unwrap_or_else(PoisonError::into_inner));
-    if ACTIVE_STATE_ID.load(Ordering::Acquire) == 0 {
-        return None;
-    }
-    if !cursor.tracking {
-        cursor.tracking = true;
-        // SAFETY: the export takes a flag.
-        unsafe { (api.track)(1) };
-        TRACKING_ACTIVE.store(true, Ordering::Release);
-        xs_log!("title memory: xmem.dll tracks written pages now, every mapped page is copied at the first sync");
-    }
-    let batch = drain_journal(api, &mut cursor);
     let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
-    let mut st = guard.as_mut()?;
+    let st = guard.as_mut()?;
     st.tracking = true;
-    match batch {
-        DrainBatch::Unchanged => {}
-        DrainBatch::Changes { state_id, seq, journal_seq } if st.id == state_id => {
-            for c in &cursor.records {
-                st.apply(c);
-            }
-            st.seq = seq;
-            st.last_journal_seq = journal_seq;
-            if let Some(jseq) = journal_seq {
-                LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
-            }
-        }
-        DrainBatch::Snapshot { state_id, seq, journal_seq } if st.id == state_id => {
-            xs_log!("title memory: the journal of xmem.dll overran, starting again from a snapshot of {} records", cursor.records.len());
-            st.mirror.reset();
-            bump_mapping_gen();
-            bump_unmap_gen();
-            for c in &cursor.records {
-                st.apply(c);
-            }
-            st.seq = seq;
-            st.last_journal_seq = journal_seq;
-            if let Some(jseq) = journal_seq {
-                LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
-            }
-        }
-        DrainBatch::Changes { .. } | DrainBatch::Snapshot { .. } => {
-            st.drain(api);
-            cursor.state_id = st.id;
-            cursor.seq = st.seq;
-            cursor.last_journal_seq = st.last_journal_seq;
-        }
-    }
-    if let Some((state_id, device, start_idx, sizes)) = st.missing_window_sizes() {
-        drop(guard);
-        ensure_windows_outside_state(state_id, &device, start_idx, &sizes);
-        guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
-        st = guard.as_mut()?;
-        st.tracking = true;
-    }
-    let res = f(st, api);
-    if st.seq != cursor.seq {
-        cursor.seq = st.seq;
-        cursor.last_journal_seq = st.last_journal_seq;
-    }
-    Some(res)
+    Some(f(st, api))
 }
 
-/// Runs `f` under a shared read lock when tracking is already active and the journal sequence is
-/// unchanged since the last drain. Returns `None` if an exclusive drain or mutation is needed.
+/// Runs `f` under a shared read lock after bringing the journal up to date if needed.
 fn with_state_read<R>(f: impl FnOnce(&State) -> Option<R>) -> Option<R> {
     if !enabled() {
         return None;
     }
     let api = api()?;
-    let cur_seq = api.journal_seq.map(|g| {
-        // SAFETY: `DecantXmemJournalSeq` is a lock-free atomic load returning `u64`.
-        unsafe { g() }
-    });
-    let guard = decant_trace::timed_lock("title_mem::STATE_READ", || STATE.read().unwrap_or_else(PoisonError::into_inner));
-    let st = guard.as_ref()?;
-    if !st.tracking || !should_skip_drain(st.last_journal_seq, cur_seq) {
+    if ACTIVE_STATE_ID.load(Ordering::Acquire) == 0 {
         return None;
     }
+    if journal_unchanged(api) && !MISSING_WINDOWS.load(Ordering::Acquire) {
+        let cur_seq = api.journal_seq.map(|g| {
+            // SAFETY: `DecantXmemJournalSeq` is a lock-free atomic load returning `u64`.
+            unsafe { g() }
+        });
+        let guard = decant_trace::timed_lock("title_mem::STATE_READ", || STATE.read().unwrap_or_else(PoisonError::into_inner));
+        let st = guard.as_ref()?;
+        if st.tracking && should_skip_drain(st.last_journal_seq, cur_seq) {
+            return f(st);
+        }
+    }
+    if !sync_journal_and_windows(api) {
+        return None;
+    }
+    let guard = decant_trace::timed_lock("title_mem::STATE_READ", || STATE.read().unwrap_or_else(PoisonError::into_inner));
+    let st = guard.as_ref()?;
     f(st)
 }
 
@@ -2550,13 +2621,13 @@ pub fn device() -> Option<ID3D12Device> {
 /// The generation of the window slots now: it changes when a slot is given or freed, not when a page
 /// is mapped inside one. `None` when the module is off or `xmem.dll` is not there.
 pub fn generation() -> Option<u32> {
-    with_state(|st, _| st.mirror.generation())
+    with_state_read(|st| Some(st.mirror.generation()))
 }
 
 /// The slots of the window (GPU address and bytes), with the generation they are for. Empty when there is
 /// no device or no slot, `None` when the module is off.
 pub fn extents() -> Option<(u32, Vec<Entry>)> {
-    with_state(|st, _| {
+    with_state_read(|st| {
         let entries = st
             .mirror
             .slots()
@@ -2566,7 +2637,7 @@ pub fn extents() -> Option<(u32, Vec<Entry>)> {
                 Some(Entry { resource: w.resource.as_raw() as usize, gpu: w.gpu + offset, bytes, va })
             })
             .collect();
-        (st.mirror.generation(), entries)
+        Some((st.mirror.generation(), entries))
     })
 }
 
@@ -2605,13 +2676,6 @@ impl State {
         Some((Span { resource: w.resource.as_raw() as usize, gpu: w.gpu + placed.offset, offset: placed.offset, left: placed.left }, is_fresh))
     }
 
-    fn translate_span_give_read(&self, va: u64, len: u64) -> Option<(Span, bool)> {
-        if self.mirror.wants_use(va, len.max(ADDRESS_REACH)) || !self.mirror.has_tiles_for_span(va, len.clamp(1, ADDRESS_REACH)) {
-            return None;
-        }
-        self.translate_span_read(va, len)
-    }
-
     fn translate_span(&mut self, api: &Api, va: u64, len: u64, give: bool) -> Option<(Span, bool)> {
         if give {
             self.give(api, va, len.max(ADDRESS_REACH));
@@ -2631,25 +2695,70 @@ impl State {
     }
 }
 
-/// Translates a batch of `(va, len)` spans under one state lock and one journal drain.
+/// Asks `xmem.dll` to bring in on-demand pages outside `STATE` and `DRAIN_LOCK`, then syncs the
+/// resulting `MAP` journal records before any caller acquires `STATE.write()`.
+fn give_outside_state(api: &Api, spans: &[(u64, u64)]) {
+    if spans.is_empty() {
+        return;
+    }
+    static GIVEN: AtomicI32 = AtomicI32::new(0);
+    let mut total_pages = 0u32;
+    for &(va, len) in spans {
+        // SAFETY: the export takes plain values.
+        let pages = unsafe { (api.gpu_use)(va as usize, len as usize) };
+        if pages > 0 {
+            total_pages += pages;
+            if GIVEN.fetch_add(1, Ordering::Relaxed) < 8 {
+                xs_log!("title memory: {pages} pages from title address {va:#x} reach the GPU now (a commit whose pages come on demand)");
+            }
+        }
+    }
+    if total_pages > 0 {
+        GIVEN_PAGES.fetch_add(u64::from(total_pages), Ordering::Relaxed);
+        let _ = sync_journal_and_windows(api);
+    }
+}
+
+/// Translates a batch of `(va, len)` spans under one state lock, calling `DecantXmemGpuUse`
+/// outside `STATE` and `DRAIN_LOCK` when on-demand commits need pages.
 pub fn translate_fresh_batch(spans: &[(u64, u64)], out: &mut Vec<Option<(Span, bool)>>) {
     out.clear();
     if spans.is_empty() {
         return;
     }
-    let read_ok = with_state_read(|st| {
+    let read_res = with_state_read(|st| {
         let mut tmp = Vec::with_capacity(spans.len());
+        let mut to_give = Vec::new();
+        let mut all_ready = true;
         for &(va, len) in spans {
-            if st.mirror.wants_use(va, len.max(ADDRESS_REACH)) || !st.mirror.has_tiles_for_span(va, len.clamp(1, ADDRESS_REACH)) {
-                return None;
+            let reach = len.max(ADDRESS_REACH);
+            if st.mirror.wants_use(va, reach) {
+                to_give.push((va, reach));
+                all_ready = false;
+            } else if !st.mirror.has_tiles_for_span(va, len.clamp(1, ADDRESS_REACH)) {
+                all_ready = false;
+            } else if all_ready {
+                tmp.push(st.translate_span_read(va, len));
             }
-            tmp.push(st.translate_span_read(va, len));
         }
-        Some(tmp)
+        Some(if all_ready { Ok(tmp) } else { Err(to_give) })
     });
-    if let Some(tmp) = read_ok {
-        *out = tmp;
-        return;
+    match read_res {
+        None => {
+            out.resize(spans.len(), None);
+            return;
+        }
+        Some(Ok(tmp)) => {
+            *out = tmp;
+            return;
+        }
+        Some(Err(to_give)) => {
+            if !to_give.is_empty()
+                && let Some(api) = api()
+            {
+                give_outside_state(api, &to_give);
+            }
+        }
     }
     let filled = with_state(|st, api| {
         out.extend(spans.iter().map(|&(va, len)| st.translate_span(api, va, len, true)));
@@ -2663,11 +2772,26 @@ fn span_of_with(va: u64, len: u64, give: bool, fresh: &mut bool) -> Option<Span>
     static SEEN: AtomicI32 = AtomicI32::new(0);
     static NEAR: AtomicI32 = AtomicI32::new(0);
     let (span, is_fresh) = if !give {
-        with_state_read(|st| st.translate_span_read(va, len))
-            .or_else(|| with_state(|st, api| st.translate_span(api, va, len, false)).flatten())?
+        with_state_read(|st| st.translate_span_read(va, len))?
     } else {
-        with_state_read(|st| st.translate_span_give_read(va, len))
-            .or_else(|| with_state(|st, api| st.translate_span(api, va, len, true)).flatten())?
+        match with_state_read(|st| {
+            let reach = len.max(ADDRESS_REACH);
+            if st.mirror.wants_use(va, reach) {
+                Some(Err(true))
+            } else if !st.mirror.has_tiles_for_span(va, len.clamp(1, ADDRESS_REACH)) {
+                Some(Err(false))
+            } else {
+                Some(Ok(st.translate_span_read(va, len)))
+            }
+        })? {
+            Ok(found) => found?,
+            Err(needs_use) => {
+                if needs_use && let Some(api) = api() {
+                    give_outside_state(api, &[(va, len.max(ADDRESS_REACH))]);
+                }
+                with_state(|st, api| st.translate_span(api, va, len, true)).flatten()?
+            }
+        }
     };
     *fresh = is_fresh;
     if SEEN.fetch_add(1, Ordering::Relaxed) < 3 {
@@ -2779,8 +2903,14 @@ pub fn place_buffer(va: u64, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_S
     }
     let tiles = u32::try_from(desc.Width.div_ceil(PAGE)).ok()?;
     let reserved = reserved_desc(desc, state);
+    let span_len = u64::from(tiles) * PAGE;
+    if with_state_read(|st| Some(st.mirror.wants_use(va, span_len))) == Some(true)
+        && let Some(api) = api()
+    {
+        give_outside_state(api, &[(va, span_len)]);
+    }
     let (state_id, device, map_queue, map_fence, fence_value, pages) = with_state(|st, api| {
-        st.give(api, va, u64::from(tiles) * PAGE);
+        st.give(api, va, span_len);
         let pages = st.mirror.mirror_tiles(va, tiles)?;
         Some((st.id, st.device.clone(), st.map_queue.clone(), st.map_fence.clone(), st.fence_value.clone(), pages))
     })??;
@@ -3115,14 +3245,16 @@ pub fn show_pages(to: u64, from: u64, pages: u32) -> Option<bool> {
 /// table asked `tiles_of` once per texture at every sync, tens of thousands of times while a title loads its world,
 /// and held its own lock meanwhile.
 pub fn spans_touch(spans: &[(u64, u64)], written: &HashSet<u32>) -> Vec<Option<bool>> {
-    with_state(|st, _| {
-        spans
-            .iter()
-            .map(|&(va, len)| {
-                let (first, pages) = crate::title_mirror::page_span(va, len);
-                st.mirror.touches(first, pages, written)
-            })
-            .collect()
+    with_state_read(|st| {
+        Some(
+            spans
+                .iter()
+                .map(|&(va, len)| {
+                    let (first, pages) = crate::title_mirror::page_span(va, len);
+                    st.mirror.touches(first, pages, written)
+                })
+                .collect(),
+        )
     })
     .unwrap_or_else(|| vec![None; spans.len()])
 }
@@ -3135,33 +3267,47 @@ pub fn tiles_of(va: u64, len: u64) -> Option<Vec<u32>> {
         .or_else(|| with_state(|st, _| st.mirror.mirror_tiles(first, pages)).flatten())
 }
 
-/// Mirror tiles for each `(va, len)` span under one state lock and one journal drain.
+/// Mirror tiles for each `(va, len)` span under one state lock, taking only `STATE.read()` for
+/// spans that already have mirror tiles and touching `STATE.write()` only for misses.
 pub fn tiles_of_batch(spans: &[(u64, u64)], out: &mut Vec<Option<Vec<u32>>>) {
     out.clear();
     if spans.is_empty() {
         return;
     }
-    let read_ok = with_state_read(|st| {
+    let Some((mut partial, misses)) = with_state_read(|st| {
         let mut tmp = Vec::with_capacity(spans.len());
+        let mut misses = 0usize;
         for &(va, len) in spans {
             let (first, pages) = crate::title_mirror::page_span(va, len);
-            tmp.push(Some(st.mirror.mirror_tiles_read(first, pages)?));
+            let got = st.mirror.mirror_tiles_read(first, pages);
+            if got.is_none() {
+                misses += 1;
+            }
+            tmp.push(got);
         }
-        Some(tmp)
-    });
-    if let Some(tmp) = read_ok {
-        *out = tmp;
+        Some((tmp, misses))
+    }) else {
+        out.resize(spans.len(), None);
+        return;
+    };
+    if misses == 0 {
+        *out = partial;
         return;
     }
-    let filled = with_state(|st, _| {
-        out.extend(spans.iter().map(|&(va, len)| {
-            let (first, pages) = crate::title_mirror::page_span(va, len);
-            st.mirror.mirror_tiles(first, pages)
-        }));
-    });
-    if filled.is_none() {
+    if with_state(|st, _| {
+        for (slot, &(va, len)) in partial.iter_mut().zip(spans) {
+            if slot.is_none() {
+                let (first, pages) = crate::title_mirror::page_span(va, len);
+                *slot = st.mirror.mirror_tiles(first, pages);
+            }
+        }
+    })
+    .is_none()
+    {
         out.resize(spans.len(), None);
+        return;
     }
+    *out = partial;
 }
 
 #[cfg(test)]
@@ -3831,5 +3977,100 @@ mod tests {
         assert_eq!(res2_par, (4 * SUBPAGE_BYTES, (PAGES * SUBPAGES_PER_PAGE - 4) as u64 * SUBPAGE_BYTES as u64));
         assert_eq!(runs_seq, runs_par);
         assert_eq!(jobs_seq.len(), jobs_par.len());
+    }
+
+    #[test]
+    fn window_make_lock_does_not_block_drain_lock_or_state_access() {
+        let _w = WINDOW_MAKE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _d = DRAIN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+                assert!(STATE.try_read().is_ok());
+            })
+            .join()
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn sync_journal_and_windows_fast_path_does_not_touch_drain_lock() {
+        unsafe extern "system" fn stub_track(_: i32) {}
+        unsafe extern "system" fn stub_changes(_: u64, _: *mut GpuChange, _: u32, _: *mut u32) -> i32 { 1 }
+        unsafe extern "system" fn stub_snapshot(_: *mut GpuChange, _: u32, _: *mut u32, _: *mut u64) -> i32 { 1 }
+        unsafe extern "system" fn stub_take(_: *mut u32, _: u32) -> u32 { 0 }
+        unsafe extern "system" fn stub_view(_: u32, _: *mut usize, _: *mut u32, _: *mut u32) -> i32 { 0 }
+        unsafe extern "system" fn stub_guard() {}
+        unsafe extern "system" fn stub_writable(_: usize, _: usize) -> i32 { 0 }
+        unsafe extern "system" fn stub_use(_: usize, _: usize) -> u32 { 0 }
+        unsafe extern "system" fn stub_seq_11() -> u64 { 11 }
+
+        let api = Api {
+            track: stub_track,
+            changes: stub_changes,
+            snapshot: stub_snapshot,
+            take_dirty: stub_take,
+            section_view: stub_view,
+            guard_modules: stub_guard,
+            writable: stub_writable,
+            gpu_use: stub_use,
+            show: None,
+            journal_seq: Some(stub_seq_11),
+        };
+        let prev_id = ACTIVE_STATE_ID.swap(99, Ordering::AcqRel);
+        let prev_track = TRACKING_ACTIVE.swap(true, Ordering::AcqRel);
+        let prev_seq = LAST_JOURNAL_SEQ.swap(11, Ordering::AcqRel);
+        let prev_missing = MISSING_WINDOWS.swap(false, Ordering::AcqRel);
+
+        // Hold DRAIN_LOCK on this thread: unchanged journal fast path must return true without blocking.
+        let _drain_guard = DRAIN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let ok = std::thread::scope(|s| s.spawn(|| sync_journal_and_windows(&api)).join().unwrap());
+        assert!(ok);
+        drop(_drain_guard);
+
+        MISSING_WINDOWS.store(prev_missing, Ordering::Release);
+        LAST_JOURNAL_SEQ.store(prev_seq, Ordering::Release);
+        TRACKING_ACTIVE.store(prev_track, Ordering::Release);
+        ACTIVE_STATE_ID.store(prev_id, Ordering::Release);
+    }
+
+    #[test]
+    fn give_outside_state_calls_gpu_use_without_holding_drain_lock_or_state() {
+        unsafe extern "system" fn stub_track(_: i32) {}
+        unsafe extern "system" fn stub_changes(_: u64, _: *mut GpuChange, _: u32, _: *mut u32) -> i32 { 1 }
+        unsafe extern "system" fn stub_snapshot(_: *mut GpuChange, _: u32, _: *mut u32, _: *mut u64) -> i32 { 1 }
+        unsafe extern "system" fn stub_take(_: *mut u32, _: u32) -> u32 { 0 }
+        unsafe extern "system" fn stub_view(_: u32, _: *mut usize, _: *mut u32, _: *mut u32) -> i32 { 0 }
+        unsafe extern "system" fn stub_guard() {}
+        unsafe extern "system" fn stub_writable(_: usize, _: usize) -> i32 { 0 }
+        unsafe extern "system" fn stub_use(_: usize, _: usize) -> u32 {
+            assert!(DRAIN_LOCK.try_lock().is_ok(), "DRAIN_LOCK must not be held during gpu_use");
+            assert!(STATE.try_write().is_ok(), "STATE must not be held during gpu_use");
+            2
+        }
+        unsafe extern "system" fn stub_seq_19() -> u64 { 19 }
+
+        let api = Api {
+            track: stub_track,
+            changes: stub_changes,
+            snapshot: stub_snapshot,
+            take_dirty: stub_take,
+            section_view: stub_view,
+            guard_modules: stub_guard,
+            writable: stub_writable,
+            gpu_use: stub_use,
+            show: None,
+            journal_seq: Some(stub_seq_19),
+        };
+        let prev_id = ACTIVE_STATE_ID.swap(1, Ordering::AcqRel);
+        let prev_track = TRACKING_ACTIVE.swap(true, Ordering::AcqRel);
+        let prev_seq = LAST_JOURNAL_SEQ.swap(19, Ordering::AcqRel);
+        let prev_missing = MISSING_WINDOWS.swap(false, Ordering::AcqRel);
+
+        give_outside_state(&api, &[(0x1000_0000, PAGE)]);
+
+        MISSING_WINDOWS.store(prev_missing, Ordering::Release);
+        LAST_JOURNAL_SEQ.store(prev_seq, Ordering::Release);
+        TRACKING_ACTIVE.store(prev_track, Ordering::Release);
+        ACTIVE_STATE_ID.store(prev_id, Ordering::Release);
     }
 }
