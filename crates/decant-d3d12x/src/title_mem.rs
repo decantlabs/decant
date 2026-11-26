@@ -530,6 +530,14 @@ struct Stats {
     tile_micros: u64,
 }
 
+#[derive(Default)]
+struct TileScratch {
+    coords: Vec<D3D12_TILED_RESOURCE_COORDINATE>,
+    sizes: Vec<D3D12_TILE_REGION_SIZE>,
+    counts: Vec<u32>,
+    flags: Vec<D3D12_TILE_RANGE_FLAGS>,
+}
+
 struct State {
     /// Distinguishes a replacement device while the sampler reads outside the lock.
     id: u64,
@@ -558,6 +566,7 @@ struct State {
     /// Reused between syncs.
     scratch: Vec<GpuChange>,
     dirty: Vec<u32>,
+    tile_scratch: TileScratch,
     /// The mirror tiles of the pages the current sync copied: what the title wrote since the last one.
     written: Vec<u32>,
 }
@@ -589,8 +598,9 @@ impl Drop for State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
-/// Serializes `sync` and `device_created` across queues so `execute_copies` runs without holding `STATE`.
-static SYNC_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes `sync` and `device_created` across queues so `execute_copies` runs without holding `STATE`,
+/// and reuses the `CopyJob` buffer across syncs.
+static SYNC_LOCK: Mutex<Vec<CopyJob>> = Mutex::new(Vec::new());
 /// Pages of commits on demand given to the GPU so far (`State::give`).
 static GIVEN_PAGES: AtomicU64 = AtomicU64::new(0);
 
@@ -849,6 +859,7 @@ impl State {
     /// Reads what `xmem.dll` changed since the last time into the mirror, or starts again from a snapshot
     /// when its ring no longer holds it.
     fn drain(&mut self, api: &Api) {
+        let _trace = decant_trace::span("title_mem", "drain");
         loop {
             let mut written = 0u32;
             self.scratch.resize(CHANGE_RECORDS, GpuChange::default());
@@ -909,7 +920,7 @@ impl State {
             }
             let Some(window) = self.windows.get(call.buffer).and_then(|w| w.as_ref()) else { continue };
             ranges += call.ranges.len() as u64;
-            update_call(&self.map_queue, &window.resource, &call, call.heap.and_then(|h| self.heaps.get(h as usize)).and_then(|h| h.as_ref()).map(|h| &h._heap));
+            update_call(&self.map_queue, &window.resource, &call, call.heap.and_then(|h| self.heaps.get(h as usize)).and_then(|h| h.as_ref()).map(|h| &h._heap), &mut self.tile_scratch);
         }
         self.fence_value += 1;
         // SAFETY: both objects are live.
@@ -989,16 +1000,20 @@ impl State {
     }
 }
 
-/// One `UpdateTileMappings` call of the private queue.
-fn update_call(queue: &ID3D12CommandQueue, window: &ID3D12Resource, call: &TileCall, heap: Option<&ID3D12Heap>) {
+/// One `UpdateTileMappings` call of the private queue, reusing `scratch` buffers.
+fn update_call(queue: &ID3D12CommandQueue, window: &ID3D12Resource, call: &TileCall, heap: Option<&ID3D12Heap>, scratch: &mut TileScratch) {
     let n = call.ranges.len() as u32;
-    let coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = call.ranges.iter().map(|&(tile, _)| D3D12_TILED_RESOURCE_COORDINATE { X: tile, Y: 0, Z: 0, Subresource: 0 }).collect();
-    let sizes: Vec<D3D12_TILE_REGION_SIZE> = call.ranges.iter().map(|&(_, count)| D3D12_TILE_REGION_SIZE { NumTiles: count, ..Default::default() }).collect();
-    let counts: Vec<u32> = call.ranges.iter().map(|&(_, count)| count).collect();
+    scratch.coords.clear();
+    scratch.coords.extend(call.ranges.iter().map(|&(tile, _)| D3D12_TILED_RESOURCE_COORDINATE { X: tile, Y: 0, Z: 0, Subresource: 0 }));
+    scratch.sizes.clear();
+    scratch.sizes.extend(call.ranges.iter().map(|&(_, count)| D3D12_TILE_REGION_SIZE { NumTiles: count, ..Default::default() }));
+    scratch.counts.clear();
+    scratch.counts.extend(call.ranges.iter().map(|&(_, count)| count));
     let flag = if call.heap.is_some() && heap.is_some() { D3D12_TILE_RANGE_FLAG_NONE } else { D3D12_TILE_RANGE_FLAG_NULL };
-    let flags = vec![flag; n as usize];
+    scratch.flags.clear();
+    scratch.flags.resize(n as usize, flag);
     // SAFETY: the arrays have `n` entries each, the resource and the heap are live.
-    unsafe { queue.UpdateTileMappings(window, n, Some(coords.as_ptr()), Some(sizes.as_ptr()), heap, n, Some(flags.as_ptr()), Some(call.heap_tiles.as_ptr()), Some(counts.as_ptr()), D3D12_TILE_MAPPING_FLAG_NONE) };
+    unsafe { queue.UpdateTileMappings(window, n, Some(scratch.coords.as_ptr()), Some(scratch.sizes.as_ptr()), heap, n, Some(scratch.flags.as_ptr()), Some(call.heap_tiles.as_ptr()), Some(scratch.counts.as_ptr()), D3D12_TILE_MAPPING_FLAG_NONE) };
     crate::diagnose::removed_after(|| format!("UpdateTileMappings of {n} ranges on window buffer {} (heap {:?}, first tile {:?})", call.buffer, call.heap, call.ranges.first()));
 }
 
@@ -1044,6 +1059,7 @@ pub unsafe fn device_created(device: *mut c_void) {
         zero_scan: ZeroScan::default(),
         scratch: Vec::new(),
         dirty: Vec::new(),
+        tile_scratch: TileScratch::default(),
         written: Vec::new(),
     });
 }
@@ -1256,7 +1272,7 @@ impl State {
                 ranges: runs.iter().map(|&(at, n, _)| (at, n)).collect(),
                 heap_tiles: runs.iter().map(|&(_, _, t)| t).collect(),
             };
-            update_call(&self.map_queue, buffer, &call, Some(&pool._heap));
+            update_call(&self.map_queue, buffer, &call, Some(&pool._heap), &mut self.tile_scratch);
         }
         self.fence_value += 1;
         // SAFETY: both objects are live.
@@ -1328,13 +1344,13 @@ pub unsafe fn sync(queue: *mut c_void) {
     let _trace = decant_trace::span("title_mem", "sync");
     // SAFETY: by the contract above.
     let Some(queue_ref) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
-    let _sync_guard = decant_trace::timed_lock("title_mem::SYNC_LOCK", || SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut jobs = decant_trace::timed_lock("title_mem::SYNC_LOCK", || SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    jobs.clear();
     let started = Instant::now();
-    let Some((phase1_id, jobs, pages, written)) = with_state(|st, api| {
-        let mut jobs = Vec::new();
+    let Some((phase1_id, pages, written)) = with_state(|st, api| {
         let pages = st.prepare_upload(api, &mut jobs);
         let written = std::mem::take(&mut st.written);
-        (st.id, jobs, pages, written)
+        (st.id, pages, written)
     }) else {
         return;
     };
@@ -1399,7 +1415,7 @@ pub unsafe fn sync(queue: *mut c_void) {
             }
         }
     }
-    drop(_sync_guard);
+    drop(jobs);
     // A placed texture whose memory the title wrote is filled again (after this lock is given back:
     // the detile table asks for tiles under its own lock).
     if !written.is_empty() {

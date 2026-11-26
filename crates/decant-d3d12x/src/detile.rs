@@ -956,8 +956,6 @@ struct Registry {
     pending: HashSet<usize>,
     /// Transitions noted per PC command list as `(resource, subresource, state after)`.
     noted: HashMap<usize, Vec<(usize, u32, u32)>>,
-    detiler: Option<Detiler>,
-    unavailable: bool,
     /// Kinds of textures and refusal reasons logged so far, to log each once.
     logged: HashSet<(u32, u32)>,
     logged_refused: HashSet<String>,
@@ -1192,27 +1190,41 @@ fn tuning() -> Tuning {
     })
 }
 
+struct DetilerState {
+    detiler: Option<Detiler>,
+    unavailable: bool,
+}
+
 static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
+static DETILER: Mutex<DetilerState> = Mutex::new(DetilerState { detiler: None, unavailable: false });
 
 fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
     let mut guard = decant_trace::timed_lock("detile::REGISTRY", || REGISTRY.lock().unwrap_or_else(|e| e.into_inner()));
     f(guard.get_or_insert_with(Registry::default))
 }
 
+fn with_detiler<R>(f: impl FnOnce(&mut DetilerState) -> R) -> R {
+    let mut guard = decant_trace::timed_lock("detile::DETILER", || DETILER.lock().unwrap_or_else(|e| e.into_inner()));
+    f(&mut guard)
+}
+
 /// One line about the detile state for the device removal report. It never blocks, a busy registry
 /// is reported as such.
 pub fn summary() -> String {
-    let Ok(guard) = REGISTRY.try_lock() else { return "detile: the table is busy".into() };
-    let Some(r) = guard.as_ref() else { return "detile: no table".into() };
-    let (frames, queues, staging) = r.detiler.as_ref().map_or((0, 0, 0), Detiler::footprint);
-    let dirty = r.textures.values().filter(|t| t.dirty).count();
-    let retried = r.textures.values().filter(|t| t.wants_fill()).count();
+    let (textures_len, flushes, detiled, deferred, dirty, retried) = {
+        let Ok(guard) = REGISTRY.try_lock() else { return "detile: the table is busy".into() };
+        let Some(r) = guard.as_ref() else { return "detile: no table".into() };
+        let dirty = r.textures.values().filter(|t| t.dirty).count();
+        let retried = r.textures.values().filter(|t| t.wants_fill()).count();
+        (r.textures.len(), r.flushes, r.detiled, r.deferred, dirty, retried)
+    };
+    let (frames, queues, staging) = DETILER
+        .try_lock()
+        .ok()
+        .and_then(|d| d.detiler.as_ref().map(Detiler::footprint))
+        .unwrap_or((0, 0, 0));
     format!(
-        "detile: {} textures ({dirty} dirty, {retried} of them still tried), {} flushes, {} detiled, {} put off, {frames} lists on {queues} queues with {} MiB of staging",
-        r.textures.len(),
-        r.flushes,
-        r.detiled,
-        r.deferred,
+        "detile: {textures_len} textures ({dirty} dirty, {retried} of them still tried), {flushes} flushes, {detiled} detiled, {deferred} put off, {frames} lists on {queues} queues with {} MiB of staging",
         staging >> 20
     )
 }
@@ -1528,26 +1540,38 @@ pub unsafe fn flush(queue: *mut c_void) {
     }
     let started = Instant::now();
     let tuning = tuning();
-    let collected = with_registry(|r| {
-        if r.unavailable || r.pending.is_empty() {
-            if r.pending.is_empty() {
-                HAS_PENDING_FILLS.store(false, Ordering::Release);
+    if !crate::title_mem::enabled() {
+        with_detiler(|d| {
+            if !d.unavailable {
+                d.unavailable = true;
+                xs_log!("detile: title memory is off (DECANT_D3D12X_TITLE_MEM=1), placed textures stay unfilled");
             }
-            return None;
+        });
+        return;
+    }
+    let Some(device) = crate::title_mem::device() else { return };
+    let detiler_ready = with_detiler(|d| {
+        if d.unavailable {
+            return false;
         }
-        if !crate::title_mem::enabled() {
-            r.unavailable = true;
-            xs_log!("detile: title memory is off (DECANT_D3D12X_TITLE_MEM=1), placed textures stay unfilled");
-            return None;
-        }
-        let device = crate::title_mem::device()?;
-        if r.detiler.is_none() {
-            r.detiler = Detiler::new(&device);
-            if r.detiler.is_none() {
-                r.unavailable = true;
+        if d.detiler.is_none() {
+            d.detiler = Detiler::new(&device);
+            if d.detiler.is_none() {
+                d.unavailable = true;
                 xs_log!("detile: not available, placed textures stay unfilled");
-                return None;
+                return false;
             }
+        }
+        true
+    });
+    if !detiler_ready {
+        return;
+    }
+
+    let collected = with_registry(|r| {
+        if r.pending.is_empty() {
+            HAS_PENDING_FILLS.store(false, Ordering::Release);
+            return None;
         }
         let mut pending_items = std::mem::take(&mut r.scratch.pending_items);
         let mut pending_spans = std::mem::take(&mut r.scratch.pending_spans);
@@ -1575,7 +1599,14 @@ pub unsafe fn flush(queue: *mut c_void) {
         crate::title_mem::translate_fresh_batch(&pending_spans, &mut translated);
     }
 
-    with_registry(|r| {
+    struct OwnedJob {
+        texture: ID3D12Resource,
+        src_gpu: u64,
+        plan: Arc<Plan>,
+        states: Vec<u32>,
+    }
+
+    let prepared = with_registry(|r| {
         let mut ready = std::mem::take(&mut r.scratch.ready);
         ready.clear();
         let mut resources = std::mem::take(&mut r.scratch.resources);
@@ -1624,7 +1655,7 @@ pub unsafe fn flush(queue: *mut c_void) {
             r.scratch.resources = resources;
             r.scratch.job_res = job_res;
             r.scratch.outcome = outcome;
-            return;
+            return None;
         }
         ready.sort_unstable_by_key(|&(res, _)| res);
         resources.extend(ready.iter().map(|&(res, _)| {
@@ -1632,24 +1663,45 @@ pub unsafe fn flush(queue: *mut c_void) {
             // SAFETY: the registry holds the entry, so the title still owns the resource (it is forgotten before it is released).
             unsafe { ID3D12Resource::from_raw_borrowed(&raw) }.cloned()
         }));
-        let mut jobs: Vec<Job<'_>> = Vec::with_capacity(ready.len());
+        let mut owned_jobs = Vec::with_capacity(ready.len());
         for (&(res, gpu), resource) in ready.iter().zip(&resources) {
             if let (Some(texture), Some(placed)) = (resource, r.textures.get(&res)) {
-                jobs.push(Job { texture: texture.clone(), src_gpu: gpu, plan: &placed.plan, states: &placed.states });
+                owned_jobs.push(OwnedJob { texture: texture.clone(), src_gpu: gpu, plan: Arc::clone(&placed.plan), states: placed.states.clone() });
                 job_res.push(res);
             }
         }
-        let Some(detiler) = r.detiler.as_mut() else {
-            drop(jobs);
-            r.scratch.ready = ready;
-            r.scratch.resources = resources;
+        resources.clear();
+        let ready_count = ready.len();
+        r.scratch.ready = ready;
+        r.scratch.resources = resources;
+        Some((owned_jobs, job_res, outcome, ready_count))
+    });
+    let Some((owned_jobs, job_res, mut outcome, ready_count)) = prepared else {
+        return;
+    };
+
+    // Execute GPU detile work under DETILER without holding REGISTRY so note_tiles,
+    // note_write, and register never contend with command list recording.
+    let jobs: Vec<Job<'_>> = owned_jobs
+        .iter()
+        .map(|j| Job { texture: j.texture.clone(), src_gpu: j.src_gpu, plan: &j.plan, states: &j.states })
+        .collect();
+    let footprint = with_detiler(|d| {
+        let detiler = d.detiler.as_mut()?;
+        detiler.run_into(queue, &jobs, tuning.wait_each_flush, &mut outcome);
+        Some(detiler.footprint())
+    });
+    drop(jobs);
+    drop(owned_jobs);
+    let Some((frames, queues, staging)) = footprint else {
+        with_registry(|r| {
             r.scratch.job_res = job_res;
             r.scratch.outcome = outcome;
-            return;
-        };
-        detiler.run_into(queue, &jobs, tuning.wait_each_flush, &mut outcome);
-        let (frames, queues, staging) = detiler.footprint();
-        drop(jobs);
+        });
+        return;
+    };
+
+    with_registry(|r| {
         let mut filled_bytes = 0u64;
         for (&res, &ok) in job_res.iter().zip(&outcome) {
             if let Some(texture) = r.textures.get_mut(&res) {
@@ -1673,7 +1725,7 @@ pub unsafe fn flush(queue: *mut c_void) {
             xs_log!(
                 "detile: flush {}: {} textures ({} MiB of tiled memory) in {} ms, {} in all, {} put off, {frames} lists on {queues} queues with {} MiB of staging",
                 r.flushes,
-                ready.len(),
+                ready_count,
                 filled_bytes >> 20,
                 started.elapsed().as_millis(),
                 r.detiled,
@@ -1681,9 +1733,6 @@ pub unsafe fn flush(queue: *mut c_void) {
                 staging >> 20
             );
         }
-        resources.clear();
-        r.scratch.ready = ready;
-        r.scratch.resources = resources;
         r.scratch.job_res = job_res;
         r.scratch.outcome = outcome;
     });
@@ -1943,5 +1992,13 @@ mod tests {
         assert!(!needs_fresh_sync(false, &mapped));
         assert!(needs_fresh_sync(false, &fresh));
         assert!(!needs_fresh_sync(true, &fresh));
+    }
+
+    #[test]
+    fn detiler_lock_does_not_block_registry_access() {
+        let _detiler_guard = DETILER.lock().unwrap_or_else(|e| e.into_inner());
+        let count = std::thread::spawn(|| with_registry(|r| r.textures.len())).join().unwrap();
+        assert_eq!(count, with_registry(|r| r.textures.len()));
+        assert!(!summary().is_empty());
     }
 }
