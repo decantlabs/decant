@@ -7,7 +7,7 @@
 use std::ffi::c_void;
 
 use crate::console::console_get_factory;
-use crate::engine::{Factory, engine_factory};
+use crate::engine::{DecantDstorageMetricsSnapshot, Factory, engine_factory, metrics_snapshot};
 use crate::decant::*;
 
 /// `HRESULT DStorageGetFactory(REFIID iid, void **result)`. The project's own factory IID (or
@@ -33,5 +33,34 @@ pub unsafe extern "system" fn DStorageGetFactory(iid: *const GUID, result: *mut 
             Err(hr) => return hr,
         };
         query_interface::<Factory>(factory.as_ptr().cast(), iid, result)
+    }
+}
+
+/// Fills `*out` with a lock-free snapshot of cumulative DirectStorage I/O metrics.
+/// Returns `1` on success, `0` when `out` is null.
+///
+/// # Safety
+/// `out` is null or writable for `DecantDstorageMetricsSnapshot`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn DecantDstorageMetrics(out: *mut DecantDstorageMetricsSnapshot) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `out` is writable.
+    unsafe { *out = metrics_snapshot() };
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decant_dstorage_metrics_handles_null_and_writes_snapshot() {
+        // SAFETY: null is explicitly handled and returns 0.
+        assert_eq!(unsafe { DecantDstorageMetrics(std::ptr::null_mut()) }, 0);
+        let mut snap = DecantDstorageMetricsSnapshot::default();
+        // SAFETY: `snap` is a valid writable `DecantDstorageMetricsSnapshot`.
+        assert_eq!(unsafe { DecantDstorageMetrics(&mut snap) }, 1);
     }
 }

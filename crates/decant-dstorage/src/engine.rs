@@ -213,9 +213,56 @@ struct Core {
     timing: Arc<Timing>,
 }
 
+/// Process-wide cumulative DirectStorage metrics snapshot exported via `DecantDstorageMetrics`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct DecantDstorageMetricsSnapshot {
+    pub requests: u64,
+    pub bytes_read: u64,
+    pub active_read_ns: u64,
+    pub decode_ns: u64,
+    pub write_ns: u64,
+    pub in_flight: u64,
+    pub batches: u64,
+}
+
+struct GlobalMetrics {
+    requests: AtomicU64,
+    bytes_read: AtomicU64,
+    active_read_ns: AtomicU64,
+    decode_ns: AtomicU64,
+    write_ns: AtomicU64,
+    in_flight: AtomicU64,
+    batches: AtomicU64,
+}
+
+static GLOBAL_METRICS: GlobalMetrics = GlobalMetrics {
+    requests: AtomicU64::new(0),
+    bytes_read: AtomicU64::new(0),
+    active_read_ns: AtomicU64::new(0),
+    decode_ns: AtomicU64::new(0),
+    write_ns: AtomicU64::new(0),
+    in_flight: AtomicU64::new(0),
+    batches: AtomicU64::new(0),
+};
+
+/// Returns a lock-free snapshot of cumulative DirectStorage metrics across all queues.
+pub fn metrics_snapshot() -> DecantDstorageMetricsSnapshot {
+    DecantDstorageMetricsSnapshot {
+        requests: GLOBAL_METRICS.requests.load(Ordering::Relaxed),
+        bytes_read: GLOBAL_METRICS.bytes_read.load(Ordering::Relaxed),
+        active_read_ns: GLOBAL_METRICS.active_read_ns.load(Ordering::Relaxed),
+        decode_ns: GLOBAL_METRICS.decode_ns.load(Ordering::Relaxed),
+        write_ns: GLOBAL_METRICS.write_ns.load(Ordering::Relaxed),
+        in_flight: GLOBAL_METRICS.in_flight.load(Ordering::Relaxed),
+        batches: GLOBAL_METRICS.batches.load(Ordering::Relaxed),
+    }
+}
+
 /// Low overhead counters shared by this queue's worker and decode tasks.
 struct Timing {
     requests: AtomicU64,
+    batches: AtomicU64,
     bytes: AtomicU64,
     written_bytes: AtomicU64,
     read_ns: AtomicU64,
@@ -228,6 +275,7 @@ impl Timing {
     fn new() -> Timing {
         Timing {
             requests: AtomicU64::new(0),
+            batches: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             written_bytes: AtomicU64::new(0),
             read_ns: AtomicU64::new(0),
@@ -237,31 +285,50 @@ impl Timing {
         }
     }
 
-    fn record(&self, bytes: u32, written_bytes: u32, read: Duration, decode: Duration, write: Duration) -> Option<String> {
+    fn record_batch(&self, active_read: Duration) {
+        let ns = active_read.as_nanos() as u64;
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.read_ns.fetch_add(ns, Ordering::Relaxed);
+        GLOBAL_METRICS.batches.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_METRICS.active_read_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    fn record(&self, bytes: u32, written_bytes: u32, _read: Duration, decode: Duration, write: Duration) -> Option<String> {
         let count = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        let d_ns = decode.as_nanos() as u64;
+        let w_ns = write.as_nanos() as u64;
         self.bytes.fetch_add(u64::from(bytes), Ordering::Relaxed);
         self.written_bytes.fetch_add(u64::from(written_bytes), Ordering::Relaxed);
-        self.read_ns.fetch_add(read.as_nanos() as u64, Ordering::Relaxed);
-        self.decode_ns.fetch_add(decode.as_nanos() as u64, Ordering::Relaxed);
-        self.write_ns.fetch_add(write.as_nanos() as u64, Ordering::Relaxed);
+        self.decode_ns.fetch_add(d_ns, Ordering::Relaxed);
+        self.write_ns.fetch_add(w_ns, Ordering::Relaxed);
+
+        GLOBAL_METRICS.requests.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_METRICS.bytes_read.fetch_add(u64::from(bytes), Ordering::Relaxed);
+        GLOBAL_METRICS.decode_ns.fetch_add(d_ns, Ordering::Relaxed);
+        GLOBAL_METRICS.write_ns.fetch_add(w_ns, Ordering::Relaxed);
+
         if !count.is_multiple_of(64) {
             return None;
         }
         let Ok(mut started) = self.window.try_lock() else { return None };
-        if started.elapsed() < Duration::from_secs(5) {
+        let window_elapsed = started.elapsed();
+        if window_elapsed < Duration::from_secs(5) {
             return None;
         }
         *started = Instant::now();
         drop(started);
         let requests = self.requests.swap(0, Ordering::Relaxed);
+        let batches = self.batches.swap(0, Ordering::Relaxed);
         let bytes = self.bytes.swap(0, Ordering::Relaxed);
         let written_bytes = self.written_bytes.swap(0, Ordering::Relaxed);
         let read = Duration::from_nanos(self.read_ns.swap(0, Ordering::Relaxed));
         let decode = Duration::from_nanos(self.decode_ns.swap(0, Ordering::Relaxed));
         let write = Duration::from_nanos(self.write_ns.swap(0, Ordering::Relaxed));
+        let avg_batch = if batches > 0 { requests as f64 / batches as f64 } else { requests as f64 };
         Some(format!(
-            "dstorage 5s: requests {requests} bytes {bytes} read {:.2} MB/s decode {:.2} MB/s write {:.2} MB/s\n",
+            "dstorage 5s: requests {requests} batches {batches} avg_batch {avg_batch:.1} bytes {bytes} read {:.2} MB/s (window {:.2} MB/s) decode {:.2} MB/s write {:.2} MB/s\n",
             megabytes_per_second(bytes, read),
+            megabytes_per_second(bytes, window_elapsed),
             megabytes_per_second(bytes, decode),
             megabytes_per_second(written_bytes, write),
         ))
@@ -785,6 +852,7 @@ impl Core {
             self.in_flight_waiters.fetch_sub(1, Ordering::SeqCst);
         }
         self.in_flight_count.fetch_add(slots, Ordering::SeqCst);
+        GLOBAL_METRICS.in_flight.fetch_add(slots as u64, Ordering::Relaxed);
     }
 
     fn build_staged_job_from_parts(self: &Arc<Self>, r: DecantRead, pages: Option<PageTarget>, input: InputBuffer, decode: bool, read_time: Duration) -> crate::pool::Job {
@@ -810,6 +878,7 @@ impl Core {
                 core.fail(hr);
             }
             core.in_flight_count.fetch_sub(1, Ordering::SeqCst);
+            GLOBAL_METRICS.in_flight.fetch_sub(1, Ordering::Relaxed);
             if core.in_flight_waiters.load(Ordering::SeqCst) > 0 {
                 let _guard = lock(&core.in_flight_lock);
                 core.settled.notify_all();
@@ -934,6 +1003,7 @@ impl Core {
             self.read_batch_native(native, batch);
             return;
         }
+        let batch_started = Instant::now();
         if batch.len() == 1 {
             let op = &mut batch[0];
             let to_pages = op.pages.is_some();
@@ -942,12 +1012,14 @@ impl Core {
                 log_failure(op.read.get(), to_pages, hr);
                 self.fail(hr);
             }
+            self.timing.record_batch(batch_started.elapsed());
             return;
         }
         let plan = plan_coalesced_batches(batch, false);
         let total_tasks = plan.groups.len() + plan.singles.len();
         if total_tasks == 1 && plan.groups.len() == 1 {
             self.read_coalesced_cpu(batch, &plan.groups[0]);
+            self.timing.record_batch(batch_started.elapsed());
             return;
         }
         let base = batch.as_mut_ptr() as usize;
@@ -971,6 +1043,7 @@ impl Core {
                 }
             }
         });
+        self.timing.record_batch(batch_started.elapsed());
     }
 
     fn complete_coalesced_parts(
@@ -1052,6 +1125,7 @@ impl Core {
             }
         };
         let batch_read_time = submitted.started.elapsed();
+        self.timing.record_batch(batch_read_time);
         let per_read_time = batch_read_time / (submitted.pending.len() as u32).max(1);
         if hr < 0 {
             self.fail(hr);
@@ -2087,5 +2161,51 @@ fn coalesces_across_64k_gap_and_reuses_decode_scratch() {
 
     assert_eq!(with_decode_output(1024, |buf| { buf.fill(0xAA); S_OK }), S_OK);
     assert_eq!(with_decode_output(2048, |buf| { assert_eq!(buf.len(), 2048); S_OK }), S_OK);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(test)]
+#[test]
+fn metrics_snapshot_tracks_requests_bytes_and_batches() {
+    use std::io::Write;
+    let before = metrics_snapshot();
+    let data = vec![0x5Au8; 8192];
+    let path = std::env::temp_dir().join(format!("dstorage_metrics_{}.bin", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&path).expect("creates temp file");
+        f.write_all(&data).expect("writes temp file");
+    }
+    let wide: Vec<u16> = {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let factory = Ref::new(Factory::new(Backend::cpu(), Arc::new(XmemPool)));
+    let file = factory.open_file(wide.as_ptr()).expect("opens file");
+    let queue = factory.create_queue(8).expect("creates queue");
+    let status = factory.create_status_array(1).expect("creates status");
+    let mut dst = vec![0u8; 8192];
+    let r = DecantRead {
+        file: file.as_ptr().cast(),
+        offset: 0,
+        source_size: 8192,
+        destination: dst.as_mut_ptr().cast(),
+        destination_size: 8192,
+        codec: codec::COPY,
+        bc_mode: 0,
+    };
+    assert_eq!(queue.enqueue(r), S_OK);
+    // SAFETY: `status` is one of ours.
+    assert_eq!(unsafe { queue.enqueue_status(status.as_ptr().cast(), 0) }, S_OK);
+    assert_eq!(queue.submit(), S_OK);
+    let start = Instant::now();
+    while status.result(0) == E_PENDING {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(status.result(0), S_OK);
+    let after = metrics_snapshot();
+    assert!(after.requests > before.requests);
+    assert!(after.bytes_read >= before.bytes_read + 8192);
+    assert!(after.batches > before.batches);
     let _ = std::fs::remove_file(&path);
 }
