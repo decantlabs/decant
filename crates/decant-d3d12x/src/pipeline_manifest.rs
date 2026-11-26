@@ -68,6 +68,7 @@
 //! readers drop repeated lines.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -117,8 +118,20 @@ impl PcState {
         &self.desc
     }
 
+    fn write_hex(&self, out: &mut String) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.reserve(self.desc.len() * 2);
+        for &b in &self.desc {
+            out.push(char::from(HEX[(b >> 4) as usize]));
+            out.push(char::from(HEX[(b & 0xf) as usize]));
+        }
+    }
+
+    #[cfg(test)]
     fn text(&self) -> String {
-        self.desc.iter().map(|b| format!("{b:02x}")).collect()
+        let mut out = String::with_capacity(self.desc.len() * 2);
+        self.write_hex(&mut out);
+        out
     }
 
     fn parse(text: &str) -> Result<Self, String> {
@@ -180,15 +193,23 @@ fn class_of(letter: &str) -> Option<RegisterClass> {
 
 /// The text of `layout` in an `R` line, without `R` and the id.
 pub fn root_text(layout: &RootLayout) -> String {
-    let mut out = format!("{} {:#x}", layout.version, layout.flags);
+    let mut out = String::with_capacity(64 + layout.params.len() * 24 + layout.static_samplers.len() * 16);
+    let _ = write!(out, "{} {:#x}", layout.version, layout.flags);
     for p in &layout.params {
         let v = p.visibility;
-        let token = match &p.kind {
+        match &p.kind {
             RootParamKind::Table(ranges) => {
-                let r: Vec<String> = ranges.iter().map(|r| format!("{}.{}.{}.{}.{}.{}", class_letter(r.class), r.base, r.space, r.count, r.offset, r.flags)).collect();
-                format!("table:{v}:{}", r.join("+"))
+                let _ = write!(out, " table:{v}:");
+                for (i, r) in ranges.iter().enumerate() {
+                    if i > 0 {
+                        out.push('+');
+                    }
+                    let _ = write!(out, "{}.{}.{}.{}.{}.{}", class_letter(r.class), r.base, r.space, r.count, r.offset, r.flags);
+                }
             }
-            RootParamKind::Constants { register, space, count } => format!("const:{v}:{register}.{space}.{count}"),
+            RootParamKind::Constants { register, space, count } => {
+                let _ = write!(out, " const:{v}:{register}.{space}.{count}");
+            }
             RootParamKind::Descriptor { class, register, space } => {
                 let kind = match class {
                     RegisterClass::Cbv => "cbv",
@@ -196,14 +217,12 @@ pub fn root_text(layout: &RootLayout) -> String {
                     // A root descriptor is never a sampler, the parser of the layer refuses it.
                     RegisterClass::Uav | RegisterClass::Sampler => "uav",
                 };
-                format!("{kind}:{v}:{register}.{space}")
+                let _ = write!(out, " {kind}:{v}:{register}.{space}");
             }
-        };
-        out.push(' ');
-        out.push_str(&token);
+        }
     }
     for s in &layout.static_samplers {
-        out.push_str(&format!(" sampler:{}:{}.{}", s.visibility, s.register, s.space));
+        let _ = write!(out, " sampler:{}:{}.{}", s.visibility, s.register, s.space);
     }
     out
 }
@@ -276,16 +295,17 @@ pub fn parse_root(text: &str) -> Result<RootLayout, String> {
     Ok(layout)
 }
 
-fn escape(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
+fn escape_into(out: &mut String, name: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for b in name.bytes() {
         if b.is_ascii_alphanumeric() || b == b'_' {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            out.push('%');
+            out.push(char::from(HEX[(b >> 4) as usize]));
+            out.push(char::from(HEX[(b & 0xf) as usize]));
         }
     }
-    out
 }
 
 fn unescape(text: &str) -> Result<String, String> {
@@ -305,8 +325,17 @@ fn unescape(text: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|_| format!("semantic `{text}` is not UTF-8"))
 }
 
-fn tag(kind: StageKind) -> String {
-    kind.short().to_ascii_uppercase()
+fn tag(kind: StageKind) -> &'static str {
+    match kind {
+        StageKind::Vertex => "VS",
+        StageKind::Pixel => "PS",
+        StageKind::Domain => "DS",
+        StageKind::Hull => "HS",
+        StageKind::Geometry => "GS",
+        StageKind::Compute => "CS",
+        StageKind::Amplification => "AS",
+        StageKind::Mesh => "MS",
+    }
 }
 
 fn kind_of(tag: &str) -> Option<StageKind> {
@@ -318,24 +347,30 @@ fn kind_of(tag: &str) -> Option<StageKind> {
 /// The `P` line of a pipeline (without the line end). `hashes` are the container hashes of the
 /// stages of `linkage.stages`, in that order.
 pub fn pipeline_line(root: Option<u64>, linkage: &Linkage, hashes: &[u64]) -> String {
-    let root = root.map_or_else(|| "-".to_string(), |r| format!("{r:016x}"));
-    let targets: Vec<String> = linkage.targets.iter().map(u32::to_string).collect();
-    let inputs: Vec<String> = linkage
-        .inputs
-        .iter()
-        .map(|e| format!("{}.{}.{}.{}.{}.{}.{}", escape(&e.semantic), e.index, e.format, e.slot, e.offset, if e.per_instance { 'i' } else { 'v' }, e.step_rate))
-        .collect();
-    let mut line = format!(
-        "P {root} topo={} msaa={} ds={} rt={} so={} in={}",
-        linkage.topology_type,
-        linkage.sample_count,
-        linkage.depth_format,
-        targets.join(","),
-        u8::from(linkage.stream_output),
-        inputs.join(",")
-    );
+    let mut line = String::with_capacity(128 + linkage.inputs.len() * 24 + hashes.len() * 20);
+    match root {
+        Some(r) => {
+            let _ = write!(line, "P {r:016x}");
+        }
+        None => line.push_str("P -"),
+    }
+    let _ = write!(line, " topo={} msaa={} ds={} rt=", linkage.topology_type, linkage.sample_count, linkage.depth_format);
+    for (i, t) in linkage.targets.iter().enumerate() {
+        if i > 0 {
+            line.push(',');
+        }
+        let _ = write!(line, "{t}");
+    }
+    let _ = write!(line, " so={} in=", u8::from(linkage.stream_output));
+    for (i, e) in linkage.inputs.iter().enumerate() {
+        if i > 0 {
+            line.push(',');
+        }
+        escape_into(&mut line, &e.semantic);
+        let _ = write!(line, ".{}.{}.{}.{}.{}.{}", e.index, e.format, e.slot, e.offset, if e.per_instance { 'i' } else { 'v' }, e.step_rate);
+    }
     for (kind, hash) in linkage.stages.iter().zip(hashes) {
-        line.push_str(&format!(" {} {hash:016x}", tag(*kind)));
+        let _ = write!(line, " {} {hash:016x}", tag(*kind));
     }
     line
 }
@@ -538,7 +573,17 @@ impl Writer {
 
     /// Records a pipeline with complete inline state for offline PSO creation.
     pub fn record_state(&mut self, root: Option<&RootLayout>, linkage: &Linkage, stages: &[&[u8]], state: Option<&PcState>) -> std::io::Result<bool> {
-        let hashes: Vec<u64> = stages.iter().map(|b| *self.hashes.entry((b.as_ptr() as usize, b.len())).or_insert_with(|| decant_shader::container::fnv1a64(b))).collect();
+        let mut stack_hashes = [0u64; 8];
+        let mut heap_hashes = Vec::new();
+        let hashes: &mut [u64] = if stages.len() <= stack_hashes.len() {
+            &mut stack_hashes[..stages.len()]
+        } else {
+            heap_hashes.resize(stages.len(), 0);
+            &mut heap_hashes
+        };
+        for (slot, b) in hashes.iter_mut().zip(stages) {
+            *slot = *self.hashes.entry((b.as_ptr() as usize, b.len())).or_insert_with(|| decant_shader::container::fnv1a64(b));
+        }
         let (root_line, id) = match root {
             Some(layout) => {
                 let text = root_text(layout);
@@ -547,9 +592,10 @@ impl Writer {
             }
             None => (None, None),
         };
-        let mut line = pipeline_line(id, linkage, &hashes);
+        let mut line = pipeline_line(id, linkage, hashes);
         if let Some(state) = state {
-            line.push_str(&format!(" pcstate={}", state.text()));
+            line.push_str(" pcstate=");
+            state.write_hex(&mut line);
         }
         if !self.lines.insert(Fnv128::default().bytes(line.as_bytes()).finish()) {
             return Ok(false);
@@ -559,7 +605,8 @@ impl Writer {
         {
             self.file.write_all(r.as_bytes())?;
         }
-        self.file.write_all(format!("{line}\n").as_bytes())?;
+        line.push('\n');
+        self.file.write_all(line.as_bytes())?;
         self.pipelines += 1;
         Ok(true)
     }
@@ -602,9 +649,19 @@ pub(crate) fn created(owned: &crate::lazy_pso::Owned) {
             return;
         }
     };
-    let stages: Vec<&[u8]> = pipeline.stages.iter().map(|s| &*s.bytes).collect();
+    let mut stack_stages = [&[][..]; 8];
+    let mut heap_stages = Vec::new();
+    let stages: &[&[u8]] = if pipeline.stages.len() <= stack_stages.len() {
+        for (slot, s) in stack_stages.iter_mut().zip(&pipeline.stages) {
+            *slot = &s.bytes;
+        }
+        &stack_stages[..pipeline.stages.len()]
+    } else {
+        heap_stages.extend(pipeline.stages.iter().map(|s| &*s.bytes));
+        &heap_stages
+    };
     let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-    match w.record_state(Some(&pipeline.root), &pipeline.linkage, &stages, PcState::capture(owned.desc()).as_ref()) {
+    match w.record_state(Some(&pipeline.root), &pipeline.linkage, stages, PcState::capture(owned.desc()).as_ref()) {
         Ok(true) if w.pipelines.is_power_of_two() => xs_log!("pipeline manifest: {} pipelines, {} root signatures recorded", w.pipelines, w.roots.len()),
         Ok(_) => {}
         Err(e) => {

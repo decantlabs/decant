@@ -44,8 +44,9 @@ const SUBOBJECTS: [(u32, usize, usize); 25] = [
 ];
 
 /// Alignment and payload size of the subobject type `ty`, `None` when the type is not known.
+#[inline]
 pub fn subobject_layout(ty: u32) -> Option<(usize, usize)> {
-    SUBOBJECTS.iter().find(|s| s.0 == ty).map(|&(_, align, size)| (align, size))
+    SUBOBJECTS.get(ty as usize).map(|&(_, align, size)| (align, size))
 }
 
 /// The bytes of a x86_64 `D3D12_COMPUTE_PIPELINE_STATE_DESC` (56 bytes).
@@ -134,6 +135,17 @@ const COPIES: [(u32, usize, usize); 19] = [
     (20, at::FLAGS, 4),
 ];
 
+const COPY_TABLE: [Option<(usize, usize)>; 25] = {
+    let mut table = [None; 25];
+    let mut i = 0;
+    while i < COPIES.len() {
+        let (ty, dst, len) = COPIES[i];
+        table[ty as usize] = Some((dst, len));
+        i += 1;
+    }
+    table
+};
+
 fn rd_u32(b: &[u8], off: usize) -> u32 {
     b.get(off..off + 4).and_then(|s| s.try_into().ok()).map_or(0, u32::from_le_bytes)
 }
@@ -178,10 +190,32 @@ fn default_graphics_desc() -> [u8; GRAPHICS_DESC_SIZE] {
     g
 }
 
+const MAX_STACK_SUBS: usize = 32;
+
+#[allow(clippy::large_enum_variant)]
+enum StreamSubs {
+    Stack([(u32, usize, usize); MAX_STACK_SUBS], usize),
+    Heap(Vec<(u32, usize, usize)>),
+}
+
+impl std::ops::Deref for StreamSubs {
+    type Target = [(u32, usize, usize)];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Stack(items, len) => &items[..*len],
+            Self::Heap(vec) => vec,
+        }
+    }
+}
+
 /// Cuts a stream into `(type, payload offset, payload size)`. `Err(type)` for a type that is not
 /// known or a payload that runs past the end of the stream.
-fn split_stream(stream: &[u8]) -> Result<Vec<(u32, usize, usize)>, u32> {
-    let mut found = Vec::new();
+fn split_stream(stream: &[u8]) -> Result<StreamSubs, u32> {
+    let mut stack = [(0u32, 0usize, 0usize); MAX_STACK_SUBS];
+    let mut len = 0usize;
+    let mut heap: Option<Vec<(u32, usize, usize)>> = None;
     let mut pos = 0usize;
     while pos + 4 <= stream.len() {
         let ty = rd_u32(stream, pos);
@@ -190,10 +224,24 @@ fn split_stream(stream: &[u8]) -> Result<Vec<(u32, usize, usize)>, u32> {
         if start + size > stream.len() {
             return Err(ty);
         }
-        found.push((ty, start, size));
+        let item = (ty, start, size);
+        if let Some(vec) = &mut heap {
+            vec.push(item);
+        } else if len < MAX_STACK_SUBS {
+            stack[len] = item;
+            len += 1;
+        } else {
+            let mut vec = Vec::with_capacity(MAX_STACK_SUBS * 2);
+            vec.extend_from_slice(&stack);
+            vec.push(item);
+            heap = Some(vec);
+        }
         pos = (start + size).next_multiple_of(8);
     }
-    Ok(found)
+    Ok(match heap {
+        Some(vec) => StreamSubs::Heap(vec),
+        None => StreamSubs::Stack(stack, len),
+    })
 }
 
 fn unpack_compute(stream: &[u8], subs: &[(u32, usize, usize)]) -> PlainComputeDesc {
@@ -218,7 +266,7 @@ fn unpack_graphics(stream: &[u8], subs: &[(u32, usize, usize)]) -> ([u8; GRAPHIC
     let mut mesh_shaders = [0u8; 32];
     for &(ty, start, size) in subs {
         let payload = &stream[start..start + size];
-        if let Some(&(_, dst, len)) = COPIES.iter().find(|c| c.0 == ty) {
+        if let Some(&(dst, len)) = COPY_TABLE.get(ty as usize).and_then(Option::as_ref) {
             g[dst..dst + len].copy_from_slice(&payload[..len]);
             continue;
         }
@@ -325,8 +373,16 @@ pub fn is_integer_dxgi_format(fmt: u32) -> bool {
 /// slots stop blending, so the other targets keep it.
 fn sanitize_integer_rt_blend(g: &mut [u8; GRAPHICS_DESC_SIZE]) {
     let active = (rd_u32(g, at::RT_COUNT) as usize).min(8);
-    let integer: Vec<bool> = (0..active).map(|i| is_integer_dxgi_format(rd_u32(g, at::RT_FORMATS + i * 4))).collect();
-    if !integer.contains(&true) {
+    let mut integer = [false; 8];
+    let mut any_integer = false;
+    let mut any_non_integer = false;
+    for (i, is_int) in integer[..active].iter_mut().enumerate() {
+        let flag = is_integer_dxgi_format(rd_u32(g, at::RT_FORMATS + i * 4));
+        *is_int = flag;
+        any_integer |= flag;
+        any_non_integer |= !flag;
+    }
+    if !any_integer {
         return;
     }
     // Blend and logic operation enable flags are the first two words of a target block.
@@ -345,7 +401,7 @@ fn sanitize_integer_rt_blend(g: &mut [u8; GRAPHICS_DESC_SIZE]) {
     if !blends && !logic {
         return;
     }
-    if blends && integer.contains(&false) {
+    if blends && any_non_integer {
         wr_u32(g, at::INDEPENDENT_BLEND, 1);
         wr_u32(g, at::render_target(0) + 4, 0);
         let first = at::render_target(0);
@@ -710,5 +766,17 @@ mod tests {
         let mut ids: Vec<u32> = sdk.iter().map(|f| f.0 as u32).collect();
         ids.sort_unstable();
         assert_eq!(ids, INTEGER_FORMATS);
+    }
+
+    #[test]
+    fn split_stream_handles_more_than_stack_subobjects_capacity() {
+        let mut s = vs_only();
+        for i in 0..40u32 {
+            push_sub(&mut s, 9, &i.to_le_bytes());
+        }
+        let subs = split_stream(&s).expect("valid stream");
+        assert_eq!(subs.len(), 41);
+        let g = graphics(&s);
+        assert_eq!(rd_u32(&g[..], at::SAMPLE_MASK), 39);
     }
 }

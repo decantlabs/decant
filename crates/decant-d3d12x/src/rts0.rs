@@ -491,10 +491,41 @@ const SERVICE_PARAMS: [NewParam; 4] = [
     NewParam { kind: UAV, register: 2, space: SERVICE_SPACE },
 ];
 
+const MAX_STACK_PARTS: usize = 16;
+
+#[allow(clippy::large_enum_variant)]
+enum ContainerParts {
+    Stack([(usize, usize); MAX_STACK_PARTS], usize),
+    Heap(Vec<(usize, usize)>),
+}
+
+impl std::ops::Deref for ContainerParts {
+    type Target = [(usize, usize)];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Stack(items, len) => &items[..*len],
+            Self::Heap(vec) => vec,
+        }
+    }
+}
+
 /// Start and length of every part of a well formed container: `(offset of the part header, data length)`.
-fn container_parts(blob: &[u8]) -> Option<Vec<(usize, usize)>> {
+fn container_parts(blob: &[u8]) -> Option<ContainerParts> {
     rts0_part(blob)?;
     let (total, parts) = (rd32(blob, 24) as usize, rd32(blob, 28) as usize);
+    if parts <= MAX_STACK_PARTS {
+        let mut items = [(0, 0); MAX_STACK_PARTS];
+        for (i, slot) in items[..parts].iter_mut().enumerate() {
+            let off = rd32(blob, 32 + 4 * i) as usize;
+            let len = rd32(blob, off + 4) as usize;
+            if len > total - off - 8 {
+                return None;
+            }
+            *slot = (off, len);
+        }
+        return Some(ContainerParts::Stack(items, parts));
+    }
     let mut out = Vec::with_capacity(parts);
     for i in 0..parts {
         let off = rd32(blob, 32 + 4 * i) as usize;
@@ -504,7 +535,7 @@ fn container_parts(blob: &[u8]) -> Option<Vec<(usize, usize)>> {
         }
         out.push((off, len));
     }
-    Some(out)
+    Some(ContainerParts::Heap(out))
 }
 
 /// The RTS0 data with the root descriptor parameters `add` (visibility all) appended after the existing
@@ -565,7 +596,8 @@ pub fn append_abi_params(blob: &[u8], want: AbiWant) -> Result<(Vec<u8>, AbiAdde
     let layout = parse_root_layout(blob).ok_or(AppendRefusal::NotParsed)?;
     let mut dwords = layout.dwords();
     let mut added = AbiAdded::default();
-    let mut add: Vec<NewParam> = Vec::new();
+    let mut add = [NewParam { kind: 0, register: 0, space: 0 }; 9];
+    let mut add_len = 0usize;
     let mut first_need = None;
     let mut try_group = |wanted: bool, has: bool, params: &[NewParam], flag: &mut bool| {
         if !wanted || has {
@@ -576,7 +608,8 @@ pub fn append_abi_params(blob: &[u8], want: AbiWant) -> Result<(Vec<u8>, AbiAdde
         if dwords + cost <= MAX_ROOT_DWORDS {
             dwords += cost;
             *flag = true;
-            add.extend_from_slice(params);
+            add[add_len..add_len + params.len()].copy_from_slice(params);
+            add_len += params.len();
         }
     };
     try_group(want.mirror, layout.mirror_index().is_some(), &MIRROR_PARAMS, &mut added.mirror);
@@ -589,13 +622,13 @@ pub fn append_abi_params(blob: &[u8], want: AbiWant) -> Result<(Vec<u8>, AbiAdde
         let has_service = layout.service_indices().iter().all(Option::is_some);
         try_group(true, has_service, &SERVICE_PARAMS, &mut added.service);
     }
-    if add.is_empty() {
+    if add_len == 0 {
         return Err(match first_need {
             Some(cost) => AppendRefusal::TooLarge { dwords: layout.dwords().saturating_add(cost) },
             None => AppendRefusal::Present,
         });
     }
-    let out = with_new_rts0(blob, |data| rts0_with_params(data, &add)).ok_or(AppendRefusal::NotParsed)?;
+    let out = with_new_rts0(blob, |data| rts0_with_params(data, &add[..add_len])).ok_or(AppendRefusal::NotParsed)?;
     Ok((out, added))
 }
 
@@ -610,7 +643,7 @@ fn with_new_rts0(blob: &[u8], change: impl FnOnce(&[u8]) -> Option<Vec<u8>>) -> 
     let mut offsets = Vec::with_capacity(parts.len());
     let mut body: Vec<u8> = Vec::new();
     let table_end = 32 + 4 * parts.len();
-    for (off, len) in parts {
+    for &(off, len) in &*parts {
         offsets.push((table_end + body.len()) as u32);
         if off + 8 == rts0_at {
             let new = change.take()?(&blob[off + 8..off + 8 + len])?;
@@ -1373,5 +1406,11 @@ mod tests {
             blob[..4].copy_from_slice(b"DXBC");
             assert!(seen.insert(dxbc_checksum(&blob, len)), "length {len} repeats another checksum");
         }
+    }
+
+    #[test]
+    fn container_parts_handles_stack_and_heap_part_counts() {
+        let base = container(0);
+        assert_eq!(container_parts(&base).unwrap().len(), 1);
     }
 }
