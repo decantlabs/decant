@@ -69,10 +69,10 @@ pub const POOL_HEAP_BYTES: u64 = HEAP_PAGES as u64 * PAGE;
 
 /// Pages asked of `DecantXmemGpuTakeDirty` in one call.
 const TAKE_PAGES: usize = 65536;
-/// Bound each copy job to 512 KiB, parallelize batches of at least 2 MiB, and assign at least 1 MiB per copying thread.
-const COPY_CHUNK_PAGES: usize = 8;
-const PARALLEL_THRESHOLD_PAGES: usize = 32;
-const COPY_THREAD_PAGES: usize = 16;
+/// Bound each copy job to 256 KiB, parallelize batches of at least 512 KiB, and assign at least 512 KiB per copying thread.
+const COPY_CHUNK_PAGES: usize = 4;
+const PARALLEL_THRESHOLD_PAGES: usize = 8;
+const COPY_THREAD_PAGES: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 struct CopyJob {
@@ -597,7 +597,6 @@ struct State {
     zero_scan: ZeroScan,
     /// Reused between syncs.
     scratch: Vec<GpuChange>,
-    dirty: Vec<u32>,
     tile_scratch: TileScratch,
     /// The mirror tiles of the pages the current sync copied: what the title wrote since the last one.
     written: Vec<u32>,
@@ -735,9 +734,14 @@ fn journal_unchanged(api: &Api) -> bool {
     let last = LAST_JOURNAL_SEQ.load(Ordering::Acquire);
     last != u64::MAX && last == cur_seq
 }
+struct SyncScratch {
+    jobs: Vec<CopyJob>,
+    dirty: Vec<u32>,
+}
+
 /// Serializes `sync` and `device_created` across queues so `execute_copies` runs without holding `STATE`,
-/// and reuses the `CopyJob` buffer across syncs.
-static SYNC_LOCK: Mutex<Vec<CopyJob>> = Mutex::new(Vec::new());
+/// and reuses the `CopyJob` and dirty page buffers across syncs.
+static SYNC_LOCK: Mutex<SyncScratch> = Mutex::new(SyncScratch { jobs: Vec::new(), dirty: Vec::new() });
 
 fn should_skip_drain(last_seq: Option<u64>, current_seq: Option<u64>) -> bool {
     matches!((last_seq, current_seq), (Some(a), Some(b)) if a == b)
@@ -1095,44 +1099,23 @@ impl State {
         ranges
     }
 
-    /// Collects copy jobs for pool pages written since the last sync, ensuring heaps and sections exist.
-    fn prepare_upload(&mut self, api: &Api, jobs: &mut Vec<CopyJob>) -> u64 {
+    /// Collects copy jobs for sorted unique pool pages written since the last sync, ensuring heaps and sections exist.
+    fn plan_upload(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>) -> u64 {
+        if pages.is_empty() {
+            return 0;
+        }
         let _trace = decant_trace::span("title_mem", "upload");
         let mut total = 0;
         let mut new_tile = false;
-        loop {
-            self.dirty.clear();
-            self.dirty.reserve(TAKE_PAGES);
-            // SAFETY: `dirty` has spare capacity for `TAKE_PAGES` entries.
-            let asked = Instant::now();
-            let n = {
-                let _take = decant_trace::span("title_mem", "take_dirty");
-                unsafe { (api.take_dirty)(self.dirty.as_mut_ptr(), TAKE_PAGES as u32) }
-            } as usize;
-            self.stats.take_micros += asked.elapsed().as_micros() as u64;
-            let n = n.min(TAKE_PAGES);
-            // SAFETY: `take_dirty` wrote `n` initialized page indices into `self.dirty`.
-            unsafe { self.dirty.set_len(n) };
-            if n == 0 {
-                break;
-            }
-            let mut pages = std::mem::take(&mut self.dirty);
-            pages.sort_unstable();
-            pages.dedup();
-            // A page copied for the first time has bytes now: it gets its mirror tile here (in page order,
-            // so consecutive pages get consecutive tiles), and the window shows it from this sync on.
-            for &page in &pages {
-                if self.mirror.tile_of(page).is_none() {
-                    self.mirror.give_tile(page);
-                    new_tile = true;
-                }
-            }
-            self.plan_runs(api, &pages, jobs, &mut total);
-            self.dirty = pages;
-            if n < TAKE_PAGES {
-                break;
+        // A page copied for the first time has bytes now: it gets its mirror tile here (in page order,
+        // so consecutive pages get consecutive tiles), and the window shows it from this sync on.
+        for &page in pages {
+            if self.mirror.tile_of(page).is_none() {
+                self.mirror.give_tile(page);
+                new_tile = true;
             }
         }
+        self.plan_runs(api, pages, jobs, &mut total);
         if new_tile {
             bump_tile_gen();
         }
@@ -1233,7 +1216,6 @@ pub unsafe fn device_created(device: *mut c_void) {
         stats: Stats::default(),
         zero_scan: ZeroScan::default(),
         scratch: Vec::new(),
-        dirty: Vec::new(),
         tile_scratch: TileScratch::default(),
         written: Vec::new(),
     });
@@ -1599,6 +1581,32 @@ pub fn writable(va: usize, len: usize) -> bool {
 ///
 /// # Safety
 /// `queue` is a live PC command queue.
+/// Takes dirty pool page indices from `xmem.dll` outside `STATE` and returns `(take_micros)`.
+fn take_dirty_outside_state(api: &Api, dirty: &mut Vec<u32>) -> u64 {
+    dirty.clear();
+    let asked = Instant::now();
+    loop {
+        let base = dirty.len();
+        dirty.reserve(TAKE_PAGES);
+        // SAFETY: `dirty` has spare capacity for `TAKE_PAGES` entries past `base`.
+        let n = {
+            let _take = decant_trace::span("title_mem", "take_dirty");
+            unsafe { (api.take_dirty)(dirty.as_mut_ptr().add(base), TAKE_PAGES as u32) }
+        } as usize;
+        let n = n.min(TAKE_PAGES);
+        // SAFETY: `take_dirty` wrote `n` initialized page indices past `base`.
+        unsafe { dirty.set_len(base + n) };
+        if n < TAKE_PAGES {
+            break;
+        }
+    }
+    if !dirty.is_empty() {
+        dirty.sort_unstable();
+        dirty.dedup();
+    }
+    asked.elapsed().as_micros() as u64
+}
+
 pub unsafe fn sync(queue: *mut c_void) {
     if !enabled() {
         return;
@@ -1606,7 +1614,9 @@ pub unsafe fn sync(queue: *mut c_void) {
     let _trace = decant_trace::span("title_mem", "sync");
     // SAFETY: by the contract above.
     let Some(queue_ref) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
-    let mut jobs = decant_trace::timed_lock("title_mem::SYNC_LOCK", || SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(api_ref) = api() else { return };
+    let mut sync_scratch = decant_trace::timed_lock("title_mem::SYNC_LOCK", || SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let SyncScratch { jobs, dirty } = &mut *sync_scratch;
     jobs.clear();
     thread_local! {
         static SYNC_WRITTEN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
@@ -1614,8 +1624,10 @@ pub unsafe fn sync(queue: *mut c_void) {
     let mut written = SYNC_WRITTEN.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     written.clear();
     let started = Instant::now();
+    let take_micros = take_dirty_outside_state(api_ref, dirty);
     let Some((phase1_id, pages)) = with_state(|st, api| {
-        let pages = st.prepare_upload(api, &mut jobs);
+        st.stats.take_micros += take_micros;
+        let pages = st.plan_upload(api, dirty, jobs);
         std::mem::swap(&mut st.written, &mut written);
         (st.id, pages)
     }) else {
@@ -1630,14 +1642,15 @@ pub unsafe fn sync(queue: *mut c_void) {
         let _copy = decant_trace::span("title_mem", "copy_runs");
         // SAFETY: sorted unique pool pages have unique mirror tiles. Planning keeps each job
         // inside a live section and heap, and SYNC_LOCK keeps `device_created` from replacing heaps.
-        unsafe { execute_copies(&jobs, cores) };
+        unsafe { execute_copies(jobs, cores) };
         copying.elapsed().as_micros() as u64
     } else {
         0
     };
 
     let mut ranges_updated = 0u64;
-    if let Some(api) = api() {
+    let mut run_guard = false;
+    {
         let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
         if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
             st.stats.copy_micros += copy_micros;
@@ -1657,8 +1670,7 @@ pub unsafe fn sync(queue: *mut c_void) {
             crate::diagnose::removed_after(|| format!("a sync of {pages} pages and {ranges} tile ranges"));
             if st.last_guard.elapsed() >= GUARD_EVERY {
                 st.last_guard = Instant::now();
-                // SAFETY: the export takes no argument.
-                unsafe { (api.guard_modules)() };
+                run_guard = true;
             }
             let micros = started.elapsed().as_micros() as u64;
             let s = &mut st.stats;
@@ -1685,7 +1697,11 @@ pub unsafe fn sync(queue: *mut c_void) {
             }
         }
     }
-    drop(jobs);
+    drop(sync_scratch);
+    if run_guard {
+        // SAFETY: the export takes no argument.
+        unsafe { (api_ref.guard_modules)() };
+    }
     let page_units = pages / 16;
     let range_units = ranges_updated / 4;
     note_streaming_work(page_units.max(range_units));
@@ -1760,18 +1776,17 @@ mod tests {
     #[test]
     fn copy_planning_bounds_chunks_and_thread_counts() {
         assert_eq!(copy_threads(0, 8), 1);
-        assert_eq!(copy_threads(15, 8), 1);
-        assert_eq!(copy_threads(31, 8), 1);
-        assert_eq!(copy_threads(32, 8), 2);
-        assert_eq!(copy_threads(48, 8), 3);
+        assert_eq!(copy_threads(7, 8), 1);
+        assert_eq!(copy_threads(8, 8), 2);
+        assert_eq!(copy_threads(24, 8), 3);
         assert_eq!(copy_threads(4096, 3), 3);
         assert_eq!(copy_threads(4096, 1), 1);
         assert_eq!(copy_threads(4096, 0), 1);
         let mut jobs = Vec::new();
         plan_copy(&mut jobs, 0, 1024, 0);
         assert!(jobs.is_empty());
-        plan_copy(&mut jobs, 0, 1024, 35);
-        assert_eq!(jobs.iter().map(|job| job.pages).collect::<Vec<_>>(), [8, 8, 8, 8, 3]);
+        plan_copy(&mut jobs, 0, 1024, 15);
+        assert_eq!(jobs.iter().map(|job| job.pages).collect::<Vec<_>>(), [4, 4, 4, 3]);
         for (i, job) in jobs.iter().enumerate() {
             assert_eq!(job.source, i * COPY_CHUNK_PAGES * PAGE as usize);
             assert_eq!(job.destination, 1024 + job.source);
@@ -1953,5 +1968,43 @@ mod tests {
         assert!(!journal_unchanged(&api));
         TRACKING_ACTIVE.store(prev_track, Ordering::Release);
         LAST_JOURNAL_SEQ.store(prev_seq, Ordering::Release);
+    }
+
+    #[test]
+    fn take_dirty_outside_state_sorts_dedups_and_does_not_lock_state() {
+        unsafe extern "system" fn stub_track(_: i32) {}
+        unsafe extern "system" fn stub_changes(_: u64, _: *mut GpuChange, _: u32, _: *mut u32) -> i32 { 1 }
+        unsafe extern "system" fn stub_snapshot(_: *mut GpuChange, _: u32, _: *mut u32, _: *mut u64) -> i32 { 1 }
+        unsafe extern "system" fn stub_take(out: *mut u32, cap: u32) -> u32 {
+            assert!(cap >= 4);
+            // SAFETY: `out` has room for `cap` u32 entries.
+            unsafe {
+                *out.add(0) = 9;
+                *out.add(1) = 3;
+                *out.add(2) = 9;
+                *out.add(3) = 1;
+            }
+            4
+        }
+        unsafe extern "system" fn stub_view(_: u32, _: *mut usize, _: *mut u32, _: *mut u32) -> i32 { 0 }
+        unsafe extern "system" fn stub_guard() {}
+        unsafe extern "system" fn stub_writable(_: usize, _: usize) -> i32 { 0 }
+        unsafe extern "system" fn stub_use(_: usize, _: usize) -> u32 { 0 }
+
+        let api = Api {
+            track: stub_track,
+            changes: stub_changes,
+            snapshot: stub_snapshot,
+            take_dirty: stub_take,
+            section_view: stub_view,
+            guard_modules: stub_guard,
+            writable: stub_writable,
+            gpu_use: stub_use,
+            show: None,
+            journal_seq: None,
+        };
+        let mut dirty = Vec::new();
+        let _ = take_dirty_outside_state(&api, &mut dirty);
+        assert_eq!(dirty, [1, 3, 9]);
     }
 }
