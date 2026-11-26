@@ -695,7 +695,7 @@ mod platform {
     /// The thread sampler of [`crate::sampler`]: the debuggee's threads and modules as the debug
     /// events announce them, and a sampling round whenever one is due.
     #[cfg(target_arch = "x86_64")]
-    mod sampling {
+    pub(super) mod sampling {
         use super::*;
         use crate::sampler::{Module, Profile};
         use std::collections::HashMap;
@@ -805,6 +805,7 @@ mod platform {
         const LIST_MODULES_ALL: u32 = 0x03;
         const SYMOPT_UNDNAME: u32 = 0x0000_0002;
         const SYMOPT_DEFERRED_LOADS: u32 = 0x0000_0004;
+        const SYMOPT_LOAD_LINES: u32 = 0x0000_0010;
 
         #[repr(C)]
         struct ThreadEntry32 {
@@ -979,7 +980,7 @@ mod platform {
                     let sym_from_addr = std::mem::transmute::<unsafe extern "system" fn() -> isize, SymFromAddrFn>(from_addr);
                     let sym_refresh = GetProcAddress(dll, c"SymRefreshModuleList".as_ptr().cast())
                         .map(|f| std::mem::transmute::<unsafe extern "system" fn() -> isize, SymRefreshModuleListFn>(f));
-                    sym_set_opts(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                    sym_set_opts(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
                     let search_wide: Option<Vec<u16>> = search_dir.map(|p| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect());
                     let search_ptr = search_wide.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
                     if sym_init(process, search_ptr, 1) == 0 {
@@ -991,8 +992,9 @@ mod platform {
             }
 
             fn refresh(&mut self) {
+                self.cache.retain(|_, v| v.is_some());
                 if let Some(f) = self.sym_refresh {
-                    // SAFETY: `self.process` was initialized with `SymInitialize`.
+                    // SAFETY: `self.process` was initialized with `SymInitializeW`.
                     unsafe { f(self.process) };
                 }
             }
@@ -1073,6 +1075,10 @@ mod platform {
             }
         }
 
+        pub(crate) fn modules_changed(prev: &[Module], fresh: &[Module]) -> bool {
+            prev != fresh
+        }
+
         pub fn run_nodebug(process: HANDLE, pid: u32, every: Duration, out: PathBuf, stop: std::sync::Arc<AtomicBool>) {
             use windows_sys::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
             let _ = std::fs::write(&out, format!("thread samples every {} ms (no debugger)\n", every.as_millis()));
@@ -1089,10 +1095,15 @@ mod platform {
 
             while !stop.load(Ordering::Acquire) {
                 let now = Instant::now();
-                if now >= last_mod_refresh + Duration::from_secs(1) {
+                let refresh_every = if now.duration_since(started) < Duration::from_secs(5) {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_secs(1)
+                };
+                if now >= last_mod_refresh + refresh_every {
                     if let Some(api) = mod_api.as_ref() {
                         let fresh = api.snapshot(process);
-                        if fresh.len() != modules.len() {
+                        if modules_changed(&modules, &fresh) {
                             modules = fresh;
                             if let Some(d) = dbghelp.as_mut() {
                                 d.refresh();
@@ -2073,5 +2084,15 @@ mod tests {
         let sample = std::fs::read_to_string(dir.path().join("decant_sample.txt")).unwrap();
         assert!(sample.contains("(no debugger)"), "{sample}");
         assert!(sample.contains("--- window "), "{sample}");
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn modules_changed_detects_count_and_base_changes() {
+        let a = vec![(0x1000, 0x1000, "a.dll".to_owned())];
+        let b = vec![(0x2000, 0x1000, "b.dll".to_owned())];
+        assert!(!platform::sampling::modules_changed(&a, &a));
+        assert!(platform::sampling::modules_changed(&a, &b));
+        assert!(platform::sampling::modules_changed(&a, &[]));
     }
 }
