@@ -1,0 +1,687 @@
+# Feature map of Decant, a generic layer that runs Xbox Series titles built with the GDK natively on a PC.
+#
+# The proofs name milestones of a title profile that lives on tester machines. The profile id is `title`.
+# The scenarios are `boot` (start the title and run to its first screens) and `menu` (get past a menu with
+# scripted pad input). A milestone is named by what a run log shows. The milestone ids used in this file:
+#   process_started, title_config_read, memory_allocated, device_created, swapchain_created,
+#   first_present, direct_shaders_compiled, shader_cache_hit, textures_detiled, storage_backend_ready,
+#   audio_voice_started, pad_input_seen, user_signed_in, save_provider_opened, trace_written
+#
+# The status of a feature is not written here. The hub derives it from the matrix cells of its proofs.
+
+version = 1
+
+[[area]]
+id = "launch"
+title = "Launch and loading"
+
+[[area]]
+id = "memory"
+title = "Memory"
+
+[[area]]
+id = "graphics"
+title = "Graphics device and command lists"
+
+[[area]]
+id = "present"
+title = "Presentation"
+
+[[area]]
+id = "shaders"
+title = "Shader translation"
+
+[[area]]
+id = "textures"
+title = "Textures"
+
+[[area]]
+id = "storage"
+title = "Storage and file I/O"
+
+[[area]]
+id = "audio"
+title = "Audio"
+
+[[area]]
+id = "input"
+title = "Input"
+
+[[area]]
+id = "system"
+title = "System services of the GDK"
+
+[[area]]
+id = "diagnostics"
+title = "Diagnostics and tooling"
+
+# ---------------------------------------------------------------- launch
+
+[[feature]]
+id = "launch.config_read"
+title = "The title configuration and executable headers are read"
+area = "launch"
+paths = ["crates/decant-gdk-config/**"]
+how = "Run gdk_config_reader on a staged title folder. Unit tests of the crate cover the parsing."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "title_config_read"
+
+[[feature]]
+id = "launch.import_audit"
+title = "Missing imports are found before the title starts"
+area = "launch"
+paths = ["crates/decant-audit-imports/**"]
+how = "Run audit_xbox_imports on a staged title. The crate unit tests prove the report."
+
+[[feature]]
+id = "launch.stand_ins"
+title = "Stand in libraries answer for console modules nothing provides"
+area = "launch"
+paths = ["crates/decant-stub/**"]
+depends = ["launch.import_audit"]
+how = "Run decant_stubgen on an audit report. The tests of decant-stub prove the generated projects."
+
+[[feature]]
+id = "launch.stage"
+title = "A title package is staged with the Decant libraries first"
+area = "launch"
+paths = ["crates/decant-launch/src/stage.rs", "crates/decant-launch/src/relaunch.rs"]
+depends = ["launch.config_read"]
+how = "Start decant-launch on a title folder and look at the overlay folder it makes."
+
+[[feature]]
+id = "launch.run"
+title = "The title runs under the launcher and every library load is logged"
+area = "launch"
+paths = [
+  "crates/decant-launch/src/main.rs",
+  "crates/decant-launch/src/run.rs",
+  "crates/decant-launch/src/runtime.rs",
+  "crates/decant-launch/src/lib.rs",
+  "crates/decant-launch/tests/**",
+]
+depends = ["launch.stage"]
+how = "Start decant-launch on a staged title and read the launcher log."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "process_started"
+
+[[feature]]
+id = "launch.hang_reports"
+title = "A thread that waits too long is reported with its stack"
+area = "launch"
+paths = ["crates/decant-launch/src/tools/**", "crates/decant-launch/src/sampler.rs"]
+depends = ["launch.run"]
+how = "Set DECANT_WAITS to a number of seconds and read decant_waits.txt next to the title."
+
+[[feature]]
+id = "launch.shader_precompile"
+title = "Shaders are translated ahead of time while the title loads"
+area = "launch"
+paths = ["crates/decant-launch/src/precompile.rs"]
+depends = ["launch.run", "shaders.cache"]
+how = "Start decant-launch with the precompile switch and read the precompile lines of the log."
+
+[[feature]]
+id = "launch.linux"
+title = "A title is prepared and launched under Wine and Proton"
+area = "launch"
+paths = ["crates/decant-linux/**", "src/gdk/**", "sandbox/**"]
+how = "Run launch_prep on Linux as src/gdk/README.md says. Unit tests of decant-linux prove the planning."
+
+# ---------------------------------------------------------------- memory
+
+[[feature]]
+id = "memory.alloc"
+title = "The console allocator serves title allocations"
+area = "memory"
+paths = [
+  "crates/decant-xmem/src/engine.rs",
+  "crates/decant-xmem/src/exports.rs",
+  "crates/decant-xmem/src/regions.rs",
+  "crates/decant-xmem/src/track.rs",
+]
+how = "Run loadtest and xmem_abitest, or start a title and watch the XMem lines of the log."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "memory_allocated"
+
+[[feature]]
+id = "memory.physical_pages"
+title = "Physical page functions map and unmap pages"
+area = "memory"
+paths = ["crates/decant-xmem/src/pages.rs", "crates/decant-xmem/tests/**"]
+depends = ["memory.alloc"]
+how = "Run xmem_abitest. The tests under crates/decant-xmem/tests prove it without a title."
+
+[[feature]]
+id = "memory.title_mirror"
+title = "Title memory is mirrored for the GPU without a copy of every byte"
+area = "memory"
+paths = [
+  "crates/decant-d3d12x/src/title_mem.rs",
+  "crates/decant-d3d12x/src/title_heap.rs",
+  "crates/decant-d3d12x/src/title_mirror.rs",
+  "crates/decant-d3d12x/src/upload_mem.rs",
+  "docs/title-mem-zerocopy.md",
+]
+depends = ["memory.alloc", "graphics.device"]
+how = "Start a title with the title memory log on and read the title memory lines. tests/title_mem_commit.ps1 checks commit growth."
+
+# ---------------------------------------------------------------- graphics
+
+[[feature]]
+id = "graphics.device"
+title = "A console style graphics device starts on a PC adapter"
+area = "graphics"
+paths = [
+  "crates/decant-d3d12x/src/adapter_choice.rs",
+  "crates/decant-d3d12x/src/device_cache.rs",
+  "crates/decant-d3d12x/src/exports.rs",
+  "crates/decant-d3d12x/src/dxgi.rs",
+  "crates/decant-d3d12x/src/lib.rs",
+]
+how = "Start a title and wait for the adapter and device lines of the log. d3d12xs_test checks it without a title."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "device_created"
+
+[[feature]]
+id = "graphics.console_proxies"
+title = "Device, queue and list answer in the console method order"
+area = "graphics"
+paths = [
+  "crates/decant-d3d12x/src/proxy.rs",
+  "crates/decant-d3d12x/src/abi.rs",
+  "crates/decant-d3d12x/src/slot_tags.rs",
+  "crates/decant-d3d12x/src/proxy/pc_slots.rs",
+]
+depends = ["graphics.device"]
+how = "Run d3d12xs_test and d3d12x_vtprobe. The first checks calls through console slots, the second the table layout."
+
+[[feature]]
+id = "graphics.root_signatures"
+title = "Console root signatures serialize on a PC device"
+area = "graphics"
+paths = [
+  "crates/decant-d3d12x/src/rts0.rs",
+  "crates/decant-d3d12x/src/proxy/root_views.rs",
+  "crates/decant-d3d12x/src/bin/run/root_views.rs",
+]
+depends = ["graphics.console_proxies"]
+how = "Run d3d12xs_test. Tests inside decant-d3d12x cover the container parsing."
+
+[[feature]]
+id = "graphics.command_lists"
+title = "Command lists record draws and run on a queue"
+area = "graphics"
+paths = [
+  "crates/decant-d3d12x/src/proxy/list_*.rs",
+  "crates/decant-d3d12x/src/list_sync.rs",
+  "crates/decant-d3d12x/src/rect_list.rs",
+  "crates/decant-d3d12x/src/draw_diag.rs",
+]
+depends = ["graphics.console_proxies"]
+how = "Run d3d12xs_test, which runs a command list on a proxied queue on a real GPU."
+
+[[feature]]
+id = "graphics.descriptors"
+title = "Descriptors, views and samplers resolve to PC objects"
+area = "graphics"
+paths = [
+  "crates/decant-d3d12x/src/view_*.rs",
+  "crates/decant-d3d12x/src/views_at.rs",
+  "crates/decant-d3d12x/src/cbv_copies.rs",
+  "crates/decant-d3d12x/src/sampler_registry.rs",
+  "crates/decant-d3d12x/src/proxy/immediate_samplers.rs",
+  "crates/decant-d3d12x/src/proxy/heap_pages.rs",
+]
+depends = ["graphics.console_proxies"]
+how = "Run d3d12xs_test on a real GPU. The view tests inside decant-d3d12x need a device."
+
+[[feature]]
+id = "graphics.pipelines"
+title = "Pipelines are created when the title binds them"
+area = "graphics"
+paths = [
+  "crates/decant-d3d12x/src/lazy_pso.rs",
+  "crates/decant-d3d12x/src/stream_pso.rs",
+  "crates/decant-d3d12x/src/mesh_pso.rs",
+  "crates/decant-d3d12x/src/proxy/mesh_pipeline.rs",
+  "crates/decant-d3d12x/src/proxy/pso_cache.rs",
+  "crates/decant-d3d12x/src/pso_library.rs",
+  "crates/decant-d3d12x/src/pipeline_manifest.rs",
+  "crates/decant-d3d12x/src/bin/run/pipeline_slots.rs",
+]
+depends = ["graphics.root_signatures", "shaders.dxil"]
+how = "Start a title and read the pipeline and lazy pso lines of the log."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "direct_shaders_compiled"
+
+[[feature]]
+id = "graphics.frame_events"
+title = "Frame events and fences the title waits for are emulated"
+area = "graphics"
+paths = [
+  "crates/decant-d3d12x/src/frame.rs",
+  "crates/decant-d3d12x/src/fence_cell.rs",
+  "crates/decant-d3d12x/src/retire.rs",
+  "crates/decant-d3d12x/src/watchdog_hold.rs",
+]
+depends = ["graphics.console_proxies"]
+how = "Start a title and check that its frame loop does not stall. Unit tests inside decant-d3d12x cover the counters."
+
+[[feature]]
+id = "graphics.ray_tracing"
+title = "Ray tracing acceleration structures are built"
+area = "graphics"
+paths = ["crates/decant-bvh/**", "crates/decant-d3d12x/src/rt_diag.rs"]
+depends = ["graphics.device"]
+how = "Run decant_bvh_test on a real GPU. It builds one bottom level structure."
+
+[[feature]]
+id = "graphics.upscaling"
+title = "FidelityFX calls are forwarded to a PC backend"
+area = "graphics"
+paths = ["crates/decant-ffx/**"]
+how = "Run ffxtest with DECANT_FFX_BACKEND set. It checks context creation and jitter phases."
+
+# ---------------------------------------------------------------- presentation
+
+[[feature]]
+id = "present.window"
+title = "The title window is fitted and shown"
+area = "present"
+paths = ["crates/decant-d3d12x/src/window_service.rs", "crates/decant-d3d12x/src/service_mem.rs"]
+depends = ["graphics.device"]
+how = "Start a title and look for the window lines of the log."
+
+[[feature]]
+id = "present.swapchain"
+title = "A swap chain is made on the title window"
+area = "present"
+paths = ["crates/decant-d3d12x/src/present.rs"]
+depends = ["present.window"]
+how = "Start a title and wait for the swap chain line of the log."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "swapchain_created"
+
+[[feature]]
+id = "present.first_frame"
+title = "Frames reach the window"
+area = "present"
+paths = ["crates/decant-d3d12x/src/capture.rs", "crates/decant-d3d12x/src/flicker_probe.rs"]
+depends = ["present.swapchain", "graphics.pipelines", "graphics.frame_events"]
+how = "Start a title and wait for the first frame shown line of the log. Take a screenshot of the window."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "first_present"
+
+# ---------------------------------------------------------------- shaders
+
+[[feature]]
+id = "shaders.find"
+title = "Console shader code is found in a title and isolated"
+area = "shaders"
+paths = ["crates/decant-extract-shaders/**", "crates/decant-shader/src/container.rs"]
+how = "Run the extract tool on a file. The unit tests of both crates prove the container reading."
+
+[[feature]]
+id = "shaders.decode"
+title = "Console GPU machine code is decoded and lifted"
+area = "shaders"
+paths = [
+  "crates/decant-shader/src/decode/**",
+  "crates/decant-shader/src/asm/**",
+  "crates/decant-shader/src/lift/**",
+  "crates/decant-shader/src/ir/**",
+  "crates/decant-shader/src/tables/**",
+]
+depends = ["shaders.find"]
+how = "Run cargo test on decant-shader. The census tools count what decodes."
+
+[[feature]]
+id = "shaders.hlsl"
+title = "A pipeline of shaders is printed as HLSL"
+area = "shaders"
+paths = [
+  "crates/decant-shader/src/hlsl/**",
+  "crates/decant-shader/src/structure/**",
+  "crates/decant-shader/src/resource/**",
+  "crates/decant-shader/src/stage/**",
+  "crates/decant-shader/src/api.rs",
+  "crates/decant-shader/src/cfg.rs",
+]
+depends = ["shaders.decode"]
+how = "Run cargo test on decant-shader. docs/SHADER_TRANSLATOR.md says how to translate one shader."
+
+[[feature]]
+id = "shaders.dxil"
+title = "HLSL compiles to signed DXIL"
+area = "shaders"
+paths = ["crates/decant-dxc/**", "crates/decant-dxil/**"]
+depends = ["shaders.hlsl"]
+how = "Run the tests of decant-dxc and decant-dxil. They need dxcompiler.dll and dxil.dll at run time."
+
+[[feature]]
+id = "shaders.cache"
+title = "Translated shaders load from a cache"
+area = "shaders"
+paths = [
+  "crates/decant-shader/src/cache.rs",
+  "crates/decant-d3d12x/src/direct_cache.rs",
+  "crates/decant-d3d12x/tests/disk_cache.rs",
+  "crates/decant-shader-batch/**",
+]
+depends = ["shaders.dxil"]
+how = "Start a title twice and compare the direct shaders lines. decant_shader_warm builds the cache on a player machine."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "shader_cache_hit"
+
+[[feature]]
+id = "shaders.direct_path"
+title = "The layer hands translated shaders to pipeline creation"
+area = "shaders"
+paths = [
+  "crates/decant-d3d12x/src/direct_pso.rs",
+  "crates/decant-d3d12x/src/direct_source.rs",
+  "crates/decant-d3d12x/src/shader_source.rs",
+  "crates/decant-d3d12x/src/compile_service.rs",
+  "crates/decant-d3d12x/src/precompile_queue.rs",
+  "crates/decant-d3d12x/src/dxil_override.rs",
+]
+depends = ["shaders.dxil", "graphics.pipelines"]
+how = "Start a title with DECANT_D3D12X_DIRECT on and read the direct shaders lines of the log."
+
+[[feature]]
+id = "shaders.vkd3d_bridge"
+title = "Shaders fit the layout vkd3d-proton chose"
+area = "shaders"
+paths = ["crates/decant-shader-bridge/**", "crates/decant-shader-core/**", "third_party/vkd3d-proton/**"]
+depends = ["shaders.hlsl"]
+how = "Run the tests of decant-shader-bridge. On Linux the patched vkd3d-proton runs the result."
+
+[[feature]]
+id = "shaders.gpu_output"
+title = "Translated shaders give the expected pixels on a real GPU"
+area = "shaders"
+paths = [
+  "crates/decant-shader-ab/**",
+  "crates/decant-shader-bench/**",
+  "crates/decant-shader-harness/**",
+  "src/shaders/decant_shader/harness/**",
+  "crates/decant-spirv-exercise/**",
+]
+depends = ["shaders.dxil"]
+how = "Run run_tests and run_vkd3d_test as docs/GPU_TESTING.md says. decant_shader_ab compares two shaders."
+
+[[feature]]
+id = "shaders.census"
+title = "Translation coverage of a corpus is counted"
+area = "shaders"
+paths = [
+  "crates/decant-shader/src/census.rs",
+  "crates/decant-shader/src/census/**",
+  "crates/decant-shader/src/bin/**",
+  "crates/decant-shader-analysis/**",
+  "crates/decant-shader-tools/**",
+]
+depends = ["shaders.decode"]
+how = "Run decant_shader_direct_census on a folder of shader containers."
+
+# ---------------------------------------------------------------- textures
+
+[[feature]]
+id = "textures.layout"
+title = "Console texture layout and tiling are computed"
+area = "textures"
+paths = ["crates/decant-texture/**", "crates/decant-xg/**", "tests/detile_vectors.txt"]
+how = "Run cargo test on decant-texture and decant-xg. The XG exports are tested through the DLL."
+
+[[feature]]
+id = "textures.detile"
+title = "Tiled console textures are untiled on the GPU"
+area = "textures"
+paths = [
+  "crates/decant-d3d12x/src/detile.rs",
+  "crates/decant-d3d12x/src/detile_plan.rs",
+  "crates/decant-d3d12x/src/gpu_copy.rs",
+  "crates/decant-d3d12x/shaders/**",
+]
+depends = ["textures.layout", "graphics.device"]
+how = "Run d3d12xs_test. Start a title and read the detile lines of the log."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "textures_detiled"
+
+[[feature]]
+id = "textures.bcpack"
+title = "Compressed texture blocks are decoded"
+area = "textures"
+paths = ["crates/decant-bcpack/**"]
+how = "Run cargo test on decant-bcpack. It covers BC1, BC3, BC4, BC5, BC6H and BC7 on synthetic data."
+
+# ---------------------------------------------------------------- storage
+
+[[feature]]
+id = "storage.reads"
+title = "The title reads files through the console storage interface"
+area = "storage"
+paths = [
+  "crates/decant-dstorage/src/**",
+  "crates/decant-dstorage/abi/**",
+  "crates/decant-dstorage/tests/**",
+  "docs/DSTORAGE_ABI.md",
+]
+how = "Run dstoragetest and dstorage_abi_test. Start a title and read the DStorageGetFactory backend line."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "storage_backend_ready"
+
+[[feature]]
+id = "storage.second_name"
+title = "The storage interface is served under its second library name"
+area = "storage"
+paths = ["crates/decant-dstorage-xcrdapi/**"]
+depends = ["storage.reads"]
+how = "Build the crate and load xcrdapi.dll. The tests of decant-dstorage cover the shared code."
+
+[[feature]]
+id = "storage.compressed_reads"
+title = "Compressed reads are decoded in process"
+area = "storage"
+paths = ["crates/decant-dstorage/src/codecs.rs", "crates/decant-dstorage/src/libdeflate.rs"]
+depends = ["storage.reads", "textures.bcpack"]
+how = "Run dstoragetest, which reads zlib and GDeflate files. The engine tests cover the codecs."
+
+# ---------------------------------------------------------------- audio
+
+[[feature]]
+id = "audio.xaudio2"
+title = "Sound plays through the PC audio engine"
+area = "audio"
+paths = ["crates/decant-xaudio2/**"]
+how = "Run xaudio2test, which plays a 440 Hz sine. Start a title and listen."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "audio_voice_started"
+
+[[feature]]
+id = "audio.xma2_decode"
+title = "XMA2 audio is decoded to PCM"
+area = "audio"
+paths = ["crates/decant-xma/**", "crates/decant-xma2/**"]
+how = "Run xma2test on a RIFF XMA2 file. The decoder tests of decant-xma run without files."
+
+[[feature]]
+id = "audio.console_hardware"
+title = "Console audio hardware libraries answer"
+area = "audio"
+paths = ["crates/decant-acphal/**", "crates/decant-xapu/**", "docs/CONSOLE_LIBS.md", "docs/AUDIO_INPUT.md"]
+how = "Run cargo test on decant-acphal and decant-xapu. They test the exports of the libraries."
+
+[[feature]]
+id = "audio.dsp"
+title = "The console XDSP library convolves and transforms"
+area = "audio"
+paths = ["crates/decant-chad/**"]
+how = "Run cargo test on decant-chad. It covers convolution and the forward and inverse transforms."
+
+# ---------------------------------------------------------------- input
+
+[[feature]]
+id = "input.gamepad"
+title = "A controller drives the title"
+area = "input"
+paths = [
+  "crates/decant-gameinput/src/com.rs",
+  "crates/decant-gameinput/src/devices.rs",
+  "crates/decant-gameinput/src/lib.rs",
+  "crates/decant-gameinput/src/pad.rs",
+  "crates/decant-gameinput/src/runtime.rs",
+  "crates/decant-gameinput/tests/**",
+]
+how = "Write input with decant-pad and watch the title react. gameinputtest checks the API."
+
+[[feature.proof]]
+profile = "title"
+scenario = "menu"
+milestone = "pad_input_seen"
+
+[[feature]]
+id = "input.scripted_keys"
+title = "A timed key script gets the title past a menu"
+area = "input"
+paths = ["crates/decant-gameinput/src/keys.rs", "crates/decant-gameinput/src/bin/**"]
+depends = ["input.gamepad"]
+how = "Set DECANT_KEYS to timed presses and start the title. The unit tests of keys.rs prove the parsing."
+
+# ---------------------------------------------------------------- system
+
+[[feature]]
+id = "system.runtime_calls"
+title = "Game runtime calls are answered or logged and forwarded"
+area = "system"
+paths = [
+  "crates/decant-xgameruntime/src/exports.rs",
+  "crates/decant-xgameruntime/src/runtime_proxy*.rs",
+  "crates/decant-xgameruntime/src/calllog.rs",
+  "crates/decant-xgameruntime/src/tables.rs",
+  "crates/decant-xgameruntime/src/taskqueue.rs",
+  "crates/decant-xgameruntime/src/xasync.rs",
+  "crates/decant-xgameruntime/src/local_table.rs",
+  "crates/decant-xgameruntime/src/lib.rs",
+  "crates/decant-xgameruntime/src/bin/**",
+  "crates/decant-xgameruntime/tests/**",
+]
+how = "Run xgameruntime_test. Start a title and read the call log."
+
+[[feature]]
+id = "system.user"
+title = "One local user is signed in"
+area = "system"
+paths = ["crates/decant-xgameruntime/src/local_user.rs"]
+depends = ["system.runtime_calls"]
+how = "Start a title and look for its user sign in. xgameruntime_test checks the table."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "user_signed_in"
+
+[[feature]]
+id = "system.save_data"
+title = "Save data is written and read back"
+area = "system"
+paths = [
+  "crates/decant-xgameruntime/src/local_gamesave.rs",
+  "crates/decant-xgameruntime/src/local_gamesave_store.rs",
+  "crates/decant-xgameruntime/src/local_pls.rs",
+]
+depends = ["system.user"]
+how = "Save in the title, restart and load. The tests of the save store prove the folder layout."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "save_provider_opened"
+
+[[feature]]
+id = "system.offline_services"
+title = "Network, store, package and display questions get honest offline answers"
+area = "system"
+paths = [
+  "crates/decant-xgameruntime/src/local_networking.rs",
+  "crates/decant-xgameruntime/src/local_store.rs",
+  "crates/decant-xgameruntime/src/local_package.rs",
+  "crates/decant-xgameruntime/src/local_display.rs",
+  "crates/decant-xgameruntime/src/local_accessibility.rs",
+  "crates/decant-xgameruntime/src/local_system.rs",
+  "crates/decant-xgameruntime/src/local_title.rs",
+  "crates/decant-xgameruntime/src/local_game.rs",
+  "crates/decant-xgameruntime/src/console_mode.rs",
+]
+depends = ["system.runtime_calls"]
+how = "Run xgameruntime_test. The unit tests of each table prove its fixed answers."
+
+# ---------------------------------------------------------------- diagnostics
+
+[[feature]]
+id = "diagnostics.log"
+title = "Every layer writes one shared session log"
+area = "diagnostics"
+paths = ["crates/decant-log/**", "crates/decant-d3d12x/src/log.rs", "docs/DEBUG_TOOLS.md"]
+how = "Set DECANT_LOG_PATH and start any test program. The tests of decant-log prove the sinks."
+
+[[feature]]
+id = "diagnostics.trace"
+title = "A trace of the layers can be written and summarized"
+area = "diagnostics"
+paths = ["crates/decant-trace/**"]
+depends = ["diagnostics.log"]
+how = "Set DECANT_TRACE, run a title and open the Perfetto file or run decant_trace_summary."
+
+[[feature.proof]]
+profile = "title"
+scenario = "boot"
+milestone = "trace_written"
+
+[[feature]]
+id = "diagnostics.gpu_report"
+title = "A hardware tester gets an anonymous record of adapters and test outcomes"
+area = "diagnostics"
+paths = ["crates/decant-gpu-diag/**", "docs/GPU_TESTING.md"]
+how = "Run decant-gpu-diag as docs/GPU_TESTING.md says. Its sanitizer tests prove the allowlist."
+
+[[feature]]
+id = "diagnostics.smoketest"
+title = "Every staged library loads and passes light checks"
+area = "diagnostics"
+paths = ["crates/decant-smoketest/**", "crates/decant-testkit/**"]
+how = "Run gdk_smoketest in a folder with the built DLLs."
