@@ -75,10 +75,8 @@ const MESH_DESC_SIZE: usize = crate::mesh_pso::MESH_DESC_SIZE;
 /// Where the `D3D12_CACHED_PIPELINE_STATE` (blob pointer, blob size) of a description lies.
 pub fn cached_field(desc_len: usize) -> Option<usize> {
     match desc_len {
-        GRAPHICS_DESC_SIZE => Some(0x278),
+        GRAPHICS_DESC_SIZE | MESH_DESC_SIZE => Some(0x278),
         COMPUTE_DESC_SIZE => Some(0x20),
-        // The PC stream of a mesh pipeline carries no cached blob (see the module comment).
-        MESH_DESC_SIZE => None,
         _ => None,
     }
 }
@@ -101,6 +99,20 @@ fn masked_ranges(desc_len: usize) -> &'static [(usize, usize)] {
             (0x278, 0x288), // CachedPSO
             (0x28C, 0x290), // padding
         ],
+        MESH_DESC_SIZE => &[
+            (0x000, 0x008), // pRootSignature
+            (0x008, 0x058), // VS, PS, DS, HS, GS
+            (0x058, 0x060), // StreamOutput.pSODeclaration
+            (0x064, 0x068), // padding
+            (0x068, 0x070), // StreamOutput.pBufferStrides
+            (0x224, 0x228), // padding
+            (0x228, 0x230), // InputLayout.pInputElementDescs
+            (0x234, 0x238), // padding
+            (0x274, 0x278), // padding
+            (0x278, 0x288), // CachedPSO
+            (0x28C, 0x290), // padding
+            (GRAPHICS_DESC_SIZE, MESH_DESC_SIZE), // AS and MS D3D12_SHADER_BYTECODE
+        ],
         COMPUTE_DESC_SIZE => &[
             (0x00, 0x08), // pRootSignature
             (0x08, 0x18), // CS
@@ -116,10 +128,9 @@ fn masked_ranges(desc_len: usize) -> &'static [(usize, usize)] {
 /// `stages` the compiled bytes of its stages in order, `identity` the direct pipeline key (console
 /// stages, root signature layout and linkage). `None` for a pipeline the library does not keep.
 pub fn pipeline_key(desc: &[u8], stages: &[&[u8]], identity: u128) -> Option<u128> {
-    // Only descriptions with a `CachedPSO` field are keyed, which leaves mesh pipelines out.
     cached_field(desc.len())?;
     // Stream output declarations live behind pointers: not keyed, not kept.
-    if desc.len() == GRAPHICS_DESC_SIZE && u32::from_le_bytes(desc[0x60..0x64].try_into().ok()?) != 0 {
+    if (desc.len() == GRAPHICS_DESC_SIZE || desc.len() == MESH_DESC_SIZE) && u32::from_le_bytes(desc[0x60..0x64].try_into().ok()?) != 0 {
         return None;
     }
     let mut state = desc.to_vec();
@@ -631,9 +642,9 @@ mod tests {
     }
 
     #[test]
-    fn mesh_pipelines_get_no_key_and_no_cached_field() {
+    fn mesh_pipelines_get_a_key_and_cached_field() {
         use crate::mesh_pso::{AS_AT, MS_AT};
-        assert_eq!(cached_field(MESH_DESC_SIZE), None, "the PC mesh stream carries no cached blob");
+        assert_eq!(cached_field(MESH_DESC_SIZE), Some(0x278));
         // A mesh description as `mesh_pso` lays it out: the graphics part, then the amplification
         // and the mesh shader.
         let mut mesh = vec![0u8; MESH_DESC_SIZE];
@@ -643,7 +654,15 @@ mod tests {
             mesh[at + 8..at + 16].copy_from_slice(&64u64.to_le_bytes());
         }
         let stages: [&[u8]; 3] = [b"DXIL amplification", b"DXIL mesh", b"DXIL pixel"];
-        assert_eq!(pipeline_key(&mesh, &stages, 7), None);
+        let base = pipeline_key(&mesh, &stages, 7).expect("mesh pipeline should be keyed");
+        let mut other_ptrs = vec![0u8; MESH_DESC_SIZE];
+        other_ptrs[..GRAPHICS_DESC_SIZE].copy_from_slice(&graphics(0x99, 1));
+        for at in [AS_AT, MS_AT] {
+            other_ptrs[at..at + 8].copy_from_slice(&0x9000u64.to_le_bytes());
+            other_ptrs[at + 8..at + 16].copy_from_slice(&128u64.to_le_bytes());
+        }
+        assert_eq!(pipeline_key(&other_ptrs, &stages, 7), Some(base), "pointers and AS/MS bytecode fields are masked");
+        assert_ne!(pipeline_key(&mesh, &[b"DXIL amplification", b"DXIL mesh 2", b"DXIL pixel"], 7), Some(base));
     }
 
     #[test]

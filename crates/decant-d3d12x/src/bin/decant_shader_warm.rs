@@ -607,29 +607,65 @@ fn emit_progress(done: usize, total: usize, ready: u64, compiled: u64, cache_hit
 
 /// A pointer free description prepared without a device.
 #[cfg(any(windows, test))]
-fn prepare_pso(record: &Record, root: &RootLayout) -> Result<Vec<u8>, String> {
-    if !root.static_samplers.is_empty() {
-        return Err("root signature has static sampler bindings without descriptions".into());
-    }
+fn prepare_pso(record: &Record, _root: &RootLayout) -> Result<Vec<u8>, String> {
     let kinds: Vec<_> = record.stages.iter().map(|s| s.0).collect();
     if kinds != record.linkage.stages {
         return Err("stage linkage differs from the recorded stages".into());
     }
     let compute = kinds == [StageKind::Compute];
-    if !compute && (kinds.first() != Some(&StageKind::Vertex)
+    let mesh = kinds.contains(&StageKind::Mesh) || kinds.contains(&StageKind::Amplification);
+    if compute {
+        // Compute stage is valid.
+    } else if mesh {
+        let valid_mesh = kinds.contains(&StageKind::Mesh)
+            && kinds.iter().all(|k| matches!(k, StageKind::Amplification | StageKind::Mesh | StageKind::Pixel))
+            && kinds.iter().collect::<HashSet<_>>().len() == kinds.len();
+        if !valid_mesh {
+            return Err("unsupported mesh stage combination".into());
+        }
+    } else if kinds.first() != Some(&StageKind::Vertex)
         || kinds.iter().any(|k| matches!(k, StageKind::Compute | StageKind::Mesh | StageKind::Amplification))
-        || kinds.iter().collect::<HashSet<_>>().len() != kinds.len()) {
+        || kinds.iter().collect::<HashSet<_>>().len() != kinds.len()
+    {
         return Err("unsupported graphics stage combination".into());
     }
     if record.linkage.stream_output {
         return Err("stream output is not supported by the PSO cache".into());
     }
     let desc = match &record.pc_state {
+        Some(state) if mesh && state.description().len() == 0x290 => {
+            let mut full = vec![0; d3d12_xs::mesh_pso::MESH_DESC_SIZE];
+            full[..0x290].copy_from_slice(state.description());
+            full
+        }
         Some(state) => state.description().to_vec(),
         None if compute => vec![0; 0x38],
+        None if mesh => {
+            let mut full = vec![0; d3d12_xs::mesh_pso::MESH_DESC_SIZE];
+            let l = &record.linkage;
+            if l.targets.len() > 8 || l.sample_count == 0 {
+                return Err("mesh linkage has invalid render target or sample count".into());
+            }
+            full[0x1c0..0x1c4].copy_from_slice(&u32::MAX.to_le_bytes());
+            full[0x23c..0x240].copy_from_slice(&l.topology_type.to_le_bytes());
+            full[0x240..0x244].copy_from_slice(&(l.targets.len() as u32).to_le_bytes());
+            for (i, f) in l.targets.iter().enumerate() {
+                full[0x244 + 4 * i..0x248 + 4 * i].copy_from_slice(&f.to_le_bytes());
+            }
+            full[0x264..0x268].copy_from_slice(&l.depth_format.to_le_bytes());
+            full[0x268..0x26c].copy_from_slice(&l.sample_count.to_le_bytes());
+            full
+        }
         None => return Err("graphics pipeline needs version 2 full state".into()),
     };
-    if desc.len() != if compute { 0x38 } else { 0x290 } {
+    let expected_len = if compute {
+        0x38
+    } else if mesh {
+        d3d12_xs::mesh_pso::MESH_DESC_SIZE
+    } else {
+        0x290
+    };
+    if desc.len() != expected_len {
         return Err("PC state does not match the pipeline kind".into());
     }
     if !compute {
@@ -638,7 +674,8 @@ fn prepare_pso(record: &Record, root: &RootLayout) -> Result<Vec<u8>, String> {
         if l.targets.len() > 8 || l.inputs.len() > 32 || l.sample_count == 0
             || n(0x230) as usize != l.inputs.len() || n(0x240) as usize != l.targets.len()
             || n(0x23c) != l.topology_type || n(0x264) != l.depth_format || n(0x268) != l.sample_count
-            || l.targets.iter().enumerate().any(|(i, f)| n(0x244 + 4 * i) != *f) {
+            || l.targets.iter().enumerate().any(|(i, f)| n(0x244 + 4 * i) != *f)
+        {
             return Err("PC graphics state differs from linkage".into());
         }
     }
@@ -739,7 +776,21 @@ mod offline_pso {
     }
 
     fn root_signature(device: &ID3D12Device, layout: &RootLayout) -> Result<ID3D12RootSignature, String> {
-        if !layout.static_samplers.is_empty() { return Err("static sampler descriptions unavailable".into()) }
+        let static_samplers: Vec<_> = layout.static_samplers.iter().map(|s| D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MipLODBias: 0.0,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+            BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+            MinLOD: 0.0,
+            MaxLOD: f32::MAX,
+            ShaderRegister: s.register,
+            RegisterSpace: s.space,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY(s.visibility as i32),
+        }).collect();
         let ranges: Vec<Vec<D3D12_DESCRIPTOR_RANGE1>> = layout.params.iter().map(|p| {
             if let RootParamKind::Table(ranges) = &p.kind {
                 ranges.iter().map(|r| D3D12_DESCRIPTOR_RANGE1 {
@@ -761,8 +812,10 @@ mod offline_pso {
         }).collect();
         let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC { Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
             Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 { Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
-                NumParameters: params.len() as u32, pParameters: params.as_ptr(), NumStaticSamplers: 0,
-                pStaticSamplers: std::ptr::null(), Flags: D3D12_ROOT_SIGNATURE_FLAGS(layout.flags as i32),
+                NumParameters: params.len() as u32, pParameters: params.as_ptr(),
+                NumStaticSamplers: static_samplers.len() as u32,
+                pStaticSamplers: if static_samplers.is_empty() { std::ptr::null() } else { static_samplers.as_ptr() },
+                Flags: D3D12_ROOT_SIGNATURE_FLAGS(layout.flags as i32),
             } } };
         let serialize = export(c"D3D12SerializeVersionedRootSignature").ok_or("system root signature serializer unavailable")?;
         let (mut raw, mut errors) = (std::ptr::null_mut(), std::ptr::null_mut());
@@ -789,13 +842,21 @@ mod offline_pso {
         let mut bytes = desc.to_vec();
         bytes[..8].copy_from_slice(&(root.as_raw() as u64).to_le_bytes());
         for ((kind, _), stage) in record.stages.iter().zip(stages) {
-            let at = match kind { StageKind::Vertex | StageKind::Compute => 8, StageKind::Pixel => 24, StageKind::Domain => 40, StageKind::Hull => 56, StageKind::Geometry => 72, _ => return Err("unsupported PSO stage".into()) };
+            let at = match kind {
+                StageKind::Vertex | StageKind::Compute => 8,
+                StageKind::Pixel => d3d12_xs::mesh_pso::PS_AT,
+                StageKind::Domain => 40,
+                StageKind::Hull => 56,
+                StageKind::Geometry => 72,
+                StageKind::Amplification => d3d12_xs::mesh_pso::AS_AT,
+                StageKind::Mesh => d3d12_xs::mesh_pso::MS_AT,
+            };
             bytes[at..at + 8].copy_from_slice(&(stage.as_ptr() as u64).to_le_bytes());
             bytes[at + 8..at + 16].copy_from_slice(&(stage.len() as u64).to_le_bytes());
         }
-        if bytes.len() == 0x290 {
+        if bytes.len() >= 0x290 {
             bytes[0x228..0x230].copy_from_slice(&(inputs.as_ptr() as u64).to_le_bytes());
-            let graphics: &mut [u8; 0x290] = bytes.as_mut_slice().try_into().map_err(|_| "graphics description size")?;
+            let graphics: &mut [u8; 0x290] = (&mut bytes[..0x290]).try_into().map_err(|_| "graphics description size")?;
             d3d12_xs::stream_pso::valid_states(graphics);
         }
         if let Some(blob) = blob {
@@ -809,6 +870,15 @@ mod offline_pso {
         unsafe {
             if bytes.len() == 0x38 {
                 device.CreateComputePipelineState(&*aligned.as_ptr().cast::<D3D12_COMPUTE_PIPELINE_STATE_DESC>())
+            } else if bytes.len() == d3d12_xs::mesh_pso::MESH_DESC_SIZE {
+                let mesh_arr: &[u8; d3d12_xs::mesh_pso::MESH_DESC_SIZE] = bytes.as_slice().try_into().map_err(|_| "mesh description size")?;
+                let mut stream = d3d12_xs::mesh_pso::pc_stream(mesh_arr);
+                let dev2: ID3D12Device2 = device.cast().map_err(|e| e.to_string())?;
+                let stream_desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+                    SizeInBytes: stream.len(),
+                    pPipelineStateSubobjectStream: stream.as_mut_ptr().cast(),
+                };
+                dev2.CreatePipelineState(&stream_desc)
             } else {
                 device.CreateGraphicsPipelineState(&*aligned.as_ptr().cast::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>())
             }.map_err(|e| e.to_string())
@@ -1215,9 +1285,15 @@ mod tests {
         record.pc_state = graphics.pc_state.clone();
         assert!(prepare_pso(&record, &root).is_err());
         record.pc_state = None;
-        let mut sampler_root = root;
+        let mut sampler_root = root.clone();
         sampler_root.static_samplers.push(d3d12_xs::rts0::StaticSampler { register: 0, space: 0, visibility: 0 });
-        assert!(prepare_pso(&record, &sampler_root).unwrap_err().contains("sampler"));
+        assert_eq!(prepare_pso(&record, &sampler_root).unwrap(), vec![0; 0x38]);
+
+        let mesh = pipeline_manifest::parse_pipeline("P - topo=3 msaa=1 ds=40 rt=28 so=0 in= AS 0000000000000001 MS 0000000000000002 PS 0000000000000003").unwrap();
+        let mesh_desc = prepare_pso(&mesh, &sampler_root).unwrap();
+        assert_eq!(mesh_desc.len(), d3d12_xs::mesh_pso::MESH_DESC_SIZE);
+        let mesh_stages: [&[u8]; 3] = [b"compiled amp", b"compiled mesh", b"compiled pixel"];
+        assert!(d3d12_xs::pso_library::pipeline_key(&mesh_desc, &mesh_stages, 9).is_some());
     }
 
     #[test]
