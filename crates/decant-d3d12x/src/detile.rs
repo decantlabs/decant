@@ -963,11 +963,13 @@ pub fn may_overlap_tile(tile: u32) -> bool {
 }
 
 fn rebuild_coarse_tile_bits(tile_to_textures: &FastMap<u32, TileRefs>) {
-    for word in &COARSE_TILE_BITS {
-        word.store(0, Ordering::Relaxed);
-    }
+    let mut bits = [0u64; COARSE_TILE_WORDS];
     for &tile in tile_to_textures.keys() {
-        coarse_tile_set(tile);
+        let (word, mask) = coarse_tile_bit(tile);
+        bits[word] |= mask;
+    }
+    for (slot, &val) in COARSE_TILE_BITS.iter().zip(&bits) {
+        slot.store(val, Ordering::Relaxed);
     }
 }
 
