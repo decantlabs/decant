@@ -746,6 +746,50 @@ fn swizzle(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
     Ok(true)
 }
 
+fn successors(block: &crate::cfg::Block) -> [Option<usize>; 2] {
+    match block.term {
+        crate::cfg::Term::End => [None, None],
+        crate::cfg::Term::Jump(t) => [Some(t), None],
+        crate::cfg::Term::Branch { taken, fall, .. } => [Some(taken), Some(fall)],
+    }
+}
+
+fn reaches_from_succ(graph: &crate::cfg::Cfg, start: usize, target: usize) -> bool {
+    let mut seen = vec![false; graph.blocks.len()];
+    let mut stack: Vec<usize> = successors(&graph.blocks[start]).into_iter().flatten().collect();
+    while let Some(b) = stack.pop() {
+        if b == target {
+            return true;
+        }
+        if !seen[b] {
+            seen[b] = true;
+            stack.extend(successors(&graph.blocks[b]).into_iter().flatten());
+        }
+    }
+    false
+}
+
+fn post_dominates(graph: &crate::cfg::Cfg, dom: usize, start: usize) -> bool {
+    if dom == start {
+        return true;
+    }
+    let mut seen = vec![false; graph.blocks.len()];
+    seen[dom] = true;
+    let mut stack = vec![start];
+    while let Some(b) = stack.pop() {
+        if matches!(graph.blocks[b].term, crate::cfg::Term::End) {
+            return false;
+        }
+        for succ in successors(&graph.blocks[b]).into_iter().flatten() {
+            if !seen[succ] {
+                seen[succ] = true;
+                stack.push(succ);
+            }
+        }
+    }
+    true
+}
+
 /// Native lane reads permit scalar control flow when its condition is uniform.
 /// Mask tests and scalar wave substitutions can make that condition differ by invocation.
 /// Refuse those combinations before structuring the control flow.
@@ -760,19 +804,32 @@ pub(crate) fn check_dpp_context(
         Operand::Reg(Reg::S(n)) => masks.reads_mask(n),
         _ => false,
     };
-    if graph.blocks.iter().any(|block| {
+    let is_lane_branch = |b: usize| {
         matches!(
-            block.term,
+            graph.blocks[b].term,
             crate::cfg::Term::Branch {
                 cond: crate::cfg::Cond::ExecZero(_) | crate::cfg::Cond::VccZero(_),
                 ..
             }
         )
-    }) {
-        return Err(Refusal::new(
-            RefusalKind::Exec("dpp-control-flow"),
-            "native DPP requires converged compute control flow",
-        ));
+    };
+    let has_dpp = |b: usize| {
+        graph.blocks[b].insns.iter().any(|insn| {
+            matches!(insn.form, crate::decode::Form::Dpp16 | crate::decode::Form::Dpp8)
+                || matches!(insn.op, Op::v_permlane16_b32 | Op::v_permlanex16_b32 | Op::ds_bpermute_b32)
+        })
+    };
+    for b in 0..graph.blocks.len() {
+        if has_dpp(b)
+            && (0..graph.blocks.len()).any(|br| {
+                is_lane_branch(br) && reaches_from_succ(graph, br, b) && !post_dominates(graph, b, br)
+            })
+        {
+            return Err(Refusal::new(
+                RefusalKind::Exec("dpp-control-flow"),
+                "native DPP requires converged compute control flow",
+            ));
+        }
     }
     for insn in graph.insns() {
         masks.enter(insn.pc);
@@ -1338,5 +1395,37 @@ pub fn lift(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
             }
         }
         _ => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asm::*;
+
+    #[test]
+    fn converged_dpp_allows_unrelated_execz_branch_and_still_refuses_divergent_dpp() {
+        let mut converged = Asm::new();
+        let skip = converged.label();
+        let join = converged.label();
+        converged.branch(Op::s_cbranch_execz, skip);
+        converged.push(vop1(Op::v_mov_b32, v(3), v(1)));
+        converged.branch(Op::s_branch, join);
+        converged.bind(skip);
+        converged.push(vop1(Op::v_mov_b32, v(3), v(2)));
+        converged.bind(join);
+        converged.push(dpp16(Op::v_add_u32, v(2), v(0), v(3), 0xff08_b100));
+        converged.push(sopp(Op::s_endpgm, 0));
+        let converged_prog = crate::api::StageProgram::new(Stage::Compute, converged.finish());
+        assert!(crate::lift_program(&converged_prog).is_ok());
+
+        let mut divergent = Asm::new();
+        let done = divergent.label();
+        divergent.branch(Op::s_cbranch_execz, done);
+        divergent.push(dpp16(Op::v_add_u32, v(2), v(0), v(1), 0xff08_b100));
+        divergent.bind(done);
+        divergent.push(sopp(Op::s_endpgm, 0));
+        let divergent_prog = crate::api::StageProgram::new(Stage::Compute, divergent.finish());
+        assert_eq!(crate::lift_program(&divergent_prog).unwrap_err().key(), "exec:dpp-control-flow");
     }
 }

@@ -811,6 +811,8 @@ struct Group {
     sure: bool,
     /// What it reads and what reads it have no kind in common.
     clash: bool,
+    /// Whether any definition in this group is read by a later instruction.
+    def_live: bool,
 }
 
 impl Group {
@@ -1711,6 +1713,59 @@ impl Typing<'_> {
         changed
     }
 
+    /// Which locations are read by any later instruction before being redefined.
+    fn live_outs(&self) -> Vec<Bits> {
+        let n = self.spans.len();
+        let mut kill = vec![Bits::NONE; n];
+        let mut used = vec![Bits::NONE; n];
+        for (b, list) in self.spans.iter().enumerate() {
+            for span in list.iter().rev() {
+                for t in self.own(span).iter().filter(|t| t.def) {
+                    kill[b].put(t.loc, true);
+                    used[b].put(t.loc, false);
+                }
+                for t in self.own(span).iter().filter(|t| !t.def) {
+                    used[b].put(t.loc, true);
+                }
+            }
+        }
+        let successors = |b: usize| -> [Option<usize>; 2] {
+            match self.cfg.blocks[b].term {
+                Term::End => [None, None],
+                Term::Jump(t) => [Some(t), None],
+                Term::Branch { taken, fall, .. } => [Some(taken), Some(fall)],
+            }
+        };
+        let mut outs = vec![Bits::NONE; n];
+        let mut ins = vec![Bits::NONE; n];
+        for b in 0..n {
+            for w in 0..ins[b].0.len() {
+                ins[b].0[w] = (outs[b].0[w] & !kill[b].0[w]) | used[b].0[w];
+            }
+        }
+        loop {
+            let mut changed = false;
+            for b in (0..n).rev() {
+                let mut new = Bits::NONE;
+                for s in successors(b).into_iter().flatten() {
+                    for w in 0..new.0.len() {
+                        new.0[w] |= ins[s].0[w];
+                    }
+                }
+                if new != outs[b] {
+                    outs[b] = new;
+                    for w in 0..ins[b].0.len() {
+                        ins[b].0[w] = (new.0[w] & !kill[b].0[w]) | used[b].0[w];
+                    }
+                    changed = true;
+                }
+            }
+            if !changed {
+                return outs;
+            }
+        }
+    }
+
     /// Narrows the groups by what reads their results. Whether a group changed.
     fn narrow_by_readers(&mut self, outs: &[Kinds]) -> bool {
         let mut changed = false;
@@ -1881,6 +1936,7 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
                     kinds: ANY,
                     sure: false,
                     clash: false,
+                    def_live: false,
                 }; 2],
             );
             for t in own.iter_mut().filter(|t| t.role == Role::Same) {
@@ -1946,12 +2002,38 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
             break;
         }
     }
-    // A group nothing sure reaches is a number from here on (see `Group::verdict`), also for
-    // the instructions that read its result.
-    for g in &mut typing.groups {
-        if !g.clash && !g.sure && g.kinds.count_ones() != 1 {
-            g.kinds = NUMBER;
+    let live_outs = typing.live_outs();
+    for (b, end) in live_outs.iter().enumerate() {
+        let mut live = *end;
+        for span in typing.spans[b].iter().rev() {
+            let own = &typing.touches[span.start..span.end];
+            for t in own.iter().filter(|t| t.def && t.role == Role::Same) {
+                if live.has(t.loc) {
+                    typing.groups[t.group as usize].def_live = true;
+                }
+            }
+            for t in own.iter().filter(|t| t.def) {
+                live.put(t.loc, false);
+            }
+            for t in own.iter().filter(|t| !t.def) {
+                live.put(t.loc, true);
+            }
         }
+    }
+    // A group nothing sure reaches, or whose result is never read, is a number from here on.
+    let mut resolved_dead = false;
+    for g in &mut typing.groups {
+        if !g.clash && (!g.def_live || (!g.sure && g.kinds.count_ones() != 1)) {
+            if !g.def_live && g.kinds != NUMBER {
+                resolved_dead = true;
+            }
+            g.kinds = NUMBER;
+            g.sure = false;
+        }
+    }
+    if resolved_dead {
+        let outs = typing.backward();
+        typing.narrow_by_readers(&outs);
     }
     let ins = typing.forward();
     let later = typing.later_readers(&typing.backward());
@@ -2071,5 +2153,26 @@ mod tests {
         assert!(masks.reads_mask(26));
         assert!(masks.writes_mask(40));
         assert_eq!(masks.refusal(), None);
+    }
+
+    #[test]
+    fn move_b64_with_mixed_provenance_and_dead_result_does_not_refuse_mixed_pair() {
+        let mut a = Asm::new();
+        let numeric = a.label();
+        let join = a.label();
+        a.push(sopc(Op::s_cmp_eq_u32, s(0), int(0)));
+        a.branch(Op::s_cbranch_scc1, numeric);
+        a.push(sop1(Op::s_mov_b64, s(32), EXEC));
+        a.branch(Op::s_branch, join);
+        a.bind(numeric);
+        a.push(sop1(Op::s_mov_b64, s(32), int(0)));
+        a.bind(join);
+        a.push(sop1(Op::s_mov_b64, s(62), s(32)));
+        let (graph, masks) = analyse_asm(a);
+        assert_eq!(masks.lanes(), 64);
+        for insn in graph.insns() {
+            masks.enter(insn.pc);
+            assert_eq!(masks.refusal(), None, "{insn}");
+        }
     }
 }
