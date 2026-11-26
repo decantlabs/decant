@@ -97,6 +97,7 @@ mod lazy_pso;
 mod log;
 #[cfg(windows)]
 mod proxy;
+mod queue_fifo;
 #[cfg(windows)]
 mod pso_diag;
 #[cfg(windows)]

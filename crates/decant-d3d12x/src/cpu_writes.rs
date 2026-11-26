@@ -15,12 +15,16 @@
 //! `QueryPerformanceCounter` value, and the counter now is converted into GPU ticks. The result is a
 //! little later than the moment the GPU reached the write and never earlier. The values advance at
 //! the rate of the GPU clock frequency that the title asked for.
+//!
+//! The memory waits of the title (`list_sync::PendingWait`) are answered here too ([`wait_until`]).
+//! Every set of writes wakes them, so a queue worker (`queue_fifo`) that waits for a value runs
+//! its list as soon as the write it waits for is made.
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use windows_sys::core::{GUID, HRESULT};
@@ -31,7 +35,7 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-use crate::list_sync::{CpuWrite, PendingWait};
+use crate::list_sync::{CpuWrite, PendingWait, WaitLimits};
 use crate::log::xs_log;
 
 type Object = *mut c_void;
@@ -165,17 +169,58 @@ impl Job {
                 }
             }
         }
-        let mut cached_region: Option<(usize, usize)> = None;
-        for (va, words) in &self.writes {
-            if !words.is_empty() {
-                // SAFETY: the target is checked against the title's memory before the store.
-                unsafe { write_now_cached(*va, words, &mut cached_region) };
-            } else if let Some(clock) = self.clock {
-                let tick = clock.gpu_at(counter_now());
-                // SAFETY: as above.
-                unsafe { write_now_cached(*va, &[tick as u32, (tick >> 32) as u32], &mut cached_region) };
-            }
+        apply_writes(&self.writes, self.clock);
+    }
+}
+
+/// Makes `writes` now, in order, and wakes the memory waits ([`wait_until`]). A timestamp write
+/// takes the GPU clock from `clock`, and is left out without one.
+pub(crate) fn apply_writes(writes: &[CpuWrite], clock: Option<Clock>) {
+    let mut cached_region: Option<(usize, usize)> = None;
+    for (va, words) in writes {
+        if !words.is_empty() {
+            // SAFETY: the target is checked against the title's memory before the store.
+            unsafe { write_now_cached(*va, words, &mut cached_region) };
+        } else if let Some(clock) = clock {
+            let tick = clock.gpu_at(counter_now());
+            // SAFETY: as above.
+            unsafe { write_now_cached(*va, &[tick as u32, (tick >> 32) as u32], &mut cached_region) };
         }
+    }
+    wake_waits();
+}
+
+/// Submissions whose writes are not made yet: sent to the worker, not yet run by it.
+static PENDING_JOBS: AtomicUsize = AtomicUsize::new(0);
+
+/// A count of the times writes were made, and the waits that sleep until it moves.
+fn writes_made() -> &'static (Mutex<u64>, Condvar) {
+    static MADE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+    MADE.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+fn writes_count() -> u64 {
+    *writes_made().0.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Wakes every memory wait, so it reads its value again at once.
+fn wake_waits() {
+    let (count, changed) = writes_made();
+    *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    changed.notify_all();
+}
+
+/// Sleeps until writes are made after the count `seen`, for at most `timeout`.
+fn sleep_until_written(seen: u64, timeout: Duration) {
+    let (count, changed) = writes_made();
+    let deadline = Instant::now() + timeout;
+    let mut now_count = count.lock().unwrap_or_else(|e| e.into_inner());
+    while *now_count == seen {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        now_count = changed.wait_timeout(now_count, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
 
@@ -191,6 +236,8 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
             for job in jobs {
                 // SAFETY: `QUEUES` keeps the fences alive for the process.
                 unsafe { job.run(event) };
+                PENDING_JOBS.fetch_sub(1, Ordering::AcqRel);
+                wake_waits();
             }
         });
         if let Err(e) = started {
@@ -295,19 +342,29 @@ pub(crate) fn satisfied(wait: &PendingWait) -> bool {
     read_title(wait.va as usize, usize::from(wait.width)).is_none_or(|current| wait.satisfied_by(current))
 }
 
-/// Checks `wait` again and again until the memory meets it or `timeout` is over. Returns whether
-/// it was met.
-pub(crate) fn wait_until(wait: &PendingWait, timeout: Duration) -> bool {
+/// The longest a memory wait sleeps before it reads its value again although no write of this
+/// module was made: the title's own threads may write the value too, and they wake nobody.
+const RECHECK: Duration = Duration::from_millis(2);
+
+/// Waits until the memory meets `wait`. Returns whether it was met. Each write this module makes
+/// wakes the wait at once. It gives up after `limits.hard`, or after `limits.idle` when no write of
+/// this module is on its way and `elsewhere()` (other work that might still write it) says no.
+/// Called by the worker of a queue (`queue_fifo`), never on the title's thread.
+pub(crate) fn wait_until(wait: &PendingWait, limits: WaitLimits, elsewhere: impl Fn() -> bool) -> bool {
     let started = Instant::now();
     loop {
+        let seen = writes_count();
         if satisfied(wait) {
             return true;
         }
         let waited = started.elapsed();
-        if waited >= timeout {
+        if waited >= limits.hard {
             return false;
         }
-        std::thread::sleep(if waited < Duration::from_millis(10) { Duration::from_micros(100) } else { Duration::from_millis(1) });
+        if waited >= limits.idle && PENDING_JOBS.load(Ordering::Acquire) == 0 && !elsewhere() {
+            return false;
+        }
+        sleep_until_written(seen, (limits.hard - waited).min(RECHECK));
     }
 }
 
@@ -416,7 +473,10 @@ pub(crate) unsafe fn after(queue: Object, writes: Vec<CpuWrite>) {
     if ANNOUNCED.fetch_add(1, Ordering::Relaxed) < 3 {
         xs_log!("bottom-of-pipe writes outside the GPU's memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len());
     }
-    let _ = worker().lock().unwrap_or_else(|e| e.into_inner()).send(job);
+    PENDING_JOBS.fetch_add(1, Ordering::AcqRel);
+    if worker().lock().unwrap_or_else(|e| e.into_inner()).send(job).is_err() {
+        PENDING_JOBS.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[cfg(test)]
@@ -460,20 +520,56 @@ mod tests {
         assert!(satisfied(&at_least_5));
         assert!(!satisfied(&PendingWait { value: 6, ..at_least_5 }));
         assert!(satisfied(&PendingWait { va: 0, ..at_least_5 }), "nothing the CPU could wait for");
-        assert!(wait_until(&at_least_5, Duration::ZERO));
-        assert!(!wait_until(&PendingWait { value: 6, ..at_least_5 }, Duration::from_millis(5)));
+        let no_time = WaitLimits { idle: Duration::ZERO, hard: Duration::ZERO };
+        assert!(wait_until(&at_least_5, no_time, || false));
+        let short = WaitLimits { idle: Duration::from_millis(5), hard: Duration::from_millis(5) };
+        assert!(!wait_until(&PendingWait { value: 6, ..at_least_5 }, short, || true));
     }
 
     #[test]
-    fn a_waiting_thread_sees_the_value_arrive() {
+    fn a_waiting_thread_sees_a_value_the_title_stores() {
         let cell: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
         let wait = PendingWait { va: cell.as_ptr() as u64, width: 8, comparison: 3, value: 9, mask: u64::MAX };
         let setter = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             cell.store(9, Ordering::Release);
         });
-        assert!(wait_until(&wait, Duration::from_secs(5)));
+        let limits = WaitLimits { idle: Duration::from_secs(5), hard: Duration::from_secs(5) };
+        assert!(wait_until(&wait, limits, || false), "a store that wakes nobody is seen at the next check");
         setter.join().unwrap();
+    }
+
+    #[test]
+    fn a_write_of_this_module_wakes_the_wait_at_once() {
+        let cell: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+        let va = cell.as_ptr() as usize;
+        let wait = PendingWait { va: va as u64, width: 8, comparison: 7, value: 3, mask: u64::MAX };
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let at = Instant::now();
+            apply_writes(&[(va, vec![3, 0])], None);
+            at
+        });
+        let limits = WaitLimits { idle: Duration::from_secs(5), hard: Duration::from_secs(5) };
+        assert!(wait_until(&wait, limits, || false));
+        let woke = Instant::now();
+        let written = writer.join().unwrap();
+        let latency = woke.saturating_duration_since(written);
+        assert!(latency < Duration::from_millis(50), "woke {latency:?} after the write");
+    }
+
+    #[test]
+    fn a_wait_gives_up_early_only_when_no_producer_can_come() {
+        let cell = Box::new(0u64);
+        let wait = PendingWait { va: &*cell as *const u64 as u64, width: 8, comparison: 7, value: 1, mask: u64::MAX };
+        let limits = WaitLimits { idle: Duration::from_millis(10), hard: Duration::from_millis(300) };
+        let begun = Instant::now();
+        assert!(!wait_until(&wait, limits, || false));
+        let idle_end = begun.elapsed();
+        assert!(idle_end < Duration::from_millis(250), "nothing can write it, so the idle limit ends the wait ({idle_end:?})");
+        let begun = Instant::now();
+        assert!(!wait_until(&wait, limits, || true));
+        assert!(begun.elapsed() >= Duration::from_millis(300), "work elsewhere may still write it, so the wait runs to its hard limit");
     }
 
     #[test]

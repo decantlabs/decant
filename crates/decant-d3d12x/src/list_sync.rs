@@ -5,16 +5,48 @@
 //! such values (`Wait32/64BitValueX`, slots 73 and 74). The PC GPU has no access to that memory, so
 //! the layer keeps the writes and the waits next to the list that recorded them. The CPU makes the
 //! writes once the submission has finished (`cpu_writes`) and checks the waits before it submits.
+//! A submission whose waits are not met yet is queued on its queue (`queue_fifo`) and its worker
+//! waits for them, so the title's thread never waits on a memory wait.
 //!
 //! The state is a table keyed by the address of the list proxy. A reset of the list drops all of it.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-/// How long a memory wait of the title may hold a list back before the list runs anyway.
-pub const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a memory wait may hold a list back when nothing that could still write the value is
+/// on its way (no write of `cpu_writes` pending, no work queued on another queue).
+pub const WAIT_IDLE: Duration = Duration::from_millis(200);
+/// How long a memory wait may hold a list back at most before the list runs anyway.
+pub const WAIT_HARD: Duration = Duration::from_secs(2);
+
+/// The limits of one memory wait (see `cpu_writes::wait_until`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitLimits {
+    pub idle: Duration,
+    pub hard: Duration,
+}
+
+/// The limits from the settings `DECANT_D3D12X_MEMORY_WAIT_MS` (hard) and
+/// `DECANT_D3D12X_MEMORY_WAIT_IDLE_MS` (idle), given as milliseconds. A missing or unparsable
+/// setting keeps its default. The idle limit is never above the hard one.
+pub fn limits_from(hard: Option<&str>, idle: Option<&str>) -> WaitLimits {
+    let ms = |text: Option<&str>| text.and_then(|t| t.trim().parse::<u64>().ok()).map(Duration::from_millis);
+    let hard = ms(hard).unwrap_or(WAIT_HARD);
+    let idle = ms(idle).unwrap_or(WAIT_IDLE).min(hard);
+    WaitLimits { idle, hard }
+}
+
+/// The limits of the memory waits of this process, read from the settings once.
+pub fn wait_limits() -> WaitLimits {
+    static LIMITS: OnceLock<WaitLimits> = OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let hard = std::env::var("DECANT_D3D12X_MEMORY_WAIT_MS").ok();
+        let idle = std::env::var("DECANT_D3D12X_MEMORY_WAIT_IDLE_MS").ok();
+        limits_from(hard.as_deref(), idle.as_deref())
+    })
+}
 
 /// A write the CPU makes after the GPU: the title address and the dwords stored there in order.
 /// An empty dword list is a GPU timestamp: eight bytes that the CPU fills from the GPU clock at the
@@ -168,6 +200,11 @@ pub fn waits_of(list: usize) -> Vec<PendingWait> {
     peek(list, |r| r.waits.clone()).unwrap_or_default()
 }
 
+/// Whether every wait recorded on `list` passes `met`. A list without waits passes.
+pub fn all_waits(list: usize, met: impl Fn(&PendingWait) -> bool) -> bool {
+    peek(list, |r| r.waits.iter().all(&met)).unwrap_or(true)
+}
+
 /// Whether `list` holds a CPU write that overlaps `[va, va + bytes)`. Such a write only happens
 /// after the list ran, so a wait on that memory in the same list can never be met beforehand and the
 /// caller must not record it.
@@ -270,9 +307,21 @@ mod tests {
         record_wait(0x4_0000, wait(1));
         record_wait(0x4_0000, wait(2));
         assert_eq!(waits_of(0x4_0000), [wait(1), wait(2)]);
+        assert!(all_waits(0x4_0000, |w| w.va > 0));
+        assert!(!all_waits(0x4_0000, |w| w.va == 1));
         assert!(waits_of(0x4_0001).is_empty());
+        assert!(all_waits(0x4_0001, |_| false), "a list without waits passes");
         forget(0x4_0000);
         assert!(waits_of(0x4_0000).is_empty());
+    }
+
+    #[test]
+    fn wait_limits_take_the_settings_or_the_defaults() {
+        assert_eq!(limits_from(None, None), WaitLimits { idle: WAIT_IDLE, hard: WAIT_HARD });
+        assert_eq!(limits_from(Some(" 500 "), Some("50")), WaitLimits { idle: Duration::from_millis(50), hard: Duration::from_millis(500) });
+        assert_eq!(limits_from(Some("100"), None), WaitLimits { idle: Duration::from_millis(100), hard: Duration::from_millis(100) }, "idle never above hard");
+        assert_eq!(limits_from(Some("soon"), Some("-1")), WaitLimits { idle: WAIT_IDLE, hard: WAIT_HARD });
+        assert_eq!(limits_from(Some("0"), None).hard, Duration::ZERO, "0 runs every list at once");
     }
 
     #[test]

@@ -503,11 +503,18 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
             crate::rt_diag::forget(proxy.pc as usize);
             crate::present::forget_resource(proxy.pc as usize);
         }
+        if proxy.kind == Kind::Queue as i32 {
+            // its queued work holds the PC queue and still runs
+            crate::queue_fifo::close(proxy.pc as usize);
+        }
         // SAFETY: the last reference is gone, so the PC object is released and the memory freed once.
         // Any object but the device is released once the GPU is past the work in flight now
         // (`retire`): the title's lists may still use it, as they may on the console.
         unsafe {
             if proxy.kind == Kind::Device as i32 {
+                if !crate::queue_fifo::drain_all(crate::list_sync::wait_limits().hard * 2) {
+                    xs_log!("device release: queued work of its queues did not finish in time");
+                }
                 crate::retire::flush(proxy.pc);
                 method::<Release>(proxy.pc, 2)(proxy.pc);
             } else if let Some(charge) = side.charge {
@@ -3810,9 +3817,16 @@ unsafe fn bound_at_reset(this: *mut Proxy, pso: Object) -> Object {
 }
 
 /// Resets list `this` with `allocator` and `pso` (proxies or PC objects): every table of the layer
-/// that follows the recording of a list forgets it, then the PC list is reset.
+/// that follows the recording of a list forgets it, then the PC list is reset. A queued submission
+/// of the list (`queue_fifo`) runs first, because the PC list is only read when it does.
 fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
     let key = this as usize;
+    if !crate::queue_fifo::wait_lists_idle(key, crate::list_sync::wait_limits().hard * 2) {
+        static N: AtomicI32 = AtomicI32::new(0);
+        if log_due(&N) {
+            xs_log!("console list {key:#x}: Reset while a queued submission of it has not run yet, reset anyway");
+        }
+    }
     crate::list_sync::forget(key);
     crate::user_mirror::forget(key);
     crate::title_heap::list_reset(key);
@@ -3919,9 +3933,14 @@ unsafe fn execute_closed(pc: Object, lists: &[Object]) {
     crate::diagnose::removed_after(|| format!("a title submission of {} lists on queue {pc:p}", kept.len()));
 }
 
+/// Lists of a submission kept on the stack before a heap allocation is needed.
+const STACK_LISTS: usize = 16;
+
+/// Console queue slot 10 (`ExecuteCommandLists`, and `ExecuteCommandListsX` through the later slots).
+/// The submission runs here when its queue has nothing queued and the memory waits of its lists
+/// are met. Otherwise it queues behind the work of its queue (`queue_fifo`), whose worker waits for
+/// the values, so the title's thread goes on as it does on the console.
 extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object) {
-    const STACK_LISTS: usize = 16;
-    let _pc_call = crate::watchdog_hold::pc_call();
     // SAFETY: `this` is a live proxy, `lists` points to `n` objects.
     unsafe {
         let count = n as usize;
@@ -3936,15 +3955,6 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
             mapped_heap = unwrap_array(n, lists);
             &mapped_heap
         };
-        let pc = (*this).pc;
-        // objects released from now on wait for this submission
-        let tracked = crate::retire::begin(pc);
-        // the title bytes that running submissions read and that this sync is about to copy (`flicker_probe`)
-        let suspects = crate::flicker_probe::before_sync();
-        // the memory the title wrote since its last submission is in the GPU mirror before its lists run
-        crate::title_mem::sync(pc);
-        // the textures the title wrote since its last submission are readable by the GPU before its lists run
-        crate::detile::flush(pc);
         let mut keys_stack = [0usize; STACK_LISTS];
         let keys_heap;
         let keys: &[usize] = if count == 0 || lists.is_null() {
@@ -3958,6 +3968,36 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
             keys_heap = (0..count).map(|i| *lists.add(i) as usize).collect::<Vec<_>>();
             &keys_heap
         };
+        let pc = (*this).pc;
+        let ready = || keys.iter().all(|&key| crate::list_sync::all_waits(key, crate::cpu_writes::satisfied));
+        if let Some(_gate) = crate::queue_fifo::inline_gate(pc as usize, ready) {
+            let _pc_call = crate::watchdog_hold::pc_call();
+            // objects released from now on wait for this submission
+            let tracked = crate::retire::begin(pc);
+            submit_lists(pc, mapped, keys, tracked);
+        } else {
+            QueuedLists::hold(pc, mapped, keys).queue();
+        }
+    }
+}
+
+/// Runs one submission of the title on the PC queue `pc`: title memory and placed textures are
+/// brought up to date, each list waits for its memory waits, the lists run, and their bottom of
+/// pipe writes follow the GPU. Only the worker of a queue gets here with waits that are not met.
+/// `tracked` is the answer of `retire::begin` for this submission.
+///
+/// # Safety
+/// `pc` is a live PC queue, `mapped` the live PC lists of the submission and `keys` the console
+/// lists behind them (empty when the title passed none).
+unsafe fn submit_lists(pc: Object, mapped: &[Object], keys: &[usize], tracked: bool) {
+    // SAFETY: by the contract above.
+    unsafe {
+        // the title bytes that running submissions read and that this sync is about to copy (`flicker_probe`)
+        let suspects = crate::flicker_probe::before_sync();
+        // the memory the title wrote since its last submission is in the GPU mirror before its lists run
+        crate::title_mem::sync(pc);
+        // the textures the title wrote since its last submission are readable by the GPU before its lists run
+        crate::detile::flush(pc);
         crate::draw_diag::submitted(keys);
         // constant buffer copies of these lists take the bytes the title wrote since their recording
         let refresh = crate::cbv_copies::submitted(keys);
@@ -3969,18 +4009,18 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
         }
         let watched = crate::flicker_probe::submitting(pc, keys, suspects);
         // a list whose memory waits are not met runs after the lists before it, once they are
-        // (the GPU has to run those first); the wait holds it back for at most WAIT_TIMEOUT
+        // (the GPU has to run those first); the wait holds it back within `list_sync::wait_limits`
         let mut start = 0usize;
         for (i, &key) in keys.iter().enumerate() {
-            let waits = crate::list_sync::waits_of(key);
-            if waits.iter().all(crate::cpu_writes::satisfied) {
+            if crate::list_sync::all_waits(key, crate::cpu_writes::satisfied) {
                 continue;
             }
             if i > start {
                 execute_closed(pc, &mapped[start..i]);
             }
-            for w in &waits {
-                if !crate::cpu_writes::wait_until(w, crate::list_sync::WAIT_TIMEOUT) {
+            let _trace = decant_trace::span("queue", "memory_wait");
+            for w in &crate::list_sync::waits_of(key) {
+                if !crate::cpu_writes::wait_until(w, crate::list_sync::wait_limits(), || crate::queue_fifo::busy_elsewhere(pc as usize)) {
                     static N: AtomicI32 = AtomicI32::new(0);
                     if log_due(&N) {
                         xs_log!("console list: a memory wait at {:#x} ({} bytes, comparison {}, value {:#x}, mask {:#x}) timed out, the list runs anyway", w.va, w.width, w.comparison, w.value, w.mask);
@@ -4019,6 +4059,96 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
         }
         if tracked {
             crate::retire::submitted(pc);
+        }
+    }
+}
+
+type AddRef = unsafe extern "system" fn(Object) -> u32;
+
+/// Takes a reference on `object` (one of our proxies or a PC object) when there is one.
+///
+/// # Safety
+/// `object` is null or a live COM object.
+unsafe fn com_add_ref(object: Object) {
+    if !object.is_null() {
+        // SAFETY: by the contract above, slot 1 is AddRef.
+        unsafe { method::<AddRef>(object, 1)(object) };
+    }
+}
+
+/// Lets go of a reference taken with [`com_add_ref`].
+///
+/// # Safety
+/// `object` is null or a COM object this caller holds a reference on.
+unsafe fn com_release(object: Object) {
+    if !object.is_null() {
+        // SAFETY: by the contract above, slot 2 is Release.
+        unsafe { method::<Release>(object, 2)(object) };
+    }
+}
+
+/// A submission queued behind the work of its queue (`queue_fifo`). Until it ran it holds a
+/// reference on the PC queue and on each console list, and the lists against a `Reset`.
+struct QueuedLists {
+    queue: usize,
+    lists: Vec<usize>,
+    keys: Vec<usize>,
+    /// The submission is open in `retire` and not yet closed.
+    tracked: bool,
+}
+
+// SAFETY: the queue and the lists are free threaded COM objects that this value keeps alive.
+unsafe impl Send for QueuedLists {}
+
+impl QueuedLists {
+    /// Takes the references and opens the submission in `retire` now, on the title's thread, so
+    /// that an object the title releases from now on waits until the submission ran.
+    ///
+    /// # Safety
+    /// As for [`submit_lists`].
+    unsafe fn hold(pc: Object, mapped: &[Object], keys: &[usize]) -> Self {
+        // SAFETY: by the contract above.
+        unsafe {
+            com_add_ref(pc);
+            for &key in keys {
+                com_add_ref(key as Object);
+            }
+            crate::queue_fifo::hold_lists(keys);
+            let tracked = crate::retire::begin(pc);
+            Self { queue: pc as usize, lists: mapped.iter().map(|&l| l as usize).collect(), keys: keys.to_vec(), tracked }
+        }
+    }
+
+    fn queue(self) {
+        static N: AtomicI32 = AtomicI32::new(0);
+        let (queue, lists) = (self.queue, self.lists.len());
+        let queued = crate::queue_fifo::defer(queue, Box::new(move || self.run()));
+        if log_due(&N) {
+            xs_log!("console queue {queue:#x}: a submission of {lists} lists waits on title memory or on earlier work of its queue, queued so the title's thread goes on ({queued} queued so far)");
+        }
+    }
+
+    fn run(mut self) {
+        let mapped: Vec<Object> = self.lists.iter().map(|&l| l as Object).collect();
+        // SAFETY: the references taken in `hold` keep the queue and the lists alive.
+        unsafe { submit_lists(self.queue as Object, &mapped, &self.keys, self.tracked) };
+        self.tracked = false;
+    }
+}
+
+impl Drop for QueuedLists {
+    fn drop(&mut self) {
+        crate::queue_fifo::release_lists(&self.keys);
+        // SAFETY: the references were taken in `hold`. A submission that never ran is closed in
+        // `retire` all the same, so its targets are reached.
+        unsafe {
+            if self.tracked {
+                crate::retire::submitted(self.queue as Object);
+            }
+            for &key in &self.keys {
+                com_release(key as Object);
+            }
+            com_release(self.queue as Object);
         }
     }
 }
@@ -4087,17 +4217,66 @@ fn queue_slot16_17(this: *mut Proxy, slot: usize, a: usize, b: usize, c: usize) 
 }
 
 /// Signal (PC 14) or Wait (PC 15) of `fence` (a proxy or a PC fence) to `value`. A signal also
-/// tells the completed value cells (`fence_cell`) which value to watch for.
+/// tells the completed value cells (`fence_cell`) which value to watch for. Behind queued work
+/// of the queue (`queue_fifo`) the call queues too and answers `S_OK`.
 fn queue_fence_op(this: *mut Proxy, signal: bool, fence: Object, value: u64) -> HRESULT {
     // SAFETY: `this` is a live proxy, `fence` a fence proxy or a PC fence.
     unsafe {
         let pc = (*this).pc;
         let fence = unwrap(fence);
+        if let Some(_gate) = crate::queue_fifo::inline_gate(pc as usize, || true) {
+            return fence_op_now(pc, signal, fence, value);
+        }
+        com_add_ref(pc);
+        com_add_ref(fence);
+        let op = QueuedFenceOp { queue: pc as usize, fence: fence as usize, signal, value };
+        crate::queue_fifo::defer(pc as usize, Box::new(move || op.run()));
+        S_OK
+    }
+}
+
+/// # Safety
+/// `pc` is a live PC queue and `fence` null or a live PC fence.
+unsafe fn fence_op_now(pc: Object, signal: bool, fence: Object, value: u64) -> HRESULT {
+    // SAFETY: by the contract above.
+    unsafe {
         let hr = method::<Signal>(pc, if signal { 14 } else { 15 })(pc, fence, value);
         if signal && hr >= 0 {
             crate::fence_cell::queued(fence, value);
         }
         hr
+    }
+}
+
+/// A fence signal or wait queued behind the work of its queue, holding the queue and the fence.
+struct QueuedFenceOp {
+    queue: usize,
+    fence: usize,
+    signal: bool,
+    value: u64,
+}
+
+// SAFETY: the queue and the fence are free threaded COM objects that this value keeps alive.
+unsafe impl Send for QueuedFenceOp {}
+
+impl QueuedFenceOp {
+    fn run(self) {
+        static N: AtomicI32 = AtomicI32::new(0);
+        // SAFETY: the references taken when it was queued keep both objects alive.
+        let hr = unsafe { fence_op_now(self.queue as Object, self.signal, self.fence as Object, self.value) };
+        if hr < 0 && log_due(&N) {
+            xs_log!("console queue {:#x}: a queued fence {} to {:#x} failed, hr {hr:#x}", self.queue, if self.signal { "signal" } else { "wait" }, self.value);
+        }
+    }
+}
+
+impl Drop for QueuedFenceOp {
+    fn drop(&mut self) {
+        // SAFETY: the references were taken when it was queued.
+        unsafe {
+            com_release(self.fence as Object);
+            com_release(self.queue as Object);
+        }
     }
 }
 
@@ -4295,35 +4474,36 @@ extern "system" fn queue_signal_x(this: *mut Proxy, fence: Object, value: u64, f
 /// untouched. Without a hook the token is read (0 is a valid token, a console present does not
 /// fail for the title) and handed to the frame clock (`frame::mark_flipped`), the first resource
 /// of plane 0 goes to the built in present, and the answer is `S_OK` so a title that uses
-/// `PresentX` on its own is not stuck here.
+/// `PresentX` on its own is not stuck here. Behind queued work of the queue (`queue_fifo`) the
+/// built in present queues too, so the frame is shown after the work that draws it. The hook
+/// takes the title's pointers, so it runs once the queued work has reached the PC queue.
 extern "system" fn queue_present_x(this: *mut Proxy, plane_count: u32, planes: *const c_void, parameters: *const c_void) -> HRESULT {
     static N: AtomicI32 = AtomicI32::new(0);
-    heap_pages::present();
-    crate::flicker_probe::present();
-    crate::retire::present();
+    // SAFETY: `this` is a live queue proxy.
+    let pc = unsafe { (*this).pc };
     let hook = PRESENT_HOOK.load(Ordering::SeqCst);
     if hook != 0 {
+        static LATE: AtomicI32 = AtomicI32::new(0);
+        if !crate::queue_fifo::drain(pc as usize, crate::list_sync::wait_limits().hard) && log_due(&LATE) {
+            xs_log!("console queue slot 30 (PresentX): queued work of the queue did not finish in time, the present hook runs anyway");
+        }
+        present_counted();
         // SAFETY: the hook was installed through `DecantD3D12X_SetPresentHook` with this signature.
         unsafe {
             let hook = std::mem::transmute::<usize, PresentFn>(hook);
-            return hook((*this).pc, plane_count, planes, parameters);
+            return hook(pc, plane_count, planes, parameters);
         }
     }
     // Plane 0 is readable for its 0x18 bytes when there is a plane at all, and its array holds
-    // `count` resource pointers.
+    // `count` resource pointers. Both are read now: the title may reuse them once this returns.
     let plane_zero = (plane_count > 0 && !planes.is_null()).then_some(planes.cast::<u8>());
     // SAFETY: by the line above, `plane` points to a plane 0.
     let token = plane_zero.map_or(0, |plane| unsafe { plane.cast::<u64>().read_unaligned() });
     // SAFETY: as above, the resource array is read only when the plane has one.
-    let shown = plane_zero.is_some_and(|plane| unsafe {
+    let frame = plane_zero.and_then(|plane| unsafe {
         let count = plane.add(8).cast::<u32>().read_unaligned();
         let array = plane.add(0x10).cast::<*const Object>().read_unaligned();
-        if count == 0 || array.is_null() {
-            return false;
-        }
-        let frame = unwrap(array.read_unaligned());
-        crate::capture::presented((*this).pc, frame);
-        crate::present::show((*this).pc, frame)
+        (count != 0 && !array.is_null()).then(|| unwrap(array.read_unaligned()))
     });
     crate::pso_diag::present();
     crate::direct_pso::note_present();
@@ -4336,15 +4516,91 @@ extern "system" fn queue_present_x(this: *mut Proxy, plane_count: u32, planes: *
     if PLANES.swap(plane_count, Ordering::Relaxed) != plane_count && PLANE_LINES.fetch_add(1, Ordering::Relaxed) < 64 {
         xs_log!("console queue slot 30 (PresentX): the plane count is now {plane_count} (token {token:016X}), only plane 0 is shown");
     }
+    let shown = match crate::queue_fifo::inline_gate(pc as usize, || true) {
+        // SAFETY: `pc` is the live queue and `frame` a resource the title presents now.
+        Some(_gate) => {
+            if unsafe { present_now(pc, frame) } {
+                "showed it"
+            } else {
+                "did not show it"
+            }
+        }
+        None => {
+            // SAFETY: as above.
+            unsafe { QueuedPresent::hold(pc, frame) }.queue();
+            "queued it behind earlier work of the queue"
+        }
+    };
     if log_due(&N) {
-        xs_log!(
-            "console queue slot 30 (PresentX) ({plane_count}, {}, {}, token {token:016X}): no present hook installed, built in present {}",
-            p(planes),
-            p(parameters),
-            if shown { "showed it" } else { "did not show it" }
-        );
+        xs_log!("console queue slot 30 (PresentX) ({plane_count}, {}, {}, token {token:016X}): no present hook installed, built in present {shown}", p(planes), p(parameters));
     }
     S_OK
+}
+
+/// The present counts of the layer that follow the order of the queue.
+fn present_counted() {
+    heap_pages::present();
+    crate::flicker_probe::present();
+    crate::retire::present();
+}
+
+/// The built in present of `frame` on the PC queue `pc`, in the order of that queue.
+///
+/// # Safety
+/// `pc` is a live PC queue and `frame` null or a live PC resource.
+unsafe fn present_now(pc: Object, frame: Option<Object>) -> bool {
+    present_counted();
+    frame.is_some_and(|frame| {
+        // SAFETY: by the contract above.
+        unsafe {
+            crate::capture::presented(pc, frame);
+            crate::present::show(pc, frame)
+        }
+    })
+}
+
+/// A built in present queued behind the work of its queue, holding the queue and the frame.
+struct QueuedPresent {
+    queue: usize,
+    frame: usize,
+}
+
+// SAFETY: the queue and the frame are free threaded COM objects that this value keeps alive.
+unsafe impl Send for QueuedPresent {}
+
+impl QueuedPresent {
+    /// # Safety
+    /// `pc` is a live PC queue and `frame` null or a live PC resource.
+    unsafe fn hold(pc: Object, frame: Option<Object>) -> Self {
+        let frame = frame.unwrap_or(std::ptr::null_mut());
+        // SAFETY: by the contract above.
+        unsafe {
+            com_add_ref(pc);
+            com_add_ref(frame);
+        }
+        Self { queue: pc as usize, frame: frame as usize }
+    }
+
+    fn queue(self) {
+        let queue = self.queue;
+        crate::queue_fifo::defer(queue, Box::new(move || self.run()));
+    }
+
+    fn run(self) {
+        let frame = (self.frame != 0).then_some(self.frame as Object);
+        // SAFETY: the references taken in `hold` keep both objects alive.
+        unsafe { present_now(self.queue as Object, frame) };
+    }
+}
+
+impl Drop for QueuedPresent {
+    fn drop(&mut self) {
+        // SAFETY: the references were taken in `hold`.
+        unsafe {
+            com_release(self.frame as Object);
+            com_release(self.queue as Object);
+        }
+    }
 }
 
 // ---- command allocator ----
@@ -4892,22 +5148,124 @@ extern "system" fn list_execute_indirect(this: *mut Proxy, sig: Object, max: u32
     }
 }
 
-/// Console queue slot 8 (UpdateTileMappings, PC 8): the tiled resource unwrapped.
+/// Console queue slot 8 (UpdateTileMappings, PC 8): the tiled resource unwrapped. Behind queued
+/// work of the queue (`queue_fifo`) the call queues with copies of its arrays.
 #[allow(clippy::too_many_arguments)]
 extern "system" fn queue_update_tile_mappings(this: *mut Proxy, res: Object, n_regions: u32, coords: *const c_void, sizes: *const c_void, heap: Object, n_ranges: u32, flags: *const c_void, offsets: *const c_void, counts: *const c_void, mode: u32) {
-    // SAFETY: `this` is a live queue proxy; the objects are proxies or PC objects.
+    // SAFETY: `this` is a live queue proxy; the objects are proxies or PC objects, the arrays hold
+    // `n_regions` and `n_ranges` entries or are null.
     unsafe {
         let pc = (*this).pc;
-        method::<UpdateTileMappings>(pc, 8)(pc, unwrap(res), n_regions, coords, sizes, unwrap(heap), n_ranges, flags, offsets, counts, mode);
+        let (res, heap) = (unwrap(res), unwrap(heap));
+        if let Some(_gate) = crate::queue_fifo::inline_gate(pc as usize, || true) {
+            method::<UpdateTileMappings>(pc, 8)(pc, res, n_regions, coords, sizes, heap, n_ranges, flags, offsets, counts, mode);
+            return;
+        }
+        com_add_ref(pc);
+        com_add_ref(res);
+        com_add_ref(heap);
+        let (regions, ranges) = (n_regions as usize, n_ranges as usize);
+        let update = QueuedTiles::Update {
+            queue: pc as usize,
+            res: res as usize,
+            heap: heap as usize,
+            n_regions,
+            n_ranges,
+            coords: copied(coords, regions * TILE_STRUCT_BYTES),
+            sizes: copied(sizes, regions * TILE_STRUCT_BYTES),
+            flags: copied(flags, ranges * 4),
+            offsets: copied(offsets, ranges * 4),
+            counts: copied(counts, ranges * 4),
+            mode,
+        };
+        crate::queue_fifo::defer(pc as usize, Box::new(move || update.run()));
     }
 }
 
-/// Console queue slot 9 (CopyTileMappings, PC 9): both resources unwrapped.
+/// Console queue slot 9 (CopyTileMappings, PC 9): both resources unwrapped. Behind queued work of
+/// the queue (`queue_fifo`) the call queues with copies of its structures.
 extern "system" fn queue_copy_tile_mappings(this: *mut Proxy, dst: Object, dst_start: *const c_void, src: Object, src_start: *const c_void, size: *const c_void, flags: u32) {
-    // SAFETY: `this` is a live queue proxy; the objects are proxies or PC objects.
+    // SAFETY: `this` is a live queue proxy; the objects are proxies or PC objects, the structures
+    // are null or readable.
     unsafe {
         let pc = (*this).pc;
-        method::<CopyTileMappings>(pc, 9)(pc, unwrap(dst), dst_start, unwrap(src), src_start, size, flags);
+        let (dst, src) = (unwrap(dst), unwrap(src));
+        if let Some(_gate) = crate::queue_fifo::inline_gate(pc as usize, || true) {
+            method::<CopyTileMappings>(pc, 9)(pc, dst, dst_start, src, src_start, size, flags);
+            return;
+        }
+        com_add_ref(pc);
+        com_add_ref(dst);
+        com_add_ref(src);
+        let copy = QueuedTiles::Copy {
+            queue: pc as usize,
+            dst: dst as usize,
+            src: src as usize,
+            dst_start: copied(dst_start, TILE_STRUCT_BYTES),
+            src_start: copied(src_start, TILE_STRUCT_BYTES),
+            size: copied(size, TILE_STRUCT_BYTES),
+            flags,
+        };
+        crate::queue_fifo::defer(pc as usize, Box::new(move || copy.run()));
+    }
+}
+
+/// Bytes of a `D3D12_TILED_RESOURCE_COORDINATE` and of a `D3D12_TILE_REGION_SIZE` (d3d12.h).
+const TILE_STRUCT_BYTES: usize = 16;
+
+/// A copy of the `bytes` bytes at `at`, or `None` for a null pointer.
+///
+/// # Safety
+/// `at` is null or readable for `bytes` bytes.
+unsafe fn copied(at: *const c_void, bytes: usize) -> Option<Vec<u8>> {
+    // SAFETY: by the contract above.
+    (!at.is_null()).then(|| unsafe { std::slice::from_raw_parts(at.cast::<u8>(), bytes) }.to_vec())
+}
+
+/// The pointer of a copy made by [`copied`], null for none.
+fn copy_ptr(copy: &Option<Vec<u8>>) -> *const c_void {
+    copy.as_ref().map_or(std::ptr::null(), |bytes| bytes.as_ptr().cast())
+}
+
+/// A tile mapping call queued behind the work of its queue, with its own copies of the title's
+/// arrays and a reference on every object it names.
+enum QueuedTiles {
+    Update { queue: usize, res: usize, heap: usize, n_regions: u32, n_ranges: u32, coords: Option<Vec<u8>>, sizes: Option<Vec<u8>>, flags: Option<Vec<u8>>, offsets: Option<Vec<u8>>, counts: Option<Vec<u8>>, mode: u32 },
+    Copy { queue: usize, dst: usize, src: usize, dst_start: Option<Vec<u8>>, src_start: Option<Vec<u8>>, size: Option<Vec<u8>>, flags: u32 },
+}
+
+// SAFETY: the objects are free threaded COM objects that this value keeps alive.
+unsafe impl Send for QueuedTiles {}
+
+impl QueuedTiles {
+    fn run(self) {
+        // SAFETY: the references taken when it was queued keep the objects alive, and the copies
+        // hold the arrays the PC call reads.
+        unsafe {
+            match &self {
+                Self::Update { queue, res, heap, n_regions, n_ranges, coords, sizes, flags, offsets, counts, mode } => {
+                    let pc = *queue as Object;
+                    method::<UpdateTileMappings>(pc, 8)(pc, *res as Object, *n_regions, copy_ptr(coords), copy_ptr(sizes), *heap as Object, *n_ranges, copy_ptr(flags), copy_ptr(offsets), copy_ptr(counts), *mode);
+                }
+                Self::Copy { queue, dst, src, dst_start, src_start, size, flags } => {
+                    let pc = *queue as Object;
+                    method::<CopyTileMappings>(pc, 9)(pc, *dst as Object, copy_ptr(dst_start), *src as Object, copy_ptr(src_start), copy_ptr(size), *flags);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for QueuedTiles {
+    fn drop(&mut self) {
+        let held = match self {
+            Self::Update { queue, res, heap, .. } => [*res, *heap, *queue],
+            Self::Copy { queue, dst, src, .. } => [*dst, *src, *queue],
+        };
+        for object in held {
+            // SAFETY: the references were taken when it was queued.
+            unsafe { com_release(object as Object) };
+        }
     }
 }
 
@@ -5226,6 +5584,65 @@ pub(crate) unsafe fn query_object(object: Object, riid: *const GUID, out: *mut *
 #[cfg(test)]
 mod tests {
     use super::host_queue_flags;
+
+    #[test]
+    fn queued_tile_copies_keep_their_own_structures_and_release_what_they_held() {
+        use super::{Object, QueuedTiles, TILE_STRUCT_BYTES, com_add_ref, copied};
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+
+        #[repr(C)]
+        struct Fake {
+            vtbl: *const usize,
+            refs: AtomicU32,
+        }
+        unsafe extern "system" fn add_ref(this: Object) -> u32 {
+            // SAFETY: only `Fake` objects get this vtable.
+            unsafe { (*this.cast::<Fake>()).refs.fetch_add(1, Ordering::SeqCst) + 1 }
+        }
+        unsafe extern "system" fn release(this: Object) -> u32 {
+            // SAFETY: as above.
+            unsafe { (*this.cast::<Fake>()).refs.fetch_sub(1, Ordering::SeqCst) - 1 }
+        }
+        static SEEN: AtomicU8 = AtomicU8::new(0);
+        unsafe extern "system" fn copy_tiles(_: Object, _: Object, dst_start: *const c_void, _: Object, src_start: *const c_void, size: *const c_void, flags: u32) {
+            assert!(src_start.is_null(), "a structure the title did not pass stays absent");
+            // SAFETY: the queued call passes its own 16 byte copies.
+            let (start, tiles) = unsafe { (*dst_start.cast::<u8>(), *size.cast::<u8>()) };
+            SEEN.store(start + tiles + flags as u8, Ordering::SeqCst);
+        }
+        let vtbl: [usize; 10] = [0, add_ref as *const () as usize, release as *const () as usize, 0, 0, 0, 0, 0, 0, copy_tiles as *const () as usize];
+        let make = || Fake { vtbl: vtbl.as_ptr(), refs: AtomicU32::new(1) };
+        let (queue, dst, src) = (make(), make(), make());
+        let object = |f: &Fake| std::ptr::from_ref(f).cast_mut().cast::<c_void>();
+        let mut start = vec![0u8; TILE_STRUCT_BYTES];
+        start[0] = 5;
+        let mut size = vec![0u8; TILE_STRUCT_BYTES];
+        size[0] = 7;
+        // SAFETY: the fakes live until the end of the test, the structures are 16 readable bytes.
+        let copy = unsafe {
+            for f in [&queue, &dst, &src] {
+                com_add_ref(object(f));
+            }
+            QueuedTiles::Copy {
+                queue: object(&queue) as usize,
+                dst: object(&dst) as usize,
+                src: object(&src) as usize,
+                dst_start: copied(start.as_ptr().cast(), TILE_STRUCT_BYTES),
+                src_start: copied(std::ptr::null(), TILE_STRUCT_BYTES),
+                size: copied(size.as_ptr().cast(), TILE_STRUCT_BYTES),
+                flags: 1,
+            }
+        };
+        // the title may free its structures as soon as the call returned
+        drop((start, size));
+        assert_eq!(queue.refs.load(Ordering::SeqCst), 2, "the queued call holds the queue");
+        std::thread::spawn(move || copy.run()).join().unwrap();
+        assert_eq!(SEEN.load(Ordering::SeqCst), 5 + 7 + 1, "the call ran on the worker with the values of the time it was queued");
+        for f in [&queue, &dst, &src] {
+            assert_eq!(f.refs.load(Ordering::SeqCst), 1, "every reference taken is given back");
+        }
+    }
 
     #[test]
     fn create_srv_at_makes_a_null_view_for_a_3d_view_over_a_2d_texture() {
