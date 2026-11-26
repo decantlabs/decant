@@ -384,19 +384,41 @@ impl ViewTextures {
             }
         }
         pass.heaps_freed = gone_heaps.len();
-        // committed textures one by one while still over the target
-        if pass.held_after > target {
-            let mut order: Vec<(u64, u64)> = self.made.iter().filter(|(_, e)| e.heap.is_none() && free(e)).map(|(&va, e)| (e.last_ms, va)).collect();
-            order.sort_unstable();
-            for (_, va) in order {
-                if pass.held_after <= target || pass.freed.len() >= MAX_PER_PASS {
+        // Evict individual idle unreferenced textures (placed or committed) while still over target.
+        if pass.held_after > target && pass.freed.len() < pass_limit {
+            let mut indiv: Vec<(u64, u8, u64)> = Vec::new();
+            for e in &self.stale {
+                if free(e) {
+                    indiv.push((e.last_ms, 0, e.res as u64));
+                }
+            }
+            for (&va, e) in &self.made {
+                if free(e) {
+                    indiv.push((e.last_ms, 1, va));
+                }
+            }
+            indiv.sort_unstable();
+            for (_, kind, id) in indiv {
+                if pass.held_after <= target || pass.freed.len() >= pass_limit {
                     break;
                 }
-                if let Some(e) = self.made.remove(&va) {
+                let removed = if kind == 0 {
+                    let res = id as usize;
+                    self.stale.iter().position(|e| e.res == res).map(|i| self.stale.swap_remove(i))
+                } else {
+                    self.made.remove(&id)
+                };
+                if let Some(e) = removed {
                     self.live_bytes = self.live_bytes.saturating_sub(e.bytes);
                     pass.held_after = pass.held_after.saturating_sub(e.bytes);
                     pass.freed.push(e);
                 }
+            }
+        }
+        #[cfg(windows)]
+        for e in &pass.freed {
+            if e.heap.is_some() {
+                crate::view_heap::retire_resource(e.res, present);
             }
         }
         pass.heaps_in_use = self.held_bytes(heap_bytes).div_ceil(heap_bytes.max(1)) as usize;
@@ -682,12 +704,16 @@ mod tests {
         // one texture of heap 0 is used just now (a view made of its address)
         t.touch(0x1_0000, p, ms);
         let none = std::collections::HashSet::new();
-        let pass = t.collect(300, 1000, p, ms, &none);
-        assert!(pass.freed.iter().all(|e| e.heap == Some(1)) && pass.heaps_freed == 1, "heap 0 has a used texture, heap 1 goes");
-        // heap 1 is gone, heap 0 stays whatever the cap: its used texture keeps it
+        let pass = t.collect(1000, 1000, p, ms, &none);
+        assert!(pass.freed.iter().all(|e| e.heap == Some(1)) && pass.heaps_freed == 1, "heap 0 has a used texture, heap 1 goes whole");
+        // Individual idle textures in heap 0 go when still over cap, while the touched texture stays.
         let pass = t.collect(100, 1000, p, ms, &none);
-        assert!(pass.freed.is_empty() && pass.stuck, "nothing can go and the cache holds more than one and a half times the cap");
-        // a slot that still holds a texture of a heap keeps the heap
+        assert_eq!(pass.freed.len(), 2, "two idle textures in heap 0 are evicted individually");
+        assert!(!pass.stuck);
+        // With only the touched texture left, nothing more can go.
+        let pass2 = t.collect(50, 1000, p, ms, &none);
+        assert!(pass2.freed.is_empty() && pass2.stuck);
+        // a slot that still holds a texture of a heap keeps the heap from going whole
         let mut u = cache(2, 3, |_| (0, 0));
         let held: std::collections::HashSet<usize> = [0x200 + 1].into_iter().collect();
         let pass = u.collect(1000, 1000, p, ms, &held);
@@ -852,5 +878,16 @@ mod tests {
         let pass = t.collect(2000, 1000, 12, 100, &none);
         assert_eq!(pass.heaps_freed, 3);
         assert_eq!(t.held_bytes(1000), 2000);
+    }
+
+    #[test]
+    fn individual_eviction_frees_idle_textures_when_one_pinned_texture_holds_heap() {
+        let mut t = cache(1, 4, |_| (0, 0));
+        let pinned: std::collections::HashSet<usize> = [0x100].into_iter().collect();
+        // Heap 0 has 4x100B textures (held_before=1000), 1 pinned. Cap=700 -> 3 idle textures evicted.
+        let pass = t.collect(700, 1000, 10, 2000, &pinned);
+        assert_eq!(pass.heaps_freed, 0);
+        assert_eq!(pass.freed.len(), 3);
+        assert_eq!(t.live_bytes(), 100);
     }
 }

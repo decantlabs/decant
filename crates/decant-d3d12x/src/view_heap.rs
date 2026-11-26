@@ -137,6 +137,103 @@ struct SlotMeta {
     live: u32,
     /// The present at which `live` fell to 0.
     free_at: Option<u64>,
+    /// Freed `(offset, size, ready_present)` blocks waiting for the GPU retirement window.
+    pending_free: Vec<(u64, u64, u64)>,
+    /// Coalesced `(offset, size)` blocks safe to reuse, sorted by `offset`.
+    free_list: Vec<(u64, u64)>,
+}
+
+impl SlotMeta {
+    fn insert_coalesced(&mut self, mut offset: u64, mut size: u64) {
+        if size == 0 {
+            return;
+        }
+        let pos = self.free_list.partition_point(|&(o, _)| o < offset);
+        if pos > 0 {
+            let (prev_o, prev_s) = self.free_list[pos - 1];
+            if prev_o + prev_s == offset {
+                offset = prev_o;
+                size += prev_s;
+                self.free_list.remove(pos - 1);
+                return self.insert_coalesced(offset, size);
+            }
+        }
+        if pos < self.free_list.len() {
+            let (next_o, next_s) = self.free_list[pos];
+            if offset + size == next_o {
+                size += next_s;
+                self.free_list.remove(pos);
+                return self.insert_coalesced(offset, size);
+            }
+        }
+        self.free_list.insert(pos, (offset, size));
+        while let Some(&(last_o, last_s)) = self.free_list.last() {
+            if last_o + last_s == self.used {
+                self.used = last_o;
+                self.free_list.pop();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn drain_ready(&mut self, now: u64) {
+        if self.pending_free.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.pending_free.len() {
+            if self.pending_free[i].2 <= now {
+                let (offset, size, _) = self.pending_free.swap_remove(i);
+                self.insert_coalesced(offset, size);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn alloc(&mut self, size: u64, align: u64, capacity: u64, now: u64) -> Option<u64> {
+        self.drain_ready(now);
+        let align = align.max(1);
+        for i in 0..self.free_list.len() {
+            let (b_off, b_len) = self.free_list[i];
+            let Some(aligned) = b_off.checked_next_multiple_of(align) else { continue };
+            let Some(end) = aligned.checked_add(size) else { continue };
+            if end <= b_off + b_len {
+                self.free_list.remove(i);
+                if aligned > b_off {
+                    self.insert_coalesced(b_off, aligned - b_off);
+                }
+                let block_end = b_off + b_len;
+                if end < block_end {
+                    self.insert_coalesced(end, block_end - end);
+                }
+                self.live += 1;
+                self.free_at = None;
+                return Some(aligned);
+            }
+        }
+        let at = fit_in(self.used, size, align, capacity)?;
+        self.used = at + size;
+        self.live += 1;
+        self.free_at = None;
+        Some(at)
+    }
+
+    fn retire_block(&mut self, offset: u64, size: u64, ready_at: u64) {
+        self.pending_free.push((offset, size, ready_at));
+    }
+
+    fn free_now(&mut self, offset: u64, size: u64) {
+        self.insert_coalesced(offset, size);
+    }
+
+    fn reset_empty(&mut self) {
+        self.used = 0;
+        self.free_at = None;
+        self.pending_free.clear();
+        self.free_list.clear();
+    }
 }
 
 struct Heap {
@@ -154,7 +251,9 @@ struct HeapPool {
     active_hint: [usize; 2],
 }
 
+type AllocMap = Mutex<HashMap<usize, (usize, u64, u64)>>;
 static HEAPS: Mutex<HeapPool> = Mutex::new(HeapPool { heaps: Vec::new(), active_hint: [0, 0] });
+static ALLOCS: LazyLock<AllocMap> = LazyLock::new(Default::default);
 static HEAP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn insert_heap(pool: &mut HeapPool, heap: Heap) -> usize {
@@ -178,8 +277,7 @@ fn reclaim_empty_in_pool(pool: &mut HeapPool, now: u64) -> Vec<(ID3D12Heap, u64)
         let class_idx = h.class as usize;
         if warm[class_idx] < WARM_FREE_HEAPS_PER_CLASS {
             warm[class_idx] += 1;
-            h.meta.used = 0;
-            h.meta.free_at = None;
+            h.meta.reset_empty();
         } else if let Some(gone) = slot.take() {
             to_release.push((gone.heap, class_heap_bytes(gone.class)));
         }
@@ -187,7 +285,7 @@ fn reclaim_empty_in_pool(pool: &mut HeapPool, now: u64) -> Vec<(ID3D12Heap, u64)
     to_release
 }
 
-fn reserve_in_pool(pool: &mut HeapPool, class: SizeClass, size: u64, align: u64) -> Option<(ID3D12Heap, usize, u64)> {
+fn reserve_in_pool(pool: &mut HeapPool, class: SizeClass, size: u64, align: u64, now: u64) -> Option<(ID3D12Heap, usize, u64)> {
     let len = pool.heaps.len();
     if len == 0 {
         return None;
@@ -201,10 +299,7 @@ fn reserve_in_pool(pool: &mut HeapPool, class: SizeClass, size: u64, align: u64)
         if h.class != class {
             continue;
         }
-        if let Some(at) = fit_in(h.meta.used, size, align, capacity) {
-            h.meta.used = at + size;
-            h.meta.live += 1;
-            h.meta.free_at = None;
+        if let Some(at) = h.meta.alloc(size, align, capacity, now) {
             *hint = index;
             return Some((h.heap.clone(), index, at));
         }
@@ -242,7 +337,7 @@ pub fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: u32) -> O
     let (reserved, excess) = {
         let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         let excess = reclaim_empty_in_pool(&mut pool, now);
-        let reserved = reserve_in_pool(&mut pool, class, size, align);
+        let reserved = reserve_in_pool(&mut pool, class, size, align, now);
         (reserved, excess)
     };
     release_excess_heaps(excess);
@@ -263,7 +358,7 @@ pub fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: u32) -> O
             // SAFETY: a live heap, named for DRED.
             let _ = unsafe { new_heap.SetName(&windows::core::HSTRING::from(format!("decant view texture heap {seq}"))) };
             let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-            let choice = if let Some(hit) = reserve_in_pool(&mut pool, class, size, align) {
+            let choice = if let Some(hit) = reserve_in_pool(&mut pool, class, size, align, now) {
                 insert_heap(&mut pool, Heap { heap: new_heap, class, meta: SlotMeta::default() });
                 hit
             } else {
@@ -273,7 +368,7 @@ pub fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: u32) -> O
                     Heap {
                         heap: new_heap,
                         class,
-                        meta: SlotMeta { used: size, live: 1, free_at: None },
+                        meta: SlotMeta { used: size, live: 1, ..SlotMeta::default() },
                     },
                 );
                 pool.active_hint[class as usize] = new_index;
@@ -295,10 +390,30 @@ pub fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: u32) -> O
     // SAFETY: the heap is live, the reserved range lies inside it, and CreatePlacedResource runs lock free.
     let placed = unsafe { device.CreatePlacedResource(&heap, at, &d, D3D12_RESOURCE_STATES(state as i32), None, &mut res) };
     if placed.is_err() || res.is_none() {
-        released(index);
+        let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Some(h)) = pool.heaps.get_mut(index) {
+            h.meta.live = h.meta.live.saturating_sub(1);
+            h.meta.free_now(at, size);
+            if h.meta.live == 0 {
+                h.meta.free_at = Some(now);
+            }
+        }
         return None;
     }
-    Some((res?, index, size))
+    let resource = res?;
+    ALLOCS.lock().unwrap_or_else(|e| e.into_inner()).insert(resource.as_raw() as usize, (index, at, size));
+    Some((resource, index, size))
+}
+
+/// Schedules a placed texture's `(offset, size)` range for reuse after [`REUSE_PRESENTS`] presents.
+pub fn retire_resource(res: usize, present: u64) {
+    let Some((index, offset, size)) = ALLOCS.lock().unwrap_or_else(|e| e.into_inner()).remove(&res) else {
+        return;
+    };
+    let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(h)) = pool.heaps.get_mut(index) {
+        h.meta.retire_block(offset, size, present.saturating_add(REUSE_PRESENTS));
+    }
 }
 
 /// A texture placed in heap `index` was released (its last reference is held back until the GPU is
@@ -410,9 +525,9 @@ mod tests {
         }
 
         let mut slots = vec![
-            SlotMeta { used: HEAP_BYTES, live: 0, free_at: Some(100) },
-            SlotMeta { used: HEAP_BYTES - 4096, live: 1, free_at: None },
-            SlotMeta { used: HEAP_BYTES, live: 1, free_at: None },
+            SlotMeta { used: HEAP_BYTES, live: 0, free_at: Some(100), ..SlotMeta::default() },
+            SlotMeta { used: HEAP_BYTES - 4096, live: 1, free_at: None, ..SlotMeta::default() },
+            SlotMeta { used: HEAP_BYTES, live: 1, free_at: None, ..SlotMeta::default() },
         ];
         let mut hint = 1;
         // Hint is at slot 1, which still has 4096 bytes left.
@@ -441,12 +556,12 @@ mod tests {
     fn excess_empty_heaps_keep_warm_pool_and_reclaim_rest() {
         use super::{SlotMeta, SizeClass, WARM_FREE_HEAPS_PER_CLASS};
         let mut slots = [
-            Some((SizeClass::Small, SlotMeta { used: 4096, live: 0, free_at: Some(10) })),
-            Some((SizeClass::Small, SlotMeta { used: 4096, live: 0, free_at: Some(10) })),
-            Some((SizeClass::Small, SlotMeta { used: 4096, live: 0, free_at: Some(10) })),
-            Some((SizeClass::Large, SlotMeta { used: 65536, live: 0, free_at: Some(10) })),
-            Some((SizeClass::Large, SlotMeta { used: 65536, live: 0, free_at: Some(10) })),
-            Some((SizeClass::Large, SlotMeta { used: 65536, live: 0, free_at: Some(10) })),
+            Some((SizeClass::Small, SlotMeta { used: 4096, live: 0, free_at: Some(10), ..SlotMeta::default() })),
+            Some((SizeClass::Small, SlotMeta { used: 4096, live: 0, free_at: Some(10), ..SlotMeta::default() })),
+            Some((SizeClass::Small, SlotMeta { used: 4096, live: 0, free_at: Some(10), ..SlotMeta::default() })),
+            Some((SizeClass::Large, SlotMeta { used: 65536, live: 0, free_at: Some(10), ..SlotMeta::default() })),
+            Some((SizeClass::Large, SlotMeta { used: 65536, live: 0, free_at: Some(10), ..SlotMeta::default() })),
+            Some((SizeClass::Large, SlotMeta { used: 65536, live: 0, free_at: Some(10), ..SlotMeta::default() })),
         ];
         let now = 10 + REUSE_PRESENTS;
         let mut warm = [0usize; 2];
@@ -467,5 +582,37 @@ mod tests {
         }
         assert_eq!(reclaimed, vec![1, 2, 4, 5], "excess empty heaps beyond warm pool per class are reclaimed");
         assert_eq!(slots.iter().flatten().count(), 2);
+    }
+
+    #[test]
+    fn freelist_coalesces_adjacent_blocks_and_respects_retirement_window() {
+        use super::{HEAP_BYTES, SlotMeta};
+        let mut meta = SlotMeta::default();
+        let a = meta.alloc(4096, 4096, HEAP_BYTES, 10).unwrap();
+        let b = meta.alloc(8192, 4096, HEAP_BYTES, 10).unwrap();
+        let c = meta.alloc(4096, 4096, HEAP_BYTES, 10).unwrap();
+        assert_eq!((a, b, c), (0, 4096, 12288));
+
+        // Retire `a` and `b` at present 10 -> ready at 10 + REUSE_PRESENTS.
+        meta.retire_block(a, 4096, 10 + REUSE_PRESENTS);
+        meta.retire_block(b, 8192, 10 + REUSE_PRESENTS);
+        // Before retirement window, new allocation must NOT reuse `a` or `b`.
+        let d = meta.alloc(4096, 4096, HEAP_BYTES, 10 + REUSE_PRESENTS - 1).unwrap();
+        assert_eq!(d, 16384);
+
+        // Once retirement window passes, `a` + `b` coalesce into 12288 bytes at offset 0.
+        let e = meta.alloc(12288, 4096, HEAP_BYTES, 10 + REUSE_PRESENTS).unwrap();
+        assert_eq!(e, 0);
+
+        // Alignment inside a free block at offset 4096 splits prefix cleanly.
+        meta.free_now(e, 12288);
+        assert_eq!(meta.alloc(4096, 4096, HEAP_BYTES, 10 + REUSE_PRESENTS), Some(0));
+        let aligned = meta.alloc(4096, 8192, HEAP_BYTES, 10 + REUSE_PRESENTS).unwrap();
+        assert_eq!(aligned, 8192);
+        assert_eq!(meta.free_list, vec![(4096, 4096)]);
+
+        // Freeing tail block shrinks `used`.
+        meta.free_now(d, 4096);
+        assert_eq!(meta.used, 16384);
     }
 }
