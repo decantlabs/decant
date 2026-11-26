@@ -141,28 +141,201 @@ impl Buffer {
     }
 }
 
+/// Maximum pool-page index kept in the flat `owners_dense` vector; larger sparse indices spill
+/// into `owners_sparse`.
+const DENSE_OWNER_LIMIT: usize = 4_000_000;
+
+/// Owners of one pool page across window tiles: inline for the common 1-owner case, boxed `Vec`
+/// only when a physical pool page is aliased into multiple virtual tiles.
+#[derive(Clone, Debug, Default)]
+enum PageOwners {
+    #[default]
+    None,
+    One(u32, u32),
+    Many(Vec<(usize, u32)>),
+}
+
+impl PageOwners {
+    fn add(&mut self, at: (usize, u32), buf_u32: Option<u32>) {
+        match self {
+            Self::None => {
+                if let Some(b) = buf_u32 {
+                    *self = Self::One(b, at.1);
+                } else {
+                    *self = Self::Many(vec![at]);
+                }
+            }
+            Self::One(b, t) => {
+                let first = (*b as usize, *t);
+                if first != at {
+                    *self = Self::Many(vec![first, at]);
+                }
+            }
+            Self::Many(v) => {
+                if !v.contains(&at) {
+                    v.push(at);
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self, at: (usize, u32)) -> bool {
+        match self {
+            Self::None => true,
+            Self::One(b, t) => {
+                if (*b as usize, *t) == at {
+                    *self = Self::None;
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::Many(v) => {
+                v.retain(|&o| o != at);
+                if v.is_empty() {
+                    *self = Self::None;
+                    true
+                } else if v.len() == 1
+                    && let Ok(b) = u32::try_from(v[0].0)
+                {
+                    *self = Self::One(b, v[0].1);
+                    false
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn for_each(&self, mut f: impl FnMut((usize, u32))) {
+        match self {
+            Self::None => {}
+            Self::One(b, t) => f((*b as usize, *t)),
+            Self::Many(v) => {
+                for &at in v.iter() {
+                    f(at);
+                }
+            }
+        }
+    }
+}
+
+/// Contiguous run of pending window tile updates within one pool heap (or all `Null`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingRun {
+    pages: u32,
+    target: Target,
+}
+
+fn advance_target(t: Target, delta: u32) -> Target {
+    match t {
+        Target::Null => Target::Null,
+        Target::Heap(p) => Target::Heap(p + delta),
+    }
+}
+
+fn can_merge_runs(left: Target, left_pages: u32, right: Target) -> bool {
+    match (left, right) {
+        (Target::Null, Target::Null) => true,
+        (Target::Heap(lp), Target::Heap(rp)) => lp + left_pages == rp && lp / HEAP_PAGES == rp / HEAP_PAGES,
+        _ => false,
+    }
+}
+
+fn pending_insert_chunk(pending: &mut BTreeMap<(usize, u32), PendingRun>, buffer: usize, start: u32, count: u32, target: Target) {
+    if count == 0 {
+        return;
+    }
+    let end = start + count;
+    // Split any run starting strictly before `start` that overlaps `[start, end)`.
+    if let Some((&(b, lk), &lrun)) = pending.range(..(buffer, start)).next_back()
+        && b == buffer
+        && lk + lrun.pages > start
+    {
+        pending.remove(&(b, lk));
+        pending.insert((b, lk), PendingRun { pages: start - lk, target: lrun.target });
+        if lk + lrun.pages > end {
+            pending.insert((b, end), PendingRun { pages: lk + lrun.pages - end, target: advance_target(lrun.target, end - lk) });
+        }
+    }
+    // Remove/trim any runs starting in `[start, end)`.
+    let overlapping: Vec<(u32, PendingRun)> = pending.range((buffer, start)..(buffer, end)).map(|(&(_, k), &v)| (k, v)).collect();
+    for (k, run) in overlapping {
+        pending.remove(&(buffer, k));
+        if k + run.pages > end {
+            pending.insert((buffer, end), PendingRun { pages: k + run.pages - end, target: advance_target(run.target, end - k) });
+        }
+    }
+    // Merge with left neighbor if adjacent and compatible within the same heap.
+    let (mut ins_start, mut ins_pages, mut ins_target) = (start, count, target);
+    if let Some((&(b, lk), &lrun)) = pending.range(..(buffer, start)).next_back()
+        && b == buffer
+        && lk + lrun.pages == start
+        && can_merge_runs(lrun.target, lrun.pages, ins_target)
+    {
+        pending.remove(&(b, lk));
+        ins_start = lk;
+        ins_pages += lrun.pages;
+        ins_target = lrun.target;
+    }
+    // Merge with right neighbor if adjacent and compatible within the same heap.
+    if let Some(&rrun) = pending.get(&(buffer, end))
+        && can_merge_runs(ins_target, ins_pages, rrun.target)
+    {
+        pending.remove(&(buffer, end));
+        ins_pages += rrun.pages;
+    }
+    pending.insert((buffer, ins_start), PendingRun { pages: ins_pages, target: ins_target });
+}
+
+fn pending_set(pending: &mut BTreeMap<(usize, u32), PendingRun>, buffer: usize, start: u32, count: u32, target: Target) {
+    let mut done = 0u32;
+    while done < count {
+        let sub_target = advance_target(target, done);
+        let sub_count = match sub_target {
+            Target::Null => count - done,
+            Target::Heap(p) => (HEAP_PAGES - (p % HEAP_PAGES)).min(count - done),
+        };
+        pending_insert_chunk(pending, buffer, start + done, sub_count, sub_target);
+        done += sub_count;
+    }
+}
+
 #[derive(Debug)]
 pub struct Mirror {
     /// The size of a window buffer.
     window_bytes: u64,
     reservations: BTreeMap<u64, Reservation>,
     buffers: Vec<Buffer>,
-    /// The tiles whose mapping must change, by window buffer and tile. The last change of a tile wins.
-    pending: BTreeMap<(usize, u32), Target>,
+    /// Non-overlapping pending tile update runs keyed by `(window buffer, first window tile)`.
+    pending: BTreeMap<(usize, u32), PendingRun>,
     generation: u32,
     /// The mirror tile of each pool page, `NO_TILE` before it has bytes (`give_tile`).
     tiles: Vec<u32>,
     /// The pool page of each mirror tile, in tile order.
     tile_pages: Vec<u32>,
-    /// The window tiles that show each mapped pool page: `(window buffer, tile)`.
-    owners: HashMap<u32, Vec<(usize, u32)>>,
+    /// Dense owners table indexed by pool page (`< DENSE_OWNER_LIMIT`).
+    owners_dense: Vec<PageOwners>,
+    /// Overflow owners map for pool pages `>= DENSE_OWNER_LIMIT`.
+    owners_sparse: HashMap<u32, PageOwners>,
     /// The mirror tiles given so far.
     next_tile: u32,
 }
 
 impl Mirror {
     pub fn new(window_bytes: u64) -> Mirror {
-        Mirror { window_bytes: window_bytes.max(PAGE), reservations: BTreeMap::new(), buffers: Vec::new(), pending: BTreeMap::new(), generation: 0, tiles: Vec::new(), tile_pages: Vec::new(), owners: HashMap::new(), next_tile: 0 }
+        Mirror {
+            window_bytes: window_bytes.max(PAGE),
+            reservations: BTreeMap::new(),
+            buffers: Vec::new(),
+            pending: BTreeMap::new(),
+            generation: 0,
+            tiles: Vec::new(),
+            tile_pages: Vec::new(),
+            owners_dense: Vec::new(),
+            owners_sparse: HashMap::new(),
+            next_tile: 0,
+        }
     }
 
     /// The mirror tile of pool page `page`, given now when it has none: the page has bytes for the GPU (it
@@ -184,8 +357,15 @@ impl Mirror {
                 1,
                 PAGE,
             );
-            for &at in self.owners.get(&page).into_iter().flatten() {
-                self.pending.insert(at, Target::Heap(tile));
+            let target = Target::Heap(tile);
+            if i < self.owners_dense.len() {
+                let pending = &mut self.pending;
+                self.owners_dense[i].for_each(|(b, t)| pending_set(pending, b, t, 1, target));
+            } else if i >= DENSE_OWNER_LIMIT
+                && let Some(owners) = self.owners_sparse.get(&page)
+            {
+                let pending = &mut self.pending;
+                owners.for_each(|(b, t)| pending_set(pending, b, t, 1, target));
             }
         }
         self.tiles[i]
@@ -229,29 +409,77 @@ impl Mirror {
         }
     }
 
-    /// What window tile `at` shows for pool page `page`: its mirror tile, or nothing before it has one.
-    fn show(&mut self, at: (usize, u32), page: u32) {
-        let owners = self.owners.entry(page).or_default();
-        if !owners.contains(&at) {
-            owners.push(at);
+    fn ensure_owner_capacity(&mut self, first_page: u32, pages: u32) {
+        let dense_end = first_page.saturating_add(pages).min(DENSE_OWNER_LIMIT as u32) as usize;
+        if self.owners_dense.len() < dense_end {
+            self.owners_dense.resize_with(dense_end, PageOwners::default);
         }
-        let target = self.tile_of(page).map_or(Target::Null, Target::Heap);
-        self.pending.insert(at, target);
+    }
+
+    /// Records window tiles `first_tile..first_tile + pages` as showing pool pages
+    /// `first_page..first_page + pages` and emits range-coalesced pending tile updates.
+    fn show_span(&mut self, buffer: usize, first_tile: u32, first_page: u32, pages: u32) {
+        if pages == 0 {
+            return;
+        }
+        self.ensure_owner_capacity(first_page, pages);
+        let buf_u32 = u32::try_from(buffer).ok();
+        let tiles_len = self.tiles.len();
+        let mut run_start = 0u32;
+        let mut run_target: Option<Target> = None;
+        for k in 0..pages {
+            let page = first_page + k;
+            let at = (buffer, first_tile + k);
+            let p_idx = page as usize;
+            if p_idx < DENSE_OWNER_LIMIT {
+                self.owners_dense[p_idx].add(at, buf_u32);
+            } else {
+                self.owners_sparse.entry(page).or_default().add(at, buf_u32);
+            }
+            let target = if p_idx < tiles_len && self.tiles[p_idx] != NO_TILE {
+                Target::Heap(self.tiles[p_idx])
+            } else {
+                Target::Null
+            };
+            match run_target {
+                None => {
+                    run_start = k;
+                    run_target = Some(target);
+                }
+                Some(rt) if can_merge_runs(rt, k - run_start, target) => {}
+                Some(rt) => {
+                    pending_set(&mut self.pending, buffer, first_tile + run_start, k - run_start, rt);
+                    run_start = k;
+                    run_target = Some(target);
+                }
+            }
+        }
+        if let Some(rt) = run_target {
+            pending_set(&mut self.pending, buffer, first_tile + run_start, pages - run_start, rt);
+        }
     }
 
     /// Window tiles from `first_tile` no longer show the `pages` pool pages from `first_page`: they show
     /// nothing.
     fn hide(&mut self, buffer: usize, first_tile: u32, pages: u32, first_page: u32) {
-        for k in 0..pages {
-            let at = (buffer, first_tile + k);
-            if let Some(owners) = self.owners.get_mut(&(first_page + k)) {
-                owners.retain(|&o| o != at);
-                if owners.is_empty() {
-                    self.owners.remove(&(first_page + k));
-                }
-            }
-            self.pending.insert(at, Target::Null);
+        if pages == 0 {
+            return;
         }
+        let dense_len = self.owners_dense.len();
+        for k in 0..pages {
+            let page = first_page + k;
+            let at = (buffer, first_tile + k);
+            let p_idx = page as usize;
+            if p_idx < dense_len {
+                self.owners_dense[p_idx].remove(at);
+            } else if p_idx >= DENSE_OWNER_LIMIT
+                && let Some(owners) = self.owners_sparse.get_mut(&page)
+                && owners.remove(at)
+            {
+                self.owners_sparse.remove(&page);
+            }
+        }
+        pending_set(&mut self.pending, buffer, first_tile, pages, Target::Null);
     }
 
     /// The mirror tiles given so far.
@@ -321,8 +549,16 @@ impl Mirror {
     /// Takes the mapped runs out of `[start, end)`, cutting the ones that stick out. Returns what was
     /// removed as `(va, pages, first pool page)`.
     fn cut(views: &mut BTreeMap<u64, View>, start: u64, end: u64) -> Vec<(u64, u32, u32)> {
-        let touched: Vec<(u64, View)> = views.range(..end).filter(|&(&v, view)| v + u64::from(view.pages) * PAGE > start).map(|(&v, &view)| (v, view)).collect();
-        let mut removed = Vec::new();
+        let mut touched: Vec<(u64, View)> = Vec::new();
+        if let Some((&v, &view)) = views.range(..start).next_back()
+            && v + u64::from(view.pages) * PAGE > start
+        {
+            touched.push((v, view));
+        }
+        for (&v, &view) in views.range(start..end) {
+            touched.push((v, view));
+        }
+        let mut removed = Vec::with_capacity(touched.len());
         for (v, view) in touched {
             let vend = v + u64::from(view.pages) * PAGE;
             views.remove(&v);
@@ -377,9 +613,7 @@ impl Mirror {
                     self.hide(slot.buffer, Self::window_tile(slot, base, at), n, page);
                 }
                 let first_tile = Self::window_tile(slot, base, va);
-                for k in 0..pages {
-                    self.show((slot.buffer, first_tile + k), first_page + k);
-                }
+                self.show_span(slot.buffer, first_tile, first_page, pages);
                 refused
             }
             Change::Unmap { va, pages } => {
@@ -519,31 +753,20 @@ impl Mirror {
         let first = (offset / PAGE) as u32;
         let last = (offset.saturating_add(len.max(1)) - 1) / PAGE;
         let last = u32::try_from(last).unwrap_or(u32::MAX);
-        self.pending.range((buffer, first)..=(buffer, last)).next().is_some()
+        if self.pending.range((buffer, first)..=(buffer, last)).next().is_some() {
+            return true;
+        }
+        self.pending
+            .range(..(buffer, first))
+            .next_back()
+            .is_some_and(|(&(b, k), run)| b == buffer && k + run.pages > first)
     }
 
     /// The tile mappings to apply now, one call for each window buffer and pool heap (one more for the
     /// tiles that show nothing), and forgets them.
     pub fn drain_updates(&mut self) -> Vec<TileCall> {
         let mut calls: Vec<TileCall> = Vec::new();
-        // The previous tile, and the call whose last range it ended.
-        let mut last: Option<(usize, u32, Target, usize)> = None;
-        for ((buffer, tile), target) in std::mem::take(&mut self.pending) {
-            // A tile joins the range before it when it follows it and shows the next page of the same heap.
-            if let Some((b, t, was, call)) = last
-                && b == buffer
-                && t + 1 == tile
-                && match (was, target) {
-                    (Target::Null, Target::Null) => true,
-                    (Target::Heap(p), Target::Heap(q)) => p + 1 == q && q % HEAP_PAGES != 0,
-                    _ => false,
-                }
-                && let Some(range) = calls[call].ranges.last_mut()
-            {
-                range.1 += 1;
-                last = Some((buffer, tile, target, call));
-                continue;
-            }
+        for ((buffer, tile), PendingRun { pages, target }) in std::mem::take(&mut self.pending) {
             let heap = match target {
                 Target::Heap(p) => Some(heap_of(p).0),
                 Target::Null => None,
@@ -555,12 +778,24 @@ impl Mirror {
                     calls.len() - 1
                 }
             };
-            calls[call].ranges.push((tile, 1));
+            let prev_end = calls[call].ranges.last().map(|&(t, n)| t + n);
+            let same_heap_contig = matches!(target, Target::Null)
+                || calls[call]
+                    .ranges
+                    .last()
+                    .zip(calls[call].heap_tiles.last())
+                    .is_some_and(|(&(_, n), &ht)| {
+                        matches!(target, Target::Heap(p) if ht + n == heap_of(p).1)
+                    });
+            if prev_end == Some(tile) && same_heap_contig && let Some(range) = calls[call].ranges.last_mut() {
+                range.1 += pages;
+                continue;
+            }
+            calls[call].ranges.push((tile, pages));
             calls[call].heap_tiles.push(match target {
                 Target::Heap(p) => heap_of(p).1,
                 Target::Null => 0,
             });
-            last = Some((buffer, tile, target, call));
         }
         calls
     }
@@ -878,5 +1113,34 @@ mod tests {
         assert!(m.has_tiles_for_span(0x1000_0000, PAGE * 2));
         assert_eq!(m.mirror_tiles_read(0x1000_0000, 2), Some(vec![0, 1]));
         assert!(!m.has_tiles_for_span(0x2000_0000, PAGE));
+    }
+
+    #[test]
+    fn bulk_map_and_scatter_unmap_coalesce_pending_runs_across_heap_boundaries() {
+        let mut m = Mirror::new(GIB);
+        let pages = 99_776u32;
+        reserve(&mut m, 0x2_0000_0000, pages);
+        assert_eq!(m.apply(Change::Map { va: 0x2_0000_0000, pages, first_page: 0 }), None);
+        assert_eq!(m.pending.len(), 1, "un-tiled bulk map must produce a single pending run");
+        assert!(m.pending_in(0, 50_000 * PAGE, PAGE), "interior offset must still see pending run");
+        assert_eq!(m.drain_updates(), [TileCall { buffer: 0, heap: None, ranges: vec![(0, pages)], heap_tiles: vec![0] }]);
+        assert!(!m.pending_in(0, 50_000 * PAGE, PAGE));
+
+        // Give contiguous tiles across heap 0 -> heap 1 boundary and remap overlapping middle slice.
+        for p in 0..300u32 {
+            m.give_tile(p);
+        }
+        let calls = m.drain_updates();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], TileCall { buffer: 0, heap: Some(0), ranges: vec![(0, HEAP_PAGES)], heap_tiles: vec![0] });
+        assert_eq!(calls[1], TileCall { buffer: 0, heap: Some(1), ranges: vec![(HEAP_PAGES, 300 - HEAP_PAGES)], heap_tiles: vec![0] });
+
+        // Overwrite a middle slice with Null (unmap) and verify left/right split keeps exact tiles.
+        m.apply(Change::Unmap { va: 0x2_0000_0000 + 200 * PAGE, pages: 60 });
+        assert!(m.pending_in(0, 210 * PAGE, 4));
+        assert_eq!(m.drain_updates(), [TileCall { buffer: 0, heap: None, ranges: vec![(200, 60)], heap_tiles: vec![0] }]);
+        assert_eq!(m.translate(0x2_0000_0000 + 199 * PAGE, 4).map(|p| p.offset), Some(199 * PAGE));
+        assert!(m.translate(0x2_0000_0000 + 210 * PAGE, 4).is_none());
+        assert_eq!(m.translate(0x2_0000_0000 + 260 * PAGE, 4).map(|p| p.offset), Some(260 * PAGE));
     }
 }

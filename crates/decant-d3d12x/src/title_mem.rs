@@ -1627,6 +1627,7 @@ static DRAIN_LOCK: Mutex<DrainCursor> = Mutex::new(DrainCursor {
     tracking: false,
     scratch: Vec::new(),
     records: Vec::new(),
+    known_res: std::collections::BTreeMap::new(),
 });
 
 struct DrainCursor {
@@ -1636,6 +1637,7 @@ struct DrainCursor {
     tracking: bool,
     scratch: Vec<GpuChange>,
     records: Vec<GpuChange>,
+    known_res: std::collections::BTreeMap<u64, u64>,
 }
 
 enum DrainBatch {
@@ -1671,6 +1673,7 @@ fn drain_journal(api: &Api, cursor: &mut DrainCursor) -> DrainBatch {
         cursor.state_id = active_id;
         cursor.seq = 0;
         cursor.last_journal_seq = None;
+        cursor.known_res.clear();
     }
     let cur_seq = api.journal_seq.map(|f| {
         // SAFETY: `DecantXmemJournalSeq` is a lock-free atomic load returning `u64`.
@@ -1764,22 +1767,150 @@ fn known_holding(res_bounds: &std::collections::BTreeMap<u64, u64>, va: u64) -> 
     (va < end).then_some((base, end))
 }
 
-/// Compacts drained journal records before acquiring `STATE.write()`:
-/// - merges consecutive page-adjacent `MAP` records inside the same known `RESERVE`
-/// - merges consecutive page-adjacent `UNMAP` records inside the same known `RESERVE`
+fn record_reserve(res_bounds: &mut std::collections::BTreeMap<u64, u64>, va: u64, pages: u32) -> u64 {
+    let new_end = va.saturating_add(u64::from(pages).saturating_mul(PAGE));
+    let stale: Vec<u64> = res_bounds
+        .iter()
+        .filter(|&(&b, &e)| b < new_end && e > va)
+        .map(|(&b, _)| b)
+        .collect();
+    for b in stale {
+        res_bounds.remove(&b);
+    }
+    res_bounds.insert(va, new_end);
+    new_end
+}
+
+/// Flushes a contiguous run of `UNMAP` records at the tail of `out`: because `UNMAP` commutes
+/// with `UNMAP`, known-reservation runs can be sorted by `(base, va)` and merged into minimal spans.
+fn flush_unmap_run(out: &mut Vec<GpuChange>, run_start: usize, res_bounds: &std::collections::BTreeMap<u64, u64>) {
+    if out.len() - run_start < 2 {
+        return;
+    }
+    let slice = &out[run_start..];
+    let mut known: Vec<(u64, u64, u64, GpuChange)> = Vec::with_capacity(slice.len());
+    let mut unknown: Vec<GpuChange> = Vec::new();
+    for &c in slice {
+        if c.pages > 0
+            && let Some((base, res_end)) = known_holding(res_bounds, c.va)
+            && let Some(end) = c.va.checked_add(u64::from(c.pages) * PAGE)
+        {
+            known.push((base, c.va, end.min(res_end), c));
+        } else {
+            unknown.push(c);
+        }
+    }
+    if known.len() < 2 {
+        return;
+    }
+    known.sort_unstable_by_key(|&(base, va, _, c)| (base, va, c.seq));
+    out.truncate(run_start);
+    let mut cur: Option<(u64, u64, u64, GpuChange)> = None;
+    for (base, va, end, c) in known {
+        match &mut cur {
+            Some((c_base, c_va, c_end, prev)) if *c_base == base && va <= *c_end => {
+                *c_end = (*c_end).max(end);
+                let merged = ((*c_end - *c_va) / PAGE).min(u64::from(u32::MAX)) as u32;
+                prev.pages = merged;
+                prev.seq = prev.seq.max(c.seq);
+            }
+            _ => {
+                if let Some((_, _, _, prev)) = cur.take() {
+                    out.push(prev);
+                }
+                let mut first = c;
+                first.pages = ((end - va) / PAGE).min(u64::from(u32::MAX)) as u32;
+                cur = Some((base, va, end, first));
+            }
+        }
+    }
+    if let Some((_, _, _, prev)) = cur {
+        out.push(prev);
+    }
+    out.extend(unknown);
+}
+
+/// Flushes a contiguous run of `MAP` records at the tail of `out`: when every entry in the run
+/// falls within `res_bounds` and has strictly disjoint VAs, sorting by `(base, va)` merges adjacent
+/// `(va, first_page)` scatter entries without altering semantics.
+fn flush_map_run(out: &mut Vec<GpuChange>, run_start: usize, res_bounds: &std::collections::BTreeMap<u64, u64>) {
+    if out.len() - run_start < 2 {
+        return;
+    }
+    let slice = &out[run_start..];
+    let mut items: Vec<(u64, u64, u64, GpuChange)> = Vec::with_capacity(slice.len());
+    for &c in slice {
+        let Some((base, res_end)) = known_holding(res_bounds, c.va) else { return };
+        let Some(end) = c.va.checked_add(u64::from(c.pages) * PAGE) else { return };
+        if c.pages == 0 || end > res_end {
+            return;
+        }
+        items.push((base, c.va, end, c));
+    }
+    items.sort_unstable_by_key(|&(base, va, _, _)| (base, va));
+    // Reordering is safe only if every pair of MAP intervals in this run is disjoint.
+    for w in items.windows(2) {
+        if w[0].2 > w[1].1 {
+            return;
+        }
+    }
+    out.truncate(run_start);
+    for (base, va, end, c) in items {
+        if let Some(prev) = out[run_start..].last_mut()
+            && prev.va.checked_add(u64::from(prev.pages) * PAGE) == Some(va)
+            && prev.first_page.checked_add(prev.pages) == Some(c.first_page)
+            && let Some(merged_pages) = prev.pages.checked_add(c.pages)
+            && known_holding(res_bounds, prev.va).is_some_and(|(b0, e0)| b0 == base && end <= e0)
+        {
+            prev.pages = merged_pages;
+            prev.seq = prev.seq.max(c.seq);
+            continue;
+        }
+        out.push(c);
+    }
+}
+
+/// Compacts drained journal records before acquiring `STATE.write()` while keeping `res_bounds`
+/// synchronized across batches:
+/// - merges contiguous and disjoint `MAP` runs inside known reservations
+/// - merges contiguous and unsorted `UNMAP` runs inside known reservations
 /// - collapses `RESERVE(va)` + intra-`va` `MAP`/`UNMAP` + `RELEASE(va)` in one batch into `RELEASE(va)`.
-fn coalesce_changes(records: &mut Vec<GpuChange>) {
+fn coalesce_changes(records: &mut Vec<GpuChange>, res_bounds: &mut std::collections::BTreeMap<u64, u64>, is_snapshot: bool) {
+    if is_snapshot {
+        res_bounds.clear();
+    }
     if records.len() < 2 {
+        for &c in records.iter() {
+            match c.kind {
+                RESERVE => {
+                    record_reserve(res_bounds, c.va, c.pages);
+                }
+                RELEASE => {
+                    res_bounds.remove(&c.va);
+                }
+                _ => {}
+            }
+        }
         return;
     }
     let mut out: Vec<GpuChange> = Vec::with_capacity(records.len());
-    let mut res_bounds: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     let mut open_res: HashMap<u64, (usize, bool)> = HashMap::new();
+    let mut active_run: Option<(u32, usize)> = None;
+
+    let flush_run = |out: &mut Vec<GpuChange>, run: &mut Option<(u32, usize)>, bounds: &std::collections::BTreeMap<u64, u64>| {
+        if let Some((kind, start)) = run.take() {
+            if kind == UNMAP {
+                flush_unmap_run(out, start, bounds);
+            } else if kind == MAP {
+                flush_map_run(out, start, bounds);
+            }
+        }
+    };
 
     for &c in records.iter() {
         match c.kind {
             RESERVE => {
-                // Invalidate any overlapping prior tracked reservation bounds in this batch.
+                flush_run(&mut out, &mut active_run, res_bounds);
                 let new_end = c.va.saturating_add(u64::from(c.pages).saturating_mul(PAGE));
                 let stale: Vec<u64> = res_bounds
                     .iter()
@@ -1798,6 +1929,7 @@ fn coalesce_changes(records: &mut Vec<GpuChange>) {
                 out.push(c);
             }
             RELEASE => {
+                flush_run(&mut out, &mut active_run, res_bounds);
                 res_bounds.remove(&c.va);
                 if let Some((idx, pure)) = open_res.remove(&c.va)
                     && pure
@@ -1815,21 +1947,29 @@ fn coalesce_changes(records: &mut Vec<GpuChange>) {
                 out.push(c);
             }
             MAP => {
-                let target_base = known_holding(&res_bounds, c.va).map(|(b, _)| b);
+                if active_run.is_some_and(|(k, _)| k != MAP) {
+                    flush_run(&mut out, &mut active_run, res_bounds);
+                }
+                if active_run.is_none() {
+                    active_run = Some((MAP, out.len()));
+                }
+                let run_start = active_run.map_or(out.len(), |(_, s)| s);
+                let target_base = known_holding(res_bounds, c.va).map(|(b, _)| b);
                 for (&base, (_, pure)) in open_res.iter_mut() {
                     if target_base != Some(base) {
                         *pure = false;
                     }
                 }
                 if c.pages > 0
+                    && out.len() > run_start
                     && let Some(prev) = out.last_mut()
                     && prev.kind == MAP
                     && prev.pages > 0
                     && prev.va.checked_add(u64::from(prev.pages) * PAGE) == Some(c.va)
                     && prev.first_page.checked_add(prev.pages) == Some(c.first_page)
                     && let Some(merged_pages) = prev.pages.checked_add(c.pages)
-                    && let Some((base, end)) = known_holding(&res_bounds, prev.va)
-                    && known_holding(&res_bounds, c.va).is_some_and(|(b2, _)| b2 == base)
+                    && let Some((base, end)) = known_holding(res_bounds, prev.va)
+                    && known_holding(res_bounds, c.va).is_some_and(|(b2, _)| b2 == base)
                     && c.va.checked_add(u64::from(c.pages) * PAGE).is_some_and(|e| e <= end)
                 {
                     prev.pages = merged_pages;
@@ -1839,20 +1979,28 @@ fn coalesce_changes(records: &mut Vec<GpuChange>) {
                 out.push(c);
             }
             UNMAP => {
-                let target_base = known_holding(&res_bounds, c.va).map(|(b, _)| b);
+                if active_run.is_some_and(|(k, _)| k != UNMAP) {
+                    flush_run(&mut out, &mut active_run, res_bounds);
+                }
+                if active_run.is_none() {
+                    active_run = Some((UNMAP, out.len()));
+                }
+                let run_start = active_run.map_or(out.len(), |(_, s)| s);
+                let target_base = known_holding(res_bounds, c.va).map(|(b, _)| b);
                 for (&base, (_, pure)) in open_res.iter_mut() {
                     if target_base != Some(base) {
                         *pure = false;
                     }
                 }
                 if c.pages > 0
+                    && out.len() > run_start
                     && let Some(prev) = out.last_mut()
                     && prev.kind == UNMAP
                     && prev.pages > 0
                     && prev.va.checked_add(u64::from(prev.pages) * PAGE) == Some(c.va)
                     && let Some(merged_pages) = prev.pages.checked_add(c.pages)
-                    && let Some((base, end)) = known_holding(&res_bounds, prev.va)
-                    && known_holding(&res_bounds, c.va).is_some_and(|(b2, _)| b2 == base)
+                    && let Some((base, end)) = known_holding(res_bounds, prev.va)
+                    && known_holding(res_bounds, c.va).is_some_and(|(b2, _)| b2 == base)
                     && c.va.checked_add(u64::from(c.pages) * PAGE).is_some_and(|e| e <= end)
                 {
                     prev.pages = merged_pages;
@@ -1862,10 +2010,12 @@ fn coalesce_changes(records: &mut Vec<GpuChange>) {
                 out.push(c);
             }
             _ => {
+                flush_run(&mut out, &mut active_run, res_bounds);
                 out.push(c);
             }
         }
     }
+    flush_run(&mut out, &mut active_run, res_bounds);
 
     *records = out;
 }
@@ -2654,7 +2804,7 @@ fn sync_journal_and_windows(api: &Api) -> bool {
                 }
                 DrainBatch::Changes { state_id, seq, journal_seq } => {
                     let mut records = std::mem::take(&mut cursor.records);
-                    coalesce_changes(&mut records);
+                    coalesce_changes(&mut records, &mut cursor.known_res, false);
                     PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner).push(PendingBatch {
                         state_id,
                         snapshot: false,
@@ -2671,7 +2821,7 @@ fn sync_journal_and_windows(api: &Api) -> bool {
                 }
                 DrainBatch::Snapshot { state_id, seq, journal_seq } => {
                     let mut records = std::mem::take(&mut cursor.records);
-                    coalesce_changes(&mut records);
+                    coalesce_changes(&mut records, &mut cursor.known_res, true);
                     PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner).push(PendingBatch {
                         state_id,
                         snapshot: true,
@@ -2694,64 +2844,56 @@ fn sync_journal_and_windows(api: &Api) -> bool {
     let mut missing = None;
     if need_apply || HAS_PENDING_JOURNAL.load(Ordering::Acquire) {
         let _apply = decant_trace::timed_lock("title_mem::APPLY_LOCK", || APPLY_LOCK.lock().unwrap_or_else(PoisonError::into_inner));
-        let mut batches = std::mem::take(&mut *PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner));
         loop {
-            if !batches.is_empty() {
-                let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
-                let Some(st) = guard.as_mut() else {
-                    HAS_PENDING_JOURNAL.store(false, Ordering::Release);
-                    return false;
-                };
-                st.tracking = true;
-                for b in batches.drain(..) {
-                    if b.state_id != st.id {
-                        continue;
-                    }
-                    if b.snapshot {
-                        xs_log!("title memory: the journal of xmem.dll overran, starting again from a snapshot of {} records", b.records.len());
-                        st.mirror.reset();
-                        bump_mapping_gen();
-                        bump_unmap_gen();
-                        MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
-                        for c in &b.records {
-                            st.apply(c);
-                        }
-                        st.seq = b.seq;
-                        st.last_journal_seq = b.journal_seq;
-                    } else {
-                        for c in &b.records {
-                            if c.seq > st.seq {
-                                st.apply(c);
-                            }
-                        }
-                        st.seq = st.seq.max(b.seq);
-                        if b.journal_seq.is_some() {
-                            st.last_journal_seq = b.journal_seq;
-                        }
-                    }
-                    if let Some(jseq) = b.journal_seq {
-                        LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
-                    }
-                }
-                let m = st.missing_window_sizes();
-                if m.is_some() {
-                    MISSING_WINDOWS.store(true, Ordering::Release);
-                }
-                missing = m;
-            }
-            let next = {
+            let mut batches = {
                 let mut p = PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner);
                 if p.is_empty() {
                     HAS_PENDING_JOURNAL.store(false, Ordering::Release);
-                    Vec::new()
-                } else {
-                    std::mem::take(&mut *p)
+                    break;
                 }
+                std::mem::take(&mut *p)
             };
-            if next.is_empty() {
-                break;
+            let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
+            let Some(st) = guard.as_mut() else {
+                HAS_PENDING_JOURNAL.store(false, Ordering::Release);
+                return false;
+            };
+            st.tracking = true;
+            for b in batches.drain(..) {
+                if b.state_id != st.id {
+                    continue;
+                }
+                if b.snapshot {
+                    xs_log!("title memory: the journal of xmem.dll overran, starting again from a snapshot of {} records", b.records.len());
+                    st.mirror.reset();
+                    bump_mapping_gen();
+                    bump_unmap_gen();
+                    MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
+                    for c in &b.records {
+                        st.apply(c);
+                    }
+                    st.seq = b.seq;
+                    st.last_journal_seq = b.journal_seq;
+                } else {
+                    for c in &b.records {
+                        if c.seq > st.seq {
+                            st.apply(c);
+                        }
+                    }
+                    st.seq = st.seq.max(b.seq);
+                    if b.journal_seq.is_some() {
+                        st.last_journal_seq = b.journal_seq;
+                    }
+                }
+                if let Some(jseq) = b.journal_seq {
+                    LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
+                }
             }
-            batches = next;
+            let m = st.missing_window_sizes();
+            if m.is_some() {
+                MISSING_WINDOWS.store(true, Ordering::Release);
+            }
+            missing = m;
         }
     }
 
@@ -2795,14 +2937,19 @@ fn with_state_read<R>(f: impl FnOnce(&State) -> Option<R>) -> Option<R> {
     if ACTIVE_STATE_ID.load(Ordering::Acquire) == 0 {
         return None;
     }
-    if journal_unchanged(api) && !MISSING_WINDOWS.load(Ordering::Acquire) {
-        let cur_seq = api.journal_seq.map(|g| {
-            // SAFETY: `DecantXmemJournalSeq` is a lock-free atomic load returning `u64`.
-            unsafe { g() }
-        });
+    let cur_seq = api.journal_seq.map(|g| {
+        // SAFETY: `DecantXmemJournalSeq` is a lock-free atomic load returning `u64`.
+        unsafe { g() }
+    });
+    if TRACKING_ACTIVE.load(Ordering::Acquire)
+        && !HAS_PENDING_JOURNAL.load(Ordering::Acquire)
+        && !MISSING_WINDOWS.load(Ordering::Acquire)
+        && let Some(seq) = cur_seq
+        && LAST_JOURNAL_SEQ.load(Ordering::Acquire) == seq
+    {
         let guard = decant_trace::timed_lock("title_mem::STATE_READ", || STATE.read().unwrap_or_else(PoisonError::into_inner));
         let st = guard.as_ref()?;
-        if st.tracking && should_skip_drain(st.last_journal_seq, cur_seq) {
+        if st.tracking && st.last_journal_seq == Some(seq) {
             return f(st);
         }
     }
@@ -4503,6 +4650,7 @@ mod tests {
 
     #[test]
     fn coalesce_changes_merges_contiguous_maps_and_unmaps_within_reservation() {
+        let mut known_res = std::collections::BTreeMap::new();
         let mut recs = vec![
             // Adjacent MAPs with unknown reservation (pre-existing) must NOT be merged.
             GpuChange { seq: 1, kind: MAP, pages: 2, va: 0x1000_0000, first_page: 10, flags: 0 },
@@ -4522,7 +4670,7 @@ mod tests {
             GpuChange { seq: 11, kind: UNMAP, pages: 8, va: 0x3000_0000, first_page: 0, flags: 0 },
             GpuChange { seq: 12, kind: RELEASE, va: 0x3000_0000, ..GpuChange::default() },
         ];
-        coalesce_changes(&mut recs);
+        coalesce_changes(&mut recs, &mut known_res, false);
         assert_eq!(recs.len(), 7);
         assert_eq!((recs[0].kind, recs[0].pages), (MAP, 2));
         assert_eq!((recs[1].kind, recs[1].pages), (MAP, 3));
@@ -4531,6 +4679,19 @@ mod tests {
         assert_eq!((recs[4].kind, recs[4].pages, recs[4].first_page), (MAP, 2, 200));
         assert_eq!((recs[5].kind, recs[5].pages, recs[5].seq), (UNMAP, 10, 8));
         assert_eq!((recs[6].kind, recs[6].va, recs[6].seq), (RELEASE, 0x3000_0000, 12));
+
+        // Second batch reuses persistent `known_res` for `0x2000_0000`: unsorted disjoint MAPs & UNMAPs coalesce!
+        let mut batch2 = vec![
+            GpuChange { seq: 13, kind: MAP, pages: 1, va: 0x2000_0000 + 2 * PAGE, first_page: 502, flags: 0 },
+            GpuChange { seq: 14, kind: MAP, pages: 1, va: 0x2000_0000 + PAGE, first_page: 501, flags: 0 },
+            GpuChange { seq: 15, kind: MAP, pages: 1, va: 0x2000_0000, first_page: 500, flags: 0 },
+            GpuChange { seq: 16, kind: UNMAP, pages: 1, va: 0x2000_0000 + 2 * PAGE, first_page: 0, flags: 0 },
+            GpuChange { seq: 17, kind: UNMAP, pages: 2, va: 0x2000_0000, first_page: 0, flags: 0 },
+        ];
+        coalesce_changes(&mut batch2, &mut known_res, false);
+        assert_eq!(batch2.len(), 2);
+        assert_eq!((batch2[0].kind, batch2[0].va, batch2[0].pages, batch2[0].first_page, batch2[0].seq), (MAP, 0x2000_0000, 3, 500, 15));
+        assert_eq!((batch2[1].kind, batch2[1].va, batch2[1].pages, batch2[1].seq), (UNMAP, 0x2000_0000, 3, 17));
     }
 
     #[test]
