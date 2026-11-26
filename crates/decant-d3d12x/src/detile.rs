@@ -1047,12 +1047,57 @@ struct Registry {
     /// Cached reverse index from mirror tile index to placed texture resources, maintained
     /// incrementally on insert and remove and rebuilt only when `title_mem::mapping_generation()`
     /// changes structurally.
-    tile_to_textures: FastMap<u32, Vec<usize>>,
+    tile_to_textures: FastMap<u32, TileRefs>,
     unmapped_textures: FastSet<usize>,
     pending_index: FastSet<usize>,
     layout_gen: u64,
     last_tile_gen: u64,
     scratch: RegistryScratch,
+}
+
+enum TileRefs {
+    One(usize),
+    Two([usize; 2]),
+    Many(Vec<usize>),
+}
+
+impl TileRefs {
+    #[inline]
+    fn push(&mut self, res: usize) {
+        match self {
+            TileRefs::One(a) => *self = TileRefs::Two([*a, res]),
+            TileRefs::Two([a, b]) => *self = TileRefs::Many(vec![*a, *b, res]),
+            TileRefs::Many(v) => v.push(res),
+        }
+    }
+
+    #[inline]
+    fn retain_not(&mut self, res: usize) -> bool {
+        match self {
+            TileRefs::One(a) => *a == res,
+            TileRefs::Two([a, b]) => {
+                if *a == res {
+                    *self = TileRefs::One(*b);
+                } else if *b == res {
+                    *self = TileRefs::One(*a);
+                }
+                false
+            }
+            TileRefs::Many(v) => {
+                v.retain(|&r| r != res);
+                v.is_empty()
+            }
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            TileRefs::One(a) => std::slice::from_ref(a),
+            TileRefs::Two(pair) => pair.as_slice(),
+            TileRefs::Many(v) => v.as_slice(),
+        }
+    }
 }
 
 impl Registry {
@@ -1081,11 +1126,10 @@ impl Registry {
         self.unmapped_textures.remove(&res);
         if let Some(tiles) = &texture.tiles {
             for &tile in tiles {
-                if let Some(list) = self.tile_to_textures.get_mut(&tile) {
-                    list.retain(|&r| r != res);
-                    if list.is_empty() {
-                        self.tile_to_textures.remove(&tile);
-                    }
+                if let Some(refs) = self.tile_to_textures.get_mut(&tile)
+                    && refs.retain_not(res)
+                {
+                    self.tile_to_textures.remove(&tile);
                 }
             }
         }
@@ -1143,14 +1187,21 @@ impl Registry {
     fn build_full_index_maps(
         items: &[(usize, u64, u64)],
         tiles_per_item: &[Option<Vec<u32>>],
-    ) -> (FastMap<u32, Vec<usize>>, FastSet<usize>) {
-        let mut tile_to_textures: FastMap<u32, Vec<usize>> = FastMap::default();
+        capacity_hint: usize,
+    ) -> (FastMap<u32, TileRefs>, FastSet<usize>) {
+        let mut tile_to_textures: FastMap<u32, TileRefs> =
+            FastMap::with_capacity_and_hasher(capacity_hint.max(items.len() * 2), Default::default());
         let mut unmapped_textures: FastSet<usize> = FastSet::default();
         for (&(res, _, _), maybe_tiles) in items.iter().zip(tiles_per_item) {
             match maybe_tiles {
                 Some(tiles) => {
                     for &tile in tiles {
-                        tile_to_textures.entry(tile).or_default().push(res);
+                        match tile_to_textures.entry(tile) {
+                            std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(res),
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                e.insert(TileRefs::One(res));
+                            }
+                        }
                     }
                 }
                 None => {
@@ -1167,11 +1218,11 @@ impl Registry {
         &mut self,
         items: &[(usize, u64, u64)],
         tiles_per_item: Vec<Option<Vec<u32>>>,
-        precomputed: (FastMap<u32, Vec<usize>>, FastSet<usize>),
+        precomputed: (FastMap<u32, TileRefs>, FastSet<usize>),
         layout_gen: u64,
         tile_gen: u64,
         layout_current: bool,
-    ) -> (FastMap<u32, Vec<usize>>, FastSet<usize>) {
+    ) -> (FastMap<u32, TileRefs>, FastSet<usize>) {
         let (mut new_tile_to_textures, mut new_unmapped) = precomputed;
         std::mem::swap(&mut self.tile_to_textures, &mut new_tile_to_textures);
         std::mem::swap(&mut self.unmapped_textures, &mut new_unmapped);
@@ -1195,7 +1246,7 @@ impl Registry {
 
     #[cfg(test)]
     fn apply_full_index(&mut self, items: &[(usize, u64, u64)], tiles_per_item: &[Option<Vec<u32>>], layout_gen: u64, tile_gen: u64, layout_current: bool) {
-        let precomputed = Self::build_full_index_maps(items, tiles_per_item);
+        let precomputed = Self::build_full_index_maps(items, tiles_per_item, self.tile_to_textures.len());
         let _ = self.apply_precomputed_full_index(items, tiles_per_item.to_vec(), precomputed, layout_gen, tile_gen, layout_current);
     }
 
@@ -1215,18 +1266,22 @@ impl Registry {
             self.unmapped_textures.remove(&res);
             if let Some(old_tiles) = texture.tiles.take() {
                 for tile in old_tiles {
-                    if let Some(list) = self.tile_to_textures.get_mut(&tile) {
-                        list.retain(|&r| r != res);
-                        if list.is_empty() {
-                            self.tile_to_textures.remove(&tile);
-                        }
+                    if let Some(refs) = self.tile_to_textures.get_mut(&tile)
+                        && refs.retain_not(res)
+                    {
+                        self.tile_to_textures.remove(&tile);
                     }
                 }
             }
             match maybe_tiles {
                 Some(tiles) => {
                     for &tile in tiles {
-                        self.tile_to_textures.entry(tile).or_default().push(res);
+                        match self.tile_to_textures.entry(tile) {
+                            std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(res),
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                e.insert(TileRefs::One(res));
+                            }
+                        }
                     }
                     texture.tiles = Some(tiles.clone());
                 }
@@ -1248,8 +1303,8 @@ impl Registry {
         let mut hit = std::mem::take(&mut self.scratch.overlapping);
         hit.clear();
         for &tile in tiles {
-            if let Some(list) = self.tile_to_textures.get(&tile) {
-                hit.extend_from_slice(list);
+            if let Some(refs) = self.tile_to_textures.get(&tile) {
+                hit.extend_from_slice(refs.as_slice());
             }
         }
         if hit.len() > 1 {
@@ -1502,6 +1557,29 @@ fn probe_line_due() -> bool {
     due
 }
 
+fn tiles_of_batch_parallel(spans: &[(u64, u64)], tiles_out: &mut Vec<Option<Vec<u32>>>) {
+    const PARALLEL_THRESHOLD: usize = 1024;
+    if spans.len() < PARALLEL_THRESHOLD {
+        crate::title_mem::tiles_of_batch(spans, tiles_out);
+        return;
+    }
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 4));
+    let chunk_len = spans.len().div_ceil(workers);
+    let mut chunk_results: Vec<Vec<Option<Vec<u32>>>> = vec![Vec::new(); workers];
+    std::thread::scope(|s| {
+        for (chunk, out) in spans.chunks(chunk_len).zip(chunk_results.iter_mut()) {
+            s.spawn(move || {
+                crate::title_mem::tiles_of_batch(chunk, out);
+            });
+        }
+    });
+    tiles_out.clear();
+    tiles_out.reserve(spans.len());
+    for mut part in chunk_results {
+        tiles_out.append(&mut part);
+    }
+}
+
 /// The title wrote the pages with mirror tiles `tiles` since its last submission (`title_mem::sync`).
 /// Every texture that owns one of them becomes dirty, and so does one whose memory had no GPU
 /// address at its first tries.
@@ -1520,7 +1598,7 @@ pub fn note_tiles(tiles: &[u32]) {
         if r.layout_gen != current_layout {
             let items: Vec<(usize, u64, u64)> = r.textures.iter().map(|(&res, t)| (res, t.va, t.plan.size)).collect();
             let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
-            return Err((true, current_layout, items, spans));
+            return Err((true, current_layout, items, spans, r.tile_to_textures.len()));
         }
         let check_unmapped = current_tile != r.last_tile_gen && !r.unmapped_textures.is_empty();
         if !r.pending_index.is_empty() || check_unmapped {
@@ -1540,13 +1618,13 @@ pub fn note_tiles(tiles: &[u32]) {
                 }
             }
             let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
-            return Err((false, current_layout, items, spans));
+            return Err((false, current_layout, items, spans, 0));
         }
         Ok(report
             || tiles.iter().any(|t| {
                 r.tile_to_textures
                     .get(t)
-                    .is_some_and(|list| list.iter().any(|res| r.textures.get(res).is_some_and(|tex| !(tex.dirty && tex.attempts == 0))))
+                    .is_some_and(|refs| refs.as_slice().iter().any(|res| r.textures.get(res).is_some_and(|tex| !(tex.dirty && tex.attempts == 0))))
             }))
     }) else {
         return;
@@ -1554,13 +1632,13 @@ pub fn note_tiles(tiles: &[u32]) {
     let marked = match fast {
         Ok(false) => 0,
         Ok(true) => with_registry(|r| r.mark_tiles_from_index(tiles, report)),
-        Err((full_rebuild, snap_layout, items, spans)) => {
+        Err((full_rebuild, snap_layout, items, spans, cap_hint)) => {
             let build_layout = crate::title_mem::mapping_generation();
             let build_tile = crate::title_mem::tile_generation();
             let mut tiles_out = Vec::new();
-            crate::title_mem::tiles_of_batch(&spans, &mut tiles_out);
+            tiles_of_batch_parallel(&spans, &mut tiles_out);
             if full_rebuild {
-                let precomputed = Registry::build_full_index_maps(&items, &tiles_out);
+                let precomputed = Registry::build_full_index_maps(&items, &tiles_out, cap_hint);
                 let (old_map, old_unmapped, marked) = with_registry(|r| {
                     let (old_map, old_unmapped) = r.apply_precomputed_full_index(
                         &items,
@@ -1573,8 +1651,15 @@ pub fn note_tiles(tiles: &[u32]) {
                     let marked = r.mark_tiles_from_index(tiles, report);
                     (old_map, old_unmapped, marked)
                 });
-                drop(old_map);
-                drop(old_unmapped);
+                if old_map.len() > 2048 {
+                    let _ = std::thread::Builder::new().name("detile-drop".into()).spawn(move || {
+                        drop(old_map);
+                        drop(old_unmapped);
+                    });
+                } else {
+                    drop(old_map);
+                    drop(old_unmapped);
+                }
                 marked
             } else {
                 with_registry(|r| {
@@ -2249,12 +2334,12 @@ mod tests {
         r.insert(2, placed(0x2000, 0x1000));
         let items = vec![(1, 0x1000, 0x1000), (2, 0x2000, 0x1000)];
         let tiles_out = vec![Some(vec![10, 11]), None];
-        let precomputed = Registry::build_full_index_maps(&items, &tiles_out);
+        let precomputed = Registry::build_full_index_maps(&items, &tiles_out, 0);
         // Simulate a new texture registered concurrently while tiles_of_batch ran.
         r.insert(3, placed(0x3000, 0x1000));
         let (old_map, old_unmapped) = r.apply_precomputed_full_index(&items, tiles_out, precomputed, 42, 7, true);
         assert!(old_map.is_empty() && old_unmapped.is_empty());
-        assert_eq!(r.tile_to_textures.get(&10).map(Vec::as_slice), Some(&[1][..]));
+        assert_eq!(r.tile_to_textures.get(&10).map(TileRefs::as_slice), Some(&[1][..]));
         assert!(r.unmapped_textures.contains(&2));
         assert!(!r.pending_index.contains(&1) && !r.pending_index.contains(&2));
         assert!(r.pending_index.contains(&3), "concurrently inserted texture stays queued");
@@ -2272,12 +2357,22 @@ mod tests {
         p2.dirty = false;
         p2.attempts = 0;
         r.insert(2, p2);
-        r.tile_to_textures.insert(5, vec![1, 2]);
+        r.tile_to_textures.insert(5, TileRefs::Two([1, 2]));
         let marked = r.mark_tiles_from_index(&[5], false);
         assert_eq!(marked, 2);
         assert!(r.pending.contains(&1));
         assert!(r.pending.contains(&2));
         assert!(r.textures[&2].dirty);
+    }
+
+    #[test]
+    fn tiles_of_batch_parallel_matches_serial_above_threshold() {
+        let spans: Vec<(u64, u64)> = (0..1500u64).map(|i| (0x1000_0000 + i * 0x10000, 0x10000)).collect();
+        let mut serial = Vec::new();
+        crate::title_mem::tiles_of_batch(&spans, &mut serial);
+        let mut parallel = Vec::new();
+        tiles_of_batch_parallel(&spans, &mut parallel);
+        assert_eq!(parallel, serial);
     }
 
     #[test]
