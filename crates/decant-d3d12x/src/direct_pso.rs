@@ -58,8 +58,9 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::direct_source::DirectSource;
@@ -194,9 +195,52 @@ static QUEUE: OnceLock<Option<Arc<Queue>>> = OnceLock::new();
 static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
 static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
 
+const WAITING_SHARDS: usize = 16;
+
+type WaitingShard = Mutex<Option<HashMap<usize, (u128, bool)>>>;
+
+struct WaitingTable {
+    count: AtomicUsize,
+    shards: [WaitingShard; WAITING_SHARDS],
+}
+
+impl WaitingTable {
+    const fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            shards: [const { Mutex::new(None) }; WAITING_SHARDS],
+        }
+    }
+
+    #[inline]
+    fn shard(&self, addr: usize) -> &WaitingShard {
+        &self.shards[(addr >> 4) & (WAITING_SHARDS - 1)]
+    }
+
+    fn insert(&self, addr: usize, entry: (u128, bool)) {
+        let mut guard = self.shard(addr).lock().unwrap_or_else(|e| e.into_inner());
+        let prev = guard.get_or_insert_with(HashMap::new).insert(addr, entry);
+        if prev.is_none() {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn take(&self, addr: usize) -> Option<(u128, bool)> {
+        if self.count.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let mut guard = self.shard(addr).lock().unwrap_or_else(|e| e.into_inner());
+        let removed = guard.as_mut()?.remove(&addr);
+        if removed.is_some() {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
+    }
+}
+
 /// The pipeline library key of each pipeline handed out with compiled shaders and not made yet,
 /// by the address of its console description copy, and whether it got a stored blob.
-static WAITING: LazyLock<Mutex<HashMap<usize, (u128, bool)>>> = LazyLock::new(Mutex::default);
+static WAITING: WaitingTable = WaitingTable::new();
 
 /// The pipeline library of the run, once the direct service started with it on.
 fn library() -> Option<&'static Library> {
@@ -305,7 +349,7 @@ pub(crate) fn pipeline_done_for(service: Option<&'static Service>, owned: &Owned
 
 /// The library key waiting for the PC creation of `owned`, taken out.
 fn take_waiting(owned: &Owned) -> Option<(u128, bool)> {
-    WAITING.lock().unwrap_or_else(|e| e.into_inner()).remove(&(owned.desc().as_ptr() as usize))
+    WAITING.take(owned.desc().as_ptr() as usize)
 }
 
 /// The PC runtime refused the pipeline of `owned` with its compiled shaders. A stored blob it was
@@ -371,7 +415,7 @@ pub fn kind_made(made: usize, owned: &Owned) {
     let desc = owned.desc();
     let graphics = desc.len() != COMPUTE_DESC_SIZE;
     let mut stages = Vec::new();
-    for (kind, at) in stage_offsets(desc) {
+    for &(kind, at) in stage_offsets(desc).iter() {
         let (ptr, len) = (read_u64(desc, at), read_u64(desc, at + 8) as usize);
         let Some(bytes) = owned.shaders().iter().find(|s| s.as_ptr() as u64 == ptr && s.len() == len) else { continue };
         let hash = crate::dxil_override::content_hash(bytes);
@@ -554,8 +598,25 @@ fn read_u32(d: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(d[at..at + 4].try_into().unwrap_or_default())
 }
 
+const MAX_PIPELINE_STAGES: usize = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StageOffsets {
+    items: [(StageKind, usize); MAX_PIPELINE_STAGES],
+    len: usize,
+}
+
+impl Deref for StageOffsets {
+    type Target = [(StageKind, usize)];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.items[..self.len]
+    }
+}
+
 /// The stages of a copied description with the offsets of their `D3D12_SHADER_BYTECODE`.
-fn stage_offsets(desc: &[u8]) -> Vec<(StageKind, usize)> {
+fn stage_offsets(desc: &[u8]) -> StageOffsets {
     let all: &[(StageKind, usize)] = match desc.len() {
         COMPUTE_DESC_SIZE => &[(StageKind::Compute, 0x08)],
         GRAPHICS_DESC_SIZE => &[(StageKind::Vertex, 0x08), (StageKind::Pixel, 0x18), (StageKind::Domain, 0x28), (StageKind::Hull, 0x38), (StageKind::Geometry, 0x48)],
@@ -563,7 +624,15 @@ fn stage_offsets(desc: &[u8]) -> Vec<(StageKind, usize)> {
         MESH_DESC_SIZE => &[(StageKind::Amplification, crate::mesh_pso::AS_AT), (StageKind::Mesh, crate::mesh_pso::MS_AT), (StageKind::Pixel, crate::mesh_pso::PS_AT)],
         _ => &[],
     };
-    all.iter().copied().filter(|&(_, at)| read_u64(desc, at) != 0 && read_u64(desc, at + 8) != 0).collect()
+    let mut items = [(StageKind::Vertex, 0); MAX_PIPELINE_STAGES];
+    let mut len = 0;
+    for &(kind, at) in all {
+        if read_u64(desc, at) != 0 && read_u64(desc, at + 8) != 0 {
+            items[len] = (kind, at);
+            len += 1;
+        }
+    }
+    StageOffsets { items, len }
 }
 
 /// The translator's input for a copied description (also what `pipeline_manifest` records).
@@ -575,7 +644,7 @@ pub(crate) fn pipeline_of(owned: &Owned) -> Result<Pipeline, Refusal> {
         return Err(Refusal::new("no shader stage", ""));
     }
     let mut stages = Vec::with_capacity(offsets.len());
-    for &(kind, at) in &offsets {
+    for &(kind, at) in &*offsets {
         let (ptr, len) = (read_u64(desc, at), read_u64(desc, at + 8) as usize);
         // The copy shares its shaders with `owned`, so the bytes are taken from there, not copied.
         let bytes = owned.shaders().iter().find(|s| s.as_ptr() as u64 == ptr && s.len() == len).cloned();
@@ -637,14 +706,14 @@ fn patch(desc: &[u8], dxil: &[Arc<[u8]>]) -> Patched {
 /// Points `patched` at the stored driver blob of its pipeline, when the library has one, and
 /// notes its key for [`library_made`] and [`library_refused`].
 fn attach_blob(library: &Library, owned: &Owned, patched: &mut Patched) {
-    let Some(key) = library_key(owned, patched) else { return };
     let Some(at) = crate::pso_library::cached_field(patched.desc.len()) else { return };
+    let Some(key) = library_key(owned, patched) else { return };
     let blob = library.lookup(key);
     if let Some(blob) = &blob {
         patched.desc[at..at + 8].copy_from_slice(&(blob.as_ptr() as u64).to_le_bytes());
         patched.desc[at + 8..at + 16].copy_from_slice(&(blob.len() as u64).to_le_bytes());
     }
-    WAITING.lock().unwrap_or_else(|e| e.into_inner()).insert(owned.desc().as_ptr() as usize, (key, blob.is_some()));
+    WAITING.insert(owned.desc().as_ptr() as usize, (key, blob.is_some()));
     patched._blob = blob;
 }
 
@@ -652,6 +721,13 @@ fn attach_blob(library: &Library, owned: &Owned, patched: &mut Patched) {
 /// the console pipeline.
 fn library_key(owned: &Owned, patched: &Patched) -> Option<u128> {
     let identity = crate::direct_cache::pipeline_key(&pipeline_of(owned).ok()?, TRANSLATOR_HASH, "");
+    let mut stack = [&[][..]; MAX_PIPELINE_STAGES];
+    if patched.dxil.len() <= MAX_PIPELINE_STAGES {
+        for (slot, d) in stack.iter_mut().zip(&patched.dxil) {
+            *slot = &d[..];
+        }
+        return crate::pso_library::pipeline_key(&patched.desc, &stack[..patched.dxil.len()], identity);
+    }
     let stages: Vec<&[u8]> = patched.dxil.iter().map(|d| &d[..]).collect();
     crate::pso_library::pipeline_key(&patched.desc, &stages, identity)
 }
@@ -956,7 +1032,7 @@ mod tests {
                 stream_output: false,
             }
         );
-        assert_eq!(stage_offsets(owned.desc()), [(StageKind::Vertex, 0x08), (StageKind::Pixel, 0x18)]);
+        assert_eq!(&*stage_offsets(owned.desc()), [(StageKind::Vertex, 0x08), (StageKind::Pixel, 0x18)]);
         // The patched copy points at the compiled shaders, the rest is the same.
         let dxil: Vec<Arc<[u8]>> = vec![Arc::from(&b"DXBCvs"[..]), Arc::from(&b"DXBCps"[..])];
         let patched = patch(d, &dxil);
@@ -990,5 +1066,41 @@ mod tests {
         assert_eq!(summary.frames, 1);
         assert!(summary.spans.iter().any(|s| s.cat == "direct_pso" && s.name == "translate"));
         assert!(summary.spans.iter().any(|s| s.cat == "direct_pso" && s.name == "create"));
+    }
+
+    #[test]
+    fn waiting_table_shards_and_tracks_count_across_concurrent_inserts_and_takes() {
+        let table = WaitingTable::new();
+        assert_eq!(table.take(0x1000), None);
+        for i in 0..32usize {
+            let addr = 0x1000 + (i << 4);
+            table.insert(addr, (i as u128 + 1, i % 2 == 0));
+        }
+        assert_eq!(table.count.load(Ordering::Relaxed), 32);
+        for i in 0..32usize {
+            let addr = 0x1000 + (i << 4);
+            assert_eq!(table.take(addr), Some((i as u128 + 1, i % 2 == 0)));
+            assert_eq!(table.take(addr), None);
+        }
+        assert_eq!(table.count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stage_offsets_collects_all_five_graphics_stages_without_allocation() {
+        let mut g = [0u8; GRAPHICS_DESC_SIZE];
+        for at in [0x08usize, 0x18, 0x28, 0x38, 0x48] {
+            g[at..at + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+            g[at + 8..at + 16].copy_from_slice(&4u64.to_le_bytes());
+        }
+        assert_eq!(
+            &*stage_offsets(&g),
+            [
+                (StageKind::Vertex, 0x08),
+                (StageKind::Pixel, 0x18),
+                (StageKind::Domain, 0x28),
+                (StageKind::Hull, 0x38),
+                (StageKind::Geometry, 0x48),
+            ]
+        );
     }
 }

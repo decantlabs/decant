@@ -47,16 +47,21 @@ pub fn has_shader(desc: &[u8], at: usize) -> bool {
     read_u64(desc, at) != 0 && read_u64(desc, at + 8) != 0
 }
 
+const MAX_PC_STREAM_BYTES: usize = 624;
+
 /// Appends one subobject: its type, padding up to the payload's alignment, the payload, padding up
 /// to the next pointer boundary (each subobject of a stream is pointer aligned).
+#[inline]
 fn push(stream: &mut Vec<u8>, ty: u32, align: usize, payload: &[u8]) {
     stream.extend_from_slice(&ty.to_le_bytes());
-    while !stream.len().is_multiple_of(align) {
-        stream.push(0);
+    let pre_pad = (align - (stream.len() & (align - 1))) & (align - 1);
+    if pre_pad != 0 {
+        stream.resize(stream.len() + pre_pad, 0);
     }
     stream.extend_from_slice(payload);
-    while !stream.len().is_multiple_of(8) {
-        stream.push(0);
+    let post_pad = (8 - (stream.len() & 7)) & 7;
+    if post_pad != 0 {
+        stream.resize(stream.len() + post_pad, 0);
     }
 }
 
@@ -64,7 +69,7 @@ fn push(stream: &mut Vec<u8>, ty: u32, align: usize, payload: &[u8]) {
 /// the fixed function state, the targets, the sample description, the node mask and the flags. The
 /// title's cached blob is the console driver's and is left out.
 pub fn pc_stream(desc: &[u8; MESH_DESC_SIZE]) -> Vec<u8> {
-    let mut s = Vec::with_capacity(768);
+    let mut s = Vec::with_capacity(MAX_PC_STREAM_BYTES);
     push(&mut s, ROOT_SIGNATURE, 8, &desc[0..8]);
     for (ty, at) in [(AS, AS_AT), (MS, MS_AT), (PS, PS_AT)] {
         if has_shader(desc, at) {
@@ -158,5 +163,22 @@ mod tests {
             pos = (at + size).next_multiple_of(8);
         }
         assert_eq!(types, [ROOT_SIGNATURE, AS, MS, PS, BLEND, SAMPLE_MASK, RASTERIZER, DEPTH_STENCIL, PRIMITIVE_TOPOLOGY, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT, SAMPLE_DESC, NODE_MASK, FLAGS]);
+    }
+
+    #[test]
+    fn pc_stream_stays_within_max_capacity_and_eight_byte_alignment() {
+        let Ok(Some(UnpackedStream::Mesh(with_as))) = unpack_stream(&mesh_stream(true)) else {
+            panic!("expected a mesh pipeline");
+        };
+        let full = pc_stream(&with_as);
+        assert!(full.len() <= MAX_PC_STREAM_BYTES);
+        assert!(full.len().is_multiple_of(8));
+
+        let Ok(Some(UnpackedStream::Mesh(without_as))) = unpack_stream(&mesh_stream(false)) else {
+            panic!("expected a mesh pipeline");
+        };
+        let compact = pc_stream(&without_as);
+        assert!(compact.len() < full.len());
+        assert!(compact.len().is_multiple_of(8));
     }
 }
