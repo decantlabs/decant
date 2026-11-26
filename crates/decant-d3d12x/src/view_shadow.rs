@@ -25,9 +25,37 @@
 //! title's view (`view_raw::clear_words`). The upload buffers and their binding exist only under
 //! `DECANT_D3D12X_DIRECT` with the user data mirror ([`wanted`]), as the mirror's.
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::view_raw::Records;
+
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(b);
+            self.0 = self.0.wrapping_mul(0x517C_C1B7_2722_0A95);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
 /// The bytes of one row.
 pub const ROW_BYTES: usize = 16;
@@ -105,21 +133,37 @@ impl HeapRows {
 #[derive(Debug, Default)]
 pub struct Shadows {
     heaps: Vec<HeapRows>,
+    gpu_buffers: FastMap<u64, Buffer>,
 }
 
 impl Shadows {
     /// Registers a view heap of `count` slots. `buffer` maps `count` rows when the heap is shader
     /// visible (`gpu_start` not 0). A heap of the same PC object or CPU start is replaced.
     pub fn add(&mut self, heap: usize, cpu_start: usize, gpu_start: u64, count: u32, increment: u32, buffer: Option<Buffer>) {
-        self.heaps.retain(|h| h.heap != heap && h.cpu_start != cpu_start);
+        self.heaps.retain(|h| {
+            let keep = h.heap != heap && h.cpu_start != cpu_start;
+            if !keep && h.gpu_start != 0 {
+                self.gpu_buffers.remove(&h.gpu_start);
+            }
+            keep
+        });
         let at = self.heaps.partition_point(|h| h.cpu_start < cpu_start);
+        if gpu_start != 0
+            && let Some(b) = buffer
+        {
+            self.gpu_buffers.insert(gpu_start, b);
+        }
         self.heaps.insert(at, HeapRows { heap, cpu_start, gpu_start, increment, rows: vec![[0; 4]; count as usize], owners: vec![0; count as usize], owner_count: 0, buffer });
     }
 
     /// Forgets the heap `heap` and gives its buffer back to be released.
     pub fn remove(&mut self, heap: usize) -> Option<Buffer> {
         let at = self.heaps.iter().position(|h| h.heap == heap)?;
-        self.heaps.remove(at).buffer
+        let removed = self.heaps.remove(at);
+        if removed.gpu_start != 0 {
+            self.gpu_buffers.remove(&removed.gpu_start);
+        }
+        removed.buffer
     }
 
     fn find(&self, cpu: usize) -> Option<(usize, usize)> {
@@ -224,14 +268,22 @@ impl Shadows {
 
     /// The buffer of the shader visible heap whose GPU start is `gpu_start`.
     pub fn buffer_at(&self, gpu_start: u64) -> Option<Buffer> {
-        self.heaps.iter().find(|h| h.gpu_start == gpu_start && gpu_start != 0)?.buffer
+        if gpu_start == 0 {
+            return None;
+        }
+        self.gpu_buffers.get(&gpu_start).copied()
     }
 }
 
-static SHADOWS: Mutex<Shadows> = Mutex::new(Shadows { heaps: Vec::new() });
+static SHADOWS: RwLock<Option<Shadows>> = RwLock::new(None);
+static HEAP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-fn shadows() -> std::sync::MutexGuard<'static, Shadows> {
-    SHADOWS.lock().unwrap_or_else(|e| e.into_inner())
+fn shadows_read() -> std::sync::RwLockReadGuard<'static, Option<Shadows>> {
+    SHADOWS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn shadows_write() -> std::sync::RwLockWriteGuard<'static, Option<Shadows>> {
+    SHADOWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Whether the layer gives the shadow to shaders: the direct path is on and the user data mirror is
@@ -242,48 +294,73 @@ pub fn wanted() -> bool {
 
 /// A view was made in host slot `cpu`: its row (zeros for a view that has none).
 pub fn view_made(cpu: usize, row: Row) {
-    let mut s = shadows();
-    if !s.heaps.is_empty() {
+    if HEAP_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut g = shadows_write();
+    if let Some(s) = g.as_mut()
+        && !s.heaps.is_empty()
+    {
         s.view_made(cpu, row);
     }
 }
 
 /// The view just made in host slot `cpu` is of the view texture `res`.
 pub fn owner_made(cpu: usize, res: usize) {
-    let mut s = shadows();
-    if !s.heaps.is_empty() {
+    if HEAP_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut g = shadows_write();
+    if let Some(s) = g.as_mut()
+        && !s.heaps.is_empty()
+    {
         s.set_owner(cpu, res);
     }
 }
 
 /// Every view texture some slot of some view heap still holds a view of (a scan of all the slots).
 pub fn referenced() -> std::collections::HashSet<usize> {
-    shadows().referenced()
+    if HEAP_COUNT.load(Ordering::Relaxed) == 0 {
+        return std::collections::HashSet::new();
+    }
+    shadows_read().as_ref().map_or_else(std::collections::HashSet::new, Shadows::referenced)
 }
 
 /// `count` view descriptors were copied from host slot `src` on to host slot `dst`. To be called
 /// after every copy of view descriptors the layer makes, with host CPU handles.
 pub fn copied(dst: usize, src: usize, count: u32) {
-    let mut s = shadows();
-    if !s.heaps.is_empty() {
+    if count == 0 || HEAP_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut g = shadows_write();
+    if let Some(s) = g.as_mut()
+        && !s.heaps.is_empty()
+    {
         s.copied(dst, src, count);
     }
 }
 
 /// The GPU address of the shadow buffer of the view heap at GPU start `gpu_start`.
 pub fn buffer_gpu(gpu_start: u64) -> Option<u64> {
-    shadows().buffer_at(gpu_start).map(|b| b.gpu)
+    if gpu_start == 0 || HEAP_COUNT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    shadows_read().as_ref()?.buffer_at(gpu_start).map(|b| b.gpu)
 }
 
 /// The row of host slot `cpu`, `None` outside the view heaps.
 pub fn row(cpu: usize) -> Option<Row> {
-    shadows().row(cpu)
+    if HEAP_COUNT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    shadows_read().as_ref()?.row(cpu)
 }
 
 #[allow(unsafe_code)]
 mod win {
-    use super::{Buffer, ROW_BYTES, shadows};
+    use super::{Buffer, HEAP_COUNT, ROW_BYTES, Shadows, shadows_write};
     use crate::log::xs_log;
+    use std::sync::atomic::Ordering;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
     use windows::core::Interface;
@@ -342,12 +419,21 @@ mod win {
             }
             b
         };
-        shadows().add(heap, cpu_start, gpu_start, count, increment, buffer);
+        let mut g = shadows_write();
+        let s = g.get_or_insert_with(Shadows::default);
+        s.add(heap, cpu_start, gpu_start, count, increment, buffer);
+        HEAP_COUNT.store(s.heaps.len(), Ordering::Relaxed);
     }
 
     /// The PC heap `heap` is gone, and with it its rows and buffer.
     pub fn heap_released(heap: usize) {
-        let buffer = shadows().remove(heap);
+        let buffer = {
+            let mut g = shadows_write();
+            let Some(s) = g.as_mut() else { return };
+            let buf = s.remove(heap);
+            HEAP_COUNT.store(s.heaps.len(), Ordering::Relaxed);
+            buf
+        };
         if let Some(b) = buffer {
             crate::mem_owners::remove(
                 crate::mem_owners::Kind::ViewShadow,
@@ -496,5 +582,21 @@ mod tests {
         s.view_made(0x2000, rec(4, 3));
         assert_eq!(s.heaps[1].owner_count, 0);
         assert!(s.referenced().is_empty());
+    }
+
+    #[test]
+    fn gpu_buffer_index_tracks_add_replace_and_remove() {
+        let mut s = Shadows::default();
+        let b1 = Buffer { resource: 1, mapped: 0x100, gpu: 0xA000, bytes: 256 };
+        let b2 = Buffer { resource: 2, mapped: 0x200, gpu: 0xB000, bytes: 256 };
+        s.add(0xA, 0x1000, 0xA000, 4, INC, Some(b1));
+        assert_eq!(s.buffer_at(0xA000), Some(b1));
+        assert_eq!(s.buffer_at(0), None);
+        // Replacing by heap removes old GPU entry and registers new one.
+        s.add(0xA, 0x1000, 0xB000, 4, INC, Some(b2));
+        assert_eq!(s.buffer_at(0xA000), None);
+        assert_eq!(s.buffer_at(0xB000), Some(b2));
+        assert_eq!(s.remove(0xA), Some(b2));
+        assert_eq!(s.buffer_at(0xB000), None);
     }
 }

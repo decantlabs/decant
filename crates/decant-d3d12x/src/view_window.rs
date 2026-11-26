@@ -72,16 +72,52 @@ impl Plan {
 /// `source` is a live PC buffer resource for the device used by `title_mem`.
 pub unsafe fn prepare(source: usize, va: u64, offset: u64, desc: [u8; 40], kind: ViewKind) -> Option<(usize, [u8; 40], Records)> {
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::sync::{OnceLock, RwLock};
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::Interface;
+
+    #[derive(Default)]
+    struct FastHasher(u64);
+
+    impl Hasher for FastHasher {
+        #[inline]
+        fn finish(&self) -> u64 {
+            self.0
+        }
+
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 = self.0.rotate_left(5) ^ u64::from(b);
+                self.0 = self.0.wrapping_mul(0x517C_C1B7_2722_0A95);
+            }
+        }
+
+        #[inline]
+        fn write_usize(&mut self, i: usize) {
+            self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        #[inline]
+        fn write_u32(&mut self, i: u32) {
+            self.0 = (self.0 ^ u64::from(i)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        #[inline]
+        fn write_u64(&mut self, i: u64) {
+            self.0 = (self.0 ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
     struct Cached {
         _source: ID3D12Resource,
         resource: ID3D12Resource,
     }
     type Key = (usize, u64, u64, Vec<u32>);
-    static CACHE: OnceLock<Mutex<HashMap<Key, Cached>>> = OnceLock::new();
+    static CACHE: OnceLock<RwLock<FastMap<Key, Cached>>> = OnceLock::new();
     let plan = Plan::new(desc, kind, offset)?;
     if let Some((desc, records)) = plan.at(kind, plan.start) {
         return Some((source, desc, records));
@@ -90,9 +126,12 @@ pub unsafe fn prepare(source: usize, va: u64, offset: u64, desc: [u8; 40], kind:
     let (desc, records) = plan.at(kind, local)?;
     let pages = crate::title_mem::tiles_of(base, width)?;
     let key = (source, base, width, pages);
-    let mut cache = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(entry) = cache.get(&key) {
-        return Some((entry.resource.as_raw() as usize, desc, records));
+    let cache_lock = CACHE.get_or_init(|| RwLock::new(FastMap::default()));
+    {
+        let cache = cache_lock.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.get(&key) {
+            return Some((entry.resource.as_raw() as usize, desc, records));
+        }
     }
     let resource_desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -109,6 +148,10 @@ pub unsafe fn prepare(source: usize, va: u64, offset: u64, desc: [u8; 40], kind:
     // A mapping change during creation must not associate the new resource with the old pages.
     if crate::title_mem::tiles_of(base, width)? != key.3 {
         return None;
+    }
+    let mut cache = cache_lock.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = cache.get(&key) {
+        return Some((entry.resource.as_raw() as usize, desc, records));
     }
     let result = resource.as_raw() as usize;
     // SAFETY: the caller supplies a live COM resource. Cloning owns a reference in the cache.

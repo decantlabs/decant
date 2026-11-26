@@ -390,8 +390,13 @@ pub fn clear_words(row: [u32; 4], values: [ClearValue; 4]) -> Clear {
         let e = element as u32;
         return Clear::Words(if at == 8 { e * 0x0101_0101 } else { e | e << 16 });
     }
-    let words: Vec<u32> = (0..at / 32).map(|i| (element >> (32 * i)) as u32).collect();
-    if words.iter().all(|&w| w == words[0]) { Clear::Words(words[0]) } else { Clear::Unsupported }
+    let first = element as u32;
+    for i in 1..at / 32 {
+        if (element >> (32 * i)) as u32 != first {
+            return Clear::Unsupported;
+        }
+    }
+    Clear::Words(first)
 }
 
 /// The rectangles (left, top, right, bottom) of a clear of a view whose view shadow row is `row`,
