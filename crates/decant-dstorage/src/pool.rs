@@ -6,6 +6,7 @@
 //! processors (clamped to `4..=24`) so decodes saturate available cores.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 
 /// One decode.
@@ -13,6 +14,7 @@ pub type Job = Box<dyn FnOnce() + Send>;
 
 struct Pool {
     jobs: Mutex<VecDeque<Job>>,
+    idle_workers: AtomicUsize,
     ready: Condvar,
 }
 
@@ -20,7 +22,7 @@ struct Pool {
 fn pool() -> Option<&'static Pool> {
     static POOL: OnceLock<Option<&'static Pool>> = OnceLock::new();
     *POOL.get_or_init(|| {
-        let pool: &'static Pool = Box::leak(Box::new(Pool { jobs: Mutex::new(VecDeque::new()), ready: Condvar::new() }));
+        let pool: &'static Pool = Box::leak(Box::new(Pool { jobs: Mutex::new(VecDeque::new()), idle_workers: AtomicUsize::new(0), ready: Condvar::new() }));
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(4, 24);
         let started = (0..threads).filter(|k| std::thread::Builder::new().name(format!("dstorage decode {k}")).spawn(move || work(pool)).is_ok()).count();
         (started > 0).then_some(pool)
@@ -35,7 +37,9 @@ fn work(pool: &Pool) {
                 if let Some(job) = jobs.pop_front() {
                     break job;
                 }
+                pool.idle_workers.fetch_add(1, Ordering::AcqRel);
                 jobs = pool.ready.wait(jobs).unwrap_or_else(PoisonError::into_inner);
+                pool.idle_workers.fetch_sub(1, Ordering::AcqRel);
             }
         };
         job();
@@ -46,7 +50,9 @@ fn work(pool: &Pool) {
 pub fn run(job: Job) {
     let Some(pool) = pool() else { return job() };
     pool.jobs.lock().unwrap_or_else(PoisonError::into_inner).push_back(job);
-    pool.ready.notify_one();
+    if pool.idle_workers.load(Ordering::Acquire) > 0 {
+        pool.ready.notify_one();
+    }
 }
 
 /// Enqueues a batch of decode jobs under a single lock acquisition.
@@ -63,10 +69,12 @@ pub fn run_batch<I: IntoIterator<Item = Job>>(jobs_iter: I) {
         jobs.extend(jobs_iter);
         jobs.len() - before
     };
-    if count == 1 {
-        pool.ready.notify_one();
-    } else if count > 1 {
-        pool.ready.notify_all();
+    if count > 0 && pool.idle_workers.load(Ordering::Acquire) > 0 {
+        if count == 1 {
+            pool.ready.notify_one();
+        } else {
+            pool.ready.notify_all();
+        }
     }
 }
 

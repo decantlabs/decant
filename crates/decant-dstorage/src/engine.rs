@@ -171,11 +171,29 @@ enum QueueOp {
 /// Maximum consecutive reads batched into one submission or parallel CPU read pass.
 const READ_BATCH_LIMIT: usize = 256;
 
-/// The PC DirectStorage queue behind a project queue, with its status array and completion event.
+/// The PC DirectStorage queue behind a project queue, with double-buffered status/event slots
+/// for overlapped batch submission and decode/write pipelining.
 struct Native {
     queue: Pc,
     status: Pc,
-    done: Handle,
+    done: [Handle; 2],
+    in_flight: Mutex<Option<NativeInFlight>>,
+    next_slot: AtomicUsize,
+}
+
+enum PendingNative {
+    Direct { destination: *mut c_void, destination_size: u32, source_size: u32, pinned: bool },
+    Staged { read: Sendable<DecantRead>, pages: Option<PageTarget>, input: PooledBuffer, len: u32, decode: bool },
+    Coalesced { start: u64, span: u32, members: Vec<(Sendable<DecantRead>, Option<PageTarget>)>, master: PooledBuffer },
+}
+
+// SAFETY: `PendingNative` is only moved from the queue worker into `Native.in_flight` and consumed by the same worker.
+unsafe impl Send for PendingNative {}
+
+struct NativeInFlight {
+    slot: usize,
+    started: Instant,
+    pending: Vec<PendingNative>,
 }
 
 /// What the worker thread and the operations share.
@@ -726,8 +744,7 @@ impl Core {
         self.in_flight_count.fetch_add(slots, Ordering::SeqCst);
     }
 
-    fn build_staged_job(self: &Arc<Self>, op: &mut ReadOp, input: InputBuffer, decode: bool, read_time: Duration) -> crate::pool::Job {
-        let r = *op.read.get();
+    fn build_staged_job_from_parts(self: &Arc<Self>, r: DecantRead, pages: Option<PageTarget>, input: InputBuffer, decode: bool, read_time: Duration) -> crate::pool::Job {
         let staged = Staged {
             input,
             codec: r.codec,
@@ -735,7 +752,7 @@ impl Core {
             decode,
             destination: Sendable(r.destination),
             destination_size: r.destination_size,
-            pages: op.pages.take(),
+            pages,
             core_timing: self.timing.clone(),
             source_bytes: r.source_size,
             read_time,
@@ -755,6 +772,10 @@ impl Core {
                 core.settled.notify_all();
             }
         })
+    }
+
+    fn build_staged_job(self: &Arc<Self>, op: &mut ReadOp, input: InputBuffer, decode: bool, read_time: Duration) -> crate::pool::Job {
+        self.build_staged_job_from_parts(*op.read.get(), op.pages.take(), input, decode, read_time)
     }
 
     /// Dispatches a completed read buffer to the shared decode pool.
@@ -909,159 +930,92 @@ impl Core {
         });
     }
 
-    /// Batches up to `READ_BATCH_LIMIT` consecutive reads into one `IDStorageQueue1` submission.
-    fn read_batch_native(self: &Arc<Self>, native: &Native, batch: &mut [ReadOp]) {
-        enum PendingNative {
-            Direct { destination: *mut c_void, destination_size: u32, source_size: u32, pinned: bool },
-            Staged { index: usize, input: PooledBuffer, len: u32, decode: bool },
-            Coalesced { group: CoalescedGroup, master: PooledBuffer },
-        }
-
-        let plan = if batch.len() >= 2 { Some(plan_coalesced_batches(batch, true)) } else { None };
-        let mut pending = Vec::with_capacity(plan.as_ref().map_or(batch.len(), |p| p.groups.len() + p.singles.len()));
-        let queue = native.queue.as_ptr();
-        // SAFETY: `native.queue` is a live `IDStorageQueue1` owned by `Core`.
-        let vtbl = unsafe { native.queue.vtbl::<pc::QueueVtbl>() };
-        let started = Instant::now();
-
-        if let Some(plan) = plan {
-            for group in plan.groups {
-                let first_op = &batch[group.members[0]];
-                let Some(file_native) = first_op.file.native.as_ref() else { continue };
-                let Ok(mut master) = buffer_capacity(group.span) else {
-                    for &idx in &group.members {
-                        let op = &batch[idx];
-                        log_failure(op.read.get(), op.pages.is_some(), E_OUTOFMEMORY);
-                        self.fail(E_OUTOFMEMORY);
-                    }
-                    continue;
-                };
-                let request = pc::RawRequest::file_to_memory(0, file_native.as_ptr(), group.start, group.span, master.as_mut_ptr().cast(), group.span);
-                // SAFETY: `master` buffer stays alive in `pending` until the wait below returns.
-                unsafe { (vtbl.enqueue_request)(queue, &request) };
-                pending.push(PendingNative::Coalesced { group, master });
-            }
-            for index in plan.singles {
-                let op = &batch[index];
-                let r = op.read.get();
-                if !matches!(r.codec, codec::COPY | codec::ZLIB | codec::GDEFLATE | codec::BCPACK) {
-                    decant_log::calls::record_with(decant_log::calls::Kind::NotImplemented, || format!("read with codec {}", r.codec));
-                    log_failure(r, op.pages.is_some(), E_NOTIMPL);
-                    self.fail(E_NOTIMPL);
-                    continue;
+    fn complete_coalesced_parts(
+        self: &Arc<Self>,
+        group_start: u64,
+        members: Vec<(Sendable<DecantRead>, Option<PageTarget>)>,
+        master: PooledBuffer,
+        read_time: Duration,
+        staged_jobs: &mut Vec<crate::pool::Job>,
+    ) {
+        let per_read_time = read_time / (members.len() as u32).max(1);
+        let mut iter = members.into_iter();
+        let mut first_staged: Option<(DecantRead, Option<PageTarget>, Arc<PooledBuffer>)> = None;
+        for (read, pages) in &mut iter {
+            let r = *read.get();
+            let rel_start = (r.offset - group_start) as usize;
+            let decode = r.codec != codec::COPY;
+            if !decode && pages.is_none() {
+                let write_started = Instant::now();
+                let pinned = begin_written(r.destination, r.destination_size);
+                // SAFETY: `master` holds `group.span` bytes and `r.destination` is writable for `r.destination_size` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(master.as_ptr().add(rel_start), r.destination.cast(), r.destination_size as usize);
                 }
-                if r.codec == codec::COPY && r.source_size != r.destination_size {
-                    log_failure(r, op.pages.is_some(), E_INVALIDARG);
-                    self.fail(E_INVALIDARG);
-                    continue;
+                if pinned {
+                    finish_written(r.destination, r.destination_size);
                 }
-                let Some(file_native) = op.file.native.as_ref() else {
-                    log_failure(r, op.pages.is_some(), E_INVALIDARG);
-                    self.fail(E_INVALIDARG);
-                    continue;
-                };
-                if let Some(length) = op.file.byte_length
-                    && (r.offset > length || u64::from(r.source_size) > length - r.offset)
-                {
-                    let eof = hresult_from_win32(ERROR_HANDLE_EOF);
-                    log_failure(r, op.pages.is_some(), eof);
-                    self.fail(eof);
-                    continue;
-                }
-                let decode = r.codec == codec::ZLIB || r.codec == codec::BCPACK;
-                let compression = if r.codec == codec::GDEFLATE { pc::COMPRESSION_GDEFLATE } else { 0 };
-                if !decode && op.pages.is_none() {
-                    let pinned = begin_written(r.destination, r.destination_size);
-                    let request = pc::RawRequest::file_to_memory(compression, file_native.as_ptr(), r.offset, r.source_size, r.destination, r.destination_size);
-                    // SAFETY: `r.destination` remains valid until the completion wait below returns.
-                    unsafe { (vtbl.enqueue_request)(queue, &request) };
-                    pending.push(PendingNative::Direct { destination: r.destination, destination_size: r.destination_size, source_size: r.source_size, pinned });
-                } else {
-                    let len = if decode { r.source_size } else { r.destination_size };
-                    let Ok(mut input) = buffer_capacity(len) else {
-                        log_failure(r, op.pages.is_some(), E_OUTOFMEMORY);
-                        self.fail(E_OUTOFMEMORY);
-                        continue;
-                    };
-                    let request = pc::RawRequest::file_to_memory(compression, file_native.as_ptr(), r.offset, r.source_size, input.as_mut_ptr().cast(), len);
-                    // SAFETY: `input` buffer stays alive in `pending` until the wait below returns.
-                    unsafe { (vtbl.enqueue_request)(queue, &request) };
-                    pending.push(PendingNative::Staged { index, input, len, decode });
-                }
-            }
-        } else {
-            for (index, op) in batch.iter().enumerate() {
-                let r = op.read.get();
-                if !matches!(r.codec, codec::COPY | codec::ZLIB | codec::GDEFLATE | codec::BCPACK) {
-                    decant_log::calls::record_with(decant_log::calls::Kind::NotImplemented, || format!("read with codec {}", r.codec));
-                    log_failure(r, op.pages.is_some(), E_NOTIMPL);
-                    self.fail(E_NOTIMPL);
-                    continue;
-                }
-                if r.codec == codec::COPY && r.source_size != r.destination_size {
-                    log_failure(r, op.pages.is_some(), E_INVALIDARG);
-                    self.fail(E_INVALIDARG);
-                    continue;
-                }
-                let Some(file_native) = op.file.native.as_ref() else {
-                    log_failure(r, op.pages.is_some(), E_INVALIDARG);
-                    self.fail(E_INVALIDARG);
-                    continue;
-                };
-                if let Some(length) = op.file.byte_length
-                    && (r.offset > length || u64::from(r.source_size) > length - r.offset)
-                {
-                    let eof = hresult_from_win32(ERROR_HANDLE_EOF);
-                    log_failure(r, op.pages.is_some(), eof);
-                    self.fail(eof);
-                    continue;
-                }
-                let decode = r.codec == codec::ZLIB || r.codec == codec::BCPACK;
-                let compression = if r.codec == codec::GDEFLATE { pc::COMPRESSION_GDEFLATE } else { 0 };
-                if !decode && op.pages.is_none() {
-                    let pinned = begin_written(r.destination, r.destination_size);
-                    let request = pc::RawRequest::file_to_memory(compression, file_native.as_ptr(), r.offset, r.source_size, r.destination, r.destination_size);
-                    // SAFETY: `r.destination` remains valid until the completion wait below returns.
-                    unsafe { (vtbl.enqueue_request)(queue, &request) };
-                    pending.push(PendingNative::Direct { destination: r.destination, destination_size: r.destination_size, source_size: r.source_size, pinned });
-                } else {
-                    let len = if decode { r.source_size } else { r.destination_size };
-                    let Ok(mut input) = buffer_capacity(len) else {
-                        log_failure(r, op.pages.is_some(), E_OUTOFMEMORY);
-                        self.fail(E_OUTOFMEMORY);
-                        continue;
-                    };
-                    let request = pc::RawRequest::file_to_memory(compression, file_native.as_ptr(), r.offset, r.source_size, input.as_mut_ptr().cast(), len);
-                    // SAFETY: `input` buffer stays alive in `pending` until the wait below returns.
-                    unsafe { (vtbl.enqueue_request)(queue, &request) };
-                    pending.push(PendingNative::Staged { index, input, len, decode });
-                }
+                note_written(r.destination, r.destination_size);
+                self.timing.record_and_log(r.source_size, r.destination_size, per_read_time, Duration::ZERO, write_started.elapsed());
+            } else {
+                first_staged = Some((r, pages, Arc::new(master)));
+                break;
             }
         }
-
-        if pending.is_empty() {
-            return;
+        let Some((r0, p0, shared)) = first_staged else { return };
+        let rel0 = (r0.offset - group_start) as usize;
+        staged_jobs.push(self.build_staged_job_from_parts(
+            r0,
+            p0,
+            InputBuffer::Shared { buf: shared.clone(), start: rel0, len: r0.source_size as usize },
+            r0.codec != codec::COPY,
+            per_read_time,
+        ));
+        for (read, pages) in iter {
+            let r = *read.get();
+            let rel_start = (r.offset - group_start) as usize;
+            let decode = r.codec != codec::COPY;
+            if !decode && pages.is_none() {
+                let write_started = Instant::now();
+                let pinned = begin_written(r.destination, r.destination_size);
+                // SAFETY: `shared` holds `group.span` bytes and `r.destination` is writable for `r.destination_size` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(shared.as_ptr().add(rel_start), r.destination.cast(), r.destination_size as usize);
+                }
+                if pinned {
+                    finish_written(r.destination, r.destination_size);
+                }
+                note_written(r.destination, r.destination_size);
+                self.timing.record_and_log(r.source_size, r.destination_size, per_read_time, Duration::ZERO, write_started.elapsed());
+            } else {
+                staged_jobs.push(self.build_staged_job_from_parts(
+                    r,
+                    pages,
+                    InputBuffer::Shared { buf: shared.clone(), start: rel_start, len: r.source_size as usize },
+                    decode,
+                    per_read_time,
+                ));
+            }
         }
+    }
 
-        // SAFETY: `native.queue`, `native.status`, and `native.done` are live objects created in `Queue::create`.
+    fn finish_native_in_flight(self: &Arc<Self>, native: &Native, submitted: NativeInFlight) {
+        // SAFETY: `native.done[slot]` and `native.status` are live objects created in `Queue::create`.
         let hr = unsafe {
-            (vtbl.enqueue_status)(queue, native.status.as_ptr(), 0);
-            (vtbl.enqueue_set_event)(queue, native.done.0);
-            (vtbl.submit)(queue);
-            if WaitForSingleObject(native.done.0, INFINITE) != WAIT_OBJECT_0 {
+            if WaitForSingleObject(native.done[submitted.slot].0, INFINITE) != WAIT_OBJECT_0 {
                 last_error()
             } else {
-                (native.status.vtbl::<pc::StatusArrayVtbl>().get_hresult)(native.status.as_ptr(), 0).min(S_OK)
+                (native.status.vtbl::<pc::StatusArrayVtbl>().get_hresult)(native.status.as_ptr(), submitted.slot as u32).min(S_OK)
             }
         };
-        let batch_read_time = started.elapsed();
-        let per_read_time = batch_read_time / (pending.len() as u32).max(1);
+        let batch_read_time = submitted.started.elapsed();
+        let per_read_time = batch_read_time / (submitted.pending.len() as u32).max(1);
         if hr < 0 {
             self.fail(hr);
         }
 
         let mut staged_jobs = Vec::new();
-        for item in pending {
+        for item in submitted.pending {
             match item {
                 PendingNative::Direct { destination, destination_size, source_size, pinned } => {
                     let write_started = Instant::now();
@@ -1073,27 +1027,145 @@ impl Core {
                         self.timing.record_and_log(source_size, destination_size, per_read_time, Duration::ZERO, write_started.elapsed());
                     }
                 }
-                PendingNative::Staged { index, mut input, len, decode } => {
+                PendingNative::Staged { read, pages, mut input, len, decode } => {
                     if hr < 0 {
                         continue;
                     }
                     // SAFETY: `IDStorageQueue1` wrote all `len` bytes into `input` before signalling `native.done`.
                     unsafe { input.set_len(len as usize) };
-                    staged_jobs.push(self.build_staged_job(&mut batch[index], InputBuffer::Owned(input), decode, per_read_time));
+                    staged_jobs.push(self.build_staged_job_from_parts(*read.get(), pages, InputBuffer::Owned(input), decode, per_read_time));
                 }
-                PendingNative::Coalesced { group, mut master } => {
+                PendingNative::Coalesced { start, span, members, mut master } => {
                     if hr < 0 {
                         continue;
                     }
-                    // SAFETY: `IDStorageQueue1` wrote all `group.span` bytes into `master` before signalling `native.done`.
-                    unsafe { master.set_len(group.span as usize) };
-                    self.complete_coalesced_group(batch, &group, master, per_read_time, &mut staged_jobs);
+                    // SAFETY: `IDStorageQueue1` wrote all `span` bytes into `master` before signalling `native.done`.
+                    unsafe { master.set_len(span as usize) };
+                    self.complete_coalesced_parts(start, members, master, per_read_time, &mut staged_jobs);
                 }
             }
         }
         if !staged_jobs.is_empty() {
             self.wait_for_in_flight_room(staged_jobs.len());
             crate::pool::run_batch(staged_jobs);
+        }
+    }
+
+    fn flush_native(self: &Arc<Self>) {
+        let Some(native) = self.native.get() else { return };
+        if let Some(submitted) = lock(&native.in_flight).take() {
+            self.finish_native_in_flight(native, submitted);
+        }
+    }
+
+    fn has_native_in_flight(&self) -> bool {
+        self.native.get().is_some_and(|n| lock(&n.in_flight).is_some())
+    }
+
+    /// Batches up to `READ_BATCH_LIMIT` consecutive reads into one `IDStorageQueue1` submission,
+    /// overlapping submission of batch `N+1` with completion/decode of batch `N`.
+    fn read_batch_native(self: &Arc<Self>, native: &Native, batch: &mut [ReadOp]) {
+        let plan = if batch.len() >= 2 { Some(plan_coalesced_batches(batch, true)) } else { None };
+        let mut pending = Vec::with_capacity(plan.as_ref().map_or(batch.len(), |p| p.groups.len() + p.singles.len()));
+        let queue = native.queue.as_ptr();
+        // SAFETY: `native.queue` is a live `IDStorageQueue1` owned by `Core`.
+        let vtbl = unsafe { native.queue.vtbl::<pc::QueueVtbl>() };
+        let started = Instant::now();
+
+        let enqueue_single = |op: &mut ReadOp, pending: &mut Vec<PendingNative>| {
+            let r = *op.read.get();
+            if !matches!(r.codec, codec::COPY | codec::ZLIB | codec::GDEFLATE | codec::BCPACK) {
+                decant_log::calls::record_with(decant_log::calls::Kind::NotImplemented, || format!("read with codec {}", r.codec));
+                log_failure(&r, op.pages.is_some(), E_NOTIMPL);
+                self.fail(E_NOTIMPL);
+                return;
+            }
+            if r.codec == codec::COPY && r.source_size != r.destination_size {
+                log_failure(&r, op.pages.is_some(), E_INVALIDARG);
+                self.fail(E_INVALIDARG);
+                return;
+            }
+            let Some(file_native) = op.file.native.as_ref() else {
+                log_failure(&r, op.pages.is_some(), E_INVALIDARG);
+                self.fail(E_INVALIDARG);
+                return;
+            };
+            if let Some(length) = op.file.byte_length
+                && (r.offset > length || u64::from(r.source_size) > length - r.offset)
+            {
+                let eof = hresult_from_win32(ERROR_HANDLE_EOF);
+                log_failure(&r, op.pages.is_some(), eof);
+                self.fail(eof);
+                return;
+            }
+            let decode = r.codec == codec::ZLIB || r.codec == codec::BCPACK;
+            let compression = if r.codec == codec::GDEFLATE { pc::COMPRESSION_GDEFLATE } else { 0 };
+            if !decode && op.pages.is_none() {
+                let pinned = begin_written(r.destination, r.destination_size);
+                let request = pc::RawRequest::file_to_memory(compression, file_native.as_ptr(), r.offset, r.source_size, r.destination, r.destination_size);
+                // SAFETY: `r.destination` remains valid until the completion wait in `finish_native_in_flight` returns.
+                unsafe { (vtbl.enqueue_request)(queue, &request) };
+                pending.push(PendingNative::Direct { destination: r.destination, destination_size: r.destination_size, source_size: r.source_size, pinned });
+            } else {
+                let len = if decode { r.source_size } else { r.destination_size };
+                let Ok(mut input) = buffer_capacity(len) else {
+                    log_failure(&r, op.pages.is_some(), E_OUTOFMEMORY);
+                    self.fail(E_OUTOFMEMORY);
+                    return;
+                };
+                let request = pc::RawRequest::file_to_memory(compression, file_native.as_ptr(), r.offset, r.source_size, input.as_mut_ptr().cast(), len);
+                // SAFETY: `input` buffer stays alive in `pending` until `finish_native_in_flight` returns.
+                unsafe { (vtbl.enqueue_request)(queue, &request) };
+                pending.push(PendingNative::Staged { read: Sendable(r), pages: op.pages.take(), input, len, decode });
+            }
+        };
+
+        if let Some(plan) = plan {
+            for group in plan.groups {
+                let first_op = &batch[group.members[0]];
+                let Some(file_native) = first_op.file.native.as_ref() else { continue };
+                let file_ptr = file_native.as_ptr();
+                let Ok(mut master) = buffer_capacity(group.span) else {
+                    for &idx in &group.members {
+                        let op = &batch[idx];
+                        log_failure(op.read.get(), op.pages.is_some(), E_OUTOFMEMORY);
+                        self.fail(E_OUTOFMEMORY);
+                    }
+                    continue;
+                };
+                let request = pc::RawRequest::file_to_memory(0, file_ptr, group.start, group.span, master.as_mut_ptr().cast(), group.span);
+                // SAFETY: `master` buffer stays alive in `pending` until `finish_native_in_flight` returns.
+                unsafe { (vtbl.enqueue_request)(queue, &request) };
+                let members = group.members.into_iter().map(|idx| {
+                    let op = &mut batch[idx];
+                    (Sendable(*op.read.get()), op.pages.take())
+                }).collect();
+                pending.push(PendingNative::Coalesced { start: group.start, span: group.span, members, master });
+            }
+            for index in plan.singles {
+                enqueue_single(&mut batch[index], &mut pending);
+            }
+        } else {
+            for op in batch.iter_mut() {
+                enqueue_single(op, &mut pending);
+            }
+        }
+
+        if pending.is_empty() {
+            return;
+        }
+
+        let slot = native.next_slot.fetch_xor(1, Ordering::Relaxed);
+        // SAFETY: `native.queue`, `native.status`, and `native.done[slot]` are live objects created in `Queue::create`.
+        unsafe {
+            (vtbl.enqueue_status)(queue, native.status.as_ptr(), slot as u32);
+            (vtbl.enqueue_set_event)(queue, native.done[slot].0);
+            (vtbl.submit)(queue);
+        }
+
+        let prev = lock(&native.in_flight).replace(NativeInFlight { slot, started, pending });
+        if let Some(prev_submitted) = prev {
+            self.finish_native_in_flight(native, prev_submitted);
         }
     }
 
@@ -1331,7 +1403,7 @@ impl Queue {
         let spawned = std::thread::Builder::new().spawn(move || run(&core, &work));
         queue.worker = Some(spawned.map_err(|_| E_OUTOFMEMORY)?);
         let Some(factory) = queue.core.backend.factory.as_ref() else { return Ok(queue) };
-        let native_capacity = capacity.max(pc::MIN_QUEUE_CAPACITY).clamp(512, 4096);
+        let native_capacity = capacity.max(pc::MIN_QUEUE_CAPACITY).clamp(1024, 4096);
         let desc = pc::QueueDesc { source_type: 0, capacity: native_capacity, priority: 0, name: std::ptr::null(), device: std::ptr::null_mut() };
         let mut raw = std::ptr::null_mut();
         // SAFETY: the factory is an `IDStorageFactory`, `desc` and `raw` live for the call.
@@ -1341,19 +1413,24 @@ impl Queue {
         if hr < 0 {
             return Err(hr);
         }
-        // SAFETY: plain Win32 call.
-        let done = Handle(unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) });
-        if done.0.is_null() {
+        // SAFETY: plain Win32 calls.
+        let done0 = Handle(unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) });
+        if done0.0.is_null() {
             return Err(last_error());
         }
-        decant_log::handles::created(done.0 as usize, "queue completion event");
+        let done1 = Handle(unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) });
+        if done1.0.is_null() {
+            return Err(last_error());
+        }
+        decant_log::handles::created(done0.0 as usize, "queue completion event 0");
+        decant_log::handles::created(done1.0 as usize, "queue completion event 1");
         let mut raw = std::ptr::null_mut();
         // SAFETY: as above, with a zero terminated name.
-        let hr = unsafe { (factory.vtbl::<pc::FactoryVtbl>().create_status_array)(factory.as_ptr(), 1, c"DecantStorage".as_ptr().cast(), &pc::IID_STATUS_ARRAY, &mut raw) };
+        let hr = unsafe { (factory.vtbl::<pc::FactoryVtbl>().create_status_array)(factory.as_ptr(), 2, c"DecantStorage".as_ptr().cast(), &pc::IID_STATUS_ARRAY, &mut raw) };
         // SAFETY: on success `raw` is a status array reference we now own.
         let status = unsafe { Pc::from_raw(raw) };
         if let (Some(queue_pc), Some(status)) = (native, status) {
-            let _ = queue.core.native.set(Native { queue: queue_pc, status, done });
+            let _ = queue.core.native.set(Native { queue: queue_pc, status, done: [done0, done1], in_flight: Mutex::new(None), next_slot: AtomicUsize::new(0) });
         }
         if hr < 0 { Err(hr) } else { Ok(queue) }
     }
@@ -1573,9 +1650,16 @@ fn run(core: &Arc<Core>, work: &Work) {
     let mut batch = Vec::with_capacity(READ_BATCH_LIMIT);
     let mut state = lock(&work.state);
     loop {
+        if state.submitted.is_empty() && !state.stopping && core.has_native_in_flight() {
+            drop(state);
+            core.flush_native();
+            state = lock(&work.state);
+            continue;
+        }
         state = work.ready.wait_while(state, |s| !s.stopping && s.submitted.is_empty()).unwrap_or_else(PoisonError::into_inner);
         if state.submitted.is_empty() {
             drop(state);
+            core.flush_native();
             // The decodes handed on still write into the title's memory: the queue is closed only after them.
             core.settle();
             return;
@@ -1583,6 +1667,7 @@ fn run(core: &Arc<Core>, work: &Work) {
         if state.stopping {
             let rest = std::mem::take(&mut state.submitted);
             drop(state);
+            core.flush_native();
             for operation in rest {
                 if let QueueOp::Barrier(barrier) = operation {
                     barrier(core, true);
@@ -1606,6 +1691,7 @@ fn run(core: &Arc<Core>, work: &Work) {
         }
         let Some(QueueOp::Barrier(operation)) = state.submitted.pop_front() else { continue };
         drop(state);
+        core.flush_native();
         let hr = operation(core, false);
         if hr < 0 {
             core.fail(hr);
@@ -1854,5 +1940,54 @@ fn adjacent_reads_coalesce_and_complete_correctly() {
     assert_eq!(d0, data[0..4096]);
     assert_eq!(d1, data[4096..8192]);
     assert_eq!(d2, data[8192..12288]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(test)]
+#[test]
+fn multi_batch_pipelined_reads_settle_before_status_barrier() {
+    use std::io::Write;
+    let total_reads = READ_BATCH_LIMIT + 32;
+    let chunk_size = 1024usize;
+    let data: Vec<u8> = (0..total_reads * chunk_size).map(|i| (i * 29 + i / 131) as u8).collect();
+    let path = std::env::temp_dir().join(format!("dstorage_pipeline_{}.bin", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&path).expect("creates temp file");
+        f.write_all(&data).expect("writes temp file");
+    }
+    let wide: Vec<u16> = {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let factory = Ref::new(Factory::new(Backend::cpu(), Arc::new(XmemPool)));
+    let file = factory.open_file(wide.as_ptr()).expect("opens file");
+    let queue = factory.create_queue((total_reads + 4) as u16).expect("creates queue");
+    let status = factory.create_status_array(1).expect("creates status");
+
+    let mut bufs: Vec<Vec<u8>> = (0..total_reads).map(|_| vec![0u8; chunk_size]).collect();
+    for (i, buf) in bufs.iter_mut().enumerate() {
+        let r = DecantRead {
+            file: file.as_ptr().cast(),
+            offset: (i * chunk_size) as u64,
+            source_size: chunk_size as u32,
+            destination: buf.as_mut_ptr().cast(),
+            destination_size: chunk_size as u32,
+            codec: codec::COPY,
+            bc_mode: 0,
+        };
+        assert_eq!(queue.enqueue(r), S_OK);
+    }
+    // SAFETY: `status` is one of ours.
+    assert_eq!(unsafe { queue.enqueue_status(status.as_ptr().cast(), 0) }, S_OK);
+    assert_eq!(queue.submit(), S_OK);
+    let start = Instant::now();
+    while status.result(0) == E_PENDING {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(status.result(0), S_OK);
+    for (i, buf) in bufs.iter().enumerate() {
+        assert_eq!(buf.as_slice(), &data[i * chunk_size..(i + 1) * chunk_size], "mismatch at chunk {i}");
+    }
     let _ = std::fs::remove_file(&path);
 }
