@@ -29,20 +29,37 @@ fn pool() -> Option<&'static Pool> {
     })
 }
 
+fn pop_batch(jobs: &mut VecDeque<Job>, out: &mut [Option<Job>; 4]) -> usize {
+    let take = if jobs.len() >= 16 { 4 } else { 1 };
+    let mut n = 0;
+    while n < take {
+        let Some(job) = jobs.pop_front() else { break };
+        out[n] = Some(job);
+        n += 1;
+    }
+    n
+}
+
 fn work(pool: &Pool) {
+    let mut batch: [Option<Job>; 4] = [None, None, None, None];
     loop {
-        let job = {
+        let count = {
             let mut jobs = pool.jobs.lock().unwrap_or_else(PoisonError::into_inner);
             loop {
-                if let Some(job) = jobs.pop_front() {
-                    break job;
+                let n = pop_batch(&mut jobs, &mut batch);
+                if n > 0 {
+                    break n;
                 }
                 pool.idle_workers.fetch_add(1, Ordering::AcqRel);
                 jobs = pool.ready.wait(jobs).unwrap_or_else(PoisonError::into_inner);
                 pool.idle_workers.fetch_sub(1, Ordering::AcqRel);
             }
         };
-        job();
+        for slot in &mut batch[..count] {
+            if let Some(job) = slot.take() {
+                job();
+            }
+        }
     }
 }
 
@@ -69,11 +86,14 @@ pub fn run_batch<I: IntoIterator<Item = Job>>(jobs_iter: I) {
         jobs.extend(jobs_iter);
         jobs.len() - before
     };
-    if count > 0 && pool.idle_workers.load(Ordering::Acquire) > 0 {
-        if count == 1 {
-            pool.ready.notify_one();
-        } else {
+    let idle = pool.idle_workers.load(Ordering::Acquire);
+    if count > 0 && idle > 0 {
+        if count >= idle {
             pool.ready.notify_all();
+        } else {
+            for _ in 0..count {
+                pool.ready.notify_one();
+            }
         }
     }
 }
@@ -100,5 +120,24 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(done.load(Ordering::Relaxed), 16);
+    }
+
+    #[test]
+    fn run_batch_large_burst_executes_all_jobs() {
+        let total = 128;
+        let done = Arc::new(AtomicUsize::new(0));
+        let jobs = (0..total).map(|_| {
+            let done = done.clone();
+            Box::new(move || {
+                done.fetch_add(1, Ordering::Relaxed);
+            }) as super::Job
+        });
+        super::run_batch(jobs);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while done.load(Ordering::Relaxed) < total {
+            assert!(Instant::now() < deadline, "large batch jobs timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(done.load(Ordering::Relaxed), total);
     }
 }

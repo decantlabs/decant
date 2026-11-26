@@ -261,3 +261,19 @@ impl Drop for Backend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_request_file_to_memory_populates_expected_fields() {
+        let mut buf = [0u8; 64];
+        let req = RawRequest::file_to_memory(COMPRESSION_GDEFLATE, std::ptr::dangling_mut(), 4096, 32, buf.as_mut_ptr().cast(), 64);
+        assert_eq!(req.compression, COMPRESSION_GDEFLATE);
+        assert_eq!(req.source_offset, 4096);
+        assert_eq!(req.source_size, 32);
+        assert_eq!(req.destination_size, 64);
+        assert_eq!(req.uncompressed_size, 64);
+    }
+}
