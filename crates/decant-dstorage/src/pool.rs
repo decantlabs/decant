@@ -2,8 +2,8 @@
 //! have read (zlib, GDeflate, BCPack) and write it to its destination. A BCPack stream decodes on
 //! one thread, so the title's many requests are what runs in parallel.
 //!
-//! The threads start on first use and live as long as the process. Their number is half the
-//! logical processors, at least 2 and at most 8, so the title's own threads keep the rest.
+//! The threads start on first use and live as long as the process. Their number is three
+//! quarters of the logical processors, at least 4 and at most 16, so decodes scale across cores.
 
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
@@ -21,7 +21,7 @@ fn pool() -> Option<&'static Pool> {
     static POOL: OnceLock<Option<&'static Pool>> = OnceLock::new();
     *POOL.get_or_init(|| {
         let pool: &'static Pool = Box::leak(Box::new(Pool { jobs: Mutex::new(VecDeque::new()), ready: Condvar::new() }));
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8);
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get() * 3 / 4).clamp(4, 16);
         let started = (0..threads).filter(|k| std::thread::Builder::new().name(format!("dstorage decode {k}")).spawn(move || work(pool)).is_ok()).count();
         (started > 0).then_some(pool)
     })

@@ -338,3 +338,56 @@ fn options_that_are_not_implemented_are_refused_by_name() {
     r.destination = std::ptr::null_mut();
     assert_eq!(queue.enqueue_console(&r), E_INVALIDARG, "a page destination needs its array");
 }
+
+#[test]
+fn batched_reads_preserve_barrier_ordering_and_propagate_eof_errors() {
+    let chunk_size = 4096usize;
+    let count = 72usize;
+    let plain = pattern(chunk_size * count);
+    let file_on_disk = TempFile::new("batched", &plain);
+    let pool = TestPool::new(&[]);
+    let factory = Ref::new(Factory::new(Backend::cpu(), pool));
+    let queue = factory.create_queue(128).expect("a queue");
+    let status = factory.create_status_array(4).expect("a status array");
+    let file = factory.open_file(file_on_disk.wide().as_ptr()).expect("the file opens");
+
+    let mut outputs: Vec<Vec<u8>> = (0..count).map(|_| vec![0xAA; chunk_size]).collect();
+    for (i, out) in outputs.iter_mut().enumerate() {
+        let mut r = request(&file, 0, &[], 0, chunk_size, (i * chunk_size) as u64, chunk_size);
+        r.destination = out.as_mut_ptr().cast();
+        assert_eq!(queue.enqueue_console(&r), S_OK);
+    }
+    assert_eq!(finish(&queue, &status, 0), S_OK);
+    for (i, out) in outputs.iter().enumerate() {
+        assert_eq!(out, &plain[i * chunk_size..(i + 1) * chunk_size]);
+    }
+
+    // Mix a valid read with an EOF read in one batch; status slot 1 must observe the error,
+    // and status slot 2 after a clean read must observe S_OK.
+    let mut ok_buf = vec![0u8; chunk_size];
+    let mut eof_buf = vec![0u8; chunk_size];
+    let mut r_ok = request(&file, 0, &[], 0, chunk_size, 0, chunk_size);
+    r_ok.destination = ok_buf.as_mut_ptr().cast();
+    let mut r_eof = request(&file, 0, &[], 0, chunk_size, plain.len() as u64, chunk_size);
+    r_eof.destination = eof_buf.as_mut_ptr().cast();
+    assert_eq!(queue.enqueue_console(&r_ok), S_OK);
+    assert_eq!(queue.enqueue_console(&r_eof), S_OK);
+    assert!(finish(&queue, &status, 1) < 0);
+    assert_eq!(&ok_buf, &plain[..chunk_size]);
+
+    let mut clean_buf = vec![0u8; chunk_size];
+    let mut r_clean = request(&file, 0, &[], 0, chunk_size, chunk_size as u64, chunk_size);
+    r_clean.destination = clean_buf.as_mut_ptr().cast();
+    assert_eq!(queue.enqueue_console(&r_clean), S_OK);
+    assert_eq!(finish(&queue, &status, 2), S_OK);
+    assert_eq!(&clean_buf, &plain[chunk_size..2 * chunk_size]);
+}
+
+#[test]
+fn write_hooks_stay_no_op_when_xmem_is_not_loaded() {
+    let mut scratch = [0u8; 64];
+    let pinned = begin_written(scratch.as_mut_ptr().cast(), scratch.len() as u32);
+    assert!(!pinned);
+    finish_written(scratch.as_mut_ptr().cast(), scratch.len() as u32);
+    note_written(scratch.as_mut_ptr().cast(), scratch.len() as u32);
+}
