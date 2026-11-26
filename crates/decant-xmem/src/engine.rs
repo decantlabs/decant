@@ -595,7 +595,34 @@ const PROTECT_STRIPE_SHIFT: usize = 16;
 const MAX_PROTECT_CHUNK_BYTES: usize = 32 * PAGE_BYTES;
 
 type StripeMask = [u64; 4];
-type RunSnapshot = (usize, usize, StripeMask, Vec<u64>);
+type RunSnapshot = (usize, usize, StripeMask, MaskGens);
+
+const INLINE_STRIPE_CAP: usize = 8;
+
+enum MaskGens {
+    Inline { len: u8, buf: [u64; INLINE_STRIPE_CAP] },
+    Heap(Vec<u64>),
+}
+
+impl MaskGens {
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            Self::Inline { len, buf } => &buf[..usize::from(*len)],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+#[allow(dead_code)]
+enum MaskGuards<'a> {
+    Inline([Option<MutexGuard<'a, ()>>; INLINE_STRIPE_CAP]),
+    Heap(Vec<MutexGuard<'a, ()>>),
+}
 
 /// Coordinates page protection changes outside the `dirty` mutex so `VirtualProtect` and
 /// `VirtualQuery` syscalls do not block fault, I/O preparation, or tracking updates.
@@ -685,12 +712,23 @@ impl ProtectSync {
         });
     }
 
-    fn read_mask_gens(&self, mask: StripeMask) -> Vec<u64> {
-        let mut gens = Vec::with_capacity(Self::mask_count(mask));
-        Self::for_each_stripe(mask, |s| {
-            gens.push(self.gens[s].load(Ordering::Acquire));
-        });
-        gens
+    fn read_mask_gens(&self, mask: StripeMask) -> MaskGens {
+        let count = Self::mask_count(mask);
+        if count <= INLINE_STRIPE_CAP {
+            let mut buf = [0u64; INLINE_STRIPE_CAP];
+            let mut len = 0usize;
+            Self::for_each_stripe(mask, |s| {
+                buf[len] = self.gens[s].load(Ordering::Acquire);
+                len += 1;
+            });
+            MaskGens::Inline { len: len as u8, buf }
+        } else {
+            let mut gens = Vec::with_capacity(count);
+            Self::for_each_stripe(mask, |s| {
+                gens.push(self.gens[s].load(Ordering::Acquire));
+            });
+            MaskGens::Heap(gens)
+        }
     }
 
     fn gens_match(&self, mask: StripeMask, expected: &[u64]) -> bool {
@@ -709,12 +747,23 @@ impl ProtectSync {
         true
     }
 
-    fn lock_mask(&self, mask: StripeMask) -> Vec<MutexGuard<'_, ()>> {
-        let mut guards = Vec::with_capacity(Self::mask_count(mask));
-        Self::for_each_stripe(mask, |s| {
-            guards.push(self.locks[s].lock().unwrap_or_else(PoisonError::into_inner));
-        });
-        guards
+    fn lock_mask(&self, mask: StripeMask) -> MaskGuards<'_> {
+        let count = Self::mask_count(mask);
+        if count <= INLINE_STRIPE_CAP {
+            let mut buf: [Option<MutexGuard<'_, ()>>; INLINE_STRIPE_CAP] = [const { None }; INLINE_STRIPE_CAP];
+            let mut idx = 0usize;
+            Self::for_each_stripe(mask, |s| {
+                buf[idx] = Some(self.locks[s].lock().unwrap_or_else(PoisonError::into_inner));
+                idx += 1;
+            });
+            MaskGuards::Inline(buf)
+        } else {
+            let mut guards = Vec::with_capacity(count);
+            Self::for_each_stripe(mask, |s| {
+                guards.push(self.locks[s].lock().unwrap_or_else(PoisonError::into_inner));
+            });
+            MaskGuards::Heap(guards)
+        }
     }
 
     fn protect_rw_locked(&self, addrs: Vec<usize>) {
@@ -769,7 +818,7 @@ impl ProtectSync {
         let mut retries = 0usize;
         for (start, bytes, mask, expected_gens) in runs {
             let guards = self.lock_mask(mask);
-            if self.gens_match(mask, &expected_gens) {
+            if self.gens_match(mask, expected_gens.as_slice()) {
                 Engine::protect_range(start, bytes, protect);
                 protected_runs += 1;
                 drop(guards);
@@ -800,7 +849,7 @@ impl ProtectSync {
                 let mut retry = Vec::new();
                 for (sub_s, sub_b, sub_mask, fresh_gens) in sub_runs {
                     let guards = self.lock_mask(sub_mask);
-                    if self.gens_match(sub_mask, &fresh_gens) {
+                    if self.gens_match(sub_mask, fresh_gens.as_slice()) {
                         Engine::protect_range(sub_s, sub_b, protect);
                         protected_runs += 1;
                     } else {
