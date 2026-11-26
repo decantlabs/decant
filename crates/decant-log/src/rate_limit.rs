@@ -44,21 +44,34 @@ pub enum FilterAction {
 pub fn rate_limit_enabled() -> bool {
     std::env::var("DECANT_LOG_RATE_LIMIT")
         .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+            let t = v.trim();
+            !(t == "0"
+                || t.eq_ignore_ascii_case("off")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no"))
         })
         .unwrap_or(true)
+}
+
+#[inline]
+fn contains_ascii_ignore_case(haystack: &str, needle: &[u8]) -> bool {
+    let bytes = haystack.as_bytes();
+    bytes.len() >= needle.len() && bytes.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// Checks whether a message line carries an error.
 ///
 /// Error lines are never suppressed or dropped.
 pub fn is_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("error")
-        || lower.contains("failed")
-        || lower.contains("failure")
-        || lower.contains("exception")
+    contains_ascii_ignore_case(message, b"error")
+        || contains_ascii_ignore_case(message, b"failed")
+        || contains_ascii_ignore_case(message, b"failure")
+        || contains_ascii_ignore_case(message, b"exception")
+}
+
+/// Checks whether a message line carries a warning or error that should flush buffered logs.
+pub fn is_urgent(message: &str) -> bool {
+    is_error(message) || contains_ascii_ignore_case(message, b"warning")
 }
 
 /// Splits a message into a call identifier and the text key.
@@ -198,7 +211,8 @@ impl Limiter {
             }
 
             let repeats = slot.count.saturating_sub(1);
-            slot.text_key = key.to_owned();
+            slot.text_key.clear();
+            slot.text_key.push_str(key);
             slot.count = 1;
             slot.window_start = Some(now);
             slot.last_seen = Some(now);
@@ -379,5 +393,13 @@ mod tests {
 
         let flushed = limiter.flush();
         assert_eq!(flushed.len(), 2);
+    }
+
+    #[test]
+    fn urgent_detects_warnings_and_errors_case_insensitively() {
+        assert!(is_error("ERROR: bad handle"));
+        assert!(is_error("Call Failed"));
+        assert!(is_urgent("WARNING: slow path"));
+        assert!(!is_urgent("normal info line"));
     }
 }

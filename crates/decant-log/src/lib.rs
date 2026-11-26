@@ -47,8 +47,11 @@ impl SessionWriter {
         })
     }
 
-    fn write_line(&mut self, bytes: &[u8], force_flush: bool) {
-        let _ = self.writer.write_all(bytes);
+    fn write_message(&mut self, message: &str, force_flush: bool) {
+        let _ = self.writer.write_all(message.as_bytes());
+        if !message.ends_with('\n') {
+            let _ = self.writer.write_all(b"\r\n");
+        }
         let now = Instant::now();
         if force_flush || now.duration_since(self.last_flush) >= SESSION_FLUSH_INTERVAL {
             let _ = self.writer.flush();
@@ -81,8 +84,7 @@ fn write_session_to_path(path: Option<PathBuf>, message: &str) {
         *guard = SessionWriter::open(target);
     }
     if let Some(active) = guard.as_mut() {
-        let bytes = session_bytes(message);
-        active.write_line(&bytes, rate_limit::is_error(message));
+        active.write_message(message, rate_limit::is_urgent(message));
     }
 }
 
@@ -139,6 +141,7 @@ impl WideLen for OsString {
 }
 
 /// The bytes appended for one message: the message, then CR LF unless it already ends a line.
+#[cfg(test)]
 fn session_bytes(message: &str) -> Vec<u8> {
     let mut bytes = message.as_bytes().to_vec();
     if !message.ends_with('\n') {
@@ -220,7 +223,18 @@ pub fn debug_string(message: &str) {
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub fn raw_debug_string(message: &str) {
-    let mut bytes: Vec<u8> = message.bytes().take_while(|&b| b != 0).collect();
+    let raw = message.as_bytes();
+    let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    if len < 1024 {
+        let mut stack = [0u8; 1024];
+        stack[..len].copy_from_slice(&raw[..len]);
+        stack[len] = 0;
+        // SAFETY: `stack` is NUL-terminated at `len` and lives for the whole call.
+        unsafe { windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA(stack.as_ptr()) };
+        return;
+    }
+    let mut bytes = Vec::with_capacity(len + 1);
+    bytes.extend_from_slice(&raw[..len]);
     bytes.push(0);
     // SAFETY: `bytes` is a zero terminated buffer that lives for the whole call.
     unsafe { windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA(bytes.as_ptr()) };

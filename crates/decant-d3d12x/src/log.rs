@@ -39,12 +39,54 @@ pub(crate) fn pieces(text: &str, max: usize) -> Vec<&str> {
     out
 }
 
+struct StackBuf {
+    buf: [u8; 1024],
+    len: usize,
+    overflow: bool,
+}
+
+impl StackBuf {
+    fn new(prefix: &str) -> Self {
+        let mut buf = [0u8; 1024];
+        let n = prefix.len();
+        buf[..n].copy_from_slice(prefix.as_bytes());
+        Self { buf, len: n, overflow: false }
+    }
+
+    fn as_str(&self) -> &str {
+        // SAFETY: only valid UTF-8 (`prefix`, `fmt::Write`, and `"\n"`) is written into `buf[..len]`.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len]) }
+    }
+}
+
+impl fmt::Write for StackBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if self.overflow || self.len + s.len() > self.buf.len() - 1 {
+            self.overflow = true;
+            return Err(fmt::Error);
+        }
+        self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+        self.len += s.len();
+        Ok(())
+    }
+}
+
 /// Writes the text as one line, or as several when it is longer than a line holds: the lines after
 /// the first start with `... ` (a long probe line used to lose everything past 1000 characters).
 pub(crate) fn write(args: fmt::Arguments<'_>) {
+    const PREFIX: &str = "d3d12_xs: ";
+    let mut stack = StackBuf::new(PREFIX);
+    if fmt::Write::write_fmt(&mut stack, args).is_ok() && stack.len - PREFIX.len() <= MAX_TEXT - MORE.len() {
+        stack.buf[stack.len] = b'\n';
+        stack.len += 1;
+        let line = stack.as_str();
+        decant_log::debug_string(line);
+        decant_log::session_log(line);
+        return;
+    }
     let text = args.to_string();
     for (i, piece) in pieces(&text, MAX_TEXT - MORE.len()).into_iter().enumerate() {
-        let line = format!("d3d12_xs: {}{piece}\n", if i == 0 { "" } else { MORE });
+        let line = format!("{PREFIX}{}{piece}\n", if i == 0 { "" } else { MORE });
         decant_log::debug_string(&line);
         decant_log::session_log(&line);
     }
@@ -100,5 +142,14 @@ mod tests {
         // two byte characters are not cut in the middle
         assert_eq!(pieces("ääää", 3), vec!["ä", "ä", "ä", "ä"]);
         assert_eq!(pieces("abcd", 4), vec!["abcd"]);
+    }
+
+    #[test]
+    fn stack_buf_formats_short_lines_without_overflow() {
+        use std::fmt::Write;
+        let mut b = super::StackBuf::new("d3d12_xs: ");
+        write!(b, "value={}", 42).unwrap();
+        assert_eq!(b.as_str(), "d3d12_xs: value=42");
+        assert!(write!(b, "{}", "x".repeat(1024)).is_err());
     }
 }
