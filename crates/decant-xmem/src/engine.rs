@@ -464,13 +464,15 @@ pub struct Footprint {
 /// Whether the page at `address` is committed.
 /// Where the time of `take_dirty` goes, logged every 200 calls: waiting for the lock, looking at
 /// the pending pages (with a `VirtualQuery` each), and protecting them again.
-fn take_stats(pages: usize, protected: usize, pending: usize, queries: usize, times: [std::time::Duration; 3]) {
+fn take_stats(pages: usize, protected: usize, runs: usize, retries: usize, pending: usize, queries: usize, times: [std::time::Duration; 3]) {
     static STATS: Mutex<(u64, u64, u64, [u128; 3])> = Mutex::new((0, 0, 0, [0; 3]));
-    static LOOKED: Mutex<(u64, u64)> = Mutex::new((0, 0));
+    static LOOKED: Mutex<(u64, u64, u64, u64)> = Mutex::new((0, 0, 0, 0));
     let looked = {
         let mut l = LOOKED.lock().unwrap_or_else(|e| e.into_inner());
         l.0 += pending as u64;
         l.1 += queries as u64;
+        l.2 += runs as u64;
+        l.3 += retries as u64;
         *l
     };
     let mut s = STATS.lock().unwrap_or_else(|e| e.into_inner());
@@ -482,12 +484,12 @@ fn take_stats(pages: usize, protected: usize, pending: usize, queries: usize, ti
     }
     if s.0.is_multiple_of(200) {
         decant_log::trace(&format!(
-            "[xmem] written pages taken: {} calls, {} pages, {} pages protected again; {} us waiting for the lock, {} us looking at the pages ({} pending pages looked at, {} VirtualQuery), {} us protecting
+            "[xmem] written pages taken: {} calls, {} pages, {} pages protected again ({} runs, {} retries); {} us waiting for the lock, {} us looking at the pages ({} pending pages looked at, {} VirtualQuery), {} us protecting
 ",
-            s.0, s.1, s.2, s.3[0], s.3[1], looked.0, looked.1, s.3[2]
+            s.0, s.1, s.2, looked.2, looked.3, s.3[0], s.3[1], looked.0, looked.1, s.3[2]
         ));
         *s = (s.0, 0, 0, [0; 3]);
-        *LOOKED.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0);
+        *LOOKED.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, 0, 0);
     }
 }
 
@@ -588,10 +590,12 @@ struct State {
     on_demand: BTreeMap<usize, Vec<bool>>,
 }
 
-const PROTECT_STRIPES: usize = 64;
+const PROTECT_STRIPES: usize = 256;
 const PROTECT_STRIPE_SHIFT: usize = 16;
+const MAX_PROTECT_CHUNK_BYTES: usize = 32 * PAGE_BYTES;
 
-type RunSnapshot = (usize, usize, u64, Vec<u64>);
+type StripeMask = [u64; 4];
+type RunSnapshot = (usize, usize, StripeMask, Vec<u64>);
 
 /// Coordinates page protection changes outside the `dirty` mutex so `VirtualProtect` and
 /// `VirtualQuery` syscalls do not block fault, I/O preparation, or tracking updates.
@@ -621,19 +625,44 @@ impl ProtectSync {
         (addr >> PROTECT_STRIPE_SHIFT) & (PROTECT_STRIPES - 1)
     }
 
-    fn stripe_mask(start: usize, bytes: usize) -> u64 {
+    fn set_bit(mask: &mut StripeMask, bit: usize) {
+        mask[bit >> 6] |= 1u64 << (bit & 63);
+    }
+
+    fn merge_mask(dst: &mut StripeMask, src: StripeMask) {
+        for (d, s) in dst.iter_mut().zip(src) {
+            *d |= s;
+        }
+    }
+
+    fn mask_count(mask: StripeMask) -> usize {
+        mask.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    fn for_each_stripe(mask: StripeMask, mut f: impl FnMut(usize)) {
+        for (word_idx, mut word) in mask.into_iter().enumerate() {
+            let base = word_idx << 6;
+            while word != 0 {
+                let s = base + word.trailing_zeros() as usize;
+                f(s);
+                word &= word - 1;
+            }
+        }
+    }
+
+    fn stripe_mask(start: usize, bytes: usize) -> StripeMask {
         if bytes == 0 {
-            return 0;
+            return [0; 4];
         }
         let first = start >> PROTECT_STRIPE_SHIFT;
         let last = (start + bytes - 1) >> PROTECT_STRIPE_SHIFT;
         let span = last - first + 1;
         if span >= PROTECT_STRIPES {
-            return u64::MAX;
+            return [u64::MAX; 4];
         }
-        let mut mask = 0u64;
+        let mut mask = [0u64; 4];
         for k in 0..span {
-            mask |= 1u64 << ((first + k) & (PROTECT_STRIPES - 1));
+            Self::set_bit(&mut mask, (first + k) & (PROTECT_STRIPES - 1));
         }
         mask
     }
@@ -647,47 +676,44 @@ impl ProtectSync {
     }
 
     fn bump_addrs(&self, addrs: &[usize]) {
-        let mut mask = 0u64;
+        let mut mask = [0u64; 4];
         for &addr in addrs {
-            mask |= 1u64 << Self::stripe(addr);
+            Self::set_bit(&mut mask, Self::stripe(addr));
         }
-        while mask != 0 {
-            let s = mask.trailing_zeros() as usize;
+        Self::for_each_stripe(mask, |s| {
             self.gens[s].fetch_add(1, Ordering::Release);
-            mask &= mask - 1;
-        }
+        });
     }
 
-    fn read_mask_gens(&self, mut mask: u64) -> Vec<u64> {
-        let mut gens = Vec::with_capacity(mask.count_ones() as usize);
-        while mask != 0 {
-            let s = mask.trailing_zeros() as usize;
+    fn read_mask_gens(&self, mask: StripeMask) -> Vec<u64> {
+        let mut gens = Vec::with_capacity(Self::mask_count(mask));
+        Self::for_each_stripe(mask, |s| {
             gens.push(self.gens[s].load(Ordering::Acquire));
-            mask &= mask - 1;
-        }
+        });
         gens
     }
 
-    fn gens_match(&self, mut mask: u64, expected: &[u64]) -> bool {
+    fn gens_match(&self, mask: StripeMask, expected: &[u64]) -> bool {
         let mut idx = 0usize;
-        while mask != 0 {
-            let s = mask.trailing_zeros() as usize;
-            if self.gens[s].load(Ordering::Acquire) != expected[idx] {
-                return false;
+        for (word_idx, mut word) in mask.into_iter().enumerate() {
+            let base = word_idx << 6;
+            while word != 0 {
+                let s = base + word.trailing_zeros() as usize;
+                if self.gens[s].load(Ordering::Acquire) != expected[idx] {
+                    return false;
+                }
+                idx += 1;
+                word &= word - 1;
             }
-            idx += 1;
-            mask &= mask - 1;
         }
         true
     }
 
-    fn lock_mask(&self, mut mask: u64) -> Vec<MutexGuard<'_, ()>> {
-        let mut guards = Vec::with_capacity(mask.count_ones() as usize);
-        while mask != 0 {
-            let s = mask.trailing_zeros() as usize;
+    fn lock_mask(&self, mask: StripeMask) -> Vec<MutexGuard<'_, ()>> {
+        let mut guards = Vec::with_capacity(Self::mask_count(mask));
+        Self::for_each_stripe(mask, |s| {
             guards.push(self.locks[s].lock().unwrap_or_else(PoisonError::into_inner));
-            mask &= mask - 1;
-        }
+        });
         guards
     }
 
@@ -701,48 +727,51 @@ impl ProtectSync {
     fn snapshot_runs(&self, addrs: Vec<usize>) -> Vec<RunSnapshot> {
         let mut runs = Vec::new();
         for (start, bytes) in track::runs(addrs) {
-            let mask = Self::stripe_mask(start, bytes);
-            let gens = self.read_mask_gens(mask);
-            runs.push((start, bytes, mask, gens));
+            let end = start + bytes;
+            let mut at = start;
+            while at < end {
+                let cb = (end - at).min(MAX_PROTECT_CHUNK_BYTES);
+                let mask = Self::stripe_mask(at, cb);
+                let gens = self.read_mask_gens(mask);
+                runs.push((at, cb, mask, gens));
+                at += cb;
+            }
         }
         runs
     }
 
     fn snapshot_rw_runs(&self, addrs: Vec<usize>) -> Vec<RunSnapshot> {
         let runs = self.snapshot_runs(addrs);
-        for &(_, _, mut mask, _) in &runs {
-            while mask != 0 {
-                let s = mask.trailing_zeros() as usize;
+        for &(_, _, mask, _) in &runs {
+            Self::for_each_stripe(mask, |s| {
                 self.in_flight_rw[s].fetch_add(1, Ordering::Release);
-                mask &= mask - 1;
-            }
+            });
         }
         runs
     }
 
-    fn release_in_flight_rw(&self, mut mask: u64) {
-        while mask != 0 {
-            let s = mask.trailing_zeros() as usize;
+    fn release_in_flight_rw(&self, mask: StripeMask) {
+        Self::for_each_stripe(mask, |s| {
             self.in_flight_rw[s].fetch_sub(1, Ordering::Release);
-            mask &= mask - 1;
-        }
+        });
     }
 
-    fn wait_in_flight_rw(&self, mut mask: u64) {
-        while mask != 0 {
-            let s = mask.trailing_zeros() as usize;
+    fn wait_in_flight_rw(&self, mask: StripeMask) {
+        Self::for_each_stripe(mask, |s| {
             while self.in_flight_rw[s].load(Ordering::Acquire) != 0 {
                 std::hint::spin_loop();
             }
-            mask &= mask - 1;
-        }
+        });
     }
 
-    fn protect_runs_checked(&self, runs: Vec<RunSnapshot>, protect: u32, want_clean: bool, release_rw: bool, dirty: &Mutex<Dirty>) {
+    fn protect_runs_checked(&self, runs: Vec<RunSnapshot>, protect: u32, want_clean: bool, release_rw: bool, dirty: &Mutex<Dirty>) -> (usize, usize) {
+        let mut protected_runs = 0usize;
+        let mut retries = 0usize;
         for (start, bytes, mask, expected_gens) in runs {
             let guards = self.lock_mask(mask);
             if self.gens_match(mask, &expected_gens) {
                 Engine::protect_range(start, bytes, protect);
+                protected_runs += 1;
                 drop(guards);
                 if release_rw {
                     self.release_in_flight_rw(mask);
@@ -750,6 +779,7 @@ impl ProtectSync {
                 continue;
             }
             drop(guards);
+            retries += 1;
             let mut pending_addrs: Vec<usize> = (start..start + bytes).step_by(PAGE_BYTES).collect();
             loop {
                 let sub_runs = {
@@ -772,7 +802,9 @@ impl ProtectSync {
                     let guards = self.lock_mask(sub_mask);
                     if self.gens_match(sub_mask, &fresh_gens) {
                         Engine::protect_range(sub_s, sub_b, protect);
+                        protected_runs += 1;
                     } else {
+                        retries += 1;
                         retry.extend((sub_s..sub_s + sub_b).step_by(PAGE_BYTES));
                     }
                     drop(guards);
@@ -786,14 +818,15 @@ impl ProtectSync {
                 self.release_in_flight_rw(mask);
             }
         }
+        (protected_runs, retries)
     }
 
     fn protect_rw_runs(&self, runs: Vec<RunSnapshot>, dirty: &Mutex<Dirty>) {
-        self.protect_runs_checked(runs, PAGE_READWRITE, false, true, dirty);
+        let _ = self.protect_runs_checked(runs, PAGE_READWRITE, false, true, dirty);
     }
 
-    fn protect_ro_runs(&self, runs: Vec<RunSnapshot>, dirty: &Mutex<Dirty>) {
-        self.protect_runs_checked(runs, PAGE_READONLY, true, false, dirty);
+    fn protect_ro_runs(&self, runs: Vec<RunSnapshot>, dirty: &Mutex<Dirty>) -> (usize, usize) {
+        self.protect_runs_checked(runs, PAGE_READONLY, true, false, dirty)
     }
 
     fn ensure_rw(&self, page: usize) -> bool {
@@ -1927,7 +1960,7 @@ impl Engine {
             return false;
         }
         let page = address & !(PAGE_BYTES - 1);
-        let (index, was_held, is_held, chunks) = {
+        let (index, was_hot, is_hot, chunks) = {
             let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(track) = dirty.track.as_mut() else { return false };
             let Some(mut index) = track.writable_page(page) else { return false };
@@ -1945,9 +1978,10 @@ impl Engine {
             }
             let Some(track) = dirty.track.as_mut() else { return false };
             let now = Instant::now();
-            let was_held = track.is_held(index, now);
-            let open = track.on_fault(index, now);
-            let is_held = track.is_held(index, now);
+            let hot_threshold = now + track::guard_rest();
+            let was_hot = track.is_held(index, hot_threshold);
+            let open = track.on_fault(index, page, now);
+            let is_hot = track.is_held(index, hot_threshold);
             let chunks = open.map(|addrs| {
                 self.protect_sync.bump_addrs(&addrs);
                 self.protect_sync.snapshot_rw_runs(addrs)
@@ -1955,7 +1989,7 @@ impl Engine {
             if track.pending_len() > 0 {
                 self.protect_sync.set_pending(true);
             }
-            (index, was_held, is_held, chunks)
+            (index, was_hot, is_hot, chunks)
         };
         let handled = match chunks {
             Some(chunks) => {
@@ -1964,7 +1998,7 @@ impl Engine {
             }
             None => self.protect_sync.ensure_rw(page),
         };
-        if !was_held && is_held {
+        if !was_hot && is_hot {
             let hot = HOT.fetch_add(1, Ordering::Relaxed) + 1;
             if hot <= 8 || hot.is_multiple_of(1000) {
                 decant_log::trace(&format!("[xmem] suivi des pages : page {index} (0x{page:x}) ecrite a chaque copie, ouverte et copiee a chaque synchronisation pour {} ms ({hot} fois)\r\n", track::hot_hold().as_millis()));
@@ -2020,7 +2054,7 @@ impl Engine {
             let mut chunks = None;
             if let Some(track) = dirty_guard.track.as_mut() {
                 track.mark_committed(index as u32);
-                if let Some(addrs) = track.on_fault(index as u32, Instant::now()) {
+                if let Some(addrs) = track.on_fault(index as u32, page, Instant::now()) {
                     protect_sync.bump_addrs(&addrs);
                     chunks = Some(protect_sync.snapshot_rw_runs(addrs));
                 }
@@ -2121,9 +2155,9 @@ impl Engine {
         };
         let taken = Instant::now();
         drop(dirty);
-        self.protect_sync.protect_ro_runs(chunks, &self.dirty);
+        let (vp_runs, retries) = self.protect_sync.protect_ro_runs(chunks, &self.dirty);
         let done = Instant::now();
-        take_stats(pages.len(), runs, pending, queries, [locked - asked, taken - locked, done - taken]);
+        take_stats(pages.len(), runs, vp_runs, retries, pending, queries, [locked - asked, taken - locked, done - taken]);
         pages
     }
 
@@ -2288,14 +2322,14 @@ impl Engine {
             return;
         }
         let until = Instant::now() + track::io_hold_for(total_bytes);
-        let mut wait_mask = 0u64;
+        let mut wait_mask = [0u64; 4];
         for &(address, len) in runs {
-            wait_mask |= ProtectSync::stripe_mask(address, len);
+            ProtectSync::merge_mask(&mut wait_mask, ProtectSync::stripe_mask(address, len));
         }
         Self::commit_and_prepare_until(&st, indices, until, wait_mask);
     }
 
-    fn commit_and_prepare_until(st: &State, indices: Vec<u32>, until: Instant, wait_mask: u64) {
+    fn commit_and_prepare_until(st: &State, indices: Vec<u32>, until: Instant, wait_mask: StripeMask) {
         let dirty_state = Arc::clone(&st.dirty);
         let protect_sync = Arc::clone(&st.protect_sync);
         let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2397,9 +2431,9 @@ impl Engine {
         let chunks = protect_sync.snapshot_rw_runs(open);
         drop(dirty_guard);
         drop(st);
-        let mut wait_mask = 0u64;
+        let mut wait_mask = [0u64; 4];
         for &(address, len) in runs {
-            wait_mask |= ProtectSync::stripe_mask(address, len);
+            ProtectSync::merge_mask(&mut wait_mask, ProtectSync::stripe_mask(address, len));
         }
         protect_sync.protect_rw_runs(chunks, &dirty_state);
         protect_sync.wait_in_flight_rw(wait_mask);
@@ -3945,17 +3979,19 @@ mod tests {
     }
 
     #[test]
-    fn protect_sync_coalesces_contiguous_pages_across_stripes_into_one_run() {
+    fn protect_sync_256_stripe_mask_and_32_page_chunk_split() {
         let sync = ProtectSync::default();
-        // 32 contiguous pages spanning 32 stripes.
+        // 40 contiguous pages span 40 stripes and split into 32 + 8 page chunks.
         let base = 0x10_0000usize;
-        let addrs: Vec<usize> = (0..32).rev().map(|k| base + k * P).collect();
+        let addrs: Vec<usize> = (0..40).rev().map(|k| base + k * P).collect();
         let runs = sync.snapshot_runs(addrs);
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].0, base);
-        assert_eq!(runs[0].1, 32 * P);
-        assert_eq!(runs[0].2.count_ones(), 32);
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[0].0, runs[0].1), (base, 32 * P));
+        assert_eq!(ProtectSync::mask_count(runs[0].2), 32);
         assert_eq!(runs[0].3.len(), 32);
+        assert_eq!((runs[1].0, runs[1].1), (base + 32 * P, 8 * P));
+        assert_eq!(ProtectSync::mask_count(runs[1].2), 8);
+        assert_eq!(runs[1].3.len(), 8);
     }
 
     #[test]
@@ -3973,7 +4009,7 @@ mod tests {
         // and not yet finished VirtualProtect(PAGE_READWRITE) on that stripe.
         let chunks = {
             let mut dirty = e.dirty.lock().unwrap();
-            let open = dirty.track.as_mut().unwrap().on_fault(page_of(frames[0]), Instant::now()).unwrap();
+            let open = dirty.track.as_mut().unwrap().on_fault(page_of(frames[0]), area, Instant::now()).unwrap();
             e.protect_sync.bump_addrs(&open);
             e.protect_sync.snapshot_rw_runs(open)
         };
@@ -3990,6 +4026,46 @@ mod tests {
         });
 
         e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
+    }
+
+    #[test]
+    fn one_view_per_fault_opens_only_faulting_alias_and_io_opens_siblings() {
+        let Some(e) = held(|| Engine::load_limited(4, 4)) else { return };
+        e.set_tracking(true);
+        let a1 = e.reserve(0, P, PAGE_READWRITE).unwrap();
+        let a2 = e.reserve(0, P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(1).unwrap();
+        e.map_frames(a1, &frames).unwrap();
+        e.map_frames(a2, &frames).unwrap();
+        write(a1, 0, 1);
+        assert_eq!(e.take_dirty(10).len(), 1);
+        assert!(!accessible(a1, true));
+        assert!(!accessible(a2, true));
+
+        // Faulting on a1 opens only a1; a2 remains guarded until it faults or I/O prepares it.
+        assert!(e.on_write_fault(a1));
+        assert!(accessible(a1, true));
+        assert!(!accessible(a2, true));
+
+        // Faulting on a2 while page is already dirty still opens a2.
+        assert!(e.on_write_fault(a2));
+        assert!(accessible(a2, true));
+
+        std::thread::sleep(track::GUARD_REST + std::time::Duration::from_millis(5));
+        assert_eq!(e.take_dirty(10).len(), 1);
+        assert!(!accessible(a1, true));
+        assert!(!accessible(a2, true));
+
+        // Fault a1 again, then begin_io_write on a2 opens a2 safely.
+        assert!(e.on_write_fault(a1));
+        assert!(!accessible(a2, true));
+        assert!(e.begin_io_write_checked(a2, P));
+        assert!(accessible(a2, true));
+        e.finish_io_write(a2, P);
+
+        e.release(a1).unwrap();
+        e.release(a2).unwrap();
         e.free_pages(&frames).unwrap();
     }
 

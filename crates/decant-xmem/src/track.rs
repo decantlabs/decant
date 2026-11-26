@@ -75,11 +75,13 @@ pub fn io_hold_for(bytes: usize) -> Duration {
     io_hold().max(Duration::from_millis(((bytes as u64) / (32 * 1024)).min(30_000)))
 }
 
-/// One title view page of a pool page: its address and whether the title protection is read write.
+/// One title view page of a pool page: its address, whether the title protection is read write,
+/// and whether that alias is currently open (`PAGE_READWRITE`) rather than guarded (`PAGE_READONLY`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Alias {
     addr: usize,
     rw: bool,
+    open: bool,
 }
 
 #[derive(Debug, Default)]
@@ -147,24 +149,34 @@ impl Track {
         }
     }
 
-    /// Appends the addresses of the read write views of `page` to `out`.
-    fn extend_rw(&self, page: u32, out: &mut Vec<usize>) {
-        if let Some(v) = self.aliases.get(&page) {
-            out.extend(v.iter().filter(|a| a.rw).map(|a| a.addr));
+    /// Appends the addresses of the open read write views of `page` to `out` and marks them closed.
+    fn take_open_rw(&mut self, page: u32, out: &mut Vec<usize>) {
+        if let Some(v) = self.aliases.get_mut(&page) {
+            for a in v.iter_mut() {
+                if a.rw && a.open {
+                    a.open = false;
+                    out.push(a.addr);
+                }
+            }
         }
     }
 
-    /// Makes the page dirty and queues it when it has a view, appending read write views to
-    /// `out` when it was clean.
+    /// Makes the page dirty and queues it when it has a view, appending any closed read write views
+    /// to `out` and marking them open.
     fn dirty_into(&mut self, page: u32, out: &mut Vec<usize>) {
         let i = page as usize;
-        let was_clean = std::mem::replace(&mut self.clean[i], false);
+        self.clean[i] = false;
         if !self.queued[i] && self.aliases.contains_key(&page) {
             self.queued[i] = true;
             self.pending.push(page);
         }
-        if was_clean {
-            self.extend_rw(page, out);
+        if let Some(v) = self.aliases.get_mut(&page) {
+            for a in v.iter_mut() {
+                if a.rw && !a.open {
+                    a.open = true;
+                    out.push(a.addr);
+                }
+            }
         }
     }
 
@@ -185,7 +197,7 @@ impl Track {
     /// A view of the page appeared at `addr`, with the title protection `rw` (a new map counts as a write).
     pub fn on_map(&mut self, page: u32, addr: usize, rw: bool) -> Vec<usize> {
         self.addresses.insert(addr, (page, rw));
-        self.aliases.entry(page).or_default().push(Alias { addr, rw });
+        self.aliases.entry(page).or_default().push(Alias { addr, rw, open: false });
         self.dirty(page)
     }
 
@@ -204,15 +216,23 @@ impl Track {
         }
     }
 
-    /// A write faulted on a read write view of the page at `now`. `Some(views)` when the page was clean:
-    /// those views become read write again and the page is dirty. `None` when it was dirty already (another
-    /// thread won the race, the faulting write may simply run again). The `HOT_FAULTS`th quick fault in a
-    /// row makes the page hot: held for `hot_hold()`.
-    pub fn on_fault(&mut self, page: u32, now: Instant) -> Option<Vec<usize>> {
-        if !self.clean[page as usize] {
+    /// A write faulted on a read write view `fault_addr` of `page` at `now`. `Some(views)` when
+    /// `fault_addr` needs opening (`PAGE_READWRITE`): only `fault_addr` is opened and returned, while
+    /// sibling aliases stay guarded until they fault or are opened for I/O. `None` when `fault_addr`
+    /// was already open (another thread won the race, the faulting write may simply run again).
+    /// The `HOT_FAULTS`th quick fault in a row makes the page hot: held for `hot_hold()`.
+    pub fn on_fault(&mut self, page: u32, fault_addr: usize, now: Instant) -> Option<Vec<usize>> {
+        let i = page as usize;
+        let was_clean = self.clean[i];
+        let needs_open = self
+            .aliases
+            .get(&page)
+            .and_then(|v| v.iter().find(|a| a.addr == fault_addr && a.rw))
+            .is_some_and(|a| !a.open);
+        if !was_clean && !needs_open {
             return None;
         }
-        if let Some((at, quick)) = self.cleaned.get_mut(&page) {
+        if was_clean && let Some((at, quick)) = self.cleaned.get_mut(&page) {
             *quick = if now.saturating_duration_since(*at) < HOT_WINDOW { *quick + 1 } else { 0 };
             if *quick >= HOT_FAULTS {
                 *quick = 0;
@@ -226,7 +246,19 @@ impl Track {
             let held = self.held.entry(page).or_insert(until);
             *held = (*held).max(until);
         }
-        Some(self.dirty(page))
+        self.clean[i] = false;
+        if !self.queued[i] && self.aliases.contains_key(&page) {
+            self.queued[i] = true;
+            self.pending.push(page);
+        }
+        if let Some(v) = self.aliases.get_mut(&page)
+            && let Some(alias) = v.iter_mut().find(|a| a.addr == fault_addr && a.rw)
+            && (was_clean || !alias.open)
+        {
+            alias.open = true;
+            return Some(vec![fault_addr]);
+        }
+        None
     }
 
     /// Whether the page is held now (a kernel write may reach it, or it is hot).
@@ -351,10 +383,18 @@ impl Track {
         out
     }
 
-    /// Whether `address` currently maps a writable view of a clean page.
+    /// Whether `address` currently maps a writable view that is clean or guarded (`!open`).
     pub fn is_clean_addr(&self, address: usize) -> bool {
         let Some(&(page, rw)) = self.addresses.get(&address) else { return false };
-        rw && self.clean[page as usize]
+        if !rw {
+            return false;
+        }
+        self.clean[page as usize]
+            || self
+                .aliases
+                .get(&page)
+                .and_then(|v| v.iter().find(|a| a.addr == address))
+                .is_some_and(|a| !a.open)
     }
 
     /// Whether the page has a view with a read write title protection.
@@ -393,7 +433,7 @@ impl Track {
                 self.committed[i] = true;
                 self.held.remove(&page);
                 self.io_held.remove(&page);
-                self.extend_rw(page, &mut protect);
+                self.take_open_rw(page, &mut protect);
                 let quick = self.cleaned.get(&page).map_or(0, |&(_, q)| q);
                 self.cleaned.insert(page, (now, quick));
                 self.clean[i] = true;
@@ -463,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn every_read_write_alias_is_protected_and_a_fault_on_one_unprotects_all() {
+    fn one_view_per_fault_opens_only_faulting_alias_and_protects_only_opened_aliases() {
         let mut t = track();
         t.on_map(2, 0x10_0000, true);
         t.on_map(2, 0x20_0000, true);
@@ -471,11 +511,39 @@ mod tests {
         let (_, mut protect) = t.take(Instant::now(), 10, all);
         protect.sort_unstable();
         assert_eq!(protect, [0x10_0000, 0x20_0000], "the read only view is never touched");
-        let mut open = t.on_fault(2, Instant::now()).unwrap();
-        open.sort_unstable();
-        assert_eq!(open, [0x10_0000, 0x20_0000]);
-        assert_eq!(t.on_fault(2, Instant::now()), None, "a second fault on a dirty page has nothing to do");
-        assert_eq!(t.take(Instant::now(), 10, all).0, [2], "the page is back in the dirty list");
+
+        let now = Instant::now();
+        assert_eq!(t.on_fault(2, 0x10_0000, now), Some(vec![0x10_0000]), "only faulting alias opens");
+        assert_eq!(t.on_fault(2, 0x10_0000, now), None, "a second fault on an already open alias has nothing to do");
+        assert_eq!(t.on_fault(2, 0x20_0000, now), Some(vec![0x20_0000]), "closed sibling alias opens when it faults while dirty");
+        assert_eq!(t.on_fault(2, 0x20_0000, now), None);
+
+        let (pages, mut protect2) = t.take(now + GUARD_REST, 10, all);
+        protect2.sort_unstable();
+        assert_eq!(pages, [2], "the page is back in the dirty list");
+        assert_eq!(protect2, [0x10_0000, 0x20_0000]);
+
+        // Faulting on only one alias protects only that opened alias on the next take.
+        assert_eq!(t.on_fault(2, 0x10_0000, now + GUARD_REST), Some(vec![0x10_0000]));
+        let (_, protect3) = t.take(now + GUARD_REST * 2, 10, all);
+        assert_eq!(protect3, [0x10_0000]);
+    }
+
+    #[test]
+    fn begin_write_pin_and_prepare_open_closed_sibling_aliases() {
+        let mut t = track();
+        t.on_map(3, 0x10_0000, true);
+        t.on_map(3, 0x20_0000, true);
+        let now = Instant::now();
+        let _ = t.take(now, 10, all);
+        // Only alias 0x10_0000 faults, leaving 0x20_0000 closed.
+        assert_eq!(t.on_fault(3, 0x10_0000, now), Some(vec![0x10_0000]));
+        // Kernel I/O pin must open the closed sibling 0x20_0000 as well.
+        assert_eq!(t.begin_write_pin(3), vec![0x20_0000]);
+        t.finish_write_pin(3);
+        let (_, mut protect) = t.take(now + GUARD_REST, 10, all);
+        protect.sort_unstable();
+        assert_eq!(protect, [0x10_0000, 0x20_0000]);
     }
 
     #[test]
@@ -528,7 +596,7 @@ mod tests {
         t.grow(64);
         t.on_map(40, 0x90_0000, true);
         assert_eq!(t.take(now, 3, all).0, [3, 40]);
-        assert_eq!(t.on_fault(0, Instant::now()).map(|v| v.len()), Some(1), "page 0 kept its clean state over the growth");
+        assert_eq!(t.on_fault(0, 0x10_0000, Instant::now()).map(|v| v.len()), Some(1), "page 0 kept its clean state over the growth");
     }
 
     #[test]
@@ -540,7 +608,7 @@ mod tests {
         let (pages, protect) = t.take(now, 10, |page| page == 7);
         assert_eq!((pages, protect), (vec![7], vec![0x20_0000]), "the untouched page is neither copied nor protected");
         assert_eq!(t.take(now, 10, all).0, Vec::<u32>::new(), "and not queued again");
-        assert_eq!(t.on_fault(6, Instant::now()), Some(vec![0x10_0000]), "its first access makes it dirty");
+        assert_eq!(t.on_fault(6, 0x10_0000, Instant::now()), Some(vec![0x10_0000]), "its first access makes it dirty");
         assert_eq!(t.take(now, 10, all).0, [6]);
     }
 
@@ -553,20 +621,20 @@ mod tests {
         t.take(now, 10, all);
         for round in 1..HOT_FAULTS {
             now += Duration::from_millis(30);
-            assert!(t.on_fault(8, now).is_some());
+            assert!(t.on_fault(8, 0x10_0000, now).is_some());
             now += GUARD_REST;
             let (pages, protect) = t.take(now, 10, all);
-            assert_eq!((pages, protect.len()), (vec![8], 2), "quick fault {round}: copied and protected again");
+            assert_eq!((pages, protect.len()), (vec![8], 1), "quick fault {round}: copied and protected again");
         }
         now += Duration::from_millis(30);
-        assert!(t.on_fault(8, now).is_some());
+        assert!(t.on_fault(8, 0x10_0000, now).is_some());
         assert!(t.is_held(8, now + GUARD_REST), "the third quick fault in a row makes it hot");
         for _ in 0..3 {
             now += Duration::from_millis(30);
             assert_eq!(t.take(now, 10, all), (vec![8], vec![]), "a hot page is copied at every sync and stays writable");
         }
         let (pages, protect) = t.take(now + HOT_HOLD, 10, all);
-        assert_eq!((pages, protect.len()), (vec![8], 2), "after the hold it is protected again");
+        assert_eq!((pages, protect.len()), (vec![8], 1), "after the hold it is protected again");
     }
 
     #[test]
@@ -577,7 +645,7 @@ mod tests {
         t.take(now, 10, all);
         for _ in 0..10 {
             now += HOT_WINDOW + Duration::from_millis(1);
-            assert!(t.on_fault(9, now).is_some());
+            assert!(t.on_fault(9, 0x10_0000, now).is_some());
             now += GUARD_REST;
             assert!(!t.is_held(9, now), "a page written now and then stays tracked by faults");
             t.take(now, 10, all);
@@ -691,7 +759,7 @@ mod tests {
         assert_eq!(protect, vec![0x10_0000]);
         assert!(t.is_clean_addr(0x10_0000));
         assert!(t.is_clean_addr(0x10_1000));
-        let _ = t.on_fault(0, now);
+        let _ = t.on_fault(0, 0x10_0000, now);
         assert!(!t.is_clean_addr(0x10_0000));
     }
 
@@ -710,7 +778,7 @@ mod tests {
         t.on_map(1, 0x10_0000, true);
         assert_eq!(t.take(t0, 10, all), (vec![1], vec![0x10_0000]));
 
-        assert_eq!(t.on_fault(1, t0), Some(vec![0x10_0000]));
+        assert_eq!(t.on_fault(1, 0x10_0000, t0), Some(vec![0x10_0000]));
         // Immediately after fault, take copies the page but keeps it writable during guard rest.
         assert_eq!(t.take(t0 + Duration::from_millis(1), 10, all), (vec![1], vec![]));
         // Once guard rest elapses, take copies and protects it again.
