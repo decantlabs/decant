@@ -209,7 +209,7 @@ pub fn cmp_rax_with(bytes: &[u8]) -> Option<u8> {
 /// else. The clzero carries no prefix, so it works on RAX, and the jump lands exactly on it.
 pub fn match_loop(bytes: &[u8]) -> Option<(usize, u8)> {
     const CLZERO: [u8; 3] = [0x0F, 0x01, 0xFC];
-    const ADDS: [&[u8]; 2] = [&[0x48, 0x05, 0x40, 0, 0, 0], &[0x48, 0x83, 0xC0, 0x40]];
+    const ADDS: [&[u8]; 3] = [&[0x48, 0x05, 0x40, 0, 0, 0], &[0x48, 0x83, 0xC0, 0x40], &[0x48, 0x8D, 0x40, 0x40]];
     if !bytes.starts_with(&CLZERO) {
         return None;
     }
@@ -278,6 +278,50 @@ pub fn loop_effect(rax: u64, limit: u64) -> Option<LoopEffect> {
     Some(LoopEffect { start: rax & !63, lines, rax: end, flags: sub_flags(end, limit) })
 }
 
+/// Builds an x86_64 machine code stub that executes a matched `clzero` loop in-process and jumps
+/// back to `return_addr`. `cmp_bytes` is the 3-byte `cmp rax, <limit_reg>` instruction.
+pub fn build_clzero_loop_stub(stub_addr: usize, return_addr: usize, cmp_bytes: [u8; 3], limit_reg: u8) -> Option<Vec<u8>> {
+    // Use rcx as scratch unless the limit register is rcx (1), in which case use rdx (2).
+    let scratch: u8 = if limit_reg == 1 { 2 } else { 1 };
+    let mut code = Vec::with_capacity(86);
+    // push scratch
+    code.push(0x50 | scratch);
+    let loop_top = code.len();
+    // mov scratch, rax
+    code.extend([0x48, 0x89, 0xC0 | scratch]);
+    // and scratch, -64
+    code.extend([0x48, 0x83, 0xE0 | scratch, 0xC0]);
+    // mov qword ptr [scratch], 0
+    code.extend([0x48, 0xC7, scratch, 0, 0, 0, 0]);
+    // mov qword ptr [scratch + off], 0 for off = 8..56
+    for off in [8u8, 16, 24, 32, 40, 48, 56] {
+        code.extend([0x48, 0xC7, 0x40 | scratch, off, 0, 0, 0, 0]);
+    }
+    // add rax, 0x40
+    code.extend([0x48, 0x83, 0xC0, 0x40]);
+    // cmp rax, <limit_reg>
+    code.extend(cmp_bytes);
+    // jb loop_top (2 bytes)
+    let after_jb = code.len() + 2;
+    let rel8 = i8::try_from(loop_top as isize - after_jb as isize).ok()?;
+    code.extend([0x72, rel8 as u8]);
+    // pop scratch
+    code.push(0x58 | scratch);
+    // jmp return_addr (5 bytes)
+    let after_jmp = stub_addr.checked_add(code.len() + 5)?;
+    let rel32 = i32::try_from(return_addr as i128 - after_jmp as i128).ok()?;
+    code.push(0xE9);
+    code.extend(rel32.to_le_bytes());
+    Some(code)
+}
+
+#[derive(Clone, Copy)]
+struct Slab {
+    base: usize,
+    cap: usize,
+    used: usize,
+}
+
 /// The counters of one run and the set of instructions seen so far.
 #[derive(Default)]
 pub struct Stats {
@@ -286,6 +330,7 @@ pub struct Stats {
     pub spent: Duration,
     seen: HashSet<(usize, usize)>,
     last_rdpru: [u64; 2],
+    slabs: Vec<Slab>,
 }
 
 impl Stats {
@@ -341,7 +386,8 @@ pub mod platform {
     use std::ffi::c_void;
     use std::time::Instant;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_FLOATING_POINT_AMD64, CONTEXT_INTEGER_AMD64, GetThreadContext, ReadProcessMemory, SetThreadContext, WriteProcessMemory};
+    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_FLOATING_POINT_AMD64, CONTEXT_INTEGER_AMD64, FlushInstructionCache, GetThreadContext, ReadProcessMemory, SetThreadContext, WriteProcessMemory};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAllocEx, VirtualProtectEx};
     use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
     use windows_sys::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT};
 
@@ -508,6 +554,79 @@ pub mod platform {
         [c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15][usize::from(reg & 15)]
     }
 
+    fn patch_code(process: HANDLE, address: usize, bytes: &[u8]) -> bool {
+        let mut old = 0u32;
+        // SAFETY: changes protection of the target code page(s) in the debuggee to write `bytes`.
+        let protected = unsafe { VirtualProtectEx(process, address as *const c_void, bytes.len(), PAGE_EXECUTE_READWRITE, &mut old) } != 0;
+        let mut written = 0usize;
+        // SAFETY: writes `bytes.len()` bytes from a live slice into the debuggee.
+        let ok = unsafe { WriteProcessMemory(process, address as *const c_void, bytes.as_ptr().cast(), bytes.len(), &mut written) } != 0 && written == bytes.len();
+        if protected {
+            let mut dummy = 0u32;
+            // SAFETY: restores the original page protection.
+            unsafe { VirtualProtectEx(process, address as *const c_void, bytes.len(), old, &mut dummy) };
+        }
+        if ok {
+            // SAFETY: flushes the instruction cache for the patched code range.
+            unsafe { FlushInstructionCache(process, address as *const c_void, bytes.len()) };
+        }
+        ok
+    }
+
+    fn alloc_stub(process: HANDLE, stats: &mut Stats, near: usize, size: usize) -> Option<usize> {
+        const MAX_REL: usize = 0x7FFF_0000;
+        for slab in &mut stats.slabs {
+            if slab.cap - slab.used >= size {
+                let addr = slab.base + slab.used;
+                if addr.abs_diff(near) < MAX_REL {
+                    slab.used += size;
+                    return Some(addr);
+                }
+            }
+        }
+        const SLAB_SIZE: usize = 0x10000;
+        let align = near & !0xFFFF;
+        let step = 0x100_0000usize;
+        let max_off = 0x7000_0000usize;
+        let mut off = step;
+        while off <= max_off {
+            for candidate in [align.checked_add(off), align.checked_sub(off)].into_iter().flatten() {
+                if candidate < 0x1_0000 {
+                    continue;
+                }
+                // SAFETY: allocates an executable slab in the debuggee near `near`.
+                let base = unsafe { VirtualAllocEx(process, candidate as *const c_void, SLAB_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as usize;
+                if base != 0 && base.abs_diff(near) < MAX_REL {
+                    stats.slabs.push(Slab { base, cap: SLAB_SIZE, used: size });
+                    return Some(base);
+                }
+            }
+            off += step;
+        }
+        None
+    }
+
+    fn patch_clzero_loop(process: HANDLE, stats: &mut Stats, rip: usize, total: usize, cmp_bytes: [u8; 3], limit_reg: u8) -> bool {
+        if total < 5 {
+            return false;
+        }
+        let return_addr = rip + total;
+        let Some(stub_addr) = alloc_stub(process, stats, rip, 96) else { return false };
+        let Some(stub) = build_clzero_loop_stub(stub_addr, return_addr, cmp_bytes, limit_reg) else {
+            return false;
+        };
+        if !patch_code(process, stub_addr, &stub) {
+            return false;
+        }
+        let Ok(rel32) = i32::try_from(stub_addr as i128 - (rip + 5) as i128) else {
+            return false;
+        };
+        let mut patch = vec![0x90u8; total];
+        patch[0] = 0xE9;
+        patch[1..5].copy_from_slice(&rel32.to_le_bytes());
+        patch_code(process, rip, &patch)
+    }
+
     fn emulate_on(process: HANDLE, handle: HANDLE, stats: &mut Stats) -> Option<Emulated> {
         // SAFETY: a plain structure the call fills; the flags name the parts wanted.
         let mut aligned: Aligned = unsafe { std::mem::zeroed() };
@@ -528,13 +647,17 @@ pub mod platform {
         let (insn, len) = decode(&bytes[..n])?;
         match insn {
             Insn::Clzero { addr32 } => {
-                let looped = match_loop(&bytes[..n]).filter(|_| !addr32).and_then(|(total, reg)| loop_effect(context.Rax, register(context, reg)).map(|e| (total, e)));
+                let looped = match_loop(&bytes[..n]).filter(|_| !addr32).and_then(|(total, reg)| loop_effect(context.Rax, register(context, reg)).map(|e| (total, reg, e)));
                 match looped {
-                    Some((total, e)) if zero(process, e.start, e.lines * 64) => {
+                    Some((total, reg, e)) if zero(process, e.start, e.lines * 64) => {
                         context.Rax = e.rax;
                         context.EFlags = (context.EFlags & !ARITH) | e.flags;
                         context.Rip += total as u64;
                         stats.add(insn, e.lines);
+                        let cmp_off = if bytes[3..].starts_with(&[0x48, 0x05, 0x40, 0, 0, 0]) { 9 } else { 7 };
+                        if let Ok(cmp_bytes) = <[u8; 3]>::try_from(&bytes[cmp_off..cmp_off + 3]) {
+                            let _ = patch_clzero_loop(process, stats, rip, total, cmp_bytes, reg);
+                        }
                     }
                     _ => {
                         let address = if addr32 { context.Rax & 0xFFFF_FFFF } else { context.Rax } & !63;
@@ -549,6 +672,9 @@ pub mod platform {
             Insn::Monitorx | Insn::Mwaitx => {
                 context.Rip += len as u64;
                 stats.add(insn, 1);
+                if len == 3 {
+                    let _ = patch_code(process, rip, &[0x0F, 0x1F, 0x00]);
+                }
             }
             Insn::Rdpru => {
                 let value = stats.rdpru_value(context.Rcx as u32, counter());
@@ -817,5 +943,28 @@ mod tests {
         stats.add(Insn::Extrq { dst: 0, field: Field::Register(1) }, 1);
         assert_eq!(stats.total(), 7);
         assert_eq!(stats.summary(), "emulated clzero 6, monitorx 0, mwaitx 0, rdpru 0, extrq 1, insertq 0, time 0 ms");
+    }
+
+    #[test]
+    fn match_loop_accepts_lea_step() {
+        let code = assemble(&[0x48, 0x8D, 0x40, 0x40], &CMP_R10[0], jb_short);
+        assert_eq!(match_loop(&code), Some((code.len(), 10)));
+    }
+
+    #[test]
+    fn clzero_loop_stub_encodes_scratch_and_jumps_accurately() {
+        let stub = build_clzero_loop_stub(0x1_0000_0000, 0x1_0000_1000, CMP_R10[0], 10).unwrap();
+        assert_eq!(stub.len(), 86);
+        assert_eq!(stub[0], 0x51, "uses rcx as scratch when limit is r10");
+        assert_eq!(&stub[78..80], &[0x72, 0xB1], "jb jumps back 79 bytes to loop top");
+        assert_eq!(stub[80], 0x59, "pops rcx before exit");
+        assert_eq!(stub[81], 0xE9);
+        let rel = i32::from_le_bytes(stub[82..86].try_into().unwrap());
+        assert_eq!(0x1_0000_0000i64 + 86 + i64::from(rel), 0x1_0000_1000);
+
+        let stub_rcx = build_clzero_loop_stub(0x1_0000_0000, 0x1_0000_1000, [0x48, 0x39, 0xC8], 1).unwrap();
+        assert_eq!(stub_rcx.len(), 86);
+        assert_eq!(stub_rcx[0], 0x52, "uses rdx as scratch when limit is rcx");
+        assert_eq!(stub_rcx[80], 0x5A, "pops rdx before exit");
     }
 }
