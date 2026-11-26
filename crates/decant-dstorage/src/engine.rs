@@ -169,7 +169,7 @@ enum QueueOp {
 }
 
 /// Maximum consecutive reads batched into one submission or parallel CPU read pass.
-const READ_BATCH_LIMIT: usize = 64;
+const READ_BATCH_LIMIT: usize = 256;
 
 /// The PC DirectStorage queue behind a project queue, with its status array and completion event.
 struct Native {
@@ -188,52 +188,65 @@ struct Core {
     /// First failure since the last status entry, of the worker or of a decode it handed on.
     interval: AtomicI32,
     /// Decodes handed to the pool and not finished yet.
-    in_flight: Mutex<usize>,
+    in_flight_count: AtomicUsize,
+    in_flight_waiters: AtomicUsize,
+    in_flight_lock: Mutex<()>,
     settled: Condvar,
     timing: Arc<Timing>,
 }
 
 /// Low overhead counters shared by this queue's worker and decode tasks.
 struct Timing {
-    window: Mutex<TimingWindow>,
-}
-
-struct TimingWindow {
-    started: Instant,
-    requests: u64,
-    bytes: u64,
-    written_bytes: u64,
-    read: Duration,
-    decode: Duration,
-    write: Duration,
+    requests: AtomicU64,
+    bytes: AtomicU64,
+    written_bytes: AtomicU64,
+    read_ns: AtomicU64,
+    decode_ns: AtomicU64,
+    write_ns: AtomicU64,
+    window: Mutex<Instant>,
 }
 
 impl Timing {
     fn new() -> Timing {
-        Timing { window: Mutex::new(TimingWindow { started: Instant::now(), requests: 0, bytes: 0, written_bytes: 0, read: Duration::ZERO, decode: Duration::ZERO, write: Duration::ZERO }) }
+        Timing {
+            requests: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            written_bytes: AtomicU64::new(0),
+            read_ns: AtomicU64::new(0),
+            decode_ns: AtomicU64::new(0),
+            write_ns: AtomicU64::new(0),
+            window: Mutex::new(Instant::now()),
+        }
     }
 
     fn record(&self, bytes: u32, written_bytes: u32, read: Duration, decode: Duration, write: Duration) -> Option<String> {
-        let mut window = lock(&self.window);
-        window.requests += 1;
-        window.bytes += u64::from(bytes);
-        window.written_bytes += u64::from(written_bytes);
-        window.read += read;
-        window.decode += decode;
-        window.write += write;
-        if window.started.elapsed() < Duration::from_secs(5) {
+        let count = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        self.bytes.fetch_add(u64::from(bytes), Ordering::Relaxed);
+        self.written_bytes.fetch_add(u64::from(written_bytes), Ordering::Relaxed);
+        self.read_ns.fetch_add(read.as_nanos() as u64, Ordering::Relaxed);
+        self.decode_ns.fetch_add(decode.as_nanos() as u64, Ordering::Relaxed);
+        self.write_ns.fetch_add(write.as_nanos() as u64, Ordering::Relaxed);
+        if !count.is_multiple_of(64) {
             return None;
         }
-        let line = format!(
-            "dstorage 5s: requests {} bytes {} read {:.2} MB/s decode {:.2} MB/s write {:.2} MB/s\n",
-            window.requests,
-            window.bytes,
-            megabytes_per_second(window.bytes, window.read),
-            megabytes_per_second(window.bytes, window.decode),
-            megabytes_per_second(window.written_bytes, window.write),
-        );
-        *window = TimingWindow { started: Instant::now(), requests: 0, bytes: 0, written_bytes: 0, read: Duration::ZERO, decode: Duration::ZERO, write: Duration::ZERO };
-        Some(line)
+        let Ok(mut started) = self.window.try_lock() else { return None };
+        if started.elapsed() < Duration::from_secs(5) {
+            return None;
+        }
+        *started = Instant::now();
+        drop(started);
+        let requests = self.requests.swap(0, Ordering::Relaxed);
+        let bytes = self.bytes.swap(0, Ordering::Relaxed);
+        let written_bytes = self.written_bytes.swap(0, Ordering::Relaxed);
+        let read = Duration::from_nanos(self.read_ns.swap(0, Ordering::Relaxed));
+        let decode = Duration::from_nanos(self.decode_ns.swap(0, Ordering::Relaxed));
+        let write = Duration::from_nanos(self.write_ns.swap(0, Ordering::Relaxed));
+        Some(format!(
+            "dstorage 5s: requests {requests} bytes {bytes} read {:.2} MB/s decode {:.2} MB/s write {:.2} MB/s\n",
+            megabytes_per_second(bytes, read),
+            megabytes_per_second(bytes, decode),
+            megabytes_per_second(written_bytes, write),
+        ))
     }
 
     fn record_and_log(&self, bytes: u32, written_bytes: u32, read: Duration, decode: Duration, write: Duration) {
@@ -404,11 +417,113 @@ fn finish_written(destination: *mut c_void, len: u32) {
 
 /// Decodes handed on by one queue that may wait or run at once. The queue's worker waits beyond
 /// that, so the buffers they hold stay bounded.
-const MAX_IN_FLIGHT: usize = 128;
+const MAX_IN_FLIGHT: usize = 512;
+
+/// Minimum pooled buffer size (4 KiB, one OS page).
+const POOL_MIN_SHIFT: u32 = 12;
+/// Maximum pooled buffer size (16 MiB).
+const POOL_MAX_SHIFT: u32 = 24;
+/// Number of power-of-two size classes in `BufferPool`.
+const POOL_BUCKETS: usize = (POOL_MAX_SHIFT - POOL_MIN_SHIFT + 1) as usize;
+/// Cap on total memory retained in `BufferPool` (128 MiB).
+const MAX_POOL_BYTES: usize = 128 * 1024 * 1024;
+
+struct BufferPoolInner {
+    buckets: [Vec<Vec<u8>>; POOL_BUCKETS],
+    total_bytes: usize,
+}
+
+impl BufferPoolInner {
+    const fn new() -> Self {
+        Self { buckets: [const { Vec::new() }; POOL_BUCKETS], total_bytes: 0 }
+    }
+}
+
+struct BufferPool {
+    inner: Mutex<BufferPoolInner>,
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        Self { inner: Mutex::new(BufferPoolInner::new()) }
+    }
+
+    fn bucket_for(cap: usize) -> Option<usize> {
+        if !(1 << POOL_MIN_SHIFT..=1 << POOL_MAX_SHIFT).contains(&cap) || !cap.is_power_of_two() {
+            return None;
+        }
+        Some((cap.trailing_zeros() - POOL_MIN_SHIFT) as usize)
+    }
+
+    fn acquire(&self, len: u32) -> Result<PooledBuffer, ()> {
+        let len = len as usize;
+        if len == 0 {
+            return Ok(PooledBuffer(Vec::new()));
+        }
+        let target_cap = len.next_power_of_two().max(1 << POOL_MIN_SHIFT);
+        if let Some(bucket) = Self::bucket_for(target_cap) {
+            let mut inner = lock(&self.inner);
+            if let Some(mut buf) = inner.buckets[bucket].pop() {
+                inner.total_bytes -= buf.capacity();
+                buf.clear();
+                return Ok(PooledBuffer(buf));
+            }
+            drop(inner);
+            let mut buf = Vec::new();
+            if buf.try_reserve_exact(target_cap).is_ok() {
+                return Ok(PooledBuffer(buf));
+            }
+        }
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len).map_err(|_| ())?;
+        Ok(PooledBuffer(buf))
+    }
+
+    fn release(&self, mut buf: Vec<u8>) {
+        let cap = buf.capacity();
+        let Some(bucket) = Self::bucket_for(cap) else { return };
+        let mut inner = lock(&self.inner);
+        if inner.total_bytes.saturating_add(cap) > MAX_POOL_BYTES {
+            return;
+        }
+        buf.clear();
+        inner.total_bytes += cap;
+        inner.buckets[bucket].push(buf);
+    }
+}
+
+fn buffer_pool() -> &'static BufferPool {
+    static POOL: OnceLock<BufferPool> = OnceLock::new();
+    POOL.get_or_init(BufferPool::new)
+}
+
+/// A `Vec<u8>` rented from `buffer_pool()` that returns to the pool on drop.
+struct PooledBuffer(Vec<u8>);
+
+impl std::ops::Deref for PooledBuffer {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PooledBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if self.0.capacity() > 0 {
+            buffer_pool().release(std::mem::take(&mut self.0));
+        }
+    }
+}
 
 /// A read whose bytes are in, to be decoded or written into physical pages on the decode pool.
 struct Staged {
-    input: Vec<u8>,
+    input: PooledBuffer,
     codec: u32,
     bc_mode: u32,
     decode: bool,
@@ -443,7 +558,7 @@ impl Staged {
             self.core_timing.record_and_log(self.source_bytes, self.destination_size, self.read_time, decode_time, write_time);
             return hr;
         };
-        let output = if self.decode {
+        let (output, decode_time) = if self.decode {
             let Ok(mut output) = buffer_capacity(self.destination_size) else { return E_OUTOFMEMORY };
             // SAFETY: `input` holds the source bytes and `output` has capacity for `destination_size` bytes.
             let decode_started = Instant::now();
@@ -458,9 +573,8 @@ impl Staged {
         } else {
             (self.input, Duration::ZERO)
         };
-        let (output, decode_time) = output;
         let write_started = Instant::now();
-        let frames = target.frames_now();
+        let frames = target.frames_now_cow();
         let result = match pool.write(&frames, target.offset, &output) {
             Ok(views) => {
                 static WRITTEN: AtomicU64 = AtomicU64::new(0);
@@ -474,7 +588,7 @@ impl Staged {
                 S_OK
             }
             Err(error) => {
-                storage_log(&format!("page destination frames={:x?} (at enqueue {:x?}) offset={:#x} bytes={} hr={:08x}\n", frames, target.frames, target.offset, output.len(), error as u32));
+                storage_log(&format!("page destination frames={:x?} (at enqueue {:x?}) offset={:#x} bytes={} hr={:08x}\n", frames.as_ref(), target.frames, target.offset, output.len(), error as u32));
                 error
             }
         };
@@ -505,14 +619,30 @@ impl Core {
     /// Waits until every decode handed on has finished. A status entry, an event or a fence
     /// reports on the reads before it, so it runs only after this.
     fn settle(&self) {
-        let mut in_flight = lock(&self.in_flight);
-        while *in_flight > 0 {
-            in_flight = self.settled.wait(in_flight).unwrap_or_else(PoisonError::into_inner);
+        if self.in_flight_count.load(Ordering::SeqCst) == 0 {
+            return;
         }
+        let mut guard = lock(&self.in_flight_lock);
+        self.in_flight_waiters.fetch_add(1, Ordering::SeqCst);
+        while self.in_flight_count.load(Ordering::SeqCst) > 0 {
+            guard = self.settled.wait(guard).unwrap_or_else(PoisonError::into_inner);
+        }
+        self.in_flight_waiters.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// Dispatches a completed read buffer to the shared decode pool.
-    fn dispatch_staged(self: &Arc<Self>, op: &mut ReadOp, input: Vec<u8>, decode: bool, read_time: Duration) {
+    fn wait_for_in_flight_room(&self, slots: usize) {
+        if self.in_flight_count.load(Ordering::SeqCst) + slots > MAX_IN_FLIGHT {
+            let mut guard = lock(&self.in_flight_lock);
+            self.in_flight_waiters.fetch_add(1, Ordering::SeqCst);
+            while self.in_flight_count.load(Ordering::SeqCst) + slots > MAX_IN_FLIGHT {
+                guard = self.settled.wait(guard).unwrap_or_else(PoisonError::into_inner);
+            }
+            self.in_flight_waiters.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.in_flight_count.fetch_add(slots, Ordering::SeqCst);
+    }
+
+    fn build_staged_job(self: &Arc<Self>, op: &mut ReadOp, input: PooledBuffer, decode: bool, read_time: Duration) -> crate::pool::Job {
         let r = *op.read.get();
         let staged = Staged {
             input,
@@ -526,25 +656,27 @@ impl Core {
             source_bytes: r.source_size,
             read_time,
         };
-        {
-            let mut in_flight = lock(&self.in_flight);
-            while *in_flight >= MAX_IN_FLIGHT {
-                in_flight = self.settled.wait(in_flight).unwrap_or_else(PoisonError::into_inner);
-            }
-            *in_flight += 1;
-        }
         let core = self.clone();
         let read = Sendable(r);
-        crate::pool::run(Box::new(move || {
+        Box::new(move || {
             let to_pages = staged.pages.is_some();
             let hr = staged.finish(core.pages.as_ref());
             if hr < 0 {
                 log_failure(read.get(), to_pages, hr);
                 core.fail(hr);
             }
-            *lock(&core.in_flight) -= 1;
-            core.settled.notify_all();
-        }));
+            core.in_flight_count.fetch_sub(1, Ordering::SeqCst);
+            if core.in_flight_waiters.load(Ordering::SeqCst) > 0 {
+                let _guard = lock(&core.in_flight_lock);
+                core.settled.notify_all();
+            }
+        })
+    }
+
+    /// Dispatches a completed read buffer to the shared decode pool.
+    fn dispatch_staged(self: &Arc<Self>, op: &mut ReadOp, input: PooledBuffer, decode: bool, read_time: Duration) {
+        self.wait_for_in_flight_room(1);
+        crate::pool::run(self.build_staged_job(op, input, decode, read_time));
     }
 
     /// Runs a batch of up to `READ_BATCH_LIMIT` consecutive reads on the active backend.
@@ -584,7 +716,7 @@ impl Core {
     fn read_batch_native(self: &Arc<Self>, native: &Native, batch: &mut [ReadOp]) {
         enum PendingNative {
             Direct { destination: *mut c_void, destination_size: u32, source_size: u32, pinned: bool },
-            Staged { index: usize, input: Vec<u8>, len: u32, decode: bool },
+            Staged { index: usize, input: PooledBuffer, len: u32, decode: bool },
         }
 
         let mut pending = Vec::with_capacity(batch.len());
@@ -662,6 +794,7 @@ impl Core {
             self.fail(hr);
         }
 
+        let mut staged_jobs = Vec::new();
         for item in pending {
             match item {
                 PendingNative::Direct { destination, destination_size, source_size, pinned } => {
@@ -680,9 +813,13 @@ impl Core {
                     }
                     // SAFETY: `IDStorageQueue1` wrote all `len` bytes into `input` before signalling `native.done`.
                     unsafe { input.set_len(len as usize) };
-                    self.dispatch_staged(&mut batch[index], input, decode, per_read_time);
+                    staged_jobs.push(self.build_staged_job(&mut batch[index], input, decode, per_read_time));
                 }
             }
+        }
+        if !staged_jobs.is_empty() {
+            self.wait_for_in_flight_room(staged_jobs.len());
+            crate::pool::run_batch(staged_jobs);
         }
     }
 
@@ -888,17 +1025,25 @@ fn io_pool() -> &'static IoPool {
     })
 }
 
-/// An uninitialized buffer with capacity for `len` bytes, or `Err` when it cannot be allocated.
-fn buffer_capacity(len: u32) -> Result<Vec<u8>, ()> {
-    let mut buffer: Vec<u8> = Vec::new();
-    buffer.try_reserve_exact(len as usize).map_err(|_| ())?;
-    Ok(buffer)
+/// A pooled buffer with capacity for at least `len` bytes, or `Err` when it cannot be allocated.
+fn buffer_capacity(len: u32) -> Result<PooledBuffer, ()> {
+    buffer_pool().acquire(len)
 }
 
 impl Queue {
     /// A queue and its worker thread, and, on PC DirectStorage, the native queue behind it.
     fn create(backend: Arc<Backend>, pages: Arc<dyn PagePool>, capacity: u16) -> Result<Queue, HRESULT> {
-        let core = Arc::new(Core { backend, pages, native: OnceLock::new(), interval: AtomicI32::new(S_OK), in_flight: Mutex::new(0), settled: Condvar::new(), timing: Arc::new(Timing::new()) });
+        let core = Arc::new(Core {
+            backend,
+            pages,
+            native: OnceLock::new(),
+            interval: AtomicI32::new(S_OK),
+            in_flight_count: AtomicUsize::new(0),
+            in_flight_waiters: AtomicUsize::new(0),
+            in_flight_lock: Mutex::new(()),
+            settled: Condvar::new(),
+            timing: Arc::new(Timing::new()),
+        });
         let work = Arc::new(Work { state: Mutex::new(WorkState::default()), ready: Condvar::new() });
         let mut queue = Queue {
             vtbl: &QUEUE_VTBL,
@@ -912,7 +1057,8 @@ impl Queue {
         let spawned = std::thread::Builder::new().spawn(move || run(&core, &work));
         queue.worker = Some(spawned.map_err(|_| E_OUTOFMEMORY)?);
         let Some(factory) = queue.core.backend.factory.as_ref() else { return Ok(queue) };
-        let desc = pc::QueueDesc { source_type: 0, capacity: pc::MIN_QUEUE_CAPACITY, priority: 0, name: std::ptr::null(), device: std::ptr::null_mut() };
+        let native_capacity = capacity.max(pc::MIN_QUEUE_CAPACITY).clamp(512, 4096);
+        let desc = pc::QueueDesc { source_type: 0, capacity: native_capacity, priority: 0, name: std::ptr::null(), device: std::ptr::null_mut() };
         let mut raw = std::ptr::null_mut();
         // SAFETY: the factory is an `IDStorageFactory`, `desc` and `raw` live for the call.
         let hr = unsafe { (factory.vtbl::<pc::FactoryVtbl>().create_queue)(factory.as_ptr(), &desc, &pc::IID_QUEUE1, &mut raw) };
@@ -940,6 +1086,9 @@ impl Queue {
 
     /// Hands every recorded operation to the worker. The caller holds the lock of `pending`.
     fn submit_locked(&self, pending: &mut VecDeque<QueueOp>) -> HRESULT {
+        if pending.is_empty() {
+            return S_OK;
+        }
         let mut batch = std::mem::take(pending);
         let mut state = lock(&self.work.state);
         if state.submitted.try_reserve(batch.len()).is_err() {
@@ -1364,4 +1513,21 @@ fn byte_rate_uses_mebibytes_per_second() {
     assert_eq!(megabytes_per_second(4 * 1024 * 1024, Duration::from_secs(2)), 2.0);
     assert_eq!(megabytes_per_second(1, Duration::ZERO), 0.0);
     assert_eq!(Timing::summary_line(3, 4 * 1024 * 1024, 16 * 1024 * 1024, Duration::from_secs(2), Duration::from_secs(4), Duration::from_secs(8)), "dstorage 5s: requests 3 bytes 4194304 read 2.00 MB/s decode 1.00 MB/s write 2.00 MB/s\n");
+}
+
+#[cfg(test)]
+#[test]
+fn buffer_pool_reuses_released_buffers() {
+    let pool = BufferPool::new();
+    let mut first = pool.acquire(1000).expect("allocates");
+    assert!(first.capacity() >= 4096);
+    let ptr = first.as_ptr();
+    let cap = first.capacity();
+    first.extend_from_slice(b"hello");
+    let raw = std::mem::take(&mut first.0);
+    pool.release(raw);
+    let second = pool.acquire(2000).expect("reuses");
+    assert_eq!(second.capacity(), cap);
+    assert_eq!(second.as_ptr(), ptr);
+    assert!(second.is_empty());
 }

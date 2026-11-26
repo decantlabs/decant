@@ -38,9 +38,15 @@ fn bcpack(mode: u32, source: &[u8], output: &mut [u8]) -> HRESULT {
 
 /// zlib stream to exactly `output.len()` bytes, the whole input consumed.
 fn zlib(source: &[u8], output: &mut [u8]) -> HRESULT {
-    let mut decoder = flate2::Decompress::new(true);
-    let finished = matches!(decoder.decompress(source, output, flate2::FlushDecompress::Finish), Ok(flate2::Status::StreamEnd));
-    if finished && decoder.total_in() == source.len() as u64 && decoder.total_out() == output.len() as u64 { S_OK } else { BAD }
+    thread_local! {
+        static DECOMPRESS: std::cell::RefCell<flate2::Decompress> = std::cell::RefCell::new(flate2::Decompress::new(true));
+    }
+    DECOMPRESS.with(|cell| {
+        let mut decoder = cell.borrow_mut();
+        decoder.reset(true);
+        let finished = matches!(decoder.decompress(source, output, flate2::FlushDecompress::Finish), Ok(flate2::Status::StreamEnd));
+        if finished && decoder.total_in() == source.len() as u64 && decoder.total_out() == output.len() as u64 { S_OK } else { BAD }
+    })
 }
 
 /// A little endian `u32` at `at`.
@@ -124,39 +130,60 @@ fn tiles_with_workers(data: &[u8], out: &mut [u8], workers: usize) -> HRESULT {
 }
 
 #[cfg(decant_gdeflate)]
+struct CachedGdeflateDecoder(*mut std::ffi::c_void);
+
+#[cfg(decant_gdeflate)]
+impl Drop for CachedGdeflateDecoder {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: allocated by `libdeflate_alloc_gdeflate_decompressor`, freed once on thread exit.
+            unsafe { crate::libdeflate::libdeflate_free_gdeflate_decompressor(self.0) };
+        }
+    }
+}
+
+#[cfg(decant_gdeflate)]
 fn decode_pages(pages: &[&[u8]], out: &mut [u8]) -> HRESULT {
-    use crate::libdeflate::{InPage, SUCCESS, libdeflate_alloc_gdeflate_decompressor, libdeflate_free_gdeflate_decompressor, libdeflate_gdeflate_decompress};
+    use crate::libdeflate::{InPage, SUCCESS, libdeflate_alloc_gdeflate_decompressor, libdeflate_gdeflate_decompress};
     use crate::decant::E_OUTOFMEMORY;
 
     // The native library initializes its process-wide GDeflate dispatch pointer on first decode.
     static DISPATCH: std::sync::Once = std::sync::Once::new();
+    thread_local! {
+        static DECODER: std::cell::RefCell<Option<CachedGdeflateDecoder>> = const { std::cell::RefCell::new(None) };
+    }
 
-    // SAFETY: no precondition. The decoder is allocated, used and freed on this thread.
-    let decoder = unsafe { libdeflate_alloc_gdeflate_decompressor() };
-    if decoder.is_null() {
-        return E_OUTOFMEMORY;
-    }
-    let mut result = S_OK;
-    for (i, (source, target)) in pages.iter().zip(out.chunks_mut(TILE_BYTES)).enumerate() {
-        let mut decode = || {
-            let mut page = InPage { data: source.as_ptr().cast(), nbytes: source.len() };
-            let mut written = 0;
-            // SAFETY: the page describes the input slice and target is writable for its length.
-            let status = unsafe { libdeflate_gdeflate_decompress(decoder, &mut page, 1, target.as_mut_ptr().cast(), target.len(), &mut written) };
-            status == SUCCESS && written == target.len()
-        };
-        let mut first = None;
-        if i == 0 {
-            DISPATCH.call_once(|| first = Some(decode()));
+    DECODER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            // SAFETY: no precondition.
+            let ptr = unsafe { libdeflate_alloc_gdeflate_decompressor() };
+            if ptr.is_null() {
+                return E_OUTOFMEMORY;
+            }
+            *slot = Some(CachedGdeflateDecoder(ptr));
         }
-        if !first.unwrap_or_else(decode) {
-            result = BAD;
-            break;
+        let decoder = slot.as_ref().expect("initialized above").0;
+        let mut result = S_OK;
+        for (i, (source, target)) in pages.iter().zip(out.chunks_mut(TILE_BYTES)).enumerate() {
+            let mut decode = || {
+                let mut page = InPage { data: source.as_ptr().cast(), nbytes: source.len() };
+                let mut written = 0;
+                // SAFETY: the page describes the input slice and target is writable for its length.
+                let status = unsafe { libdeflate_gdeflate_decompress(decoder, &mut page, 1, target.as_mut_ptr().cast(), target.len(), &mut written) };
+                status == SUCCESS && written == target.len()
+            };
+            let mut first = None;
+            if i == 0 {
+                DISPATCH.call_once(|| first = Some(decode()));
+            }
+            if !first.unwrap_or_else(decode) {
+                result = BAD;
+                break;
+            }
         }
-    }
-    // SAFETY: allocated above, freed once.
-    unsafe { libdeflate_free_gdeflate_decompressor(decoder) };
-    result
+        result
+    })
 }
 
 /// Without libdeflate there is no GDeflate decoder.
@@ -282,6 +309,24 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xFF; // the Adler 32 check
         assert_eq!(zlib(&corrupt, &mut out), BAD);
+    }
+
+    #[test]
+    fn zlib_reuses_thread_local_decompressor_across_calls() {
+        for len in [128usize, 4096, 65536, 1024] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 13 + i / 7) as u8).collect();
+            let packed = zlib_of(&data);
+            let mut out = vec![0u8; len];
+            assert_eq!(zlib(&packed, &mut out), S_OK);
+            assert_eq!(out, data);
+        }
+        let mut bad_out = [0u8; 64];
+        assert_eq!(zlib(&[0x78, 0x9c, 0x00], &mut bad_out), BAD);
+        let good = b"reusable zlib state check";
+        let packed = zlib_of(good);
+        let mut out = vec![0u8; good.len()];
+        assert_eq!(zlib(&packed, &mut out), S_OK);
+        assert_eq!(out, good);
     }
 
     #[test]

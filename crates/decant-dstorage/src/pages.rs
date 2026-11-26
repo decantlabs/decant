@@ -11,7 +11,9 @@
 //! `d3d12_xs.dll` is told, as for a read to an address.
 #![allow(unsafe_code)]
 
+use std::borrow::Cow;
 use std::ffi::c_void;
+use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
@@ -37,19 +39,28 @@ pub struct XmemPool;
 
 type WritePhysicalPages = unsafe extern "system" fn(*const u64, usize, usize, *const u8, usize, *mut [usize; 2], u32, *mut u32) -> i32;
 
+fn resolve_write_physical_pages() -> Option<WritePhysicalPages> {
+    static EXPORT: OnceLock<WritePhysicalPages> = OnceLock::new();
+    if let Some(&f) = EXPORT.get() {
+        return Some(f);
+    }
+    // SAFETY: lookups by name in a module that is loaded or not.
+    let export = unsafe {
+        let module = GetModuleHandleW(windows_sys::w!("xmem.dll"));
+        if module.is_null() { None } else { GetProcAddress(module, c"DecantXmemWritePhysicalPages".as_ptr().cast()) }
+    }?;
+    // SAFETY: the export has this signature.
+    let f: WritePhysicalPages = unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, WritePhysicalPages>(export) };
+    let _ = EXPORT.set(f);
+    Some(f)
+}
+
 impl PagePool for XmemPool {
     fn write(&self, frames: &[u64], offset: usize, data: &[u8]) -> Result<Vec<(usize, usize)>, HRESULT> {
-        // SAFETY: lookups by name in a module that is loaded or not.
-        let export = unsafe {
-            let module = GetModuleHandleW(windows_sys::w!("xmem.dll"));
-            if module.is_null() { None } else { GetProcAddress(module, c"DecantXmemWritePhysicalPages".as_ptr().cast()) }
-        };
-        let Some(export) = export else {
+        let Some(write) = resolve_write_physical_pages() else {
             decant_log::calls::not_implemented("DirectStorage page destination without DecantXmemWritePhysicalPages in xmem.dll");
             return Err(E_NOTIMPL);
         };
-        // SAFETY: the export has this signature.
-        let write = unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, WritePhysicalPages>(export) };
         let mut views = [[0usize; 2]; VIEWS];
         let mut found = 0u32;
         // SAFETY: `frames` and `data` are readable for their lengths, `views` has room for `VIEWS` pairs.
@@ -58,7 +69,7 @@ impl PagePool for XmemPool {
             // SAFETY: no precondition.
             return Err(hresult_from_win32(unsafe { GetLastError() }));
         }
-        Ok(views.iter().take(found as usize).map(|v| (v[0], v[1])).collect())
+        Ok(views.iter().take((found as usize).min(VIEWS)).map(|v| (v[0], v[1])).collect())
     }
 }
 
@@ -79,20 +90,26 @@ pub struct PageTarget {
 const NO_FRAME: u64 = 0;
 
 impl PageTarget {
-    /// The frames to write to now: the snapshot of the enqueue, or, when it holds no frame for a
-    /// page, the title's array as it is now, if that memory is still readable. Then the snapshot is
-    /// what the write refuses.
-    pub fn frames_now(&self) -> Vec<u64> {
+    /// The frames to write to now, borrowing the snapshot when every entry is already resolved.
+    pub fn frames_now_cow(&self) -> Cow<'_, [u64]> {
         if !self.frames.contains(&NO_FRAME) {
-            return self.frames.clone();
+            return Cow::Borrowed(&self.frames);
         }
         let bytes = self.frames.len() * 8;
         if !readable(self.array, bytes) {
-            return self.frames.clone();
+            return Cow::Borrowed(&self.frames);
         }
         let array = self.array as *const u64;
         // SAFETY: the range is committed readable memory (checked just above), and the array may be unaligned.
-        (0..self.frames.len()).map(|k| unsafe { array.add(k).read_unaligned() }).collect()
+        Cow::Owned((0..self.frames.len()).map(|k| unsafe { array.add(k).read_unaligned() }).collect())
+    }
+
+    /// The frames to write to now: the snapshot of the enqueue, or, when it holds no frame for a
+    /// page, the title's array as it is now, if that memory is still readable. Then the snapshot is
+    /// what the write refuses.
+    #[cfg(test)]
+    pub fn frames_now(&self) -> Vec<u64> {
+        self.frames_now_cow().into_owned()
     }
 
     /// The frames a destination of `size` bytes from `offset` (the low 16 bits of the page offset
@@ -177,5 +194,23 @@ mod tests {
             assert_eq!(three.frames, [16, 48, 32]);
             assert_eq!(PageTarget::read(std::ptr::null(), 0, 1).err(), Some(E_INVALIDARG));
         }
+    }
+
+    #[test]
+    fn frames_now_cow_borrows_when_all_frames_are_resolved() {
+        let array: [u64; 2] = [16, 32];
+        // SAFETY: the array holds two entries.
+        let target = unsafe { PageTarget::read(array.as_ptr().cast(), 0, 2 * PAGE_BYTES as u32).unwrap() };
+        assert!(matches!(target.frames_now_cow(), Cow::Borrowed(_)));
+        assert_eq!(target.frames_now_cow().as_ref(), &[16, 32]);
+
+        let mut deferred = [0u64, 0u64];
+        // SAFETY: the array holds two entries.
+        let target_deferred = unsafe { PageTarget::read(deferred.as_ptr().cast(), 0, 2 * PAGE_BYTES as u32).unwrap() };
+        deferred[0] = 64;
+        deferred[1] = 128;
+        std::hint::black_box(&deferred);
+        assert!(matches!(target_deferred.frames_now_cow(), Cow::Owned(_)));
+        assert_eq!(target_deferred.frames_now_cow().as_ref(), &[64, 128]);
     }
 }
