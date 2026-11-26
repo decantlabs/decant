@@ -47,7 +47,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
@@ -309,12 +309,54 @@ pub struct Counts {
 }
 
 const WRITER_QUEUE_CAP: usize = 128;
+const PENDING_SHARDS: usize = 16;
 
-type PendingMap = Mutex<HashMap<(PathBuf, u128), Vec<u8>>>;
-type WriteSender = Mutex<Option<SyncSender<(u128, Vec<u8>)>>>;
+type PendingMap = HashMap<(PathBuf, u128), Arc<[u8]>>;
+type WriteSender = Mutex<Option<SyncSender<(u128, Arc<[u8]>)>>>;
 
-static PENDING_WRITES: LazyLock<PendingMap> = LazyLock::new(Mutex::default);
+static PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PENDING_WRITES: LazyLock<[Mutex<PendingMap>; PENDING_SHARDS]> = LazyLock::new(|| std::array::from_fn(|_| Mutex::default()));
 static ACTIVE_WRITERS: LazyLock<Mutex<HashMap<PathBuf, Weak<BackgroundWriter>>>> = LazyLock::new(Mutex::default);
+
+fn pending_shard(key: u128) -> usize {
+    (key as usize) & (PENDING_SHARDS - 1)
+}
+
+fn lookup_pending(dir: &Path, key: u128) -> Option<Vec<u8>> {
+    if PENDING_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let map = PENDING_WRITES[pending_shard(key)].lock().unwrap_or_else(|e| e.into_inner());
+    if map.is_empty() {
+        return None;
+    }
+    map.get(&(dir.to_path_buf(), key)).map(|blob| blob.to_vec())
+}
+
+fn insert_pending(dir: &Path, key: u128, blob: Arc<[u8]>) {
+    let mut map = PENDING_WRITES[pending_shard(key)].lock().unwrap_or_else(|e| e.into_inner());
+    if map.insert((dir.to_path_buf(), key), blob).is_none() {
+        PENDING_COUNT.fetch_add(1, Ordering::Release);
+    }
+}
+
+fn remove_pending(dir: &Path, key: u128, blob: &Arc<[u8]>) {
+    let mut map = PENDING_WRITES[pending_shard(key)].lock().unwrap_or_else(|e| e.into_inner());
+    let map_key = (dir.to_path_buf(), key);
+    if map.get(&map_key).is_some_and(|cur| Arc::ptr_eq(cur, blob)) && map.remove(&map_key).is_some() {
+        PENDING_COUNT.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn clear_pending(dir: &Path, key: u128) {
+    if PENDING_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut map = PENDING_WRITES[pending_shard(key)].lock().unwrap_or_else(|e| e.into_inner());
+    if !map.is_empty() && map.remove(&(dir.to_path_buf(), key)).is_some() {
+        PENDING_COUNT.fetch_sub(1, Ordering::Release);
+    }
+}
 
 struct BackgroundWriter {
     tx: WriteSender,
@@ -324,7 +366,7 @@ struct BackgroundWriter {
 
 impl BackgroundWriter {
     fn spawn(store: Store) -> Arc<Self> {
-        let (tx, rx) = mpsc::sync_channel::<(u128, Vec<u8>)>(WRITER_QUEUE_CAP);
+        let (tx, rx) = mpsc::sync_channel::<(u128, Arc<[u8]>)>(WRITER_QUEUE_CAP);
         let writer = Arc::new(Self {
             tx: Mutex::new(Some(tx)),
             handle: Mutex::new(None),
@@ -336,13 +378,7 @@ impl BackgroundWriter {
             .spawn(move || {
                 while let Ok((key, blob)) = rx.recv() {
                     let _ = store.write(key, &blob);
-                    {
-                        let mut map = PENDING_WRITES.lock().unwrap_or_else(|e| e.into_inner());
-                        let map_key = (store.dir().to_path_buf(), key);
-                        if map.get(&map_key).is_some_and(|cur| cur.as_slice() == blob.as_slice()) {
-                            map.remove(&map_key);
-                        }
-                    }
+                    remove_pending(store.dir(), key, &blob);
                     if let Some(w) = worker_ref.upgrade() {
                         let (lock, cv) = &w.in_flight;
                         let mut count = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -358,7 +394,7 @@ impl BackgroundWriter {
         writer
     }
 
-    fn enqueue(&self, key: u128, blob: Vec<u8>) {
+    fn enqueue(&self, key: u128, blob: Arc<[u8]>) {
         {
             let mut count = self.in_flight.0.lock().unwrap_or_else(|e| e.into_inner());
             *count += 1;
@@ -452,8 +488,7 @@ impl Library {
     /// The stored blob of `key`, counted as a hit or a miss.
     pub fn lookup(&self, key: u128) -> Option<Vec<u8>> {
         let store = self.live()?;
-        let map_key = (store.dir().to_path_buf(), key);
-        if let Some(blob) = PENDING_WRITES.lock().unwrap_or_else(|e| e.into_inner()).get(&map_key).cloned() {
+        if let Some(blob) = lookup_pending(store.dir(), key) {
             self.counts.hits.fetch_add(1, Ordering::Relaxed);
             return Some(blob);
         }
@@ -472,11 +507,11 @@ impl Library {
         if blob.is_empty() || blob.len() > MAX_BLOB_BYTES {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "blob size out of range"));
         }
-        let owned = blob.to_vec();
-        PENDING_WRITES.lock().unwrap_or_else(|e| e.into_inner()).insert((store.dir().to_path_buf(), key), owned.clone());
+        let shared: Arc<[u8]> = Arc::from(blob);
+        insert_pending(store.dir(), key, Arc::clone(&shared));
         self.counts.stored.fetch_add(1, Ordering::Relaxed);
         if let Some(Some(writer)) = self.writer.get() {
-            writer.enqueue(key, owned);
+            writer.enqueue(key, shared);
         }
         Ok(())
     }
@@ -485,7 +520,7 @@ impl Library {
     /// library is still on.
     pub fn reject(&self, key: u128) -> bool {
         if let Some(store) = self.store.get().and_then(Option::as_ref) {
-            PENDING_WRITES.lock().unwrap_or_else(|e| e.into_inner()).remove(&(store.dir().to_path_buf(), key));
+            clear_pending(store.dir(), key);
             store.forget(key);
         }
         self.counts.rejected.fetch_add(1, Ordering::Relaxed) + 1 < MAX_REJECTIONS
@@ -868,5 +903,23 @@ mod tests {
         let reopened = Library::new(dir.0.clone(), "t");
         reopened.open(|| Some(adapter())).unwrap();
         assert_eq!(reopened.lookup(42).as_deref(), Some(&b"async blob payload"[..]));
+    }
+
+    #[test]
+    fn sharded_pending_writes_handle_many_keys_and_overwrites() {
+        let dir = TempDir::new("pso-library-sharded-pending");
+        let library = Library::new(dir.0.clone(), "t");
+        library.open(|| Some(adapter())).unwrap();
+        for key in 1u128..=32 {
+            let payload = format!("blob payload {key}");
+            library.keep(key, payload.as_bytes()).unwrap();
+        }
+        library.keep(5, b"updated payload 5").unwrap();
+        library.flush();
+        for key in 1u128..=32 {
+            let expected = if key == 5 { b"updated payload 5".to_vec() } else { format!("blob payload {key}").into_bytes() };
+            assert_eq!(library.lookup(key), Some(expected), "key {key}");
+        }
+        assert_eq!(library.lookup(999), None);
     }
 }

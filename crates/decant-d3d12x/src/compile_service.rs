@@ -102,23 +102,18 @@ pub enum Poll {
 }
 
 /// The state of one pipeline job.
-#[derive(Debug)]
-enum State {
-    Pending,
-    Done(Poll),
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Ticket {
-    state: Mutex<State>,
+    done: OnceLock<Poll>,
 }
 
 impl Ticket {
     fn poll(&self) -> Poll {
-        match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
-            State::Pending => Poll::Pending,
-            State::Done(p) => p.clone(),
-        }
+        self.done.get().cloned().unwrap_or(Poll::Pending)
+    }
+
+    fn complete(&self, result: Poll) {
+        let _ = self.done.set(result);
     }
 }
 
@@ -228,8 +223,12 @@ struct Shared {
     log: fn(&str),
     /// Jobs by pipeline key, while they run.
     jobs: Mutex<HashMap<u128, Arc<Ticket>>>,
+    /// Number of entries currently in `jobs` so callers can skip locking when empty.
+    active_jobs: AtomicUsize,
     /// Pipelines by the caller's id, until the caller got a final answer.
     objects: Mutex<HashMap<usize, Arc<Ticket>>>,
+    /// Number of entries currently in `objects` so callers can skip locking when empty.
+    active_objects: AtomicUsize,
     /// Stage keys by pipeline key, kept in memory when there is no disk cache.
     pipelines: Mutex<HashMap<u128, Vec<u128>>>,
     /// Stage results by stage key: in flight, or kept when there is no disk cache.
@@ -303,7 +302,9 @@ impl Service {
             dump: settings.dump,
             log: settings.log,
             jobs: Mutex::new(HashMap::new()),
+            active_jobs: AtomicUsize::new(0),
             objects: Mutex::new(HashMap::new()),
+            active_objects: AtomicUsize::new(0),
             pipelines: Mutex::new(HashMap::new()),
             stages: Mutex::new(HashMap::new()),
             counters: Counters::default(),
@@ -351,12 +352,7 @@ impl Service {
     /// caller keeps it, the service forgets `id`.
     pub fn poll(&self, id: usize, build: impl FnOnce() -> Result<Pipeline, Refusal>) -> Poll {
         let s = &self.shared;
-        let known = s.objects.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
-        if let Some(ticket) = known {
-            let p = ticket.poll();
-            if p != Poll::Pending {
-                s.objects.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-            }
+        if let Some(p) = s.take_object(id) {
             return p;
         }
         let pipeline = match build() {
@@ -365,13 +361,10 @@ impl Service {
             Err(r) => return s.refused(&r),
         };
         let key = pipeline_key(&pipeline, &s.translator_version, &s.compiler_version);
-        if let Some(ticket) = s.jobs.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() {
-            s.objects.lock().unwrap_or_else(|e| e.into_inner()).insert(id, ticket.clone());
-            let p = ticket.poll();
-            if p != Poll::Pending {
-                s.objects.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-            }
-            return p;
+        if s.active_jobs.load(Ordering::Acquire) > 0
+            && let Some(ticket) = s.jobs.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned()
+        {
+            return s.track_object(id, &ticket);
         }
         // Pipeline record and all stage files present: ready at once without translation or compile.
         if let Some(dxil) = s.cached_pipeline(key, pipeline.stages.len()) {
@@ -407,13 +400,13 @@ impl Service {
             match jobs.get(&key) {
                 Some(t) => (t.clone(), false),
                 None => {
-                    let t = Arc::new(Ticket { state: Mutex::new(State::Pending) });
+                    let t = Arc::new(Ticket::default());
                     jobs.insert(key, t.clone());
+                    s.active_jobs.fetch_add(1, Ordering::AcqRel);
                     (t, true)
                 }
             }
         };
-        s.objects.lock().unwrap_or_else(|e| e.into_inner()).insert(id, ticket.clone());
         if fresh {
             s.busy.fetch_add(1, Ordering::SeqCst);
             let sent = self.queue.lock().unwrap_or_else(|e| e.into_inner()).send(Work::Compile(Box::new(Job { pipeline, keys, key, ticket: ticket.clone() })));
@@ -421,12 +414,7 @@ impl Service {
                 s.finish(key, &ticket, Poll::Refused("no compile worker".to_string()));
             }
         }
-        // A job of the same content may have finished between the lookups above.
-        let p = ticket.poll();
-        if p != Poll::Pending {
-            s.objects.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-        }
-        p
+        s.track_object(id, &ticket)
     }
 
     #[cfg(windows)]
@@ -513,34 +501,31 @@ impl Service {
         build: impl FnOnce() -> Result<Pipeline, Refusal>,
     ) -> Poll {
         let s = &self.shared;
-        let mut objects = s.objects.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ticket) = objects.get(&id) {
-            let result = ticket.poll();
-            if result != Poll::Pending {
-                objects.remove(&id);
-            }
+        if let Some(result) = s.take_object(id) {
             return result;
         }
-        drop(objects);
         let pipeline = match build() {
             Ok(pipeline) => pipeline,
             Err(refusal) => return s.refused(&refusal),
         };
-        let mut objects = s.objects.lock().unwrap_or_else(|e| e.into_inner());
-        if objects.contains_key(&id) {
-            return Poll::Pending;
-        }
-        let ticket = Arc::new(Ticket { state: Mutex::new(State::Pending) });
-        objects.insert(id, ticket.clone());
-        drop(objects);
+        let ticket = {
+            let mut objects = s.objects.lock().unwrap_or_else(|e| e.into_inner());
+            if objects.contains_key(&id) {
+                return Poll::Pending;
+            }
+            let ticket = Arc::new(Ticket::default());
+            objects.insert(id, ticket.clone());
+            s.active_objects.fetch_add(1, Ordering::AcqRel);
+            ticket
+        };
         let sent = self.queue.lock().unwrap_or_else(|e| e.into_inner()).send(Work::Deferred(Box::new(move || {
             let (_, result) = self.compile_deferred(source, &pipeline);
-            *ticket.state.lock().unwrap_or_else(|e| e.into_inner()) = State::Done(result);
+            ticket.complete(result);
             let _guard = s.done.0.lock().unwrap_or_else(|e| e.into_inner());
             s.done.1.notify_all();
         })));
         if sent.is_err() {
-            s.objects.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            s.remove_object(id);
             return s.refused(&Refusal::new("no compile worker", ""));
         }
         Poll::Pending
@@ -549,6 +534,9 @@ impl Service {
     /// Whether the service holds a job for the pipeline the caller knows as `id` (a pipeline whose
     /// translation is still running has none: there is nothing to wait for here).
     pub fn holds(&self, id: usize) -> bool {
+        if self.shared.active_objects.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         self.shared.objects.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id)
     }
 
@@ -557,6 +545,9 @@ impl Service {
     /// the service does not hold).
     pub fn wait(&self, id: usize, timeout: Duration) -> bool {
         let s = &self.shared;
+        if s.active_objects.load(Ordering::Acquire) == 0 {
+            return true;
+        }
         let Some(ticket) = s.objects.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned() else { return true };
         let started = std::time::Instant::now();
         let guard = s.done.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -711,9 +702,49 @@ impl Shared {
         Poll::Refused(r.to_string())
     }
 
+    fn take_object(&self, id: usize) -> Option<Poll> {
+        if self.active_objects.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut objects = self.objects.lock().unwrap_or_else(|e| e.into_inner());
+        let p = objects.get(&id)?.poll();
+        if p != Poll::Pending && objects.remove(&id).is_some() {
+            self.active_objects.fetch_sub(1, Ordering::AcqRel);
+        }
+        Some(p)
+    }
+
+    fn track_object(&self, id: usize, ticket: &Arc<Ticket>) -> Poll {
+        let p = ticket.poll();
+        if p != Poll::Pending {
+            return p;
+        }
+        {
+            let mut objects = self.objects.lock().unwrap_or_else(|e| e.into_inner());
+            if objects.insert(id, ticket.clone()).is_none() {
+                self.active_objects.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        // A job of the same content may have finished before `objects` recorded `id`.
+        let p = ticket.poll();
+        if p != Poll::Pending {
+            self.remove_object(id);
+        }
+        p
+    }
+
+    fn remove_object(&self, id: usize) {
+        let mut objects = self.objects.lock().unwrap_or_else(|e| e.into_inner());
+        if objects.remove(&id).is_some() {
+            self.active_objects.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
     fn finish(&self, key: u128, ticket: &Ticket, result: Poll) {
-        *ticket.state.lock().unwrap_or_else(|e| e.into_inner()) = State::Done(result);
-        self.jobs.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        ticket.complete(result);
+        if self.jobs.lock().unwrap_or_else(|e| e.into_inner()).remove(&key).is_some() {
+            self.active_jobs.fetch_sub(1, Ordering::AcqRel);
+        }
         {
             let _g = self.done.0.lock().unwrap_or_else(|e| e.into_inner());
             self.done.1.notify_all();
@@ -800,6 +831,12 @@ impl Shared {
     /// and every item that finds no free slot run on the calling worker, the others on helper
     /// threads that give their slot back when they end.
     fn map_stages<T: Sync, R: Send>(&self, items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        if items.len() == 1 {
+            return vec![work(&items[0])];
+        }
         let mut answers: Vec<Option<R>> = Vec::new();
         answers.resize_with(items.len(), || None);
         std::thread::scope(|scope| {
@@ -1430,5 +1467,34 @@ pub(crate) mod tests {
         for off in ["0", "off", "OFF", "false"] {
             assert_eq!(parse_o0_hlsl_bytes(Some(off)), usize::MAX, "{off}");
         }
+    }
+
+    #[test]
+    fn ticket_complete_is_lock_free_and_keeps_first_result() {
+        let ticket = Ticket::default();
+        assert_eq!(ticket.poll(), Poll::Pending);
+        let dxil = vec![Arc::<[u8]>::from(&b"DXBC"[..])];
+        ticket.complete(Poll::Ready(dxil.clone()));
+        assert_eq!(ticket.poll(), Poll::Ready(dxil.clone()));
+        ticket.complete(Poll::Refused("ignored".to_string()));
+        assert_eq!(ticket.poll(), Poll::Ready(dxil));
+    }
+
+    #[test]
+    fn single_stage_map_and_cached_poll_leave_active_counts_zero() {
+        let cache_dir = crate::direct_cache::tests::TempDir::new("compile-service-fast-path");
+        let mut settings = Settings::quiet(1);
+        settings.cache = Some(DiskCache::new(cache_dir.0.clone()));
+        let service = Service::new(Arc::new(FixedSource::simple()), Arc::new(FakeCompiler::default()), settings);
+        let compute = pipeline(&[(StageKind::Compute, b"cs fast")]);
+        assert!(matches!(poll_until_final(&service, 10, &compute), Poll::Ready(_)));
+        assert_eq!(service.shared.active_jobs.load(Ordering::Acquire), 0);
+        assert_eq!(service.shared.active_objects.load(Ordering::Acquire), 0);
+        assert!(!service.holds(10));
+        assert!(matches!(service.poll(11, || Ok(compute.clone())), Poll::Ready(_)));
+        assert_eq!(service.shared.active_jobs.load(Ordering::Acquire), 0);
+        assert_eq!(service.shared.active_objects.load(Ordering::Acquire), 0);
+        assert!(service.shared.map_stages::<i32, i32>(&[], |x| x + 1).is_empty());
+        assert_eq!(service.shared.map_stages(&[41], |x| x + 1), vec![42]);
     }
 }
