@@ -64,7 +64,7 @@ use std::time::{Duration, Instant};
 
 use crate::direct_source::DirectSource;
 use crate::precompile_queue::Queue;
-use crate::compile_service::{PipelineKind, Poll, Service, Settings, MAX_LIVE_HLSL_BYTES, O0_HLSL_BYTES};
+use crate::compile_service::{o0_hlsl_bytes, PipelineKind, Poll, Service, Settings, MAX_LIVE_HLSL_BYTES};
 use crate::lazy_pso::{Owned, COMPUTE_DESC_SIZE, GRAPHICS_DESC_SIZE, MESH_DESC_SIZE};
 use crate::log::xs_log;
 use crate::pso_library::Library;
@@ -153,8 +153,9 @@ fn start() -> Option<Service> {
     let source = SOURCE.get_or_init(|| Arc::new(DirectSource::for_layer(log_line, dump.clone()))).clone();
     let settings = Settings { threads: threads(), cache, dump, log: log_line };
     let live_limit = parse_live_limit(std::env::var("DECANT_D3D12X_MAX_LIVE_HLSL_BYTES").ok().as_deref());
+    let o0_bytes = o0_hlsl_bytes();
     xs_log!(
-        "direct shaders on: {}, translator {}, translator_hash={TRANSLATOR_HASH}, {} workers, cache {}, dump {}, -O0 from {O0_HLSL_BYTES} HLSL bytes, live limit {}",
+        "direct shaders on: {}, translator {}, translator_hash={TRANSLATOR_HASH}, {} workers, cache {}, dump {}, -O0 from {o0_bytes} HLSL bytes, live limit {}",
         dxc.describe(),
         source.version(),
         settings.threads,
@@ -252,13 +253,18 @@ extern "C" fn log_final_summary() {
         service.log_summary();
     }
     if let Some(library) = library() {
+        library.flush();
         xs_log!("direct shaders: {}", library.summary());
     }
 }
 
-/// Logs the counts of the pipeline library when they changed since the last time.
+/// Logs the counts of the pipeline library when they changed since the last time, and saves the
+/// recorded pipeline manifest periodically so interrupted runs keep their progress.
 fn log_library_if_changed() {
     static LAST: Mutex<String> = Mutex::new(String::new());
+    if let Some(Some(queue)) = QUEUE.get() {
+        queue.save(false);
+    }
     let Some(library) = library() else { return };
     let line = library.summary();
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());

@@ -132,8 +132,26 @@ pub enum PipelineKind {
 
 const SUMMARY_INTERVAL: u64 = 64;
 
-/// A live cache miss of a stage with at least this much HLSL is compiled with `-O0`.
-pub const O0_HLSL_BYTES: usize = 512 * 1024;
+/// A live cache miss of a stage with at least this much HLSL is compiled with `-O0` by default.
+pub const O0_HLSL_BYTES: usize = 128 * 1024;
+
+/// Parses `DECANT_D3D12X_DIRECT_O0_BYTES`: `0`, `off`, or `false` disables `-O0` (`usize::MAX`),
+/// a positive integer sets the byte threshold, and missing or invalid values return [`O0_HLSL_BYTES`].
+pub fn parse_o0_hlsl_bytes(setting: Option<&str>) -> usize {
+    let Some(text) = setting.map(str::trim).filter(|s| !s.is_empty()) else {
+        return O0_HLSL_BYTES;
+    };
+    if matches!(text.to_ascii_lowercase().as_str(), "0" | "off" | "false") {
+        return usize::MAX;
+    }
+    text.parse::<usize>().unwrap_or(O0_HLSL_BYTES)
+}
+
+/// Returns the live `-O0` HLSL byte threshold from `DECANT_D3D12X_DIRECT_O0_BYTES`, read once.
+pub fn o0_hlsl_bytes() -> usize {
+    static THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| parse_o0_hlsl_bytes(std::env::var("DECANT_D3D12X_DIRECT_O0_BYTES").ok().as_deref()))
+}
 
 /// The default HLSL limit of a live compile (`DECANT_D3D12X_MAX_LIVE_HLSL_BYTES` sets another).
 pub const MAX_LIVE_HLSL_BYTES: usize = 8 * 1024 * 1024;
@@ -477,7 +495,8 @@ impl Service {
                 return true;
             }
         }
-        translated.hlsl.iter().zip(&translated.keys).all(|(stage, key)| stage.hlsl.len() < O0_HLSL_BYTES || s.cached(*key).is_some())
+        let limit = o0_hlsl_bytes();
+        translated.hlsl.iter().zip(&translated.keys).all(|(stage, key)| stage.hlsl.len() < limit || s.cached(*key).is_some())
     }
 
     /// Counts a pipeline the precompile queue found ready from its disk record.
@@ -824,7 +843,7 @@ impl Shared {
         }
         // A large live miss compiles with `-O0`: several times faster in DXC, still validated and
         // signed by `dxil.dll`. Never `-Vd`, the PC runtime refuses unsigned DXIL.
-        let o0 = self.live.load(Ordering::Relaxed) && stage.hlsl.len() >= O0_HLSL_BYTES;
+        let o0 = self.live.load(Ordering::Relaxed) && stage.hlsl.len() >= o0_hlsl_bytes();
         let args: std::borrow::Cow<'_, [String]> = if o0 {
             std::borrow::Cow::Owned(stage.args.iter().cloned().chain(["-O0".to_string()]).collect())
         } else {
@@ -1392,5 +1411,17 @@ pub(crate) mod tests {
         assert!(matches!(poll_until_final(&service, 1, &failing), Poll::Refused(r) if r.starts_with("dxc error (gs ")));
         assert_eq!(service.counters().dxc_errors.load(Ordering::Relaxed), 1);
         assert_eq!(service.shared.stage_slots.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn parse_o0_hlsl_bytes_handles_defaults_overrides_and_off() {
+        assert_eq!(O0_HLSL_BYTES, 128 * 1024);
+        assert_eq!(parse_o0_hlsl_bytes(None), O0_HLSL_BYTES);
+        assert_eq!(parse_o0_hlsl_bytes(Some("")), O0_HLSL_BYTES);
+        assert_eq!(parse_o0_hlsl_bytes(Some("not-a-number")), O0_HLSL_BYTES);
+        assert_eq!(parse_o0_hlsl_bytes(Some(" 262144 ")), 262_144);
+        for off in ["0", "off", "OFF", "false"] {
+            assert_eq!(parse_o0_hlsl_bytes(Some(off)), usize::MAX, "{off}");
+        }
     }
 }

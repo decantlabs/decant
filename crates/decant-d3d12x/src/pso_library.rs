@@ -42,12 +42,15 @@
 //!   made from the title's shaders by `lazy_pso`, as any refused direct pipeline is. After
 //!   [`MAX_REJECTIONS`] refusals the library stops for the run.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, Weak};
+use std::thread::JoinHandle;
 
 use crate::direct_cache::Fnv128;
 
@@ -182,6 +185,7 @@ fn resolve_root(configured: Option<OsString>, default: Option<PathBuf>) -> Optio
 }
 
 /// The blob files of one context key.
+#[derive(Clone)]
 pub struct Store {
     dir: PathBuf,
     context: u128,
@@ -293,18 +297,110 @@ pub struct Counts {
     pub rejected: AtomicU32,
 }
 
+const WRITER_QUEUE_CAP: usize = 128;
+
+type PendingMap = Mutex<HashMap<(PathBuf, u128), Vec<u8>>>;
+type WriteSender = Mutex<Option<SyncSender<(u128, Vec<u8>)>>>;
+
+static PENDING_WRITES: LazyLock<PendingMap> = LazyLock::new(Mutex::default);
+static ACTIVE_WRITERS: LazyLock<Mutex<HashMap<PathBuf, Weak<BackgroundWriter>>>> = LazyLock::new(Mutex::default);
+
+struct BackgroundWriter {
+    tx: WriteSender,
+    handle: Mutex<Option<JoinHandle<()>>>,
+    in_flight: (Mutex<usize>, Condvar),
+}
+
+impl BackgroundWriter {
+    fn spawn(store: Store) -> Arc<Self> {
+        let (tx, rx) = mpsc::sync_channel::<(u128, Vec<u8>)>(WRITER_QUEUE_CAP);
+        let writer = Arc::new(Self {
+            tx: Mutex::new(Some(tx)),
+            handle: Mutex::new(None),
+            in_flight: (Mutex::new(0), Condvar::new()),
+        });
+        let worker_ref = Arc::downgrade(&writer);
+        let handle = std::thread::Builder::new()
+            .name("decant-pso-writer".to_owned())
+            .spawn(move || {
+                while let Ok((key, blob)) = rx.recv() {
+                    let _ = store.write(key, &blob);
+                    {
+                        let mut map = PENDING_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+                        let map_key = (store.dir().to_path_buf(), key);
+                        if map.get(&map_key).is_some_and(|cur| cur.as_slice() == blob.as_slice()) {
+                            map.remove(&map_key);
+                        }
+                    }
+                    if let Some(w) = worker_ref.upgrade() {
+                        let (lock, cv) = &w.in_flight;
+                        let mut count = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            cv.notify_all();
+                        }
+                    }
+                }
+            })
+            .ok();
+        *writer.handle.lock().unwrap_or_else(|e| e.into_inner()) = handle;
+        writer
+    }
+
+    fn enqueue(&self, key: u128, blob: Vec<u8>) {
+        {
+            let mut count = self.in_flight.0.lock().unwrap_or_else(|e| e.into_inner());
+            *count += 1;
+        }
+        let sent = {
+            let guard = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().is_some_and(|tx| tx.send((key, blob)).is_ok())
+        };
+        if !sent {
+            let (lock, cv) = &self.in_flight;
+            let mut count = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                cv.notify_all();
+            }
+        }
+    }
+
+    fn wait_idle(&self) {
+        let (lock, cv) = &self.in_flight;
+        let mut count = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while *count > 0 {
+            count = cv.wait(count).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn shutdown(&self) {
+        drop(self.tx.lock().unwrap_or_else(|e| e.into_inner()).take());
+        if let Some(handle) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// The library of a run. It opens once the adapter is known, which is at the first direct
 /// pipeline the PC runtime made.
 pub struct Library {
     root: PathBuf,
     translator: &'static str,
     store: OnceLock<Option<Store>>,
+    writer: OnceLock<Option<Arc<BackgroundWriter>>>,
     counts: Counts,
 }
 
 impl Library {
     pub fn new(root: PathBuf, translator: &'static str) -> Library {
-        Library { root, translator, store: OnceLock::new(), counts: Counts::default() }
+        Library {
+            root,
+            translator,
+            store: OnceLock::new(),
+            writer: OnceLock::new(),
+            counts: Counts::default(),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -318,7 +414,20 @@ impl Library {
     /// Opens the store for the adapter `adapter` names, on the first call only. `None` when the
     /// adapter is unknown, then the library stays closed for the run.
     pub fn open(&self, adapter: impl FnOnce() -> Option<AdapterIdentity>) -> Option<&Store> {
-        self.store.get_or_init(|| adapter().map(|a| Store::new(&self.root, context_key(&a, self.translator)))).as_ref()
+        let store = self.store.get_or_init(|| adapter().map(|a| Store::new(&self.root, context_key(&a, self.translator)))).as_ref();
+        if let Some(s) = store {
+            self.writer.get_or_init(|| {
+                let dir = s.dir().to_path_buf();
+                let prev = ACTIVE_WRITERS.lock().unwrap_or_else(|e| e.into_inner()).get(&dir).and_then(Weak::upgrade);
+                if let Some(prev) = prev {
+                    prev.wait_idle();
+                }
+                let writer = BackgroundWriter::spawn(s.clone());
+                ACTIVE_WRITERS.lock().unwrap_or_else(|e| e.into_inner()).insert(dir, Arc::downgrade(&writer));
+                Some(writer)
+            });
+        }
+        store
     }
 
     /// The store while the library is open and has not seen too many refusals.
@@ -331,17 +440,33 @@ impl Library {
 
     /// The stored blob of `key`, counted as a hit or a miss.
     pub fn lookup(&self, key: u128) -> Option<Vec<u8>> {
-        let blob = self.live().and_then(|store| store.read(key));
+        let store = self.live()?;
+        let map_key = (store.dir().to_path_buf(), key);
+        if let Some(blob) = PENDING_WRITES.lock().unwrap_or_else(|e| e.into_inner()).get(&map_key).cloned() {
+            self.counts.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(blob);
+        }
+        let blob = store.read(key);
         let count = if blob.is_some() { &self.counts.hits } else { &self.counts.misses };
         count.fetch_add(1, Ordering::Relaxed);
         blob
     }
 
-    /// Stores the blob of a pipeline made without one.
+    /// Stores the blob of a pipeline made without one, persisting to disk on a background writer
+    /// while making it visible in memory immediately.
     pub fn keep(&self, key: u128, blob: &[u8]) -> io::Result<()> {
-        let Some(store) = self.live() else { return Ok(()) };
-        store.write(key, blob)?;
+        let Some(store) = self.live() else {
+            return Ok(());
+        };
+        if blob.is_empty() || blob.len() > MAX_BLOB_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "blob size out of range"));
+        }
+        let owned = blob.to_vec();
+        PENDING_WRITES.lock().unwrap_or_else(|e| e.into_inner()).insert((store.dir().to_path_buf(), key), owned.clone());
         self.counts.stored.fetch_add(1, Ordering::Relaxed);
+        if let Some(Some(writer)) = self.writer.get() {
+            writer.enqueue(key, owned);
+        }
         Ok(())
     }
 
@@ -349,9 +474,17 @@ impl Library {
     /// library is still on.
     pub fn reject(&self, key: u128) -> bool {
         if let Some(store) = self.store.get().and_then(Option::as_ref) {
+            PENDING_WRITES.lock().unwrap_or_else(|e| e.into_inner()).remove(&(store.dir().to_path_buf(), key));
             store.forget(key);
         }
         self.counts.rejected.fetch_add(1, Ordering::Relaxed) + 1 < MAX_REJECTIONS
+    }
+
+    /// Flushes any queued background disk writes.
+    pub fn flush(&self) {
+        if let Some(Some(writer)) = self.writer.get() {
+            writer.wait_idle();
+        }
     }
 
     /// One line with the counts, for the summary of the direct path.
@@ -365,6 +498,14 @@ impl Library {
             c.stored.load(Ordering::Relaxed),
             c.rejected.load(Ordering::Relaxed)
         )
+    }
+}
+
+impl Drop for Library {
+    fn drop(&mut self) {
+        if let Some(Some(writer)) = self.writer.get() {
+            writer.shutdown();
+        }
     }
 }
 
@@ -475,6 +616,7 @@ mod tests {
         let before = Library::new(dir.0.clone(), "t");
         let folder = before.open(|| Some(adapter())).unwrap().dir().to_path_buf();
         before.keep(7, b"driver blob before the reboot").unwrap();
+        before.flush();
 
         // The next boot gives the same adapter another LUID.
         let after = Library::new(dir.0.clone(), "t");
@@ -691,5 +833,21 @@ mod tests {
             damaged.truncate(damaged.len().saturating_sub(1).max(1));
             assert!(with(&damaged).is_err(), "{name}: a damaged blob is refused");
         }
+    }
+
+    #[test]
+    fn keep_is_visible_in_memory_immediately_and_flushes_to_disk_on_drop() {
+        let dir = TempDir::new("pso-library-async-write");
+        {
+            let library = Library::new(dir.0.clone(), "t");
+            library.open(|| Some(adapter())).unwrap();
+            library.keep(42, b"async blob payload").unwrap();
+            assert_eq!(library.lookup(42).as_deref(), Some(&b"async blob payload"[..]));
+            assert_eq!(library.counts().stored.load(Ordering::Relaxed), 1);
+            assert_eq!(library.counts().hits.load(Ordering::Relaxed), 1);
+        }
+        let reopened = Library::new(dir.0.clone(), "t");
+        reopened.open(|| Some(adapter())).unwrap();
+        assert_eq!(reopened.lookup(42).as_deref(), Some(&b"async blob payload"[..]));
     }
 }
