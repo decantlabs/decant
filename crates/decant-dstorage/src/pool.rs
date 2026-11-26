@@ -63,15 +63,6 @@ fn work(pool: &Pool) {
     }
 }
 
-/// Runs `job` on a decode thread, or here when the pool has no thread.
-pub fn run(job: Job) {
-    let Some(pool) = pool() else { return job() };
-    pool.jobs.lock().unwrap_or_else(PoisonError::into_inner).push_back(job);
-    if pool.idle_workers.load(Ordering::Acquire) > 0 {
-        pool.ready.notify_one();
-    }
-}
-
 /// Enqueues a batch of decode jobs under a single lock acquisition.
 pub fn run_batch<I: IntoIterator<Item = Job>>(jobs_iter: I) {
     let Some(pool) = pool() else {

@@ -182,7 +182,7 @@ struct Native {
 }
 
 enum PendingNative {
-    Direct { destination: *mut c_void, destination_size: u32, source_size: u32, pinned: bool },
+    Direct { destination_size: u32, source_size: u32 },
     Staged { read: Sendable<DecantRead>, pages: Option<PageTarget>, input: PooledBuffer, len: u32, decode: bool },
     Coalesced { start: u64, span: u32, members: Vec<(Sendable<DecantRead>, Option<PageTarget>)>, master: PooledBuffer },
 }
@@ -194,6 +194,15 @@ struct NativeInFlight {
     slot: usize,
     started: Instant,
     pending: Vec<PendingNative>,
+    /// The merged write pins held for the direct requests of pending until they completed.
+    pins: Vec<WritePin>,
+}
+
+/// A merged destination range pinned writable for direct requests of the native queue.
+struct WritePin {
+    start: usize,
+    len: u32,
+    pinned: bool,
 }
 
 /// What the worker thread and the operations share.
@@ -500,6 +509,56 @@ fn finish_written(destination: *mut c_void, len: u32) {
     }
 }
 
+/// Tells `d3d12_xs.dll` about the views a page write reported, adjacent views as one range.
+fn note_views(views: &[(usize, usize)]) {
+    if views.len() <= 1 {
+        for &(address, len) in views {
+            note_written(address as *mut c_void, len as u32);
+        }
+        return;
+    }
+    let ranges: Vec<(usize, u32)> = views.iter().map(|&(address, len)| (address, len as u32)).collect();
+    for span in crate::spans::merge(&ranges) {
+        note_written(span.start as *mut c_void, span.len);
+    }
+}
+
+/// A read of the `COPY` codec whose bytes are already in memory and go to a plain destination.
+struct DirectCopy {
+    destination: *mut c_void,
+    source: *const u8,
+    len: u32,
+    /// Compressed size of the request, for the timing line.
+    source_size: u32,
+}
+
+/// Copies every item to its destination. Destinations that touch or overlap share one write pin and
+/// one `NoteWrite`, so `n` adjacent requests cost one `BeginWrite`/`FinishWrite`/`NoteWrite` instead
+/// of `n`. A byte is only written between the `BeginWrite` and `FinishWrite` of the span that covers it.
+/// Returns the time spent, for the timing line.
+///
+/// # Safety
+/// Every `source` is readable for `len` bytes and every `destination` writable for `len` bytes,
+/// and no source overlaps a destination.
+unsafe fn copy_direct_merged(items: &[DirectCopy]) -> Duration {
+    let started = Instant::now();
+    let ranges: Vec<(usize, u32)> = items.iter().map(|item| (item.destination as usize, item.len)).collect();
+    for span in crate::spans::merge(&ranges) {
+        let start = span.start as *mut c_void;
+        let pinned = begin_written(start, span.len);
+        for &member in &span.members {
+            let item = &items[member];
+            // SAFETY: by the contract; the span covers `item.destination..+item.len` and is pinned.
+            unsafe { std::ptr::copy_nonoverlapping(item.source, item.destination.cast(), item.len as usize) };
+        }
+        if pinned {
+            finish_written(start, span.len);
+        }
+        note_written(start, span.len);
+    }
+    started.elapsed()
+}
+
 /// Decodes handed on by one queue that may wait or run at once. The queue's worker waits beyond
 /// that, so the buffers they hold stay bounded.
 const MAX_IN_FLIGHT: usize = 1024;
@@ -582,6 +641,83 @@ fn buffer_pool() -> &'static BufferPool {
     POOL.get_or_init(BufferPool::new)
 }
 
+/// Largest buffer a thread keeps in its own cache (256 KiB): the many small requests are the ones
+/// that hammer the shared pool's lock.
+const TLS_MAX_BUFFER: usize = 256 * 1024;
+/// Most bytes one thread keeps in its cache (2 MiB), so the memory held by threads stays bounded.
+const TLS_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// Most buffers of one size class one thread keeps.
+const TLS_MAX_PER_BUCKET: usize = 8;
+
+/// The per thread front of BufferPool: small buffers released on a thread are reused by it
+/// without taking the shared lock. Dropped (freed) with the thread.
+struct TlsBuffers {
+    buckets: [Vec<Vec<u8>>; POOL_BUCKETS],
+    total_bytes: usize,
+}
+
+impl TlsBuffers {
+    const fn new() -> Self {
+        Self { buckets: [const { Vec::new() }; POOL_BUCKETS], total_bytes: 0 }
+    }
+
+    fn take(&mut self, bucket: usize) -> Option<Vec<u8>> {
+        let buf = self.buckets[bucket].pop()?;
+        self.total_bytes -= buf.capacity();
+        Some(buf)
+    }
+
+    /// Keeps uf unless the caps are reached; gives it back otherwise.
+    fn put(&mut self, bucket: usize, buf: Vec<u8>) -> Result<(), Vec<u8>> {
+        let cap = buf.capacity();
+        if cap > TLS_MAX_BUFFER || self.buckets[bucket].len() >= TLS_MAX_PER_BUCKET || self.total_bytes + cap > TLS_MAX_BYTES {
+            return Err(buf);
+        }
+        self.total_bytes += cap;
+        self.buckets[bucket].push(buf);
+        Ok(())
+    }
+}
+
+thread_local! {
+    static TLS_BUFFERS: std::cell::RefCell<TlsBuffers> = const { std::cell::RefCell::new(TlsBuffers::new()) };
+}
+
+impl BufferPool {
+    /// `acquire`, trying this thread's cache before the shared lock.
+    fn acquire_cached(&self, len: u32) -> Result<PooledBuffer, ()> {
+        let target_cap = (len as usize).next_power_of_two().max(1 << POOL_MIN_SHIFT);
+        if len != 0
+            && target_cap <= TLS_MAX_BUFFER
+            && let Some(bucket) = Self::bucket_for(target_cap)
+            && let Some(mut buf) = TLS_BUFFERS.try_with(|cache| cache.borrow_mut().take(bucket)).ok().flatten()
+        {
+            buf.clear();
+            return Ok(PooledBuffer(buf));
+        }
+        self.acquire(len)
+    }
+
+    /// `release`, keeping a small buffer on this thread while its cache has room.
+    fn release_cached(&self, buf: Vec<u8>) {
+        let Some(bucket) = Self::bucket_for(buf.capacity()) else { return };
+        let mut buf = buf;
+        buf.clear();
+        match TLS_BUFFERS.try_with(|cache| cache.borrow_mut().put(bucket, std::mem::take(&mut buf))) {
+            Ok(Ok(())) => {}
+            Ok(Err(back)) => self.release(back),
+            // The thread is exiting: its cache is gone.
+            Err(_) => self.release(buf),
+        }
+    }
+}
+
+/// Bytes the calling thread holds in its cache.
+#[cfg(test)]
+fn tls_cached_bytes() -> usize {
+    TLS_BUFFERS.with(|cache| cache.borrow().total_bytes)
+}
+
 /// A `Vec<u8>` rented from `buffer_pool()` that returns to the pool on drop.
 struct PooledBuffer(Vec<u8>);
 
@@ -601,7 +737,7 @@ impl std::ops::DerefMut for PooledBuffer {
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
         if self.0.capacity() > 0 {
-            buffer_pool().release(std::mem::take(&mut self.0));
+            buffer_pool().release_cached(std::mem::take(&mut self.0));
         }
     }
 }
@@ -771,9 +907,7 @@ impl Staged {
                         if n == 1 || n.is_multiple_of(1000) {
                             storage_log(&format!("page destination: {n} reads written into physical pages so far\n"));
                         }
-                        for (address, len) in views {
-                            note_written(address as *mut c_void, len as u32);
-                        }
+                        note_views(&views);
                         S_OK
                     }
                     Err(error) => {
@@ -794,9 +928,7 @@ impl Staged {
                 if n == 1 || n.is_multiple_of(1000) {
                     storage_log(&format!("page destination: {n} reads written into physical pages so far\n"));
                 }
-                for (address, len) in views {
-                    note_written(address as *mut c_void, len as u32);
-                }
+                note_views(&views);
                 S_OK
             }
             Err(error) => {
@@ -890,79 +1022,57 @@ impl Core {
         self.build_staged_job_from_parts(*op.read.get(), op.pages.take(), input, decode, read_time)
     }
 
-    /// Dispatches a completed read buffer to the shared decode pool.
-    fn dispatch_staged(self: &Arc<Self>, op: &mut ReadOp, input: InputBuffer, decode: bool, read_time: Duration) {
-        self.wait_for_in_flight_room(1);
-        crate::pool::run(self.build_staged_job(op, input, decode, read_time));
+    /// Hands decode jobs to the shared decode pool under one queue lock.
+    fn submit_jobs(self: &Arc<Self>, jobs: Vec<crate::pool::Job>) {
+        if !jobs.is_empty() {
+            self.wait_for_in_flight_room(jobs.len());
+            crate::pool::run_batch(jobs);
+        }
     }
 
+    /// Writes the plain-destination `COPY` members of a coalesced read straight from `master` (their
+    /// adjacent destinations share one write pin and note), and turns the rest into decode jobs.
     fn complete_coalesced_group(self: &Arc<Self>, batch: &mut [ReadOp], group: &CoalescedGroup, master: PooledBuffer, read_time: Duration, staged_jobs: &mut Vec<crate::pool::Job>) {
         let per_read_time = read_time / (group.members.len() as u32).max(1);
+        let mut direct = Vec::new();
+        let mut staged = Vec::new();
         for &idx in &group.members {
+            let op = &batch[idx];
+            let r = *op.read.get();
+            if r.codec == codec::COPY && op.pages.is_none() {
+                let rel_start = (r.offset - group.start) as usize;
+                // SAFETY: `rel_start + source_size <= group.span` by construction of the group.
+                let source = unsafe { master.as_ptr().add(rel_start) };
+                direct.push(DirectCopy { destination: r.destination, source, len: r.destination_size, source_size: r.source_size });
+            } else {
+                staged.push(idx);
+            }
+        }
+        self.copy_direct_and_record(&direct, per_read_time);
+        if staged.is_empty() {
+            return;
+        }
+        let shared = Arc::new(master);
+        for idx in staged {
             let op = &mut batch[idx];
             let r = *op.read.get();
             let rel_start = (r.offset - group.start) as usize;
-            let decode = r.codec != codec::COPY;
-            if !decode && op.pages.is_none() {
-                let write_started = Instant::now();
-                let pinned = begin_written(r.destination, r.destination_size);
-                // SAFETY: `master` holds `group.span` bytes and `r.destination` is writable for `r.destination_size` bytes.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(master.as_ptr().add(rel_start), r.destination.cast(), r.destination_size as usize);
-                }
-                if pinned {
-                    finish_written(r.destination, r.destination_size);
-                }
-                note_written(r.destination, r.destination_size);
-                self.timing.record_and_log(r.source_size, r.destination_size, per_read_time, Duration::ZERO, write_started.elapsed());
-            } else {
-                let arc = Arc::new(master);
-                return self.complete_coalesced_remaining(batch, &group.members, idx, group.start, per_read_time, arc, staged_jobs);
-            }
+            staged_jobs.push(self.build_staged_job(op, InputBuffer::Shared { buf: shared.clone(), start: rel_start, len: r.source_size as usize }, r.codec != codec::COPY, per_read_time));
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn complete_coalesced_remaining(
-        self: &Arc<Self>,
-        batch: &mut [ReadOp],
-        members: &[usize],
-        first_staged_idx: usize,
-        group_start: u64,
-        per_read_time: Duration,
-        shared: Arc<PooledBuffer>,
-        staged_jobs: &mut Vec<crate::pool::Job>,
-    ) {
-        let mut active = false;
-        for &idx in members {
-            if idx == first_staged_idx {
-                active = true;
-            }
-            if !active {
-                continue;
-            }
-            let op = &mut batch[idx];
-            let r = *op.read.get();
-            let rel_start = (r.offset - group_start) as usize;
-            let decode = r.codec != codec::COPY;
-            if !decode && op.pages.is_none() {
-                let write_started = Instant::now();
-                let pinned = begin_written(r.destination, r.destination_size);
-                // SAFETY: `shared` holds `group.span` bytes and `r.destination` is writable for `r.destination_size` bytes.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(shared.as_ptr().add(rel_start), r.destination.cast(), r.destination_size as usize);
-                }
-                if pinned {
-                    finish_written(r.destination, r.destination_size);
-                }
-                note_written(r.destination, r.destination_size);
-                self.timing.record_and_log(r.source_size, r.destination_size, per_read_time, Duration::ZERO, write_started.elapsed());
-            } else {
-                staged_jobs.push(self.build_staged_job(op, InputBuffer::Shared { buf: shared.clone(), start: rel_start, len: r.source_size as usize }, decode, per_read_time));
-            }
+    /// Copies `direct` under merged write pins and records one timing line per request.
+    fn copy_direct_and_record(&self, direct: &[DirectCopy], per_read_time: Duration) {
+        if direct.is_empty() {
+            return;
+        }
+        // SAFETY: each source points into a coalesced read buffer that holds the request's bytes and each destination is writable for the request's size (the title's contract); buffer and destinations are distinct memory.
+        let write_time = unsafe { copy_direct_merged(direct) };
+        let per_write_time = write_time / (direct.len() as u32);
+        for item in direct {
+            self.timing.record_and_log(item.source_size, item.len, per_read_time, Duration::ZERO, per_write_time);
         }
     }
-
     fn read_coalesced_cpu(self: &Arc<Self>, batch: &mut [ReadOp], group: &CoalescedGroup) {
         let first_op = &batch[group.members[0]];
         let Ok(mut master) = buffer_capacity(group.span) else {
@@ -988,10 +1098,7 @@ impl Core {
         unsafe { master.set_len(group.span as usize) };
         let mut staged_jobs = Vec::new();
         self.complete_coalesced_group(batch, group, master, read_time, &mut staged_jobs);
-        if !staged_jobs.is_empty() {
-            self.wait_for_in_flight_room(staged_jobs.len());
-            crate::pool::run_batch(staged_jobs);
-        }
+        self.submit_jobs(staged_jobs);
     }
 
     /// Runs a batch of up to `READ_BATCH_LIMIT` consecutive reads on the active backend.
@@ -1007,7 +1114,9 @@ impl Core {
         if batch.len() == 1 {
             let op = &mut batch[0];
             let to_pages = op.pages.is_some();
-            let hr = self.read_cpu(op);
+            let sink = StagedSink::new();
+            let hr = self.read_cpu(op, &sink);
+            sink.flush(self);
             if hr < 0 {
                 log_failure(op.read.get(), to_pages, hr);
                 self.fail(hr);
@@ -1026,6 +1135,7 @@ impl Core {
         let batch_len = batch.len();
         let core = Sendable(self.clone());
         let groups_len = plan.groups.len();
+        let sink = StagedSink::new();
         io_pool().run(total_tasks, |task_idx| {
             if task_idx < groups_len {
                 // SAFETY: each group's member indices are disjoint across all tasks, and `batch` lives until `run` returns.
@@ -1036,13 +1146,14 @@ impl Core {
                 // SAFETY: `index` is disjoint from all other tasks, and `batch` lives until `run` returns.
                 let op = unsafe { &mut *(base as *mut ReadOp).add(index) };
                 let to_pages = op.pages.is_some();
-                let hr = core.get().read_cpu(op);
+                let hr = core.get().read_cpu(op, &sink);
                 if hr < 0 {
                     log_failure(op.read.get(), to_pages, hr);
                     core.get().fail(hr);
                 }
             }
         });
+        sink.flush(self);
         self.timing.record_batch(batch_started.elapsed());
     }
 
@@ -1055,66 +1166,29 @@ impl Core {
         staged_jobs: &mut Vec<crate::pool::Job>,
     ) {
         let per_read_time = read_time / (members.len() as u32).max(1);
-        let mut iter = members.into_iter();
-        let mut first_staged: Option<(DecantRead, Option<PageTarget>, Arc<PooledBuffer>)> = None;
-        for (read, pages) in &mut iter {
+        let mut direct = Vec::new();
+        let mut staged = Vec::new();
+        for (read, pages) in members {
             let r = *read.get();
-            let rel_start = (r.offset - group_start) as usize;
-            let decode = r.codec != codec::COPY;
-            if !decode && pages.is_none() {
-                let write_started = Instant::now();
-                let pinned = begin_written(r.destination, r.destination_size);
-                // SAFETY: `master` holds `group.span` bytes and `r.destination` is writable for `r.destination_size` bytes.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(master.as_ptr().add(rel_start), r.destination.cast(), r.destination_size as usize);
-                }
-                if pinned {
-                    finish_written(r.destination, r.destination_size);
-                }
-                note_written(r.destination, r.destination_size);
-                self.timing.record_and_log(r.source_size, r.destination_size, per_read_time, Duration::ZERO, write_started.elapsed());
+            if r.codec == codec::COPY && pages.is_none() {
+                let rel_start = (r.offset - group_start) as usize;
+                // SAFETY: `rel_start + source_size <= span` by construction of the group.
+                let source = unsafe { master.as_ptr().add(rel_start) };
+                direct.push(DirectCopy { destination: r.destination, source, len: r.destination_size, source_size: r.source_size });
             } else {
-                first_staged = Some((r, pages, Arc::new(master)));
-                break;
+                staged.push((r, pages));
             }
         }
-        let Some((r0, p0, shared)) = first_staged else { return };
-        let rel0 = (r0.offset - group_start) as usize;
-        staged_jobs.push(self.build_staged_job_from_parts(
-            r0,
-            p0,
-            InputBuffer::Shared { buf: shared.clone(), start: rel0, len: r0.source_size as usize },
-            r0.codec != codec::COPY,
-            per_read_time,
-        ));
-        for (read, pages) in iter {
-            let r = *read.get();
+        self.copy_direct_and_record(&direct, per_read_time);
+        if staged.is_empty() {
+            return;
+        }
+        let shared = Arc::new(master);
+        for (r, pages) in staged {
             let rel_start = (r.offset - group_start) as usize;
-            let decode = r.codec != codec::COPY;
-            if !decode && pages.is_none() {
-                let write_started = Instant::now();
-                let pinned = begin_written(r.destination, r.destination_size);
-                // SAFETY: `shared` holds `group.span` bytes and `r.destination` is writable for `r.destination_size` bytes.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(shared.as_ptr().add(rel_start), r.destination.cast(), r.destination_size as usize);
-                }
-                if pinned {
-                    finish_written(r.destination, r.destination_size);
-                }
-                note_written(r.destination, r.destination_size);
-                self.timing.record_and_log(r.source_size, r.destination_size, per_read_time, Duration::ZERO, write_started.elapsed());
-            } else {
-                staged_jobs.push(self.build_staged_job_from_parts(
-                    r,
-                    pages,
-                    InputBuffer::Shared { buf: shared.clone(), start: rel_start, len: r.source_size as usize },
-                    decode,
-                    per_read_time,
-                ));
-            }
+            staged_jobs.push(self.build_staged_job_from_parts(r, pages, InputBuffer::Shared { buf: shared.clone(), start: rel_start, len: r.source_size as usize }, r.codec != codec::COPY, per_read_time));
         }
     }
-
     fn finish_native_in_flight(self: &Arc<Self>, native: &Native, submitted: NativeInFlight) {
         // SAFETY: `native.done[slot]` and `native.status` are live objects created in `Queue::create`.
         let hr = unsafe {
@@ -1131,17 +1205,23 @@ impl Core {
             self.fail(hr);
         }
 
+        let pin_started = Instant::now();
+        for pin in &submitted.pins {
+            if pin.pinned {
+                finish_written(pin.start as *mut c_void, pin.len);
+            }
+            if hr >= 0 {
+                note_written(pin.start as *mut c_void, pin.len);
+            }
+        }
+        let direct_count = submitted.pending.iter().filter(|item| matches!(item, PendingNative::Direct { .. })).count();
+        let per_direct_write_time = pin_started.elapsed() / (direct_count as u32).max(1);
         let mut staged_jobs = Vec::new();
         for item in submitted.pending {
             match item {
-                PendingNative::Direct { destination, destination_size, source_size, pinned } => {
-                    let write_started = Instant::now();
-                    if pinned {
-                        finish_written(destination, destination_size);
-                    }
+                PendingNative::Direct { destination_size, source_size } => {
                     if hr >= 0 {
-                        note_written(destination, destination_size);
-                        self.timing.record_and_log(source_size, destination_size, per_read_time, Duration::ZERO, write_started.elapsed());
+                        self.timing.record_and_log(source_size, destination_size, per_read_time, Duration::ZERO, per_direct_write_time);
                     }
                 }
                 PendingNative::Staged { read, pages, mut input, len, decode } => {
@@ -1162,10 +1242,7 @@ impl Core {
                 }
             }
         }
-        if !staged_jobs.is_empty() {
-            self.wait_for_in_flight_room(staged_jobs.len());
-            crate::pool::run_batch(staged_jobs);
-        }
+        self.submit_jobs(staged_jobs);
     }
 
     fn flush_native(self: &Arc<Self>) {
@@ -1188,6 +1265,11 @@ impl Core {
         // SAFETY: `native.queue` is a live `IDStorageQueue1` owned by `Core`.
         let vtbl = unsafe { native.queue.vtbl::<pc::QueueVtbl>() };
         let started = Instant::now();
+        let singles: Vec<usize> = match &plan {
+            Some(plan) => plan.singles.clone(),
+            None => (0..batch.len()).collect(),
+        };
+        let pins = pin_direct_destinations(batch, &singles);
 
         let enqueue_single = |op: &mut ReadOp, pending: &mut Vec<PendingNative>| {
             let r = *op.read.get();
@@ -1218,11 +1300,11 @@ impl Core {
             let decode = r.codec == codec::ZLIB || r.codec == codec::BCPACK;
             let compression = if r.codec == codec::GDEFLATE { pc::COMPRESSION_GDEFLATE } else { 0 };
             if !decode && op.pages.is_none() {
-                let pinned = begin_written(r.destination, r.destination_size);
+                // The destination is pinned by pin_direct_destinations before any request is enqueued.
                 let request = pc::RawRequest::file_to_memory(compression, file_native.as_ptr(), r.offset, r.source_size, r.destination, r.destination_size);
                 // SAFETY: `r.destination` remains valid until the completion wait in `finish_native_in_flight` returns.
                 unsafe { (vtbl.enqueue_request)(queue, &request) };
-                pending.push(PendingNative::Direct { destination: r.destination, destination_size: r.destination_size, source_size: r.source_size, pinned });
+                pending.push(PendingNative::Direct { destination_size: r.destination_size, source_size: r.source_size });
             } else {
                 let len = if decode { r.source_size } else { r.destination_size };
                 let Ok(mut input) = buffer_capacity(len) else {
@@ -1269,6 +1351,11 @@ impl Core {
         }
 
         if pending.is_empty() {
+            for pin in &pins {
+                if pin.pinned {
+                    finish_written(pin.start as *mut c_void, pin.len);
+                }
+            }
             return;
         }
 
@@ -1280,14 +1367,14 @@ impl Core {
             (vtbl.submit)(queue);
         }
 
-        let prev = lock(&native.in_flight).replace(NativeInFlight { slot, started, pending });
+        let prev = lock(&native.in_flight).replace(NativeInFlight { slot, started, pending, pins });
         if let Some(prev_submitted) = prev {
             self.finish_native_in_flight(native, prev_submitted);
         }
     }
 
     /// Runs one read on the Win32 CPU backend using a reusable thread local event handle.
-    fn read_cpu(self: &Arc<Self>, op: &mut ReadOp) -> HRESULT {
+    fn read_cpu(self: &Arc<Self>, op: &mut ReadOp, sink: &StagedSink) -> HRESULT {
         let r = op.read.get();
         if !matches!(r.codec, codec::COPY | codec::ZLIB | codec::GDEFLATE | codec::BCPACK) {
             decant_log::calls::record_with(decant_log::calls::Kind::NotImplemented, || format!("read with codec {}", r.codec));
@@ -1327,8 +1414,40 @@ impl Core {
         }
         // SAFETY: `read_file_cpu` verified `got == r.source_size` (`len` bytes initialized).
         unsafe { input.set_len(len as usize) };
-        self.dispatch_staged(op, InputBuffer::Owned(input), decode, read_time);
+        sink.push(self, self.build_staged_job(op, InputBuffer::Owned(input), decode, read_time));
         S_OK
+    }
+}
+
+/// Decodes of one CPU read pass, handed to the decode pool in batches of STAGED_FLUSH (one queue
+/// lock and wake per batch rather than per read). The pass flushes the rest when its reads are done,
+/// before the queue worker waits for them.
+struct StagedSink {
+    jobs: Mutex<Vec<crate::pool::Job>>,
+}
+
+/// Decodes gathered before they go to the decode pool.
+const STAGED_FLUSH: usize = 8;
+
+impl StagedSink {
+    fn new() -> Self {
+        Self { jobs: Mutex::new(Vec::new()) }
+    }
+
+    fn push(&self, core: &Arc<Core>, job: crate::pool::Job) {
+        let full = {
+            let mut jobs = lock(&self.jobs);
+            jobs.push(job);
+            (jobs.len() >= STAGED_FLUSH).then(|| std::mem::take(&mut *jobs))
+        };
+        if let Some(full) = full {
+            core.submit_jobs(full);
+        }
+    }
+
+    fn flush(&self, core: &Arc<Core>) {
+        let rest = std::mem::take(&mut *lock(&self.jobs));
+        core.submit_jobs(rest);
     }
 }
 
@@ -1447,7 +1566,17 @@ impl IoPool {
             // SAFETY: `data` points to `f` for the entire duration of `run`.
             unsafe { (*(data as *const F))(index) };
         }
-        let _guard = lock(&self.run_lock);
+        // Another queue is fanning out already: do not wait for it, read here on this queue's own thread.
+        let _guard = match self.run_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                for i in 0..total {
+                    f(i);
+                }
+                return;
+            }
+        };
         let worker_count = total.saturating_sub(1).min(self.workers);
         if worker_count == 0 {
             for i in 0..total {
@@ -1488,9 +1617,30 @@ fn io_pool() -> &'static IoPool {
     })
 }
 
+/// Pins writable, before they are enqueued, the destinations of the singles that go to the native queue
+/// as direct requests (no decode, no page destination). Destinations that touch or overlap share one
+/// pin; the pins are released when the batch completed. The conditions are those of the direct branch
+/// of `read_batch_native`, so every pinned range is written by a request that is enqueued.
+fn pin_direct_destinations(batch: &[ReadOp], singles: &[usize]) -> Vec<WritePin> {
+    let ranges: Vec<(usize, u32)> = singles
+        .iter()
+        .filter_map(|&idx| {
+            let op = &batch[idx];
+            let r = op.read.get();
+            let valid = matches!(r.codec, codec::COPY | codec::GDEFLATE) && !(r.codec == codec::COPY && r.source_size != r.destination_size);
+            let in_bounds = op.file.byte_length.is_none_or(|len| r.offset <= len && u64::from(r.source_size) <= len - r.offset);
+            (valid && in_bounds && op.file.native.is_some() && op.pages.is_none()).then_some((r.destination as usize, r.destination_size))
+        })
+        .collect();
+    crate::spans::merge(&ranges)
+        .into_iter()
+        .map(|span| WritePin { start: span.start, len: span.len, pinned: begin_written(span.start as *mut c_void, span.len) })
+        .collect()
+}
+
 /// A pooled buffer with capacity for at least `len` bytes, or `Err` when it cannot be allocated.
 fn buffer_capacity(len: u32) -> Result<PooledBuffer, ()> {
-    buffer_pool().acquire(len)
+    buffer_pool().acquire_cached(len)
 }
 
 impl Queue {
@@ -2007,6 +2157,96 @@ fn buffer_pool_reuses_released_buffers() {
     assert_eq!(second.capacity(), cap);
     assert_eq!(second.as_ptr(), ptr);
     assert!(second.is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn thread_cache_reuses_small_buffers_and_stays_within_its_caps() {
+    std::thread::spawn(|| {
+        let pool = BufferPool::new();
+        assert_eq!(tls_cached_bytes(), 0);
+
+        // A released small buffer is reused on the same thread, without the shared pool.
+        let mut first = pool.acquire_cached(1000).expect("allocates");
+        let ptr = first.as_ptr();
+        let raw = std::mem::take(&mut first.0);
+        pool.release_cached(raw);
+        assert_eq!(tls_cached_bytes(), 4096);
+        assert!(lock(&pool.inner).buckets.iter().all(Vec::is_empty), "the shared pool was not used");
+        let mut again = pool.acquire_cached(3000).expect("reuses");
+        assert_eq!(again.as_ptr(), ptr);
+        assert!(again.is_empty());
+        assert_eq!(tls_cached_bytes(), 0);
+        drop(std::mem::take(&mut again.0));
+
+        // Per size class: at most `TLS_MAX_PER_BUCKET` stay, the rest go to the shared pool.
+        for _ in 0..TLS_MAX_PER_BUCKET + 4 {
+            pool.release_cached(Vec::with_capacity(8192));
+        }
+        assert_eq!(tls_cached_bytes(), TLS_MAX_PER_BUCKET * 8192);
+        assert_eq!(lock(&pool.inner).buckets[1].len(), 4);
+        // In total: never more than `TLS_MAX_BYTES`, whatever the size classes.
+        let sizes = [8192usize, 16_384, 32_768, 65_536, 131_072, 262_144];
+        for k in 0..60 {
+            pool.release_cached(Vec::with_capacity(sizes[k % sizes.len()]));
+            assert!(tls_cached_bytes() <= TLS_MAX_BYTES);
+        }
+
+        // A buffer larger than `TLS_MAX_BUFFER` is not kept by the thread.
+        let before = tls_cached_bytes();
+        pool.release_cached(Vec::with_capacity(TLS_MAX_BUFFER * 2));
+        assert_eq!(tls_cached_bytes(), before);
+        let bucket = (TLS_MAX_BUFFER * 2).trailing_zeros() as usize - POOL_MIN_SHIFT as usize;
+        assert_eq!(lock(&pool.inner).buckets[bucket].len(), 1);
+    })
+    .join()
+    .expect("thread cache test");
+}
+
+#[cfg(test)]
+#[test]
+fn merged_direct_copies_fill_adjacent_destinations_exactly() {
+    let source: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
+    // Destination bytes outside every request stay untouched.
+    let mut destination = vec![0xEEu8; 8192];
+    let base = destination.as_mut_ptr();
+    // Requests: [0..1000) [1000..2500) [2500..3000) (adjacent), a gap, [3500..4096).
+    let spans = [(0usize, 0usize, 1000u32), (1000, 1000, 1500), (2500, 2500, 500), (3500, 3500, 596)];
+    let items: Vec<DirectCopy> = spans
+        .iter()
+        .map(|&(src, dst, len)| DirectCopy {
+            // SAFETY: inside the buffers above.
+            destination: unsafe { base.add(dst) }.cast(),
+            source: unsafe { source.as_ptr().add(src) },
+            len,
+            source_size: len,
+        })
+        .collect();
+    // SAFETY: sources and destinations are the live, distinct buffers above.
+    unsafe { copy_direct_merged(&items) };
+    assert_eq!(&destination[..3000], &source[..3000]);
+    assert!(destination[3000..3500].iter().all(|&b| b == 0xEE), "the gap is not written");
+    assert_eq!(&destination[3500..4096], &source[3500..4096]);
+    assert!(destination[4096..].iter().all(|&b| b == 0xEE));
+}
+
+#[cfg(test)]
+#[test]
+fn overlapping_direct_copies_keep_request_order() {
+    let first = [1u8; 64];
+    let second = [2u8; 64];
+    let mut destination = vec![0u8; 128];
+    let base = destination.as_mut_ptr();
+    let items = [
+        DirectCopy { destination: base.cast(), source: first.as_ptr(), len: 64, source_size: 64 },
+        // SAFETY: inside `destination`.
+        DirectCopy { destination: unsafe { base.add(32) }.cast(), source: second.as_ptr(), len: 64, source_size: 64 },
+    ];
+    // SAFETY: live, distinct buffers.
+    unsafe { copy_direct_merged(&items) };
+    assert!(destination[..32].iter().all(|&b| b == 1));
+    assert!(destination[32..96].iter().all(|&b| b == 2), "the later request wins where they overlap");
+    assert!(destination[96..].iter().all(|&b| b == 0));
 }
 
 #[cfg(test)]

@@ -11,7 +11,6 @@
 //! `d3d12_xs.dll` is told, as for a read to an address.
 #![allow(unsafe_code)]
 
-use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -89,27 +88,62 @@ pub struct PageTarget {
 /// Frame 0 is no frame: `xmem.dll` never hands it out.
 const NO_FRAME: u64 = 0;
 
+/// Frames kept on the stack up to this many (a destination of 1 MiB), so the common write needs no allocation.
+const INLINE_FRAMES: usize = 16;
+
+/// The frames of a write: the snapshot borrowed, or the title's array as read now (inline when it is short).
+pub enum Frames<'a> {
+    Borrowed(&'a [u64]),
+    Inline { frames: [u64; INLINE_FRAMES], len: usize },
+    Heap(Vec<u64>),
+}
+
+impl std::ops::Deref for Frames<'_> {
+    type Target = [u64];
+    fn deref(&self) -> &[u64] {
+        match self {
+            Self::Borrowed(frames) => frames,
+            Self::Inline { frames, len } => &frames[..*len],
+            Self::Heap(frames) => frames,
+        }
+    }
+}
+
+impl AsRef<[u64]> for Frames<'_> {
+    fn as_ref(&self) -> &[u64] {
+        self
+    }
+}
+
 impl PageTarget {
     /// The frames to write to now, borrowing the snapshot when every entry is already resolved.
-    pub fn frames_now_cow(&self) -> Cow<'_, [u64]> {
+    /// Otherwise the array is read once after a single readability check (one `VirtualQuery` for an
+    /// array inside one region) into an inline buffer, or a `Vec` for more than `INLINE_FRAMES`.
+    pub fn frames_now_cow(&self) -> Frames<'_> {
         if !self.frames.contains(&NO_FRAME) {
-            return Cow::Borrowed(&self.frames);
+            return Frames::Borrowed(&self.frames);
         }
-        let bytes = self.frames.len() * 8;
-        if !readable(self.array, bytes) {
-            return Cow::Borrowed(&self.frames);
+        let count = self.frames.len();
+        if !readable(self.array, count * 8) {
+            return Frames::Borrowed(&self.frames);
         }
         let array = self.array as *const u64;
-        // SAFETY: the range is committed readable memory (checked just above), and the array may be unaligned.
-        Cow::Owned((0..self.frames.len()).map(|k| unsafe { array.add(k).read_unaligned() }).collect())
+        // SAFETY (both reads): the range is committed readable memory (checked just above), and the array may be unaligned.
+        if count <= INLINE_FRAMES {
+            let mut frames = [0u64; INLINE_FRAMES];
+            for (k, slot) in frames.iter_mut().enumerate().take(count) {
+                *slot = unsafe { array.add(k).read_unaligned() };
+            }
+            return Frames::Inline { frames, len: count };
+        }
+        Frames::Heap((0..count).map(|k| unsafe { array.add(k).read_unaligned() }).collect())
     }
-
     /// The frames to write to now: the snapshot of the enqueue, or, when it holds no frame for a
     /// page, the title's array as it is now, if that memory is still readable. Then the snapshot is
     /// what the write refuses.
     #[cfg(test)]
     pub fn frames_now(&self) -> Vec<u64> {
-        self.frames_now_cow().into_owned()
+        self.frames_now_cow().to_vec()
     }
 
     /// The frames a destination of `size` bytes from `offset` (the low 16 bits of the page offset
@@ -197,11 +231,33 @@ mod tests {
     }
 
     #[test]
+    fn long_deferred_arrays_use_the_heap_and_short_ones_do_not() {
+        let mut long = vec![0u64; INLINE_FRAMES + 5];
+        // SAFETY: the array holds every entry the destination covers.
+        let target = unsafe { PageTarget::read(long.as_ptr().cast(), 0, ((INLINE_FRAMES + 5) * PAGE_BYTES) as u32).unwrap() };
+        for (k, entry) in long.iter_mut().enumerate() {
+            *entry = 16 * (k as u64 + 1);
+        }
+        std::hint::black_box(&long);
+        let now = target.frames_now_cow();
+        assert!(matches!(now, Frames::Heap(_)));
+        assert_eq!(&*now, long.as_slice());
+        let mut exact = vec![0u64; INLINE_FRAMES];
+        // SAFETY: as above.
+        let target = unsafe { PageTarget::read(exact.as_ptr().cast(), 0, (INLINE_FRAMES * PAGE_BYTES) as u32).unwrap() };
+        exact.fill(32);
+        std::hint::black_box(&exact);
+        let now = target.frames_now_cow();
+        assert!(matches!(now, Frames::Inline { .. }));
+        assert_eq!(&*now, exact.as_slice());
+    }
+
+    #[test]
     fn frames_now_cow_borrows_when_all_frames_are_resolved() {
         let array: [u64; 2] = [16, 32];
         // SAFETY: the array holds two entries.
         let target = unsafe { PageTarget::read(array.as_ptr().cast(), 0, 2 * PAGE_BYTES as u32).unwrap() };
-        assert!(matches!(target.frames_now_cow(), Cow::Borrowed(_)));
+        assert!(matches!(target.frames_now_cow(), Frames::Borrowed(_)));
         assert_eq!(target.frames_now_cow().as_ref(), &[16, 32]);
 
         let mut deferred = [0u64, 0u64];
@@ -210,7 +266,7 @@ mod tests {
         deferred[0] = 64;
         deferred[1] = 128;
         std::hint::black_box(&deferred);
-        assert!(matches!(target_deferred.frames_now_cow(), Cow::Owned(_)));
+        assert!(matches!(target_deferred.frames_now_cow(), Frames::Inline { .. }));
         assert_eq!(target_deferred.frames_now_cow().as_ref(), &[64, 128]);
     }
 }

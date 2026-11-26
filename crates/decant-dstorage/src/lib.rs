@@ -26,6 +26,9 @@ mod engine;
 #[cfg(windows)]
 mod exports;
 #[cfg(windows)]
+#[cfg_attr(not(decant_gdeflate), allow(dead_code))]
+mod fanout;
+#[cfg(windows)]
 pub mod libdeflate;
 #[cfg(windows)]
 mod log;
@@ -35,6 +38,8 @@ mod pages;
 mod pc;
 #[cfg(windows)]
 mod pool;
+#[cfg(windows)]
+mod spans;
 #[cfg(windows)]
 pub mod decant;
 

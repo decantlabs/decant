@@ -69,8 +69,6 @@ fn tiles(data: &[u8], out: &mut [u8]) -> HRESULT {
 /// offsets relative to the end of the table.
 #[cfg(decant_gdeflate)]
 fn tiles_with_workers(data: &[u8], out: &mut [u8], workers: usize) -> HRESULT {
-    use crate::decant::E_OUTOFMEMORY;
-
     if data.len() < 12 || data[0] != 4 || data[1] != 251 {
         return BAD;
     }
@@ -103,34 +101,29 @@ fn tiles_with_workers(data: &[u8], out: &mut [u8], workers: usize) -> HRESULT {
     if workers == 1 {
         return decode_pages(&pages, out);
     }
+    // Split the tiles into `workers` consecutive runs, decoded on the persistent fan-out pool (no
+    // OS thread is started per decode).
+    let mut runs = Vec::with_capacity(workers);
+    let mut first = 0;
+    for workers_left in (1..=workers).rev() {
+        let len = (count - first).div_ceil(workers_left);
+        runs.push((first, len));
+        first += len;
+    }
+    let results: Vec<std::sync::atomic::AtomicI32> = runs.iter().map(|_| std::sync::atomic::AtomicI32::new(S_OK)).collect();
+    let out_base = out.as_mut_ptr() as usize;
+    let out_len = out.len();
     let pages = pages.as_slice();
-    std::thread::scope(move |scope| {
-        let mut remaining = pages;
-        let mut out = out;
-        let mut handles = Vec::with_capacity(workers - 1);
-        for workers_left in (2..=workers).rev() {
-            let count = remaining.len().div_ceil(workers_left);
-            let batch;
-            let target;
-            (batch, remaining) = remaining.split_at(count);
-            (target, out) = out.split_at_mut(count * TILE_BYTES);
-            let Ok(handle) = std::thread::Builder::new().spawn_scoped(scope, move || decode_pages(batch, target)) else {
-                return E_OUTOFMEMORY;
-            };
-            handles.push(handle);
-        }
-        let last = decode_pages(remaining, out);
-        let mut result = S_OK;
-        for handle in handles {
-            let status = handle.join().expect("GDeflate worker panicked");
-            if result == S_OK {
-                result = status;
-            }
-        }
-        if result == S_OK { last } else { result }
-    })
+    crate::fanout::parallel_for(runs.len(), |k| {
+        let (first, len) = runs[k];
+        let from = first * TILE_BYTES;
+        let to = ((first + len) * TILE_BYTES).min(out_len);
+        // SAFETY: the runs cover disjoint, consecutive byte ranges of `out`, which outlives `parallel_for`.
+        let target = unsafe { std::slice::from_raw_parts_mut((out_base as *mut u8).add(from), to - from) };
+        results[k].store(decode_pages(&pages[first..first + len], target), std::sync::atomic::Ordering::Release);
+    });
+    results.iter().map(|r| r.load(std::sync::atomic::Ordering::Acquire)).find(|&status| status != S_OK).unwrap_or(S_OK)
 }
-
 #[cfg(decant_gdeflate)]
 struct CachedGdeflateDecoder(*mut std::ffi::c_void);
 
