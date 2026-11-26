@@ -24,7 +24,7 @@ const SMALL_HEAP_BYTES: u64 = 16 << 20;
 /// Textures up to this byte size use small heaps so tiny persistent views do not pin 64 MiB heaps.
 const SMALL_TEXTURE_LIMIT: u64 = 64 << 10;
 /// Maximum warm empty heaps kept per size class for instant reuse.
-const WARM_FREE_HEAPS_PER_CLASS: usize = 2;
+const WARM_FREE_HEAPS_PER_CLASS: usize = 1;
 /// The small resource placement alignment of the PC runtime.
 const SMALL: u64 = 4096;
 
@@ -58,7 +58,7 @@ pub fn fit(used: u64, size: u64, align: u64) -> Option<u64> {
 }
 
 /// Presents a heap whose textures were all released waits before it is filled again.
-pub const REUSE_PRESENTS: u64 = 60;
+pub const REUSE_PRESENTS: u64 = 30;
 
 /// Whether a heap with `live` textures placed in it, all released at present `free_at`, may be filled
 /// again at present `now` (pure, for the tests).
@@ -465,7 +465,7 @@ mod tests {
                 reclaimed.push(idx);
             }
         }
-        assert_eq!(reclaimed, vec![2, 5], "excess empty heaps beyond warm pool per class are reclaimed");
-        assert_eq!(slots.iter().flatten().count(), 4);
+        assert_eq!(reclaimed, vec![1, 2, 4, 5], "excess empty heaps beyond warm pool per class are reclaimed");
+        assert_eq!(slots.iter().flatten().count(), 2);
     }
 }

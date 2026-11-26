@@ -170,9 +170,9 @@ pub struct ViewEntry {
 /// that took several GiB for tens of thousands of textures died of a lack of memory.
 pub const DEFAULT_VIEW_TEX_MIB: u64 = 14 * 1024;
 /// A texture is given back only when no view of its address was made for this many presents ...
-pub const MIN_IDLE_PRESENTS: u64 = 600;
+pub const MIN_IDLE_PRESENTS: u64 = 180;
 /// ... and this many milliseconds (a present is slow while the world loads).
-pub const MIN_IDLE_MS: u64 = 120_000;
+pub const MIN_IDLE_MS: u64 = 15_000;
 /// The most textures given back in one pass.
 pub const MAX_PER_PASS: usize = 4096;
 
@@ -213,7 +213,7 @@ pub fn view_texture_cap(device: &windows::Win32::Graphics::Direct3D12::ID3D12Dev
 }
 
 /// Default LRU eviction budget for placed and committed view textures (MiB).
-pub const DEFAULT_VIEW_TEX_BUDGET_MIB: u64 = 3072;
+pub const DEFAULT_VIEW_TEX_BUDGET_MIB: u64 = 1536;
 
 /// The LRU eviction budget in bytes from `DECANT_D3D12X_VIEW_TEX_BUDGET_MIB` (0 disables eviction).
 pub fn budget_from(over_ride: Option<&str>) -> u64 {
@@ -221,7 +221,7 @@ pub fn budget_from(over_ride: Option<&str>) -> u64 {
 }
 
 /// The LRU eviction budget of view textures in bytes (`DECANT_D3D12X_VIEW_TEX_BUDGET_MIB`, default
-/// 3072 MiB, 0 disables eviction). Read once.
+/// 1536 MiB, 0 disables eviction). Read once.
 #[cfg(windows)]
 pub fn view_texture_budget() -> u64 {
     static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -806,5 +806,20 @@ mod tests {
 
         // Budget 0 disables eviction.
         assert!(t.collect_budget(0, 1000, p + 10, ms + 10, &held).freed.is_empty());
+    }
+
+    #[test]
+    fn default_budget_is_1536_mib_and_tight_idle_thresholds_evict_promptly() {
+        use super::{DEFAULT_VIEW_TEX_BUDGET_MIB, MIN_IDLE_MS, MIN_IDLE_PRESENTS, budget_from};
+        assert_eq!(DEFAULT_VIEW_TEX_BUDGET_MIB, 1536);
+        assert_eq!(budget_from(None), 1536 << 20);
+        assert_eq!(MIN_IDLE_PRESENTS, 180);
+        assert_eq!(MIN_IDLE_MS, 15_000);
+
+        let mut t = cache(3, 2, |h| (h as u64, h as u64 * 100));
+        let none = std::collections::HashSet::new();
+        let pass = t.collect(2000, 1000, 180, 15_000, &none);
+        assert_eq!(pass.heaps_freed, 1, "oldest heap is reclaimed once 180 presents and 15s elapse");
+        assert_eq!(t.held_bytes(1000), 2000);
     }
 }
