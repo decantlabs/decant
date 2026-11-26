@@ -26,16 +26,18 @@ pub fn clamp_ramp(r: f32) -> f32 {
 
 pub struct Converter {
     channels: usize,
-    /// Input history per channel, `hist[c][i]` is input frame `base + i`.
+    /// Input history per channel, `hist[c][hist_head + i]` is input frame `base + i`.
     hist: Vec<Vec<f32>>,
+    hist_head: usize,
     base: i64,
     /// Input frames received since the last reset.
     total: i64,
     /// Read position of the next output frame, in input frames.
     pos: f64,
     pitch: f32,
-    /// Output frames waiting to be taken, per channel.
+    /// Output frames waiting to be taken, per channel, starting at `pending_head`.
     pending: Vec<Vec<f32>>,
+    pending_head: usize,
 }
 
 fn kernel(x: f64, cutoff: f64) -> f64 {
@@ -49,7 +51,17 @@ fn kernel(x: f64, cutoff: f64) -> f64 {
 
 impl Converter {
     pub fn new(channels: usize, pitch: f32) -> Converter {
-        Converter { channels, hist: vec![Vec::new(); channels], base: 0, total: 0, pos: 0.0, pitch: clamp_pitch(pitch), pending: vec![Vec::new(); channels] }
+        Converter {
+            channels,
+            hist: vec![Vec::new(); channels],
+            hist_head: 0,
+            base: 0,
+            total: 0,
+            pos: 0.0,
+            pitch: clamp_pitch(pitch),
+            pending: vec![Vec::new(); channels],
+            pending_head: 0,
+        }
     }
 
     pub fn pitch(&self) -> f32 {
@@ -58,12 +70,23 @@ impl Converter {
 
     /// Clears the history and the pending output and sets the pitch.
     pub fn reset(&mut self, pitch: f32) {
-        *self = Converter::new(self.channels, pitch);
+        for h in &mut self.hist {
+            h.clear();
+        }
+        for p in &mut self.pending {
+            p.clear();
+        }
+        self.hist_head = 0;
+        self.pending_head = 0;
+        self.base = 0;
+        self.total = 0;
+        self.pos = 0.0;
+        self.pitch = clamp_pitch(pitch);
     }
 
     /// Output frames waiting.
     pub fn pending_frames(&self) -> usize {
-        self.pending.first().map_or(0, Vec::len)
+        self.pending.first().map_or(0, |p| p.len() - self.pending_head)
     }
 
     /// Input frames at or ahead of the read position, not yet converted.
@@ -84,14 +107,17 @@ impl Converter {
 
     /// Feeds the delay with silence so the last input frames come out. The converter then starts over, keeping its pitch.
     pub fn flush(&mut self, target: f32, ramp: f32) {
-        let zeros = vec![0.0f32; DELAY];
-        let slices: Vec<&[f32]> = (0..self.channels).map(|_| zeros.as_slice()).collect();
-        self.push(&slices, target, ramp);
+        let zeros = [0.0f32; DELAY];
+        let slices = [&zeros[..], &zeros[..]];
+        self.push(&slices[..self.channels], target, ramp);
     }
 
     /// Forgets the input history but keeps the pending output: used after a flush, when the output is collected.
     pub fn restart(&mut self) {
-        self.hist = vec![Vec::new(); self.channels];
+        for h in &mut self.hist {
+            h.clear();
+        }
+        self.hist_head = 0;
         self.base = 0;
         self.total = 0;
         self.pos = 0.0;
@@ -99,12 +125,58 @@ impl Converter {
 
     /// Removes the first `frames` pending frames and appends them to `out` (one vector per channel).
     pub fn take(&mut self, frames: usize, out: &mut [Vec<f32>]) {
-        for (p, o) in self.pending.iter_mut().zip(out) {
-            o.extend(p.drain(..frames));
+        if frames == 0 {
+            return;
+        }
+        let start = self.pending_head;
+        let end = start + frames;
+        for (p, o) in self.pending.iter().zip(out) {
+            o.extend_from_slice(&p[start..end]);
+        }
+        self.pending_head = end;
+        let len = self.pending.first().map_or(0, Vec::len);
+        if self.pending_head >= len {
+            for p in &mut self.pending {
+                p.clear();
+            }
+            self.pending_head = 0;
+        } else if self.pending_head >= 4096 {
+            for p in &mut self.pending {
+                p.copy_within(self.pending_head.., 0);
+                p.truncate(len - self.pending_head);
+            }
+            self.pending_head = 0;
         }
     }
 
     fn produce(&mut self, target: f32, ramp: f32) {
+        let pos_i = self.pos.floor() as i64;
+        if pos_i >= self.total {
+            return;
+        }
+        let est = ((self.total as f64 - self.pos) / f64::from(self.pitch.min(target)).max(0.125)).ceil().max(0.0) as usize;
+        for p in &mut self.pending {
+            p.reserve(est);
+        }
+        if self.pitch == 1.0 && target == 1.0 && self.pos.fract() == 0.0 {
+            let mut pos = self.pos as i64;
+            while pos < self.total {
+                let k = pos - DELAY as i64;
+                if k < 0 {
+                    for c in 0..self.channels {
+                        self.pending[c].push(0.0);
+                    }
+                } else {
+                    let idx = self.hist_head + (k - self.base) as usize;
+                    for c in 0..self.channels {
+                        self.pending[c].push(self.hist[c].get(idx).copied().unwrap_or(0.0));
+                    }
+                }
+                pos += 1;
+            }
+            self.pos = pos as f64;
+            return;
+        }
         while (self.pos.floor() as i64) < self.total {
             let centre = self.pos - DELAY as f64;
             let first = centre.floor() as i64 - (DELAY as i64 - 1);
@@ -123,7 +195,7 @@ impl Converter {
                 for (i, w) in weights.iter().enumerate() {
                     let k = first + i as i64;
                     if k >= 0 && *w != 0.0 {
-                        let idx = (k - self.base) as usize;
+                        let idx = self.hist_head + (k - self.base) as usize;
                         acc += w * f64::from(self.hist[c].get(idx).copied().unwrap_or(0.0));
                     }
                 }
@@ -143,11 +215,23 @@ impl Converter {
         let keep_from = (self.pos - DELAY as f64).floor() as i64 - DELAY as i64 - 2;
         let drop = (keep_from - self.base).max(0) as usize;
         if drop > 0 {
-            for h in &mut self.hist {
-                let n = drop.min(h.len());
-                h.drain(..n);
+            let avail = self.hist.first().map_or(0, |h| h.len() - self.hist_head);
+            let n = drop.min(avail);
+            self.hist_head += n;
+            self.base += n as i64;
+            let total_len = self.hist.first().map_or(0, Vec::len);
+            if self.hist_head >= total_len {
+                for h in &mut self.hist {
+                    h.clear();
+                }
+                self.hist_head = 0;
+            } else if self.hist_head >= 4096 {
+                for h in &mut self.hist {
+                    h.copy_within(self.hist_head.., 0);
+                    h.truncate(total_len - self.hist_head);
+                }
+                self.hist_head = 0;
             }
-            self.base += drop as i64;
         }
     }
 }

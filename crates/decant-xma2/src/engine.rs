@@ -7,7 +7,7 @@
 //! frames are decoded as soon as they are complete. The streams hold two channels each, and the
 //! output interleaves all channels, stream by stream.
 
-use decant_xma::{Decoder, PACKET_BITS, PACKET_BYTES, first_frame, read_frame};
+use decant_xma::{Decoder, Frame, PACKET_BITS, PACKET_BYTES, first_frame, read_frame_into};
 
 use crate::Format;
 
@@ -41,8 +41,12 @@ struct Stream {
     last: Option<usize>,
     /// Start bit of the next frame, when known.
     pos: Option<usize>,
+    /// Reusable frame buffer to avoid per-frame heap allocations.
+    frame: Frame,
     /// Decoded samples of this stream, interleaved, not yet merged into the output.
     out: Vec<i16>,
+    /// Read cursor into `out`.
+    out_pos: usize,
     /// Packets of other streams still to come before the next packet of this one.
     skip: u32,
     /// Number of the packet of the whole block that came last to this stream (0 for none yet).
@@ -57,7 +61,14 @@ impl Stream {
             buf: Vec::new(),
             last: None,
             pos: None,
+            frame: Frame {
+                data: Vec::new(),
+                bits: 0,
+                start: 0,
+                next: None,
+            },
             out: Vec::new(),
+            out_pos: 0,
             skip: 0,
             last_packet: 0,
         }
@@ -77,17 +88,26 @@ impl Stream {
         loop {
             if self.pos.is_none() {
                 self.pos = match self.last {
-                    Some(last) => read_frame(&self.buf, last).and_then(|f| f.next),
+                    Some(last) => {
+                        if read_frame_into(&self.buf, last, &mut self.frame) {
+                            self.frame.next
+                        } else {
+                            None
+                        }
+                    }
                     None => first_frame(&self.buf),
                 };
             }
-            let Some(frame) = self.pos.and_then(|pos| read_frame(&self.buf, pos)) else {
+            let Some(pos) = self.pos else {
                 break;
             };
+            if !read_frame_into(&self.buf, pos, &mut self.frame) {
+                break;
+            }
             // A frame that does not decode leaves silence of the same length and the stream goes on.
-            let _ = self.decoder.decode(&frame, &mut self.out);
-            self.last = Some(frame.start);
-            self.pos = frame.next;
+            let _ = self.decoder.decode(&self.frame, &mut self.out);
+            self.last = Some(self.frame.start);
+            self.pos = self.frame.next;
         }
         // Packets before the last frame are not read again.
         if let Some(last) = self.last {
@@ -101,7 +121,19 @@ impl Stream {
     }
 
     fn frames(&self) -> usize {
-        self.out.len() / self.channels
+        (self.out.len() - self.out_pos) / self.channels
+    }
+
+    fn consume(&mut self, samples: usize) {
+        self.out_pos += samples;
+        if self.out_pos >= self.out.len() {
+            self.out.clear();
+            self.out_pos = 0;
+        } else if self.out_pos >= 4096 {
+            self.out.copy_within(self.out_pos.., 0);
+            self.out.truncate(self.out.len() - self.out_pos);
+            self.out_pos = 0;
+        }
     }
 
     /// Ends the stream: the held half frame is appended and the stream starts afresh.
@@ -121,6 +153,8 @@ pub struct Engine {
     streams: Vec<Stream>,
     /// Interleaved samples of all channels, merged and not yet handed out.
     pending: Vec<i16>,
+    /// Read cursor into `pending`.
+    pending_pos: usize,
     /// The stream was ended and no packet came since, so a further flush does nothing.
     flushed: bool,
     /// Packets fed since the stream began.
@@ -147,6 +181,7 @@ impl Engine {
             channels: usize::from(format.channels),
             streams,
             pending: Vec::new(),
+            pending_pos: 0,
             flushed: false,
             packets: 0,
         })
@@ -154,7 +189,7 @@ impl Engine {
 
     /// Frames decoded but not yet handed out.
     pub fn pending_frames(&self) -> usize {
-        self.pending.len() / self.channels
+        (self.pending.len() - self.pending_pos) / self.channels
     }
 
     /// Feeds whole packets. A rest shorter than one packet is ignored.
@@ -203,26 +238,46 @@ impl Engine {
             .min(max_frames)
             .min(pcm.len() / self.channels);
         let samples = give * self.channels;
-        pcm[..samples].copy_from_slice(&self.pending[..samples]);
-        self.pending.drain(..samples);
+        let end = self.pending_pos + samples;
+        pcm[..samples].copy_from_slice(&self.pending[self.pending_pos..end]);
+        self.pending_pos = end;
+        if self.pending_pos >= self.pending.len() {
+            self.pending.clear();
+            self.pending_pos = 0;
+        } else if self.pending_pos >= 8192 {
+            self.pending.copy_within(self.pending_pos.., 0);
+            self.pending.truncate(self.pending.len() - self.pending_pos);
+            self.pending_pos = 0;
+        }
         give
     }
 
     /// Interleaves the frames every stream has ready into `pending`.
     fn merge(&mut self) {
         if let [only] = self.streams.as_mut_slice() {
-            self.pending.append(&mut only.out);
+            if self.pending_pos == self.pending.len() && self.pending_pos > 0 {
+                self.pending.clear();
+                self.pending_pos = 0;
+            }
+            self.pending.extend_from_slice(&only.out[only.out_pos..]);
+            only.out.clear();
+            only.out_pos = 0;
             return;
         }
         let ready = self.streams.iter().map(Stream::frames).min().unwrap_or(0);
+        if ready == 0 {
+            return;
+        }
+        self.pending.reserve(ready * self.channels);
         for frame in 0..ready {
             for s in &self.streams {
+                let start = s.out_pos + frame * s.channels;
                 self.pending
-                    .extend_from_slice(&s.out[frame * s.channels..(frame + 1) * s.channels]);
+                    .extend_from_slice(&s.out[start..start + s.channels]);
             }
         }
         for s in &mut self.streams {
-            s.out.drain(..ready * s.channels);
+            s.consume(ready * s.channels);
         }
     }
 }

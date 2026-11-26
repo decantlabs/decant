@@ -4,11 +4,10 @@
 #![allow(unsafe_code)]
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
 
 use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, ERROR_MOD_NOT_FOUND, ERROR_PROC_NOT_FOUND, GetLastError, HMODULE, S_OK};
 use windows::Win32::Media::Audio::XAudio2::{
@@ -27,31 +26,43 @@ use crate::{CREATE_KNOWN, MASTERING_KNOWN, USE_DEFAULT_PROCESSOR, XAUDIO2_E_INVA
 type CreateFn = unsafe extern "system" fn(*mut *mut c_void, u32, u32) -> HRESULT;
 type FxFn = unsafe extern "system" fn(*mut *mut c_void) -> HRESULT;
 type SubmitFn = unsafe extern "system" fn(*mut c_void, *const XAUDIO2_BUFFER, *const XAUDIO2_BUFFER_WMA) -> HRESULT;
+type DestroyFn = unsafe extern "system" fn(*mut c_void);
 
-static VOICE_SUBMITS: OnceLock<Mutex<HashMap<usize, (SubmitFn, bool)>>> = OnceLock::new();
-
-fn voice_submits() -> &'static Mutex<HashMap<usize, (SubmitFn, bool)>> {
-    VOICE_SUBMITS.get_or_init(|| Mutex::new(HashMap::new()))
+#[repr(C)]
+struct VoiceVtable {
+    vtable: IXAudio2SourceVoice_Vtbl,
+    original_submit: SubmitFn,
+    original_destroy: DestroyFn,
+    logged: AtomicBool,
 }
 
 unsafe extern "system" fn submit_source_buffer(this: *mut c_void, buffer: *const XAUDIO2_BUFFER, wma: *const XAUDIO2_BUFFER_WMA) -> HRESULT {
-    let (submit, bytes_to_log) = {
-        let mut voices = voice_submits().lock().unwrap_or_else(|e| e.into_inner());
-        let Some((submit, logged)) = voices.get_mut(&(this as usize)) else {
-            return HRESULT(XAUDIO2_E_INVALID_CALL);
-        };
-        let bytes = if !*logged && !buffer.is_null() {
-            // SAFETY: XAudio2 passes a valid XAUDIO2_BUFFER; its packed byte count is unaligned.
-            Some(unsafe { std::ptr::addr_of!((*buffer).AudioBytes).read_unaligned() })
-        } else { None };
-        *logged |= bytes.is_some();
-        (*submit, bytes)
-    };
-    if let Some(bytes) = bytes_to_log {
+    if this.is_null() {
+        return HRESULT(XAUDIO2_E_INVALID_CALL);
+    }
+    // SAFETY: `this` is an instrumented source voice whose vtable pointer points to `VoiceVtable::vtable`.
+    let vt = unsafe { &**(this.cast::<*const VoiceVtable>()) };
+    if !vt.logged.load(Ordering::Relaxed) && !buffer.is_null() && !vt.logged.swap(true, Ordering::Relaxed) {
+        // SAFETY: XAudio2 passes a valid XAUDIO2_BUFFER; its packed byte count is unaligned.
+        let bytes = unsafe { std::ptr::addr_of!((*buffer).AudioBytes).read_unaligned() };
         log(&format!("SubmitSourceBuffer: first buffer {bytes} bytes"));
     }
     // SAFETY: this is the original XAudio2 source voice method captured at creation.
-    unsafe { submit(this, buffer, wma) }
+    unsafe { (vt.original_submit)(this, buffer, wma) }
+}
+
+unsafe extern "system" fn destroy_source_voice(this: *mut c_void) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is an instrumented source voice whose vtable pointer points to `VoiceVtable`.
+    let vt_ptr = unsafe { *this.cast::<*mut VoiceVtable>() };
+    // SAFETY: `vt_ptr` was allocated by `Box::into_raw` in `instrument_source_voice` and is freed once here.
+    let original_destroy = unsafe { (*vt_ptr).original_destroy };
+    // SAFETY: forward destruction to the PC engine before freeing our wrapper vtable.
+    unsafe { original_destroy(this) };
+    // SAFETY: `vt_ptr` is owned by this voice and no longer reachable after `original_destroy`.
+    drop(unsafe { Box::from_raw(vt_ptr) });
 }
 
 unsafe fn instrument_source_voice(raw: *mut c_void) {
@@ -60,14 +71,21 @@ unsafe fn instrument_source_voice(raw: *mut c_void) {
     let vtable_slot = raw.cast::<*const IXAudio2SourceVoice_Vtbl>();
     let original = unsafe { *vtable_slot };
     if original.is_null() { return; }
-    // Each voice receives a private copy so other XAudio2 objects keep their original vtable.
-    let mut copy = Box::new(unsafe { std::ptr::read(original) });
-    let submit = copy.SubmitSourceBuffer;
-    copy.SubmitSourceBuffer = submit_source_buffer;
-    let replacement = Box::into_raw(copy);
-    voice_submits().lock().unwrap_or_else(|e| e.into_inner()).insert(raw as usize, (submit, false));
-    // SAFETY: XAudio2 exposes a writable COM interface pointer; the copy lives for the process.
-    unsafe { *vtable_slot = replacement };
+    // Each voice receives a private vtable copy so other XAudio2 objects keep their original vtable
+    // and SubmitSourceBuffer runs lock-free without a global map.
+    let mut vtable = unsafe { std::ptr::read(original) };
+    let original_submit = vtable.SubmitSourceBuffer;
+    let original_destroy = vtable.base__.DestroyVoice;
+    vtable.SubmitSourceBuffer = submit_source_buffer;
+    vtable.base__.DestroyVoice = destroy_source_voice;
+    let replacement = Box::into_raw(Box::new(VoiceVtable {
+        vtable,
+        original_submit,
+        original_destroy,
+        logged: AtomicBool::new(false),
+    }));
+    // SAFETY: `VoiceVtable` is `#[repr(C)]` with `vtable` as its first field.
+    unsafe { *vtable_slot = std::ptr::addr_of!((*replacement).vtable) };
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -228,13 +246,14 @@ unsafe extern "system" fn query_interface(this: *mut c_void, iid: *const GUID, o
 
 unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
     // SAFETY: COM passes a live Engine.
-    unsafe { engine(this) }.refs.fetch_add(1, Ordering::SeqCst) + 1
+    unsafe { engine(this) }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     // SAFETY: COM passes a live Engine.
-    let left = unsafe { engine(this) }.refs.fetch_sub(1, Ordering::SeqCst) - 1;
+    let left = unsafe { engine(this) }.refs.fetch_sub(1, Ordering::Release) - 1;
     if left == 0 {
+        fence(Ordering::Acquire);
         // SAFETY: the last reference is gone. The Box made by `create` is dropped once, which
         // releases the PC engine.
         drop(unsafe { Box::from_raw(this.cast::<Engine>()) });
@@ -469,4 +488,56 @@ pub unsafe fn forward_fx(name: &str, out: *mut *mut c_void) -> HRESULT {
     };
     // SAFETY: both effect factories take one output pointer (xaudio2fx.h).
     unsafe { std::mem::transmute::<*const c_void, FxFn>(address)(out) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[repr(C)]
+    struct MockVoice {
+        vtable: *const IXAudio2SourceVoice_Vtbl,
+        submits: AtomicUsize,
+        destroyed: AtomicBool,
+    }
+
+    unsafe extern "system" fn mock_submit(this: *mut c_void, _buf: *const XAUDIO2_BUFFER, _wma: *const XAUDIO2_BUFFER_WMA) -> HRESULT {
+        // SAFETY: `this` is a `MockVoice`.
+        unsafe { &*this.cast::<MockVoice>() }.submits.fetch_add(1, Ordering::Relaxed);
+        S_OK
+    }
+
+    unsafe extern "system" fn mock_destroy(this: *mut c_void) {
+        // SAFETY: `this` is a `MockVoice`.
+        unsafe { &*this.cast::<MockVoice>() }.destroyed.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn voice_vtable_submit_and_destroy_are_lock_free() {
+        assert_eq!(std::mem::offset_of!(VoiceVtable, vtable), 0);
+        const SLOTS: usize = size_of::<IXAudio2SourceVoice_Vtbl>() / size_of::<usize>();
+        let raw_vtbl = [mock_destroy as *const () as usize; SLOTS];
+        // SAFETY: every slot in `IXAudio2SourceVoice_Vtbl` is a function pointer; `mock_destroy` is non-null.
+        let mut base_vtbl: IXAudio2SourceVoice_Vtbl = unsafe { std::mem::transmute_copy(&raw_vtbl) };
+        base_vtbl.SubmitSourceBuffer = mock_submit;
+        base_vtbl.base__.DestroyVoice = mock_destroy;
+
+        let mut voice = MockVoice {
+            vtable: &base_vtbl,
+            submits: AtomicUsize::new(0),
+            destroyed: AtomicBool::new(false),
+        };
+        let raw = (&raw mut voice).cast::<c_void>();
+        // SAFETY: `raw` is a valid `MockVoice` with a valid vtable pointer.
+        unsafe {
+            instrument_source_voice(raw);
+            let vt = *raw.cast::<*const IXAudio2SourceVoice_Vtbl>();
+            assert_eq!(((*vt).SubmitSourceBuffer)(raw, std::ptr::null(), std::ptr::null()), S_OK);
+            assert_eq!(((*vt).SubmitSourceBuffer)(raw, std::ptr::null(), std::ptr::null()), S_OK);
+            assert_eq!(voice.submits.load(Ordering::Relaxed), 2);
+            ((*vt).base__.DestroyVoice)(raw);
+            assert!(voice.destroyed.load(Ordering::Relaxed));
+        }
+    }
 }

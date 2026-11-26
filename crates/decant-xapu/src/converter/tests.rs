@@ -145,3 +145,23 @@ fn unconverted_frames_and_reset() {
     assert_eq!(c.unconverted_frames(), 0);
     assert_eq!(c.pitch(), 2.0);
 }
+
+#[test]
+fn cursor_compaction_over_long_stream() {
+    let total = 10_000usize;
+    let input = signal(total, |i| ((i % 251) as f32) * 0.001);
+    let mut c = Converter::new(1, 1.0);
+    let mut out = vec![Vec::new()];
+    for chunk in input.chunks(512) {
+        c.push(&[chunk], 1.0, 1.0);
+        let take_n = c.pending_frames().min(256);
+        c.take(take_n, &mut out);
+    }
+    c.flush(1.0, 1.0);
+    let rem = c.pending_frames();
+    c.take(rem, &mut out);
+    assert_eq!(out[0].len(), total + DELAY);
+    for i in DELAY..total {
+        assert!((out[0][i] - input[i - DELAY]).abs() < 1e-6, "mismatch at {i}");
+    }
+}

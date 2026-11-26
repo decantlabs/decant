@@ -30,8 +30,26 @@ impl<'a> BitReader<'a> {
     }
 
     /// The next 32 bits, not consumed. Bits beyond the end are zero.
+    #[inline]
     pub(crate) fn peek(&self) -> u32 {
         let first = self.pos / 8;
+        let shift = self.pos & 7;
+        if self.pos + 32 <= self.end {
+            if shift == 0 && first + 4 <= self.data.len() {
+                let b = &self.data[first..first + 4];
+                return u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+            }
+            if first + 5 <= self.data.len() {
+                let b = &self.data[first..first + 5];
+                let word = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                return (word << shift) | (u32::from(b[4]) >> (8 - shift));
+            }
+        }
+        self.peek_tail(first, shift)
+    }
+
+    #[cold]
+    fn peek_tail(&self, first: usize, shift: usize) -> u32 {
         let mut acc = 0u64;
         for i in 0..5 {
             let at = first + i;
@@ -42,7 +60,7 @@ impl<'a> BitReader<'a> {
             };
             acc = (acc << 8) | u64::from(byte);
         }
-        let aligned = ((acc << (self.pos % 8)) >> 8) as u32;
+        let aligned = ((acc << shift) >> 8) as u32;
         let live = self.end.saturating_sub(self.pos).min(32) as u32;
         if live == 0 {
             0

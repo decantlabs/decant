@@ -123,18 +123,79 @@ pub fn first_frame(data: &[u8]) -> Option<usize> {
 
 /// The frame that starts at bit `start`. `None` when there is none, because of padding or because the buffer ends inside it.
 pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
+    let mut frame = Frame {
+        data: Vec::new(),
+        bits: 0,
+        start: 0,
+        next: None,
+    };
+    read_frame_into(data, start, &mut frame).then_some(frame)
+}
+
+/// Reads the frame that starts at bit `start` into `frame`, reusing `frame.data`.
+/// Returns `false` when there is no complete frame at `start`.
+pub fn read_frame_into(data: &[u8], start: usize, frame: &mut Frame) -> bool {
     let mut walker = StreamBits { data, pos: start };
-    let bits = walker.number(LENGTH_BITS)?;
+    let Some(bits) = walker.number(LENGTH_BITS) else {
+        return false;
+    };
     if !is_frame_length(bits) {
-        return None;
+        return false;
     }
-    let mut body = vec![0u8; bits.div_ceil(8)];
+    let bytes = bits.div_ceil(8);
+    frame.data.clear();
+    frame.data.resize(bytes, 0);
     walker.pos = start;
-    for i in 0..bits {
-        body[i / 8] |= u8::from(walker.bit()?) << (7 - i % 8);
+    let mut copied = 0usize;
+    while copied < bits {
+        if walker.pos.is_multiple_of(PACKET_BITS) {
+            let Some(last) = (walker.pos / PACKET_BITS).checked_sub(1) else {
+                return false;
+            };
+            let Some(next_pkt) = following_packet(data, last) else {
+                return false;
+            };
+            walker.pos = next_pkt * PACKET_BITS + HEADER_BITS;
+        }
+        let pkt_rem = PACKET_BITS - (walker.pos % PACKET_BITS);
+        let chunk = (bits - copied).min(pkt_rem);
+        let mut done = 0usize;
+        if copied.is_multiple_of(8) && chunk >= 8 {
+            let nbytes = chunk / 8;
+            let src_byte = walker.pos / 8;
+            let bit_off = walker.pos % 8;
+            if bit_off == 0 {
+                if src_byte + nbytes > data.len() {
+                    return false;
+                }
+                frame.data[copied / 8..copied / 8 + nbytes]
+                    .copy_from_slice(&data[src_byte..src_byte + nbytes]);
+                done = nbytes * 8;
+            } else if src_byte + nbytes < data.len() {
+                let dst = &mut frame.data[copied / 8..copied / 8 + nbytes];
+                let src = &data[src_byte..src_byte + nbytes + 1];
+                let rshift = 8 - bit_off;
+                for (d, w) in dst.iter_mut().zip(src.windows(2)) {
+                    *d = (w[0] << bit_off) | (w[1] >> rshift);
+                }
+                done = nbytes * 8;
+            }
+        }
+        walker.pos += done;
+        copied += done;
+        while done < chunk {
+            let Some(bit) = walker.bit() else {
+                return false;
+            };
+            if bit {
+                frame.data[copied / 8] |= 0x80 >> (copied % 8);
+            }
+            copied += 1;
+            done += 1;
+        }
     }
     let end = walker.pos;
-    let more_in_packet = body[(bits - 1) / 8] >> (7 - (bits - 1) % 8) & 1 == 1;
+    let more_in_packet = frame.data[(bits - 1) / 8] >> (7 - (bits - 1) % 8) & 1 == 1;
     let last_packet = (end - 1) / PACKET_BITS;
     let crossed = last_packet != start / PACKET_BITS;
     let next = if more_in_packet || crossed {
@@ -145,12 +206,10 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
         following_packet(data, last_packet)
             .and_then(|packet| settle(data, first_start(data, packet)?))
     };
-    Some(Frame {
-        data: body,
-        bits,
-        start,
-        next,
-    })
+    frame.bits = bits;
+    frame.start = start;
+    frame.next = next;
+    true
 }
 
 #[cfg(test)]
@@ -287,5 +346,26 @@ mod tests {
         assert!(read_frame(&data, 32).is_some());
         assert!(read_frame(&data[..PACKET_BYTES], 32).is_none());
         assert!(read_frame(&data, 0).is_none());
+    }
+
+    #[test]
+    fn read_frame_into_reuses_buffer_and_matches_read_frame() {
+        let data = packets(&[5003, 5007, 17001, 400]);
+        let mut reused = Frame {
+            data: Vec::new(),
+            bits: 0,
+            start: 0,
+            next: None,
+        };
+        let mut at = first_frame(&data);
+        while let Some(pos) = at {
+            let expected = read_frame(&data, pos).unwrap();
+            assert!(read_frame_into(&data, pos, &mut reused));
+            assert_eq!(reused.data, expected.data);
+            assert_eq!(reused.bits, expected.bits);
+            assert_eq!(reused.start, expected.start);
+            assert_eq!(reused.next, expected.next);
+            at = reused.next;
+        }
     }
 }

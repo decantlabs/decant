@@ -35,6 +35,10 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+const GAIN_MIN: i32 = -256;
+const GAIN_MAX: i32 = 256;
+const GAIN_COUNT: usize = (GAIN_MAX - GAIN_MIN + 1) as usize;
+
 /// Tables that every decoder shares.
 struct Shared {
     scale_delta: PrefixCode,
@@ -45,23 +49,28 @@ struct Shared {
     single: PrefixCode,
     imdct: [HalfImdct; SIZES],
     windows: [Vec<f32>; SIZES],
+    gains: [f32; GAIN_COUNT],
 }
 
 fn shared() -> &'static Shared {
     static SHARED: OnceLock<Shared> = OnceLock::new();
-    SHARED.get_or_init(|| Shared {
-        scale_delta: PrefixCode::new(&SCALE_DELTA),
-        scale_run: PrefixCode::new(&SCALE_RUN),
-        coef: [PrefixCode::new(&COEF_A), PrefixCode::new(&COEF_B)],
-        quad: PrefixCode::new(&QUAD),
-        pair: PrefixCode::new(&PAIR),
-        single: PrefixCode::new(&SINGLE),
-        imdct: [
-            HalfImdct::new(512),
-            HalfImdct::new(256),
-            HalfImdct::new(128),
-        ],
-        windows: [sine_window(512), sine_window(256), sine_window(128)],
+    SHARED.get_or_init(|| {
+        let gains = std::array::from_fn(|i| 10f64.powf((i as i32 + GAIN_MIN) as f64 / 20.0) as f32);
+        Shared {
+            scale_delta: PrefixCode::new(&SCALE_DELTA),
+            scale_run: PrefixCode::new(&SCALE_RUN),
+            coef: [PrefixCode::new(&COEF_A), PrefixCode::new(&COEF_B)],
+            quad: PrefixCode::new(&QUAD),
+            pair: PrefixCode::new(&PAIR),
+            single: PrefixCode::new(&SINGLE),
+            imdct: [
+                HalfImdct::new(512),
+                HalfImdct::new(256),
+                HalfImdct::new(128),
+            ],
+            windows: [sine_window(512), sine_window(256), sine_window(128)],
+            gains,
+        }
     })
 }
 
@@ -123,6 +132,24 @@ impl Channel {
             at: 0,
             buf: vec![0.0; BUF_LEN],
         }
+    }
+
+    fn reset(&mut self) {
+        self.prev_len = FRAME_SAMPLES;
+        self.has_coefs = false;
+        self.sub_count = 0;
+        self.sub_index = 0;
+        self.done = 0;
+        self.quant_step = 0;
+        self.sf_known = false;
+        self.sf_step = 1;
+        self.sf_max = 0;
+        self.sf_sent = 0;
+        self.sf_used = 0;
+        self.sf_size = 0;
+        self.vector_len = 0;
+        self.at = 0;
+        self.buf.fill(0.0);
     }
 }
 
@@ -229,7 +256,7 @@ impl Decoder {
     /// Forgets the overlap of the previous frame, as at the start of a stream.
     pub fn reset(&mut self) {
         for c in &mut self.chans {
-            *c = Channel::new();
+            c.reset();
         }
     }
 
@@ -237,16 +264,32 @@ impl Decoder {
     /// the same length and gives the error.
     pub fn decode(&mut self, frame: &Frame, out: &mut Vec<i16>) -> Result<(), Error> {
         let result = self.decode_frame(frame);
+        out.reserve(FRAME_SAMPLES * self.channels);
         if result.is_ok() {
-            for i in 0..FRAME_SAMPLES {
-                out.extend(self.chans.iter().map(|c| to_pcm(c.buf[i])));
+            match self.chans.as_slice() {
+                [c0] => {
+                    for &s in &c0.buf[..FRAME_SAMPLES] {
+                        out.push(to_pcm(s));
+                    }
+                }
+                [c0, c1] => {
+                    for i in 0..FRAME_SAMPLES {
+                        out.push(to_pcm(c0.buf[i]));
+                        out.push(to_pcm(c1.buf[i]));
+                    }
+                }
+                _ => {
+                    for i in 0..FRAME_SAMPLES {
+                        out.extend(self.chans.iter().map(|c| to_pcm(c.buf[i])));
+                    }
+                }
             }
             for c in &mut self.chans {
                 c.buf
                     .copy_within(FRAME_SAMPLES..FRAME_SAMPLES + FRAME_SAMPLES / 2, 0);
             }
         } else {
-            out.extend(std::iter::repeat_n(0, FRAME_SAMPLES * self.channels));
+            out.resize(out.len() + FRAME_SAMPLES * self.channels, 0);
             self.reset();
         }
         result
@@ -254,8 +297,24 @@ impl Decoder {
 
     /// Ends the stream: appends the half frame still held for overlap, 256 samples per channel.
     pub fn flush(&mut self, out: &mut Vec<i16>) {
-        for i in 0..FRAME_SAMPLES / 2 {
-            out.extend(self.chans.iter().map(|c| to_pcm(c.buf[i])));
+        out.reserve(FRAME_SAMPLES / 2 * self.channels);
+        match self.chans.as_slice() {
+            [c0] => {
+                for &s in &c0.buf[..FRAME_SAMPLES / 2] {
+                    out.push(to_pcm(s));
+                }
+            }
+            [c0, c1] => {
+                for i in 0..FRAME_SAMPLES / 2 {
+                    out.push(to_pcm(c0.buf[i]));
+                    out.push(to_pcm(c1.buf[i]));
+                }
+            }
+            _ => {
+                for i in 0..FRAME_SAMPLES / 2 {
+                    out.extend(self.chans.iter().map(|c| to_pcm(c.buf[i])));
+                }
+            }
         }
         self.reset();
     }
@@ -740,7 +799,11 @@ impl Decoder {
             let ch = &mut self.chans[c];
             for band in 0..sub.bands {
                 let exponent = ch.quant_step - (ch.sf_max - ch.sf[ch.sf_used][band]) * ch.sf_step;
-                let gain = 10f32.powf(exponent as f32 / 20.0);
+                let gain = if (GAIN_MIN..=GAIN_MAX).contains(&exponent) {
+                    tables.gains[(exponent - GAIN_MIN) as usize]
+                } else {
+                    10f32.powf(exponent as f32 / 20.0)
+                };
                 for y in edges[band]..edges[band + 1].min(sub.len) {
                     self.scratch[y] = ch.buf[ch.at + y] * gain;
                 }

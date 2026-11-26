@@ -86,10 +86,10 @@ pub unsafe extern "system" fn XApuEnqueueCommand(handle: Handle, command: *const
 /// `result` is null or points at 0x50 writable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn XApuDequeueResult(handle: Handle, result: *mut XapuResult) -> Hresult {
-    if !engine::is_connected(handle) {
-        return failed("XApuDequeueResult", E_INVALIDARG);
-    }
     if result.is_null() {
+        if !engine::is_connected(handle) {
+            return failed("XApuDequeueResult", E_INVALIDARG);
+        }
         return failed("XApuDequeueResult", E_POINTER);
     }
     match engine::dequeue(handle) {

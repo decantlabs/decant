@@ -19,7 +19,7 @@ pub mod synth;
 mod tables;
 
 pub use decoder::{Decoder, Error};
-pub use stream::{Frame, PacketHeader, first_frame, packet_header, read_frame};
+pub use stream::{Frame, PacketHeader, first_frame, packet_header, read_frame, read_frame_into};
 
 /// Bytes in one packet.
 pub const PACKET_BYTES: usize = 2048;

@@ -414,3 +414,24 @@ fn execution_time_is_set_and_failures_leave_a_result() {
     assert!(res.execution_time_us() < 10_000_000);
     assert_eq!(res.options(), 0);
 }
+
+#[test]
+fn concurrent_streams_and_result_count() {
+    let _s = serial();
+    let c = pcm(2, 4, 0);
+    c.start(0, 1, 1.0, BUF_MONO);
+    c.start(1, 1, 1.0, BUF_MONO);
+    let mut out0 = vec![0f32; 128];
+    let mut out1 = vec![0f32; 128];
+    let input = bytes_of(&[0.5; 128]);
+    let (_, r0) = c.data(0, 0, 1.0, 1.0, 128, &input, 128, &mut out0);
+    let (_, r1) = c.data(1, 0, 1.0, 1.0, 128, &input, 128, &mut out1);
+    assert_eq!(r0.code(), S_OK);
+    assert_eq!(r1.code(), S_OK);
+    assert_eq!(r0.stream(), 0);
+    assert_eq!(r1.stream(), 1);
+    let mut dequeued = 0u32;
+    let pending = unsafe { XApuGetResultCount(c.handle, &mut dequeued) };
+    assert_eq!(pending, 0);
+    assert_eq!(dequeued, 4);
+}

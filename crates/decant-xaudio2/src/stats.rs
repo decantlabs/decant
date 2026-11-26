@@ -55,12 +55,12 @@ static COUNTERS: [AtomicU32; FIELDS] = [const { AtomicU32::new(0) }; FIELDS];
 
 /// Adds one to a counter.
 pub fn bump(counter: Counter) {
-    COUNTERS[counter as usize].fetch_add(1, Ordering::SeqCst);
+    COUNTERS[counter as usize].fetch_add(1, Ordering::Relaxed);
 }
 
 /// The counters now.
 pub fn snapshot() -> DecantXa2Stats {
-    let v: [u32; FIELDS] = std::array::from_fn(|i| if i == 0 { STATS_SIZE } else { COUNTERS[i].load(Ordering::SeqCst) });
+    let v: [u32; FIELDS] = std::array::from_fn(|i| if i == 0 { STATS_SIZE } else { COUNTERS[i].load(Ordering::Relaxed) });
     DecantXa2Stats {
         struct_size: v[0],
         engines_created: v[1],
@@ -80,7 +80,7 @@ pub fn snapshot() -> DecantXa2Stats {
 /// Sets every counter back to zero.
 pub fn reset() {
     for counter in &COUNTERS[1..] {
-        counter.store(0, Ordering::SeqCst);
+        counter.store(0, Ordering::Relaxed);
     }
 }
 

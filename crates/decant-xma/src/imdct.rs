@@ -12,6 +12,8 @@ fn unit(angle: f64) -> Cx {
     (angle.cos(), angle.sin())
 }
 
+const MAX_HALF: usize = crate::FRAME_SAMPLES / 2;
+
 /// Tables for one transform size.
 pub(crate) struct HalfImdct {
     n: usize,
@@ -19,11 +21,25 @@ pub(crate) struct HalfImdct {
     rotate: Vec<Cx>,
     /// exp(-2 pi i j / (n/2)) for j below n/4.
     roots: Vec<Cx>,
+    /// Bit-reversal permutation indices for `m = n / 2` points.
+    bit_rev: Vec<u16>,
 }
 
 impl HalfImdct {
     pub(crate) fn new(n: usize) -> Self {
         let m = n / 2;
+        assert!(m <= MAX_HALF);
+        let mut bit_rev = vec![0u16; m];
+        let mut rev = 0usize;
+        for slot in bit_rev.iter_mut().skip(1) {
+            let mut bit = m >> 1;
+            while rev & bit != 0 {
+                rev ^= bit;
+                bit >>= 1;
+            }
+            rev |= bit;
+            *slot = rev as u16;
+        }
         HalfImdct {
             n,
             rotate: (0..m)
@@ -32,6 +48,7 @@ impl HalfImdct {
             roots: (0..m / 2)
                 .map(|j| unit(-2.0 * PI * j as f64 / m as f64))
                 .collect(),
+            bit_rev,
         }
     }
 
@@ -39,8 +56,10 @@ impl HalfImdct {
     pub(crate) fn run(&self, input: &[f32], output: &mut [f32], scale: f64) {
         let n = self.n;
         let m = n / 2;
-        let mut re = vec![0f64; m];
-        let mut im = vec![0f64; m];
+        let mut re_buf = [0f64; MAX_HALF];
+        let mut im_buf = [0f64; MAX_HALF];
+        let re = &mut re_buf[..m];
+        let im = &mut im_buf[..m];
         // Fold the input into m complex values and rotate them.
         for (j, &(c, s)) in self.rotate.iter().enumerate() {
             let a = f64::from(input[2 * j]);
@@ -48,7 +67,7 @@ impl HalfImdct {
             re[j] = a * c - b * s;
             im[j] = a * s + b * c;
         }
-        self.fft(&mut re, &mut im);
+        self.fft(re, im);
         // Rotate again and unfold: even outputs come from the imaginary parts, odd ones from the real parts, reversed.
         for (j, &(c, s)) in self.rotate.iter().enumerate() {
             let real = re[j] * c - im[j] * s;
@@ -61,15 +80,8 @@ impl HalfImdct {
     /// An in place radix 2 FFT over the m points.
     fn fft(&self, re: &mut [f64], im: &mut [f64]) {
         let m = re.len();
-        // Bit reversal permutation.
-        let mut rev = 0usize;
-        for i in 1..m {
-            let mut bit = m >> 1;
-            while rev & bit != 0 {
-                rev ^= bit;
-                bit >>= 1;
-            }
-            rev |= bit;
+        for (i, &rev) in self.bit_rev.iter().enumerate() {
+            let rev = usize::from(rev);
             if i < rev {
                 re.swap(i, rev);
                 im.swap(i, rev);
