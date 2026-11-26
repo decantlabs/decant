@@ -386,6 +386,7 @@ impl ViewTextures {
         pass.heaps_freed = gone_heaps.len();
         // Evict individual idle unreferenced textures (placed or committed) while still over target.
         if pass.held_after > target && pass.freed.len() < pass_limit {
+            let mut touched_heaps = std::collections::HashSet::new();
             let mut indiv: Vec<(u64, u8, u64)> = Vec::new();
             for e in &self.stale {
                 if free(e) {
@@ -411,8 +412,15 @@ impl ViewTextures {
                 if let Some(e) = removed {
                     self.live_bytes = self.live_bytes.saturating_sub(e.bytes);
                     pass.held_after = pass.held_after.saturating_sub(e.bytes);
+                    if let Some(h) = e.heap {
+                        touched_heaps.insert(h);
+                    }
                     pass.freed.push(e);
                 }
+            }
+            if !touched_heaps.is_empty() {
+                let live_heaps: std::collections::HashSet<usize> = self.made.values().chain(self.stale.iter()).filter_map(|e| e.heap).collect();
+                pass.heaps_freed += touched_heaps.iter().filter(|h| !live_heaps.contains(h)).count();
             }
         }
         #[cfg(windows)]
@@ -421,7 +429,8 @@ impl ViewTextures {
                 crate::view_heap::retire_resource(e.res, present);
             }
         }
-        pass.heaps_in_use = self.held_bytes(heap_bytes).div_ceil(heap_bytes.max(1)) as usize;
+        pass.held_after = self.held_bytes(heap_bytes);
+        pass.heaps_in_use = pass.held_after.div_ceil(heap_bytes.max(1)) as usize;
         pass.stuck = pass.freed.is_empty() && pass.held_before > cap + cap / 2;
         pass
     }

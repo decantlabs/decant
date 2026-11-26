@@ -234,6 +234,11 @@ impl SlotMeta {
         self.pending_free.clear();
         self.free_list.clear();
     }
+
+    fn live_bytes(&self) -> u64 {
+        let free: u64 = self.free_list.iter().map(|&(_, s)| s).sum();
+        self.used.saturating_sub(free)
+    }
 }
 
 struct Heap {
@@ -417,16 +422,20 @@ pub fn retire_resource(res: usize, present: u64) {
 }
 
 /// A texture placed in heap `index` was released (its last reference is held back until the GPU is
-/// done, `retire`). The heap is used again once all of its textures are gone.
+/// done, `retire`). Reclaims any excess empty heaps past [`REUSE_PRESENTS`] back to D3D12.
 pub fn released(index: usize) {
     let now = crate::title_heap::presents();
-    let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(Some(h)) = pool.heaps.get_mut(index) {
-        h.meta.live = h.meta.live.saturating_sub(1);
-        if h.meta.live == 0 {
-            h.meta.free_at = Some(now);
+    let excess = {
+        let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Some(h)) = pool.heaps.get_mut(index) {
+            h.meta.live = h.meta.live.saturating_sub(1);
+            if h.meta.live == 0 {
+                h.meta.free_at = Some(now);
+            }
         }
-    }
+        reclaim_empty_in_pool(&mut pool, now)
+    };
+    release_excess_heaps(excess);
 }
 
 /// The dedicated video memory and the budget (bytes, 0 when unknown) of the adapter of `device`.
@@ -444,10 +453,10 @@ pub fn adapter_memory(device: &windows::Win32::Graphics::Direct3D12::ID3D12Devic
     }
 }
 
-/// Heaps made so far and the bytes taken in them.
+/// Live heaps and the live placed bytes inside them.
 pub fn usage() -> (usize, u64) {
     let pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    (pool.heaps.iter().flatten().count(), pool.heaps.iter().flatten().map(|h| h.meta.used).sum())
+    (pool.heaps.iter().flatten().count(), pool.heaps.iter().flatten().map(|h| h.meta.live_bytes()).sum())
 }
 
 /// Heaps with no live texture: kept, and reusable once their wait is over.
@@ -614,5 +623,6 @@ mod tests {
         // Freeing tail block shrinks `used`.
         meta.free_now(d, 4096);
         assert_eq!(meta.used, 16384);
+        assert_eq!(meta.live_bytes(), 12288);
     }
 }
