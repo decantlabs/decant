@@ -261,13 +261,15 @@ mod platform {
     use super::*;
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, HANDLE, WAIT_OBJECT_0};
     use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
     use windows_sys::Win32::System::Diagnostics::Debug::{
         CREATE_PROCESS_DEBUG_EVENT, CREATE_THREAD_DEBUG_EVENT, ContinueDebugEvent, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT, EXIT_THREAD_DEBUG_EVENT,
         LOAD_DLL_DEBUG_EVENT, OUTPUT_DEBUG_STRING_EVENT, RIP_EVENT, ReadProcessMemory, UNLOAD_DLL_DEBUG_EVENT, WaitForDebugEvent,
     };
-    use windows_sys::Win32::System::Threading::{CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DEBUG_ONLY_THIS_PROCESS, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DEBUG_ONLY_THIS_PROCESS, GetExitCodeProcess, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    };
 
     /// Breaks on the entry of kernelbase functions, run by the debugger (one int3 per function, one
     /// single step to run the replaced instruction, then the break is put back):
@@ -831,13 +833,37 @@ mod platform {
     pub fn run(exe: &Path, args: &[String], folder: &Path, extra_env: &[(String, String)], timeout: Option<Duration>, cancel: &AtomicBool, redirect: bool, game_drive: Option<char>, log: &mut dyn Sink) -> std::io::Result<Outcome> {
         let start = Instant::now();
         let stamp = |start: Instant| format!("{:>8.3}", start.elapsed().as_secs_f64());
+        let ours = folder.join("xgameruntime.dll");
+        let want_runtime = redirect && ours.is_file();
+        let env_lookup = |name: &str| {
+            extra_env
+                .iter()
+                .rev()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+                .or_else(|| std::env::var(name).ok())
+        };
+        let use_no_debugger = no_debugger_eligible(env_lookup(NO_DEBUGGER_ENV).as_deref(), game_drive, env_lookup);
+
+        let mut child_env: Vec<(String, String)> = extra_env.to_vec();
+        if use_no_debugger {
+            child_env.push(("DECANT_INPROC_CPU_EMU".to_owned(), "1".to_owned()));
+            if want_runtime {
+                child_env.push(("DECANT_XGR_PATH".to_owned(), ours.to_string_lossy().into_owned()));
+            }
+            if env_lookup("DECANT_LOG_PATH").is_none() {
+                child_env.push(("DECANT_LOG_PATH".to_owned(), folder.join("decant_launch.log").to_string_lossy().into_owned()));
+            }
+        }
+
         let mut command = wide(std::ffi::OsStr::new(&command_line(exe, args)));
         let application = wide(exe.as_os_str());
         let directory = wide(folder.as_os_str());
-        let env = environment(extra_env);
+        let env = environment(&child_env);
         // The folders of the game drive the redirect leaves alone: fixed, from the environment the title inherits.
-        let env_vars: Vec<(String, String)> = std::env::vars().chain(extra_env.iter().cloned()).collect();
+        let env_vars: Vec<(String, String)> = std::env::vars().chain(child_env.iter().cloned()).collect();
         let drive_keep = game_drive.map(|letter| game_drive_keep(letter, &env_vars)).unwrap_or_default();
+        let creation_flags = if use_no_debugger { CREATE_UNICODE_ENVIRONMENT } else { DEBUG_ONLY_THIS_PROCESS | CREATE_UNICODE_ENVIRONMENT };
         // SAFETY: plain structures the call fills.
         let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
         startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
@@ -850,7 +876,7 @@ mod platform {
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
-                DEBUG_ONLY_THIS_PROCESS | CREATE_UNICODE_ENVIRONMENT,
+                creation_flags,
                 env.as_ptr().cast(),
                 directory.as_ptr(),
                 &startup,
@@ -860,8 +886,9 @@ mod platform {
         if made == 0 {
             return Err(std::io::Error::last_os_error());
         }
-        log.line(&format!("{} start {} (process {})", stamp(start), command_line(exe, args), info.dwProcessId));
-        let gentle_given = extra_env.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(crate::gentle::ENV)).map(|(_, v)| v.clone());
+        let mode_note = if use_no_debugger { ", no debugger" } else { "" };
+        log.line(&format!("{} start {} (process {}{mode_note})", stamp(start), command_line(exe, args), info.dwProcessId));
+        let gentle_given = child_env.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(crate::gentle::ENV)).map(|(_, v)| v.clone());
         let mut gentle = if crate::gentle::enabled(gentle_given.or_else(|| std::env::var(crate::gentle::ENV).ok()).as_deref()) {
             let (state, line) = crate::gentle::Gentle::apply(info.hProcess);
             log.line(&format!("{} {line}", stamp(start)));
@@ -870,6 +897,47 @@ mod platform {
             None
         };
         let mut outcome = Outcome { exit_code: None, dlls: Vec::new(), timed_out: false, cancelled: false };
+        if !want_runtime {
+            let why = if ours.is_file() { format!("{REDIRECT_ENV} is off") } else { "no xgameruntime.dll in the title folder".to_owned() };
+            log.line(&format!("{} no redirect of xgameruntime.dll ({why})", stamp(start)));
+        }
+        if use_no_debugger {
+            loop {
+                if let Some(line) = gentle.as_mut().and_then(|g| g.poll(info.hProcess)) {
+                    log.line(&format!("{} {line}", stamp(start)));
+                }
+                if cancel.load(Ordering::Relaxed) && !outcome.cancelled {
+                    log.line(&format!("{} cancelled: the title is stopped", stamp(start)));
+                    outcome.cancelled = true;
+                    // SAFETY: the process handle is ours.
+                    unsafe { TerminateProcess(info.hProcess, 0xFFFF_FFFF) };
+                }
+                if timeout.is_some_and(|t| start.elapsed() > t) && !outcome.timed_out {
+                    log.line(&format!("{} timeout: the title is stopped", stamp(start)));
+                    outcome.timed_out = true;
+                    // SAFETY: the process handle is ours.
+                    unsafe { TerminateProcess(info.hProcess, 0xFFFF_FFFF) };
+                }
+                // SAFETY: `info.hProcess` is a live process handle owned by this function.
+                if unsafe { WaitForSingleObject(info.hProcess, 100) } == WAIT_OBJECT_0 {
+                    let mut code: u32 = 0;
+                    // SAFETY: `code` is writable storage for the exit code.
+                    if unsafe { GetExitCodeProcess(info.hProcess, &mut code) } != 0 {
+                        let name = exception_name(code);
+                        let name = if name.is_empty() { String::new() } else { format!(" {name}") };
+                        log.line(&format!("{} exit {code} ({code:#010x}{name})", stamp(start)));
+                        outcome.exit_code = Some(code);
+                    }
+                    break;
+                }
+            }
+            // SAFETY: handles the call gave us.
+            unsafe {
+                CloseHandle(info.hThread);
+                CloseHandle(info.hProcess);
+            }
+            return Ok(outcome);
+        }
         let mut first_breakpoint = true;
         // First chance access violations seen. Only the first ones are described in full: the dirty
         // tracking of xmem.dll faults on purpose (a video decoder thousands of times a second), its own
@@ -880,13 +948,7 @@ mod platform {
         let mut fast_av_micros: u128 = 0;
         let mut fast_av_since = Instant::now();
         let mut threads = 0usize;
-        let ours = folder.join("xgameruntime.dll");
-        let want_runtime = redirect && ours.is_file();
         let want_hook = want_runtime || game_drive.is_some();
-        if !want_runtime {
-            let why = if ours.is_file() { format!("{REDIRECT_ENV} is off") } else { "no xgameruntime.dll in the title folder".to_owned() };
-            log.line(&format!("{} no redirect of xgameruntime.dll ({why})", stamp(start)));
-        }
         #[cfg(target_arch = "x86_64")]
         let mut hook: Option<hook::Hook> = None;
         let mut modules: Vec<(usize, String)> = Vec::new();
@@ -1189,6 +1251,27 @@ pub fn run(exe: &Path, args: &[String], folder: &Path, extra_env: &[(String, Str
     run_cancellable(exe, args, folder, extra_env, timeout, &AtomicBool::new(false), log)
 }
 
+/// Environment switch that runs the title without `DEBUG_ONLY_THIS_PROCESS` when eligible.
+pub const NO_DEBUGGER_ENV: &str = "DECANT_NO_DEBUGGER";
+
+/// Whether launching without `DEBUG_ONLY_THIS_PROCESS` is allowed for this run.
+pub fn no_debugger_eligible(no_debugger: Option<&str>, game_drive: Option<char>, env_lookup: impl Fn(&str) -> Option<String>) -> bool {
+    if no_debugger.map(str::trim) != Some("1") || game_drive.is_some() {
+        return false;
+    }
+    let active = |name: &str| env_lookup(name).is_some_and(|v| {
+        let t = v.trim();
+        !t.is_empty() && t != "0"
+    });
+    !active("DECANT_DEBUGGER")
+        && !active("DECANT_WATCH")
+        && !active("DECANT_WATCH_READ")
+        && !active("DECANT_STACKS")
+        && !active("DECANT_WAITS")
+        && !active("DECANT_CALLS")
+        && !active("DECANT_SAMPLE_MS")
+}
+
 /// Like [`run`], and a title still running when another thread sets `cancel` is stopped (the
 /// outcome has `cancelled` set). The flag is read about every 100 ms.
 #[cfg(windows)]
@@ -1489,5 +1572,40 @@ mod tests {
         assert!(outcome.exit_code.is_some());
         assert!(started.elapsed() < Duration::from_secs(20));
         assert!(log.iter().any(|l| l.contains("cancelled")));
+    }
+
+    #[test]
+    fn no_debugger_eligible_checks_switch_drive_and_debug_tools() {
+        let none = |_: &str| None;
+        assert!(!no_debugger_eligible(None, None, none));
+        assert!(!no_debugger_eligible(Some("0"), None, none));
+        assert!(no_debugger_eligible(Some("1"), None, none));
+        assert!(no_debugger_eligible(Some(" 1 "), None, none));
+        assert!(!no_debugger_eligible(Some("1"), Some('G'), none));
+
+        for tool in ["DECANT_DEBUGGER", "DECANT_WATCH", "DECANT_WATCH_READ", "DECANT_STACKS", "DECANT_WAITS", "DECANT_CALLS", "DECANT_SAMPLE_MS"] {
+            assert!(!no_debugger_eligible(Some("1"), None, |k| (k == tool).then(|| "1".to_owned())));
+            assert!(no_debugger_eligible(Some("1"), None, |k| (k == tool).then(|| "0".to_owned())));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_debugger_run_returns_exit_code_and_passes_inproc_env() {
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let cmd = Path::new(&system).join("System32").join("cmd.exe");
+        let folder = std::env::temp_dir();
+        let mut log: Vec<String> = Vec::new();
+        let outcome = run(
+            &cmd,
+            &["/C".into(), "if \"%DECANT_INPROC_CPU_EMU%\"==\"1\" (exit 9) else (exit 2)".into()],
+            &folder,
+            &[(NO_DEBUGGER_ENV.into(), "1".into())],
+            Some(Duration::from_secs(30)),
+            &mut log,
+        )
+        .unwrap();
+        assert_eq!(outcome.exit_code, Some(9), "{log:#?}");
+        assert!(log.iter().any(|l| l.contains("no debugger")));
     }
 }

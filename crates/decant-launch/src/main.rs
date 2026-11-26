@@ -232,7 +232,11 @@ fn do_run(package: Option<&std::path::Path>, overlay: &std::path::Path, o: &RunO
     for line in decant_launch::runtime::report() {
         run::Sink::line(&mut sink, &line);
     }
-    let mut env = vec![("DECANT_LOG".to_owned(), "1".to_owned())];
+    let mut env = if std::env::var(run::NO_DEBUGGER_ENV).ok().as_deref() == Some("1") {
+        vec![("DECANT_LOG_PATH".to_owned(), log_path.to_string_lossy().into_owned())]
+    } else {
+        vec![("DECANT_LOG".to_owned(), "1".to_owned())]
+    };
     env.extend(stage::renderer_env(&overlay, |k| std::env::var(k).ok()));
     if stage::has_vkd3d(&overlay) {
         run::Sink::line(&mut sink, "renderer: vkd3d-proton (d3d12.dll and d3d12core.dll staged in the overlay)");
