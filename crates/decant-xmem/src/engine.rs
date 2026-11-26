@@ -20,7 +20,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, PoisonError};
 use std::time::Instant;
 
@@ -38,6 +38,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use crate::journal::{self, GpuChange, Journal};
 use crate::pages::{FRAMES_PER_PAGE, Growth, MAX_POOL_PAGES, NO_FRAME, PAGE_BYTES, PageAllocator, PageError, growth, index_of};
 use crate::regions::{Kind, RegionError, Regions, split_steps};
+use crate::smallbuf::SmallBuf;
 use crate::track::{self, Track};
 
 const MEM_COMMIT: u32 = 0x1000;
@@ -403,6 +404,13 @@ struct Section {
     pages: usize,
     ro_view: usize,
     rw_view: usize,
+    /// Per page of the section, the writes that are copying into it right now (`Engine::write_frames`,
+    /// outside every lock). A page that is pinned is not given back to the pool until the copy ends.
+    /// Heap memory that stays put when `State::sections` grows.
+    pins: Box<[AtomicU32]>,
+    /// One bit per page of the section: it is known to be committed, which `commit_page` then does not ask the
+    /// system again. A committed page of the private view stays committed (it is only ever reset).
+    committed: Box<[AtomicU64]>,
 }
 
 impl Section {
@@ -425,7 +433,15 @@ impl Section {
             close_section(handle);
             return Err(error);
         }
-        Ok(Section { handle, start, pages, ro_view: ro.Value as usize, rw_view: rw.Value as usize })
+        Ok(Section {
+            handle,
+            start,
+            pages,
+            ro_view: ro.Value as usize,
+            rw_view: rw.Value as usize,
+            pins: (0..pages).map(|_| AtomicU32::new(0)).collect(),
+            committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+        })
     }
 }
 
@@ -886,6 +902,40 @@ impl ProtectSync {
             Engine::protect_range(page, PAGE_BYTES, PAGE_READWRITE);
         }
         accessible(page, true)
+    }
+}
+
+/// The pages a write holds before it spills to the heap (2 MiB of data), and the places a title sees
+/// the bytes (`Engine::write_frames_buf`).
+pub const INLINE_WRITE_PAGES: usize = 32;
+pub const INLINE_WRITE_VIEWS: usize = 16;
+
+/// Where the title sees the bytes of a write, as `(address, bytes)`.
+pub type WrittenViews = SmallBuf<(usize, usize), INLINE_WRITE_VIEWS>;
+
+/// Pins pool pages for a copy that runs outside the locks: each page counts one more writer in
+/// `Section::pins` until this drops, and `Engine::wait_unpinned` makes whoever gives the page back wait.
+struct PinGuard<'a>(&'a [(usize, usize, usize)]);
+
+impl<'a> PinGuard<'a> {
+    /// Pins the pages of `targets`, each `(pool index, address, address of the pin)`. The pins live in
+    /// sections, which stay while the engine does, and the caller borrows the engine for as long as this lives.
+    fn pin(targets: &'a [(usize, usize, usize)]) -> Self {
+        for &(_, _, pin) in targets {
+            // SAFETY: `pin` is the address of an `AtomicU32` of `Section::pins`, heap memory of a section that
+            // is only dropped with the engine.
+            unsafe { &*(pin as *const AtomicU32) }.fetch_add(1, Ordering::AcqRel);
+        }
+        PinGuard(targets)
+    }
+}
+
+impl Drop for PinGuard<'_> {
+    fn drop(&mut self) {
+        for &(_, _, pin) in self.0 {
+            // SAFETY: as in `pin`.
+            unsafe { &*(pin as *const AtomicU32) }.fetch_sub(1, Ordering::Release);
+        }
     }
 }
 
@@ -1439,6 +1489,7 @@ impl Engine {
             self.clear_range(&mut st, dirty, address, size)?;
             st.commits.remove(&address);
             let frames: Vec<u32> = (0..count as u32).map(|k| first + k * FRAMES_PER_PAGE).collect();
+            Self::wait_unpinned(&st, &frames);
             st.pages.free(&frames)?;
             Self::reset_unused_frames(&st, &frames);
             return Ok(size);
@@ -1483,68 +1534,121 @@ impl Engine {
     /// every frame the data reaches must be allocated. Returns where the title sees the bytes now: the
     /// written part of each view page that maps one of the pages, as `(address, bytes)`, adjacent parts
     /// joined (a texture placed there has to be read again).
+    #[cfg(test)]
     pub fn write_frames(&self, frames: &[u32], offset: usize, data: &[u8]) -> Result<Vec<(usize, usize)>, EngineError> {
+        self.write_frames_buf(frames, offset, data).map(|seen| seen.as_slice().to_vec())
+    }
+
+    /// `write_frames` without a heap allocation for a write of up to `INLINE_WRITE_PAGES` pages and
+    /// `INLINE_WRITE_VIEWS` places the title sees it.
+    ///
+    /// In three steps, so that the copy of the bytes (the slow part, many 64 KiB pages) runs without
+    /// any lock and several threads copy at the same time:
+    /// 1. under the engine lock: the frames are checked, their pages committed and pinned (`Section::pins`),
+    ///    and the views that show them looked up (`Regions::views_of_page`, no scan of every view);
+    /// 2. no lock: the copy, into the private read write views, which are never protected, never unmapped
+    ///    while the engine lives and never decommitted. A pinned page is not given back by `free_pages`,
+    ///    `unplace` or `release` before the copy ends;
+    /// 3. under the dirty lock only: the pages are noted as changed, after the bytes are in, so that the GPU
+    ///    mirror never takes a page and then misses its bytes.
+    ///
+    /// Two writes that overlap on the same bytes at the same time leave either bytes or a mix of both
+    /// (a title that does that has no defined result either), and no write is ever torn across pages it did
+    /// not ask for.
+    pub fn write_frames_buf(&self, frames: &[u32], offset: usize, data: &[u8]) -> Result<WrittenViews, EngineError> {
         if offset >= PAGE_BYTES {
             return Err(EngineError::Invalid("offset past the first page"));
         }
         let count = (offset + data.len()).div_ceil(PAGE_BYTES);
         let frames = frames.get(..count).ok_or(EngineError::Invalid("fewer frames than the data covers"))?;
-        let st = self.lock();
-        let dirty_state = Arc::clone(&st.dirty);
-        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
-        let dirty = &mut *dirty_guard;
-        let mut targets = Vec::with_capacity(count);
-        for &frame in frames {
-            if !st.pages.is_allocated(frame) {
-                return Err(PageError::NotAllocated(frame).into());
+        let mut seen = WrittenViews::new();
+        if count == 0 {
+            return Ok(seen);
+        }
+        // Per page written: its pool index, its address in the private view and its pin.
+        let mut targets: SmallBuf<(usize, usize, usize), INLINE_WRITE_PAGES> = SmallBuf::with_capacity(count);
+        let pinned;
+        {
+            let st = self.lock();
+            for &frame in frames {
+                if !st.pages.is_allocated(frame) {
+                    return Err(PageError::NotAllocated(frame).into());
+                }
+                let index = index_of(frame).ok_or(PageError::BadFrame(frame))?;
+                let section = Self::section_of(&st, index).ok_or(PageError::BadFrame(frame))?;
+                let slot = index - section.start;
+                targets.push((index, section.rw_view + slot * PAGE_BYTES, &raw const section.pins[slot] as usize));
             }
-            let index = index_of(frame).ok_or(PageError::BadFrame(frame))?;
-            let page = Self::private_page(&st, index).ok_or(PageError::BadFrame(frame))?;
-            targets.push((index, page));
-        }
-        // A page that was never touched is committed first: the private view cannot fault it in under the lock.
-        for &(index, _) in &targets {
-            Self::commit_page(&st, index)?;
-        }
-        // Per page written: its pool index, and the bytes written in it as (start, length).
-        let mut written: Vec<(usize, usize, usize)> = Vec::with_capacity(count);
-        let mut at = 0;
-        for (k, (_, page)) in targets.into_iter().enumerate() {
-            let start = if k == 0 { offset } else { 0 };
-            let n = (PAGE_BYTES - start).min(data.len() - at);
-            // SAFETY: `page` is a 64 KiB page of a private read write view that lives while the engine
-            // lock is held, and `start + n` stays inside it. `data` holds `at + n` bytes.
-            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(at), (page + start) as *mut u8, n) };
-            written.extend(index_of(frames[k]).map(|index| (index, start, n)));
-            at += n;
-        }
-        self.track_changed(dirty, frames);
-        let mut seen: Vec<(usize, usize)> = Vec::new();
-        for (base, region) in st.regions.views() {
-            let Kind::View { first_frame } = region.kind else { continue };
-            let Some(first) = index_of(first_frame) else { continue };
-            let pages = region.size / PAGE_BYTES;
-            for &(index, start, n) in &written {
-                if (first..first + pages).contains(&index) {
+            // A page that was never touched is committed first, under the lock like the fault handler does it.
+            for &(index, _, _) in targets.as_slice() {
+                Self::commit_page(&st, index)?;
+            }
+            pinned = PinGuard::pin(targets.as_slice());
+            let mut at = 0;
+            for (k, &(index, _, _)) in targets.as_slice().iter().enumerate() {
+                let start = if k == 0 { offset } else { 0 };
+                let n = (PAGE_BYTES - start).min(data.len() - at);
+                for (base, first) in st.regions.views_of_page(index) {
                     seen.push((base + (index - first) * PAGE_BYTES + start, n));
                 }
+                at += n;
             }
         }
-        seen.sort_unstable();
-        let mut joined: Vec<(usize, usize)> = Vec::with_capacity(seen.len());
-        for (address, n) in seen {
-            match joined.last_mut() {
-                Some((last, len)) if *last + *len == address => *len += n,
-                _ => joined.push((address, n)),
+        let mut at = 0;
+        for (k, &(_, page, _)) in targets.as_slice().iter().enumerate() {
+            let start = if k == 0 { offset } else { 0 };
+            let n = (PAGE_BYTES - start).min(data.len() - at);
+            // SAFETY: `page` is a 64 KiB page of a private read write view that lives as long as the engine
+            // (`self` is borrowed), is committed and stays so, and is pinned: nothing gives it back to the
+            // pool before `pinned` drops. `start + n` stays inside it, and `data` holds `at + n` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(at), (page + start) as *mut u8, n) };
+            at += n;
+        }
+        // The pins go before the dirty lock is taken: a thread that waits for them holds the dirty lock.
+        drop(pinned);
+        {
+            let mut dirty_guard = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+            self.track_changed(&mut dirty_guard, frames);
+        }
+        let runs = seen.as_mut_slice();
+        runs.sort_unstable();
+        let mut joined = 0;
+        for k in 0..runs.len() {
+            let (address, n) = runs[k];
+            if joined > 0 && runs[joined - 1].0 + runs[joined - 1].1 == address {
+                runs[joined - 1].1 += n;
+            } else {
+                runs[joined] = (address, n);
+                joined += 1;
             }
         }
-        Ok(joined)
+        seen.truncate(joined);
+        Ok(seen)
+    }
+
+    /// The section that holds pool page `index`.
+    fn section_of(st: &State, index: usize) -> Option<&Section> {
+        st.sections.iter().find(|s| index >= s.start && index < s.start + s.pages)
+    }
+
+    /// Waits until no write is copying into any of `frames`. Called with the engine lock held, which is
+    /// what pins a page, so no new pin appears: the wait ends when the copies in flight end. They take no lock.
+    fn wait_unpinned(st: &State, frames: &[u32]) {
+        for &frame in frames {
+            let Some(index) = index_of(frame) else { continue };
+            let Some(section) = Self::section_of(st, index) else { continue };
+            let pin = &section.pins[index - section.start];
+            while pin.load(Ordering::Acquire) != 0 {
+                std::thread::yield_now();
+            }
+        }
     }
 
     /// Frees pages. All or nothing. A page that a view still maps stays readable through it until
     /// the last view ends.
     pub fn free_pages(&self, frames: &[u32]) -> Result<(), EngineError> {
         let mut st = self.lock();
+        Self::wait_unpinned(&st, frames);
         st.pages.free(frames)?;
         Self::reset_unused_frames(&st, frames);
         Ok(())
@@ -1623,6 +1727,7 @@ impl Engine {
                     self.forget_view(&mut st, dirty, at)?;                    // The pages of a commit go back to the pool with the reservation.
                     if let Some((first, count)) = st.commits.remove(&at) {
                         let frames: Vec<u32> = (0..count as u32).map(|k| first + k * FRAMES_PER_PAGE).collect();
+                        Self::wait_unpinned(&st, &frames);
                         if st.pages.free(&frames).is_ok() {
                             Self::reset_unused_frames(&st, &frames);
                         }
@@ -2070,8 +2175,15 @@ impl Engine {
     /// already. A failure (the commit limit of the system) is logged.
     fn commit_page(st: &State, index: usize) -> Result<bool, EngineError> {
         static FAILED: AtomicI64 = AtomicI64::new(0);
-        let page = Self::private_page(st, index).ok_or(PageError::BadFrame(0))?;
+        let section = Self::section_of(st, index).ok_or(PageError::BadFrame(0))?;
+        let slot = index - section.start;
+        let (word, bit) = (slot / 64, 1u64 << (slot % 64));
+        if section.committed[word].load(Ordering::Relaxed) & bit != 0 {
+            return Ok(false);
+        }
+        let page = section.rw_view + slot * PAGE_BYTES;
         if page_committed(page) {
+            section.committed[word].fetch_or(bit, Ordering::Relaxed);
             return Ok(false);
         }
         // SAFETY: `page` is a page of the engine's read write view of a reserved section, which only the
@@ -2083,6 +2195,7 @@ impl Engine {
             }
             return Err(error);
         }
+        section.committed[word].fetch_or(bit, Ordering::Relaxed);
         Ok(true)
     }
 
@@ -2354,6 +2467,11 @@ impl Engine {
             if unsafe { VirtualAlloc(base_addr as *const c_void, run_bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
                 for offset in 0..run_len {
                     let _ = Self::commit_page(st, start_idx + offset);
+                }
+            } else {
+                // The pages are known committed from now on: `write_frames` need not ask the system.
+                for slot in start_idx - sec.start..start_idx - sec.start + run_len {
+                    sec.committed[slot / 64].fetch_or(1u64 << (slot % 64), Ordering::Relaxed);
                 }
             }
             i += run_len;
@@ -4193,6 +4311,148 @@ mod tests {
         assert!(accessible(area, true), "dirty page 0 must stay writable");
         assert!(!accessible(area + 2 * P, true), "clean page 2 must be protected on batched retry");
 
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
+    }
+
+    /// The bytes that writer `w` writes in round `round`: tells writers, rounds and pages apart.
+    fn stamp(w: usize, round: usize, len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 13 + w * 31 + round * 7 + i / PAGE_BYTES) as u8).collect()
+    }
+
+    /// Several threads write pool pages (no lock held while they copy) while others take dirty pages, map and
+    /// unmap a view of some of those pages, and a kernel write fills a tracked page. No thread sees an
+    /// error, and the last round of each writer is in its pages whole.
+    #[test]
+    fn concurrent_pool_writes_with_take_dirty_map_unmap_and_io_lose_no_bytes() {
+        let Some((_guard, e)) = tracked() else { return };
+        const WRITERS: usize = 6;
+        const PAGES: usize = 4;
+        const ROUNDS: usize = 60;
+        let frames: Vec<Vec<u32>> = (0..WRITERS).map(|_| e.allocate_pages(PAGES).unwrap()).collect();
+        let watch = e.reserve(0, PAGES * P, PAGE_READWRITE).unwrap();
+        let io_area = e.reserve(0, P, PAGE_READWRITE).unwrap();
+        let io_frames = e.allocate_pages(1).unwrap();
+        e.map_frames(io_area, &io_frames).unwrap();
+        let path = std::env::temp_dir().join(format!("xmem_lockless_{}.bin", std::process::id()));
+        std::fs::write(&path, [0x44u8; 512]).unwrap();
+        let length = |round: usize| PAGES * P - 300 - (round % 5) * 17;
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|w| {
+                    let (frames, stop) = (&frames[w], &stop);
+                    s.spawn(move || {
+                        for round in 0..ROUNDS {
+                            let data = stamp(w, round, length(round));
+                            let seen = e.write_frames(frames, 300, &data).unwrap();
+                            if w == 0 {
+                                assert!(seen.is_empty() || seen == [(watch + 300, data.len())], "the view of writer 0 or none: {seen:?}");
+                            } else {
+                                assert!(seen.is_empty(), "no view shows the pages of writer {w}");
+                            }
+                        }
+                        let _ = stop;
+                    })
+                })
+                .collect();
+            s.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    e.take_dirty(1 << 20);
+                    std::thread::yield_now();
+                }
+            });
+            s.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    e.map_frames(watch, &frames[0]).unwrap();
+                    let mut sum = 0u8;
+                    for k in 0..PAGES {
+                        sum = sum.wrapping_add(read(watch, k * P + 5));
+                    }
+                    std::hint::black_box(sum);
+                    e.unmap_pages(watch, PAGES).unwrap();
+                }
+            });
+            s.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    e.begin_io_write(io_area, 512);
+                    let mut file = std::fs::File::open(&path).unwrap();
+                    // SAFETY: the page is mapped read write for 64 KiB, and `begin_io_write` opened it for the kernel.
+                    let target = unsafe { std::slice::from_raw_parts_mut(io_area as *mut u8, 512) };
+                    let read = std::io::Read::read(&mut file, target);
+                    e.finish_io_write(io_area, 512);
+                    assert_eq!(read.expect("no ERROR_NOACCESS for a pinned page").min(512), 512);
+                }
+            });
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            stop.store(true, Ordering::Release);
+        });
+        for (w, pages) in frames.iter().enumerate() {
+            e.map_frames(watch, pages).unwrap();
+            let want = stamp(w, ROUNDS - 1, length(ROUNDS - 1));
+            // SAFETY: the pages are mapped read write.
+            let seen = unsafe { std::slice::from_raw_parts((watch + 300) as *const u8, want.len()) };
+            assert!(seen == &want[..], "the last round of writer {w} is whole");
+            e.unmap_pages(watch, PAGES).unwrap();
+        }
+        std::fs::remove_file(&path).unwrap();
+        e.unmap_pages(io_area, 1).unwrap();
+        e.release(io_area).unwrap();
+        e.release(watch).unwrap();
+        for pages in &frames {
+            e.free_pages(pages).unwrap();
+        }
+        e.free_pages(&io_frames).unwrap();
+    }
+
+    /// A page that a write is copying into stays out of the pool until the copy ends.
+    #[test]
+    fn a_pinned_page_is_not_freed_until_its_copy_ends() {
+        let Some(held) = engine() else { return };
+        let e: &Engine = &held;
+        let frames = e.allocate_pages(2).unwrap();
+        let pin = {
+            let st = e.lock();
+            let index = index_of(frames[1]).unwrap();
+            let section = Engine::section_of(&st, index).unwrap();
+            &raw const section.pins[index - section.start] as usize
+        };
+        // SAFETY: the pin is in a section of `e`, which lives as long as the test.
+        let pin = unsafe { &*(pin as *const AtomicU32) };
+        pin.fetch_add(1, Ordering::AcqRel);
+        let freed = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                e.free_pages(&frames).unwrap();
+                freed.store(true, Ordering::Release);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(!freed.load(Ordering::Acquire), "the free waits for the copy");
+            pin.fetch_sub(1, Ordering::Release);
+        });
+        assert!(freed.load(Ordering::Acquire));
+        assert!(matches!(e.write_frames(&frames, 0, &[1]), Err(EngineError::Pages(PageError::NotAllocated(_)))));
+    }
+
+    /// A write of more pages than the inline buffers hold goes through the heap fallback and is as exact as a small one.
+    #[test]
+    fn a_large_pool_write_spills_to_the_heap_and_a_small_one_stays_inline() {
+        let Some(e) = engine() else { return };
+        let n = INLINE_WRITE_PAGES + 8;
+        let frames = e.allocate_pages(n).unwrap();
+        let area = e.reserve(0, n * P, PAGE_READWRITE).unwrap();
+        e.map_frames(area, &frames).unwrap();
+        let data = pattern(n * P - 16);
+        let seen = e.write_frames_buf(&frames, 16, &data).unwrap();
+        assert_eq!(seen.as_slice(), [(area + 16, data.len())], "n page runs joined into one");
+        // SAFETY: the pages are mapped read write.
+        let mapped = unsafe { std::slice::from_raw_parts((area + 16) as *const u8, data.len()) };
+        assert!(mapped == &data[..]);
+        let small = e.write_frames_buf(&frames[..2], 0, &data[..P + 8]).unwrap();
+        assert!(small.is_inline() && small.as_slice() == [(area, P + 8)]);
+        e.unmap_pages(area, n).unwrap();
         e.release(area).unwrap();
         e.free_pages(&frames).unwrap();
     }

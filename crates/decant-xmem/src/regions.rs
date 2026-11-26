@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::pages::PAGE_BYTES;
+use crate::pages::{PAGE_BYTES, index_of};
 
 /// What occupies a range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +69,10 @@ pub fn split_steps(start: usize, whole: usize, base: usize, size: usize) -> Vec<
 pub struct Regions {
     map: BTreeMap<usize, Region>,
     next_origin: u32,
+    /// Which views show each pool page: `(pool page index, view base)` to the pool page index of the first page
+    /// of that view. Kept by `set_view`, `clear_view` and `remove`, so that a page finds its views without a scan
+    /// of all of them (`views_of_page`).
+    by_page: BTreeMap<(usize, usize), usize>,
 }
 
 fn end_of(base: usize, size: usize) -> Option<usize> {
@@ -153,6 +157,12 @@ impl Regions {
     pub fn set_view(&mut self, base: usize, first_frame: u32) -> Result<(), RegionError> {
         let region = self.map.get_mut(&base).filter(|r| r.kind == Kind::Placeholder).ok_or(RegionError::Unknown)?;
         region.kind = Kind::View { first_frame };
+        let pages = region.size / PAGE_BYTES;
+        if let Some(first) = index_of(first_frame) {
+            for page in first..first + pages {
+                self.by_page.insert((page, base), first);
+            }
+        }
         Ok(())
     }
 
@@ -164,6 +174,7 @@ impl Regions {
             return Err(RegionError::Unknown);
         }
         region.kind = Kind::Placeholder;
+        self.unindex(base, before);
         Ok(before)
     }
 
@@ -183,7 +194,26 @@ impl Regions {
 
     /// Forgets the region at `base`.
     pub fn remove(&mut self, base: usize) -> Result<Region, RegionError> {
-        self.map.remove(&base).ok_or(RegionError::Unknown)
+        let region = self.map.remove(&base).ok_or(RegionError::Unknown)?;
+        self.unindex(base, region);
+        Ok(region)
+    }
+
+    /// Drops the page index of the view `region` at `base` (nothing for another kind).
+    fn unindex(&mut self, base: usize, region: Region) {
+        if let Kind::View { first_frame } = region.kind
+            && let Some(first) = index_of(first_frame)
+        {
+            for page in first..first + region.size / PAGE_BYTES {
+                self.by_page.remove(&(page, base));
+            }
+        }
+    }
+
+    /// The views that show pool page `index`, as `(base, pool page index of the view's first page)`, in address
+    /// order. The page is at `base + (index - first) * PAGE_BYTES`. A lookup, not a scan of every view.
+    pub fn views_of_page(&self, index: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.by_page.range((index, 0)..=(index, usize::MAX)).map(|(&(_, base), &first)| (base, first))
     }
 
     /// The bases of the views inside `[base, base + size)`, in order. The range may hold
@@ -312,6 +342,30 @@ mod tests {
         let views: Vec<(usize, usize, Kind)> = r.views().iter().map(|(b, v)| (*b, v.size, v.kind)).collect();
         assert_eq!(views, [(base + P, 2 * P, Kind::View { first_frame: 32 }), (base + 4 * P, P, Kind::View { first_frame: 160 })]);
         assert_eq!(r.reservations(), [(base, 8 * P), (0x200_0000, 2 * P)], "a cut reservation is still one");
+    }
+
+    #[test]
+    fn views_of_a_page_are_found_without_a_scan_and_follow_clear_and_remove() {
+        let mut r = Regions::new();
+        let base = 0x100_0000;
+        r.insert_placeholder(base, 8 * P, 4).unwrap();
+        for (at, size) in [(0, 2 * P), (2 * P, 2 * P), (4 * P, 4 * P)] {
+            r.split(base + at, size).ok();
+        }
+        // Two views of pool pages 1 and 2 (frames 32 and 48), one more of page 2 and 3 (frames 48 and 64).
+        r.set_view(base, 32).unwrap();
+        r.set_view(base + 2 * P, 48).unwrap();
+        let of = |r: &Regions, i: usize| r.views_of_page(i).collect::<Vec<_>>();
+        assert_eq!(of(&r, 0), []);
+        assert_eq!(of(&r, 1), [(base, 1)]);
+        assert_eq!(of(&r, 2), [(base, 1), (base + 2 * P, 2)], "two views show page 2, in address order");
+        assert_eq!(of(&r, 3), [(base + 2 * P, 2)]);
+        r.clear_view(base).unwrap();
+        assert_eq!(of(&r, 1), []);
+        assert_eq!(of(&r, 2), [(base + 2 * P, 2)]);
+        r.remove(base + 2 * P).unwrap();
+        assert_eq!(of(&r, 2), []);
+        assert_eq!(of(&r, 3), []);
     }
 
     #[test]

@@ -12,6 +12,7 @@
 pub mod journal;
 pub mod pages;
 pub mod regions;
+pub mod smallbuf;
 pub mod track;
 
 #[cfg(all(windows, target_arch = "x86_64"))]

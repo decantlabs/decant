@@ -18,8 +18,9 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
-use crate::engine::{Engine, EngineError};
+use crate::engine::{Engine, EngineError, INLINE_WRITE_PAGES};
 use crate::journal::GpuChange;
+use crate::smallbuf::SmallBuf;
 use crate::{
     HEADER_BYTES, HEADER_MAGIC, PAGES_64K, PAGES_LARGE, VirtualRoute, alignment_of, granularity_of, placement_plan, round_range, total_bytes, user_address, uses_pages, virtual_alloc_plan, virtual_route,
 };
@@ -952,16 +953,16 @@ pub unsafe extern "system" fn DecantXmemWritePhysicalPages(page_array: *const u6
     }
     // SAFETY: the caller guarantees both ranges.
     let (entries, bytes) = unsafe { (std::slice::from_raw_parts(page_array, count), std::slice::from_raw_parts(data, len)) };
-    let frames: Vec<u32> = entries.iter().map(|&f| frame32(f)).collect();
-    match Engine::global().and_then(|engine| engine.write_frames(&frames, offset, bytes)) {
+    let frames: SmallBuf<u32, INLINE_WRITE_PAGES> = entries.iter().map(|&f| frame32(f)).collect();
+    match Engine::global().and_then(|engine| engine.write_frames_buf(frames.as_slice(), offset, bytes)) {
         Ok(seen) => {
             if !views.is_null() {
-                for (k, &(address, n)) in seen.iter().take(cap as usize).enumerate() {
+                for (k, &(address, n)) in seen.as_slice().iter().take(cap as usize).enumerate() {
                     // SAFETY: the caller provides room for `cap` pairs.
                     unsafe { views.add(k).write([address, n]) };
                 }
             }
-            set(seen.len());
+            set(seen.as_slice().len());
             TRUE
         }
         Err(e) => {
