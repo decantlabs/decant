@@ -1486,40 +1486,96 @@ pub fn submitted(lists: &[usize]) {
 ///
 /// # Safety
 /// `queue` is a live PC command queue.
+fn needs_fresh_sync(defer_fresh_spans: bool, translated: &[Option<(crate::title_mem::Span, bool)>]) -> bool {
+    !defer_fresh_spans && translated.iter().any(|m| matches!(m, Some((_, true))))
+}
+
+fn collect_pending_items(r: &mut Registry, pending_items: &mut Vec<(usize, u64, u64)>, pending_spans: &mut Vec<(u64, u64)>, exhausted: &mut Vec<usize>) {
+    pending_items.clear();
+    pending_spans.clear();
+    exhausted.clear();
+    for &res in &r.pending {
+        let Some(texture) = r.textures.get(&res) else {
+            exhausted.push(res);
+            continue;
+        };
+        if !texture.wants_fill() {
+            exhausted.push(res);
+            continue;
+        }
+        pending_items.push((res, texture.va, texture.plan.size));
+        pending_spans.push((texture.va, texture.plan.size));
+    }
+    for &res in exhausted.iter() {
+        r.pending.remove(&res);
+    }
+    if r.pending.is_empty() {
+        HAS_PENDING_FILLS.store(false, Ordering::Release);
+    }
+}
+
 pub unsafe fn flush(queue: *mut c_void) {
     if !enabled() || !HAS_PENDING_FILLS.load(Ordering::Acquire) {
         return;
     }
     let _trace = decant_trace::span("detile", "flush");
+    let queue_raw = queue;
     // SAFETY: by the contract of this function.
     let Some(queue) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
     // SAFETY: a live queue.
     if unsafe { queue.GetDesc() }.Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
         return;
     }
-    with_registry(|r| {
+    let started = Instant::now();
+    let tuning = tuning();
+    let collected = with_registry(|r| {
         if r.unavailable || r.pending.is_empty() {
             if r.pending.is_empty() {
                 HAS_PENDING_FILLS.store(false, Ordering::Release);
             }
-            return;
+            return None;
         }
         if !crate::title_mem::enabled() {
             r.unavailable = true;
             xs_log!("detile: title memory is off (DECANT_D3D12X_TITLE_MEM=1), placed textures stay unfilled");
-            return;
+            return None;
         }
-        let Some(device) = crate::title_mem::device() else { return };
+        let device = crate::title_mem::device()?;
         if r.detiler.is_none() {
             r.detiler = Detiler::new(&device);
             if r.detiler.is_none() {
                 r.unavailable = true;
                 xs_log!("detile: not available, placed textures stay unfilled");
-                return;
+                return None;
             }
         }
-        let started = Instant::now();
-        let tuning = tuning();
+        let mut pending_items = std::mem::take(&mut r.scratch.pending_items);
+        let mut pending_spans = std::mem::take(&mut r.scratch.pending_spans);
+        let mut exhausted = std::mem::take(&mut r.scratch.exhausted);
+        collect_pending_items(r, &mut pending_items, &mut pending_spans, &mut exhausted);
+        if pending_items.is_empty() {
+            r.scratch.pending_items = pending_items;
+            r.scratch.pending_spans = pending_spans;
+            r.scratch.exhausted = exhausted;
+            return None;
+        }
+        let translated = std::mem::take(&mut r.scratch.translated);
+        Some((pending_items, pending_spans, exhausted, translated))
+    });
+    let Some((mut pending_items, mut pending_spans, mut exhausted, mut translated)) = collected else {
+        return;
+    };
+
+    // Translate outside REGISTRY so title_mem::STATE never nests under REGISTRY.
+    crate::title_mem::translate_fresh_batch(&pending_spans, &mut translated);
+    if needs_fresh_sync(tuning.defer_fresh_spans, &translated) {
+        // SAFETY: `queue_raw` is a live direct queue and REGISTRY is not held.
+        unsafe { crate::title_mem::sync(queue_raw) };
+        with_registry(|r| collect_pending_items(r, &mut pending_items, &mut pending_spans, &mut exhausted));
+        crate::title_mem::translate_fresh_batch(&pending_spans, &mut translated);
+    }
+
+    with_registry(|r| {
         let mut ready = std::mem::take(&mut r.scratch.ready);
         ready.clear();
         let mut resources = std::mem::take(&mut r.scratch.resources);
@@ -1529,29 +1585,12 @@ pub unsafe fn flush(queue: *mut c_void) {
         let mut outcome = std::mem::take(&mut r.scratch.outcome);
         outcome.clear();
 
-        // Pick the dirty textures that have a GPU address by now, only visiting `pending`.
         let mut unreachable = 0u32;
-        let mut exhausted = std::mem::take(&mut r.scratch.exhausted);
         exhausted.clear();
-        let mut pending_items = std::mem::take(&mut r.scratch.pending_items);
-        pending_items.clear();
-        let mut pending_spans = std::mem::take(&mut r.scratch.pending_spans);
-        pending_spans.clear();
-        for &res in &r.pending {
-            let Some(texture) = r.textures.get(&res) else {
-                exhausted.push(res);
-                continue;
-            };
-            if !texture.wants_fill() {
-                exhausted.push(res);
+        for (&(res, _, _), mapped) in pending_items.iter().zip(&translated) {
+            if !r.textures.get(&res).is_some_and(Placed::wants_fill) {
                 continue;
             }
-            pending_items.push((res, texture.va, texture.plan.size));
-            pending_spans.push((texture.va, texture.plan.size));
-        }
-        let mut translated = std::mem::take(&mut r.scratch.translated);
-        crate::title_mem::translate_fresh_batch(&pending_spans, &mut translated);
-        for (&(res, _, _), mapped) in pending_items.iter().zip(&translated) {
             match mapped {
                 // Fresh mappings go out with the next sync, before the next submission.
                 Some((_, true)) if tuning.defer_fresh_spans => r.deferred += 1,
@@ -1894,5 +1933,15 @@ mod tests {
         assert_eq!(trimmed, vec![2, 1, 3], "busy frame 0 stays untouched, largest idle frames go first");
 
         assert!(select_staging_to_trim(frames.into_iter(), |_| 5, 0).is_empty(), "cap 0 disables trimming");
+    }
+
+    #[test]
+    fn fresh_span_sync_predicate_respects_defer_flag() {
+        let span = crate::title_mem::Span { resource: 0, gpu: 0x1000, offset: 0, left: 0x1000 };
+        let mapped = [Some((span, false)), None];
+        let fresh = [Some((span, false)), Some((span, true))];
+        assert!(!needs_fresh_sync(false, &mapped));
+        assert!(needs_fresh_sync(false, &fresh));
+        assert!(!needs_fresh_sync(true, &fresh));
     }
 }
