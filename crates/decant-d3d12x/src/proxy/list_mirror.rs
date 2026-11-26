@@ -785,13 +785,14 @@ root_signature_method!(list_set_graphics_root_signature, 30, Bind::Graphics);
 macro_rules! root_table_method {
     ($name:ident, $pc:literal, $bind:expr) => {
         pub(super) extern "system" fn $name(this: *mut Proxy, index: u32, handle: u64) {
-            let handle = super::heap_pages::table_handle(this as usize, $bind, index, handle);
+            // SAFETY: `this` is a live list proxy.
+            let pc = unsafe { (*this).pc };
+            let handle = super::heap_pages::table_handle(this as usize, pc as usize, $bind, index, handle);
             if user_mirror::active() {
                 user_mirror::with_shadow(this as usize, |s| s.set_table($bind, index, handle));
             }
             // SAFETY: `this` is a live list proxy; the PC slot takes (index, handle).
             unsafe {
-                let pc = (*this).pc;
                 method::<SetTable>(pc, $pc)(pc, index, handle);
             }
         }

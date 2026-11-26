@@ -33,7 +33,7 @@ use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -158,24 +158,47 @@ pub(crate) struct Freed {
 struct QueueTrack {
     /// The raw fence of the queue, released when its device goes. Zero if none could be made.
     fence: usize,
+    /// A second fence signalled when a submission closes while another submission on this queue is
+    /// still open, so callers draining already-executed GPU work never block on queued submissions
+    /// that have not executed yet.
+    exec_fence: usize,
     /// The `IUnknown` of the device of the queue.
     device: usize,
-    /// The last value signalled on the fence.
+    /// The last value signalled on `fence`.
     last_signal: u64,
+    /// The last value signalled on `exec_fence`.
+    exec_signal: u64,
     /// How many submissions are under way: begun, their signal not yet sent.
     open: u32,
     /// Whether work was begun that the next signal has to cover.
     unsignalled: bool,
+    /// Whether an intermediate submission failed to signal `exec_fence` since the last full signal.
+    exec_failed: bool,
 }
 
 impl QueueTrack {
     /// Closes one submission. Overlapping submissions share one target, so only the last of them
     /// may send the signal: an earlier one would signal while another can still enqueue work.
+    #[cfg(test)]
     fn close(&mut self, send_signal: impl FnOnce(u64) -> bool) {
+        self.close_with_exec(send_signal, |_| true);
+    }
+
+    /// Closes one submission on `fence` when no other submission is open, or on `exec_fence` when
+    /// other submissions remain queued on the same queue.
+    fn close_with_exec(&mut self, send_main: impl FnOnce(u64) -> bool, send_exec: impl FnOnce(u64) -> bool) {
         self.open -= 1;
-        if self.open == 0 && send_signal(self.last_signal + 1) {
-            self.last_signal += 1;
-            self.unsignalled = false;
+        if self.open == 0 {
+            if send_main(self.last_signal + 1) {
+                self.last_signal += 1;
+                self.unsignalled = false;
+                self.exec_failed = false;
+            }
+        } else if send_exec(self.exec_signal + 1) {
+            self.exec_signal += 1;
+            self.exec_failed = false;
+        } else {
+            self.exec_failed = true;
         }
     }
 
@@ -306,7 +329,8 @@ pub(crate) unsafe fn begin(queue: *mut c_void) -> bool {
     let device = unsafe { q.GetDevice(&mut device) }.ok().and(device);
     let device_id = device.as_ref().map_or(0, device_identity);
     // SAFETY: a documented call on a live device.
-    let made = device.and_then(|d| unsafe { d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }.ok());
+    let made = device.as_ref().and_then(|d| unsafe { d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }.ok());
+    let exec_made = device.and_then(|d| unsafe { d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }.ok());
     let fence = match made {
         Some(f) => f.into_raw() as usize,
         None => {
@@ -317,7 +341,20 @@ pub(crate) unsafe fn begin(queue: *mut c_void) -> bool {
             0
         }
     };
-    st.queues.insert(key, QueueTrack { fence, device: device_id, last_signal: 0, open: 1, unsignalled: true });
+    let exec_fence = exec_made.map_or(0, |f| f.into_raw() as usize);
+    st.queues.insert(
+        key,
+        QueueTrack {
+            fence,
+            exec_fence,
+            device: device_id,
+            last_signal: 0,
+            exec_signal: 0,
+            open: 1,
+            unsignalled: true,
+            exec_failed: false,
+        },
+    );
     true
 }
 
@@ -331,9 +368,99 @@ pub(crate) unsafe fn submitted(queue: *mut c_void) {
     let mut st = state();
     let Some(track) = st.queues.get_mut(&(queue as usize)) else { return };
     let fence = track.fence as *mut c_void;
-    // SAFETY: the table keeps the fence alive and the queue and the fence belong to one device.
+    let exec_fence = track.exec_fence as *mut c_void;
+    // SAFETY: the table keeps both fences alive and the queue and fences belong to one device.
     // A queue without a fence signals nothing, so its target is never reached.
-    track.close(|value| unsafe { ID3D12Fence::from_raw_borrowed(&fence).is_some_and(|f| q.Signal(f, value).is_ok()) });
+    track.close_with_exec(
+        |value| unsafe { ID3D12Fence::from_raw_borrowed(&fence).is_some_and(|f| q.Signal(f, value).is_ok()) },
+        |value| unsafe { ID3D12Fence::from_raw_borrowed(&exec_fence).is_some_and(|f| q.Signal(f, value).is_ok()) },
+    );
+}
+
+/// Fence targets covering every completed submission across all tracked queues, excluding queued
+/// submissions that have not executed yet (`open > 0`). Returns `None` when any queue has work
+/// whose completion cannot be proven by a signalled fence.
+fn submitted_targets(queues: &FastMap<QueueTrack>) -> Option<Vec<Target>> {
+    let mut targets = Vec::new();
+    for track in queues.values() {
+        if track.fence == 0 {
+            if track.last_signal > 0 || track.unsignalled || track.open > 0 {
+                return None;
+            }
+            continue;
+        }
+        if track.exec_failed || (track.open == 0 && track.unsignalled) {
+            return None;
+        }
+        if track.last_signal > 0 {
+            targets.push((track.fence, track.last_signal));
+        }
+        if track.exec_fence != 0 && track.exec_signal > 0 {
+            targets.push((track.exec_fence, track.exec_signal));
+        }
+    }
+    Some(targets)
+}
+
+/// Waits up to `timeout_ms` for every already-submitted GPU command batch across all tracked
+/// queues to complete, without waiting on queued submissions that have not executed yet.
+/// Returns `true` when every tracked queue's completed submissions are proven finished.
+pub(crate) fn wait_submitted_idle(timeout_ms: u32) -> bool {
+    let fences: Vec<(ID3D12Fence, u64)> = {
+        let st = state();
+        let Some(targets) = submitted_targets(&st.queues) else {
+            return false;
+        };
+        let mut owned = Vec::with_capacity(targets.len());
+        for (fence, value) in targets {
+            let raw = fence as *mut c_void;
+            // SAFETY: every non-zero fence in `st.queues` is live while `state()` is held;
+            // cloning takes an owned COM reference that stays valid after releasing the lock.
+            if let Some(f) = unsafe { ID3D12Fence::from_raw_borrowed(&raw) } {
+                owned.push((f.clone(), value));
+            } else {
+                return false;
+            }
+        }
+        owned
+    };
+    if fences.is_empty() {
+        return true;
+    }
+    let _pc_call = crate::watchdog_hold::pc_call();
+    // SAFETY: an unnamed auto-reset event, closed below.
+    let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+    let mut all_done = true;
+    for (fence, value) in &fences {
+        // SAFETY: `fence` is a live owned COM fence and `event` is the handle created above.
+        unsafe {
+            if fence.GetCompletedValue() >= *value {
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait_ms = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
+            if wait_ms == 0 || fence.SetEventOnCompletion(*value, event).is_err() {
+                if fence.GetCompletedValue() < *value {
+                    all_done = false;
+                    break;
+                }
+                continue;
+            }
+            WaitForSingleObject(event, wait_ms);
+            if fence.GetCompletedValue() < *value {
+                all_done = false;
+                break;
+            }
+        }
+    }
+    // SAFETY: the event handle created above.
+    unsafe {
+        let _ = CloseHandle(event);
+    }
+    all_done
 }
 
 /// The targets of a release now: one per queue that has work in flight or a submission under way.
@@ -539,6 +666,10 @@ pub(crate) unsafe fn flush(device: *mut c_void) {
                 // SAFETY: the table held the one reference to the fence and it is released here once.
                 unsafe { drop(ID3D12Fence::from_raw(track.fence as *mut c_void)) };
             }
+            if track.exec_fence != 0 {
+                // SAFETY: the table held the one reference to the exec fence and it is released here once.
+                unsafe { drop(ID3D12Fence::from_raw(track.exec_fence as *mut c_void)) };
+            }
         }
         ready
     };
@@ -607,7 +738,7 @@ mod tests {
     use super::*;
 
     fn track(fence: usize, device: usize, last_signal: u64) -> QueueTrack {
-        QueueTrack { fence, device, last_signal, open: 0, unsignalled: false }
+        QueueTrack { fence, exec_fence: 0, device, last_signal, exec_signal: 0, open: 0, unsignalled: false, exec_failed: false }
     }
 
     #[test]
@@ -749,5 +880,37 @@ mod tests {
         assert_eq!(reached_in(&snap, 10), 5);
         assert_eq!(reached_in(&snap, 20), 9);
         assert_eq!(reached_in(&snap, 99), u64::MAX);
+    }
+
+    #[test]
+    fn submitted_targets_cover_executed_work_without_waiting_on_queued_submissions() {
+        let mut q1 = QueueTrack { exec_fence: 101, open: 2, unsignalled: true, ..track(10, 0xA, 4) };
+        q1.close_with_exec(|_| panic!("main fence stays unsignalled while open > 0"), |v| {
+            assert_eq!(v, 1);
+            true
+        });
+        assert_eq!((q1.open, q1.last_signal, q1.exec_signal, q1.exec_failed), (1, 4, 1, false));
+        let queues: FastMap<QueueTrack> = [(1, q1), (2, track(20, 0xA, 7))].into_iter().collect();
+        let mut targets = submitted_targets(&queues).expect("all executed work is fenced");
+        targets.sort();
+        assert_eq!(targets, vec![(10, 4), (20, 7), (101, 1)]);
+
+        // A failed intermediate exec signal prevents proving idle until the queue closes cleanly.
+        let mut q2 = QueueTrack { exec_fence: 0, open: 2, unsignalled: true, ..track(30, 0xA, 2) };
+        q2.close_with_exec(|_| unreachable!(), |_| false);
+        assert!(q2.exec_failed);
+        let broken: FastMap<QueueTrack> = [(3, q2)].into_iter().collect();
+        assert_eq!(submitted_targets(&broken), None);
+        q2.close_with_exec(|v| {
+            assert_eq!(v, 3);
+            true
+        }, |_| unreachable!());
+        assert!(!q2.exec_failed);
+        let recovered: FastMap<QueueTrack> = [(3, q2)].into_iter().collect();
+        assert_eq!(submitted_targets(&recovered), Some(vec![(30, 3)]));
+
+        // A queue without a fence cannot prove its executed work is idle.
+        let unfenced: FastMap<QueueTrack> = [(4, QueueTrack { open: 1, unsignalled: true, ..track(0, 0xA, 0) })].into_iter().collect();
+        assert_eq!(submitted_targets(&unfenced), None);
     }
 }

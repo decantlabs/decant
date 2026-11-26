@@ -422,12 +422,21 @@ pub struct PageStats {
     pub peak: u32,
     /// Host pages taken from one console page for another.
     pub evictions: u64,
+    /// GPU fence drains performed so unpinned host pages could be reused safely.
+    pub drained: u64,
     /// Host pages taken before [`KEEP_PRESENTS`] presents had passed.
     pub early: u64,
     /// Writes and tables that found no host page.
     pub refused: u64,
     /// Host pages in all.
     pub host_pages: u32,
+}
+
+/// Outcome of a single attempt to place a table in [`Pager`].
+enum MapAttempt {
+    Mapped(Mapped),
+    NeedsDrain,
+    Full,
 }
 
 /// Which console page each host page holds. Pure, for the tests.
@@ -438,7 +447,7 @@ pub struct Pager {
     copies: Vec<Vec<u32>>,
     /// Per console page, the host page the page map names, or [`NONE`].
     canonical: Vec<u32>,
-    /// Per console page, whether a table starts in it.
+    /// Per console page, whether a table starts in or spans it.
     table: Vec<bool>,
     /// Per console page, whether it was ever written.
     ever: Vec<bool>,
@@ -446,6 +455,12 @@ pub struct Pager {
     console_of: Vec<u32>,
     /// Per host page, the present count at its last use.
     used: Vec<u64>,
+    /// Monotonic GPU-drain epoch stamped onto host pages as they are bound, unpinned, or updated.
+    gpu_epoch: u64,
+    /// Highest `gpu_epoch` proven complete on every GPU queue.
+    completed_gpu_epoch: u64,
+    /// Per host page, the `gpu_epoch` of its last GPU-visible use.
+    used_epoch: Vec<u64>,
     /// Per host page, how many command lists bound it since their last reset.
     pins: Vec<u32>,
     /// Per host page, the range of its slots that differs from the backing heap.
@@ -475,6 +490,9 @@ impl Pager {
             ever: vec![false; pages],
             console_of: vec![NONE; host_pages],
             used: vec![0; host_pages],
+            gpu_epoch: 1,
+            completed_gpu_epoch: 0,
+            used_epoch: vec![0; host_pages],
             pins: vec![0; host_pages],
             dirty: vec![None; host_pages],
             lists: FastMap::default(),
@@ -495,6 +513,21 @@ impl Pager {
         PAGE.min(self.count - c * PAGE)
     }
 
+    /// Reserves the current GPU-use epoch for a fence drain and advances to a new epoch so any
+    /// concurrent bind, write, or unpin during the wait is not treated as covered by this drain.
+    pub fn begin_gpu_drain(&mut self) -> u64 {
+        let epoch = self.gpu_epoch;
+        self.gpu_epoch += 1;
+        epoch
+    }
+
+    /// Marks every GPU submission up to `epoch` complete, allowing unpinned host pages last used
+    /// at or before `epoch` to be recycled immediately without waiting for [`KEEP_PRESENTS`].
+    pub fn mark_gpu_idle(&mut self, epoch: u64) {
+        self.completed_gpu_epoch = self.completed_gpu_epoch.max(epoch);
+        self.gpu_epoch = self.gpu_epoch.max(epoch + 1);
+    }
+
     /// Whether host page `h` is the one the page map names for a page only read by index, which it
     /// keeps for good.
     fn kept(&self, h: u32) -> bool {
@@ -505,13 +538,17 @@ impl Pager {
     /// Whether host page `h` may take another console page at present `now`.
     fn cold(&self, h: u32, now: u64) -> bool {
         let i = h as usize;
-        self.console_of[i] == NONE || (self.pins[i] == 0 && !self.kept(h) && self.used[i] + KEEP_PRESENTS <= now)
+        self.console_of[i] == NONE
+            || (self.pins[i] == 0
+                && !self.kept(h)
+                && (self.used[i] + KEEP_PRESENTS <= now || self.used_epoch[i] <= self.completed_gpu_epoch))
     }
 
     /// The first of `n` host pages for console pages `c0..c0 + n`. A page of the run either holds
     /// its console page already or is taken. In this order: a run that starts at a host page of
     /// `c0` (a run grows at its end), a run after a host page of the console page before (the title
-    /// fills its ring in order, so runs stay contiguous), the cold run used longest ago, the
+    /// fills its ring in order, so runs stay contiguous), the cold run preferring redundant
+    /// duplicate copies before sole copies and age-cold pages before GPU-drained pages, then the
     /// unpinned run used longest ago (`true`: taken early).
     fn window(&self, c0: u32, n: u32, now: u64) -> Option<(u32, bool)> {
         let hp = self.host_pages();
@@ -534,10 +571,13 @@ impl Pager {
                 return Some((pos as u32, false));
             }
         }
-        let mut best_cold: Option<(u64, u32)> = None;
-        let mut best_early: Option<(u64, u32)> = None;
+        let mut best_cold: Option<((u32, u32, bool, u64), u32)> = None;
+        let mut best_early: Option<((u32, u32, u64), u32)> = None;
         for h in 0..=hp - n {
             let mut max_age = 0u64;
+            let mut sole_evictions = 0u32;
+            let mut canonical_hits = 0u32;
+            let mut needs_epoch_cold = false;
             let mut all_cold = true;
             let mut all_unpinned = true;
             for k in 0..n {
@@ -551,9 +591,22 @@ impl Pager {
                     all_cold = false;
                     break;
                 }
+                let is_canonical = self.canonical[c as usize] == h + k;
+                if is_canonical {
+                    canonical_hits += 1;
+                    if self.copies[c as usize].len() == 1 {
+                        sole_evictions += 1;
+                    }
+                }
                 let used = self.used[idx];
-                if used + KEEP_PRESENTS > now {
-                    all_cold = false;
+                let age_cold = used + KEEP_PRESENTS <= now;
+                let epoch_cold = self.used_epoch[idx] <= self.completed_gpu_epoch;
+                if !age_cold {
+                    if epoch_cold {
+                        needs_epoch_cold = true;
+                    } else {
+                        all_cold = false;
+                    }
                 }
                 max_age = max_age.max(used + 1);
             }
@@ -561,11 +614,15 @@ impl Pager {
                 if max_age == 0 {
                     return Some((h, false));
                 }
-                if best_cold.is_none_or(|(best_age, _)| max_age < best_age) {
-                    best_cold = Some((max_age, h));
+                let score = (sole_evictions, canonical_hits, needs_epoch_cold, max_age);
+                if best_cold.is_none_or(|(best_score, _)| score < best_score) {
+                    best_cold = Some((score, h));
                 }
-            } else if all_unpinned && best_cold.is_none() && best_early.is_none_or(|(best_age, _)| max_age < best_age) {
-                best_early = Some((max_age, h));
+            } else if all_unpinned && best_cold.is_none() {
+                let score = (sole_evictions, canonical_hits, max_age);
+                if best_early.is_none_or(|(best_score, _)| score < best_score) {
+                    best_early = Some((score, h));
+                }
             }
         }
         if let Some((_, h)) = best_cold {
@@ -606,17 +663,29 @@ impl Pager {
     /// `list` at present `now`: in a host run that already holds its console pages in order, else
     /// in host pages taken for it. `None` past the console slots or when no run is free.
     pub fn map(&mut self, list: usize, slot: u32, extent: u32, now: u64) -> Option<Mapped> {
+        match self.map_inner(list, slot, extent, now, true) {
+            MapAttempt::Mapped(m) => Some(m),
+            MapAttempt::Full | MapAttempt::NeedsDrain => None,
+        }
+    }
+
+    fn map_inner(&mut self, list: usize, slot: u32, extent: u32, now: u64, allow_early: bool) -> MapAttempt {
         if slot >= self.count {
-            return None;
+            return MapAttempt::Full;
         }
         let extent = extent.clamp(1, self.count - slot);
         let c0 = slot / PAGE;
         let n = (slot + extent - 1) / PAGE - c0 + 1;
-        self.table[c0 as usize] = true;
+        for k in 0..n {
+            self.table[(c0 + k) as usize] = true;
+        }
         let Some((h, early)) = self.window(c0, n, now) else {
             self.stats.refused += 1;
-            return None;
+            return MapAttempt::Full;
         };
+        if early && !allow_early {
+            return MapAttempt::NeedsDrain;
+        }
         self.stats.early += u64::from(early);
         let mut fills: Vec<Fill> = Vec::new();
         for k in 0..n {
@@ -634,16 +703,17 @@ impl Pager {
         let pinned = self.lists.entry(list).or_default();
         for k in h..h + n {
             self.used[k as usize] = now;
+            self.used_epoch[k as usize] = self.gpu_epoch;
             if !pinned.contains(&k) {
                 pinned.push(k);
                 self.pins[k as usize] += 1;
             }
         }
-        Some(Mapped { host: h * PAGE + slot % PAGE, fills, early })
+        MapAttempt::Mapped(Mapped { host: h * PAGE + slot % PAGE, fills, early })
     }
 
     /// Command list `list` was reset or released at present `now`: the host pages it bound are free
-    /// to go once [`KEEP_PRESENTS`] presents have passed.
+    /// to go once [`KEEP_PRESENTS`] presents have passed or a GPU drain completes.
     pub fn release_list(&mut self, list: usize, now: u64) {
         let Some(pinned) = self.lists.get_mut(&list) else {
             return;
@@ -651,7 +721,31 @@ impl Pager {
         for h in pinned.drain(..) {
             self.pins[h as usize] -= 1;
             self.used[h as usize] = self.used[h as usize].max(now);
+            self.used_epoch[h as usize] = self.used_epoch[h as usize].max(self.gpu_epoch);
         }
+    }
+
+    /// Whether [`written`](Self::written) for `first..first + count` would take a host page early.
+    fn written_needs_drain(&self, first: u32, count: u32, now: u64) -> bool {
+        let end = first.saturating_add(count).min(self.count);
+        if first >= end {
+            return false;
+        }
+        let mut s = first;
+        let mut free_needed = 0u32;
+        let free_avail = self.host_pages().saturating_sub(self.stats.in_use);
+        while s < end {
+            let c = s / PAGE;
+            let stop = (c * PAGE + PAGE).min(end);
+            s = stop;
+            if self.copies[c as usize].is_empty() {
+                free_needed += 1;
+                if free_needed > free_avail && matches!(self.window(c, 1, now), Some((_, true))) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Backing slots `first..first + count` were written at present `now`. A page that has no host
@@ -682,6 +776,7 @@ impl Pager {
                 self.stats.early += u64::from(early);
                 self.assign(h, c);
                 self.used[h as usize] = now;
+                self.used_epoch[h as usize] = self.gpu_epoch;
                 self.dirty[h as usize] = Some((0, self.page_len(c)));
                 any = true;
                 continue;
@@ -689,7 +784,10 @@ impl Pager {
             for &h in &self.copies[c as usize] {
                 let d = &mut self.dirty[h as usize];
                 *d = Some(d.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
-                self.used[h as usize] = now;
+                if self.canonical[c as usize] == h {
+                    self.used[h as usize] = now;
+                    self.used_epoch[h as usize] = self.gpu_epoch;
+                }
                 any = true;
             }
         }
@@ -1053,14 +1151,68 @@ pub fn paged(handle: u64) -> bool {
         })
 }
 
+/// Maximum time [`table`] or [`written`] waits for already-submitted GPU work before falling back
+/// to an early host-page eviction.
+#[cfg(windows)]
+const GPU_DRAIN_WAIT_MS: u32 = 200;
+
+fn drain_submitted_gpu() -> bool {
+    #[cfg(windows)]
+    {
+        crate::retire::wait_submitted_idle(GPU_DRAIN_WAIT_MS)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Places the table at the title's GPU handle `handle`, which reads `extent` descriptors, for
 /// command list `list`, filling host pages taken for it through `copy`.
 pub fn table(list: usize, handle: u64, extent: u32, copy: CopyFn) -> TableAt {
+    table_with_drain(list, handle, extent, copy, &mut drain_submitted_gpu)
+}
+
+fn table_with_drain(list: usize, handle: u64, extent: u32, copy: CopyFn, drain: &mut dyn FnMut() -> bool) -> TableAt {
     if !ANY_PAGED.load(Ordering::Acquire) {
         return TableAt::Same;
     }
+    let drain_epochs = {
+        let now = PRESENTS.load(Ordering::Relaxed);
+        let mut g = PAGED.write().unwrap_or_else(|e| e.into_inner());
+        let Some(p) = g.iter_mut().find(|p| {
+            let (lo, hi) = p.console_range();
+            handle >= lo && handle < hi
+        }) else {
+            return TableAt::Same;
+        };
+        let inc = u64::from(p.increment);
+        let slot = ((handle - p.gpu_start) / inc) as u32;
+        match p.pager.map_inner(list, slot, extent, now, false) {
+            MapAttempt::Mapped(m) => {
+                for f in m.fills {
+                    run_fill(p, f, copy);
+                }
+                if p.pager.map_changed() {
+                    DIRTY.store(true, Ordering::Release);
+                }
+                return TableAt::Host(p.gpu_start + u64::from(m.host) * inc + (handle - p.gpu_start) % inc, m.early);
+            }
+            MapAttempt::Full => return TableAt::Full,
+            MapAttempt::NeedsDrain => g.iter_mut().map(|ph| (ph.heap, ph.pager.begin_gpu_drain())).collect::<Vec<_>>(),
+        }
+    };
+    let idle = drain();
     let now = PRESENTS.load(Ordering::Relaxed);
     let mut g = PAGED.write().unwrap_or_else(|e| e.into_inner());
+    if idle {
+        for (heap_id, epoch) in drain_epochs {
+            if let Some(ph) = g.iter_mut().find(|ph| ph.heap == heap_id) {
+                ph.pager.mark_gpu_idle(epoch);
+                ph.pager.stats.drained += 1;
+            }
+        }
+    }
     let Some(p) = g.iter_mut().find(|p| {
         let (lo, hi) = p.console_range();
         handle >= lo && handle < hi
@@ -1069,14 +1221,18 @@ pub fn table(list: usize, handle: u64, extent: u32, copy: CopyFn) -> TableAt {
     };
     let inc = u64::from(p.increment);
     let slot = ((handle - p.gpu_start) / inc) as u32;
-    let Some(m) = p.pager.map(list, slot, extent, now) else { return TableAt::Full };
-    for f in m.fills {
-        run_fill(p, f, copy);
+    match p.pager.map_inner(list, slot, extent, now, true) {
+        MapAttempt::Mapped(m) => {
+            for f in m.fills {
+                run_fill(p, f, copy);
+            }
+            if p.pager.map_changed() {
+                DIRTY.store(true, Ordering::Release);
+            }
+            TableAt::Host(p.gpu_start + u64::from(m.host) * inc + (handle - p.gpu_start) % inc, m.early)
+        }
+        MapAttempt::Full | MapAttempt::NeedsDrain => TableAt::Full,
     }
-    if p.pager.map_changed() {
-        DIRTY.store(true, Ordering::Release);
-    }
-    TableAt::Host(p.gpu_start + u64::from(m.host) * inc + (handle - p.gpu_start) % inc, m.early)
 }
 
 /// The title's GPU handle of a host handle that [`table`] gave, the handle itself outside paged
@@ -1125,11 +1281,37 @@ pub fn console_index(gpu_start: u64, index: u32) -> Option<u32> {
 /// `n` slots from CPU handle `cpu` were written. When `cpu` is in the backing heap of a paged heap,
 /// their pages get host pages and the slots go there at the next [`flush`].
 pub fn written(cpu: usize, n: u32) {
+    written_with_drain(cpu, n, &mut drain_submitted_gpu);
+}
+
+fn written_with_drain(cpu: usize, n: u32, drain: &mut dyn FnMut() -> bool) {
     if !ANY_PAGED.load(Ordering::Acquire) {
         return;
     }
+    let drain_epochs = {
+        let now = PRESENTS.load(Ordering::Relaxed);
+        let mut g = PAGED.write().unwrap_or_else(|e| e.into_inner());
+        let Some(p) = g.iter_mut().find(|p| cpu >= p.backing_cpu && cpu < p.backing_cpu + p.pager.count as usize * p.increment as usize) else { return };
+        let first = ((cpu - p.backing_cpu) / p.increment as usize) as u32;
+        if !p.pager.written_needs_drain(first, n, now) {
+            if p.pager.written(first, n, now) || p.pager.map_changed() {
+                DIRTY.store(true, Ordering::Release);
+            }
+            return;
+        }
+        g.iter_mut().map(|ph| (ph.heap, ph.pager.begin_gpu_drain())).collect::<Vec<_>>()
+    };
+    let idle = drain();
     let now = PRESENTS.load(Ordering::Relaxed);
     let mut g = PAGED.write().unwrap_or_else(|e| e.into_inner());
+    if idle {
+        for (heap_id, epoch) in drain_epochs {
+            if let Some(ph) = g.iter_mut().find(|ph| ph.heap == heap_id) {
+                ph.pager.mark_gpu_idle(epoch);
+                ph.pager.stats.drained += 1;
+            }
+        }
+    }
     let Some(p) = g.iter_mut().find(|p| cpu >= p.backing_cpu && cpu < p.backing_cpu + p.pager.count as usize * p.increment as usize) else { return };
     let first = ((cpu - p.backing_cpu) / p.increment as usize) as u32;
     if p.pager.written(first, n, now) || p.pager.map_changed() {
@@ -1138,12 +1320,15 @@ pub fn written(cpu: usize, n: u32) {
 }
 
 /// Copies the written slots of the backing heaps into the host pages that hold them through `copy`,
-/// and writes a changed page map through `map`. Before each draw and dispatch.
+/// and writes a changed page map through `map`. Before each draw, dispatch, and queue submission.
 pub fn flush(copy: CopyFn, map: MapFn) {
-    if !DIRTY.swap(false, Ordering::AcqRel) {
+    if !DIRTY.load(Ordering::Acquire) {
         return;
     }
     let mut g = PAGED.write().unwrap_or_else(|e| e.into_inner());
+    if !DIRTY.load(Ordering::Relaxed) {
+        return;
+    }
     for p in g.iter_mut() {
         let fills = p.pager.take_flush_into();
         for &f in &fills {
@@ -1157,6 +1342,7 @@ pub fn flush(copy: CopyFn, map: MapFn) {
             p.pager.map_buf = m;
         }
     }
+    DIRTY.store(false, Ordering::Release);
 }
 
 /// The extent of a table from its root signature ranges `(count, offset)`: the end of the last
@@ -1600,6 +1786,158 @@ mod pager_tests {
         assert_eq!(map[4], 2 * PAGE);
         p.map_buf = map;
         assert!(p.take_map_into().is_none());
+    }
+
+    #[test]
+    fn straddling_table_marks_every_spanned_console_page_as_table_page() {
+        let mut p = Pager::new(6 * PAGE, 3 * PAGE);
+        // Page 1 is written into host 0 before any table starts in it, then a straddling table
+        // spans pages 0..2 into host 1..3.
+        assert!(p.written(PAGE + 4, 1, 0));
+        let m = p.map(1, PAGE - 2, 4, 0).expect("straddling table spans pages 0 and 1");
+        assert!(!m.early);
+        p.release_list(1, 0);
+        // Because page 1 was spanned by a table, host 0 is no longer pinned forever as index-only,
+        // so all three host pages can now be recycled cleanly.
+        let next = p.map(2, 2 * PAGE, 3 * PAGE, KEEP_PRESENTS).expect("all three pages can now be recycled");
+        assert!(!next.early);
+        assert_eq!(p.stats().index_pages, 0);
+    }
+
+    #[test]
+    fn duplicate_copies_do_not_stay_hot_on_writes_and_evict_before_sole_copies() {
+        let mut p = Pager::new(8 * PAGE, 4 * PAGE);
+        // Host 0 holds console 0 (canonical), host 1 holds console 5 (index-only, kept).
+        assert!(p.written(0, 1, 0));
+        assert!(p.written(5 * PAGE, 1, 0));
+        // Straddling table on console pages 0..2 allocates a contiguous duplicate at host 2..4.
+        let m = p.map(1, PAGE - 2, 4, 0).unwrap();
+        assert_eq!(m.host / PAGE, 2);
+        p.release_list(1, 0);
+        // Repeated writes to console page 0 keep canonical host 0 hot, NOT duplicate host 2.
+        for t in 1..=KEEP_PRESENTS {
+            assert!(p.written(10, 1, t));
+        }
+        // Console page 1 (sole copy at host 3) is also cold at KEEP_PRESENTS, while host 2 is a
+        // redundant duplicate of console page 0: host 2 must be evicted before host 3 so page 1
+        // stays mapped in the page map.
+        let placed = p.map(2, 4 * PAGE, 1, KEEP_PRESENTS).expect("reclaims redundant duplicate");
+        assert!(!placed.early);
+        assert_eq!(placed.host / PAGE, 2, "redundant duplicate evicted before sole copy");
+        let map = p.take_map().unwrap();
+        assert_eq!(map[0], 0, "canonical copy of console 0 stays intact");
+        assert_eq!(map[1], 3 * PAGE, "sole copy of console 1 stays mapped");
+        assert_eq!(map[4], 2 * PAGE);
+    }
+
+    #[test]
+    fn table_and_written_drain_gpu_outside_lock_before_early_eviction() {
+        const GPU: u64 = 0x8800_0000_0000;
+        const HOST: usize = 0x3100_0000;
+        const BACKING: usize = 0x3200_0000;
+        const HEAP: usize = 0x8801;
+        let inc = 32u64;
+        paged_created(Paged {
+            gpu_start: GPU,
+            increment: 32,
+            host_cpu: HOST,
+            backing_cpu: BACKING,
+            map_cpu: 0,
+            device: 0xD,
+            heap: HEAP,
+            backing: 0x8802,
+            backing_charge: None,
+            pager: Pager::new(6 * PAGE, 2 * PAGE),
+            host_count: 2 * PAGE,
+            moved_next: 0,
+            moved: Vec::new(),
+        });
+        // Fill both host pages and immediately unpin them within the same present (< KEEP_PRESENTS).
+        assert!(matches!(table_with_drain(1, GPU, 1, &mut |_, _, _, _| {}, &mut || panic!("no drain")), TableAt::Host(_, false)));
+        assert!(matches!(table_with_drain(2, GPU + u64::from(PAGE) * inc, 1, &mut |_, _, _, _| {}, &mut || panic!("no drain")), TableAt::Host(_, false)));
+        list_reset(1);
+        list_reset(2);
+
+        // Next table needs an eviction before KEEP_PRESENTS: must drop PAGED lock and drain once.
+        let mut drains = 0u32;
+        let res = table_with_drain(3, GPU + u64::from(2 * PAGE) * inc, 1, &mut |_, _, _, _| {}, &mut || {
+            drains += 1;
+            // Proves PAGED lock is NOT held during the GPU drain callback.
+            assert!(PAGED.try_write().is_ok(), "PAGED write lock must be dropped while draining GPU");
+            true
+        });
+        assert_eq!(drains, 1);
+        assert!(matches!(res, TableAt::Host(_, false)), "drained page is cold, not early");
+
+        // Second unpinned page from before the drain is already cold: written() reuses it with 0 drains.
+        written_with_drain(BACKING + (3 * PAGE) as usize * 32, 1, &mut || {
+            drains += 1;
+            true
+        });
+        assert_eq!(drains, 1, "both pre-drain unpinned pages became cold from one drain");
+
+        // Unpin list 3 and test fallback when drain fails (returns false): must fall back to early.
+        list_reset(3);
+        let fallback = table_with_drain(4, GPU + u64::from(4 * PAGE) * inc, 1, &mut |_, _, _, _| {}, &mut || {
+            drains += 1;
+            false
+        });
+        assert_eq!(drains, 2);
+        assert!(matches!(fallback, TableAt::Host(_, true)), "failed drain falls back to early eviction");
+        list_reset(4);
+        let stats = PAGED.read().unwrap().iter().find(|p| p.heap == HEAP).unwrap().pager.stats();
+        assert_eq!(stats.drained, 1);
+        assert_eq!(stats.early, 1);
+        assert_eq!(paged_released(HEAP), Some((0x8802, None)));
+    }
+
+    #[test]
+    fn flush_waits_for_an_in_flight_flush_to_finish_before_returning() {
+        use std::sync::{Arc, Barrier};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const GPU: u64 = 0x9900_0000_0000;
+        const HOST: usize = 0x4100_0000;
+        const BACKING: usize = 0x4200_0000;
+        const HEAP: usize = 0x9901;
+        paged_created(Paged {
+            gpu_start: GPU,
+            increment: 32,
+            host_cpu: HOST,
+            backing_cpu: BACKING,
+            map_cpu: 0,
+            device: 0xD,
+            heap: HEAP,
+            backing: 0x9902,
+            backing_charge: None,
+            pager: Pager::new(2 * PAGE, 2 * PAGE),
+            host_count: 2 * PAGE,
+            moved_next: 0,
+            moved: Vec::new(),
+        });
+        written_with_drain(BACKING, 1, &mut || true);
+
+        let entered_copy = Arc::new(Barrier::new(2));
+        let copy_done = Arc::new(AtomicBool::new(false));
+        let entered_clone = Arc::clone(&entered_copy);
+        let done_clone = Arc::clone(&copy_done);
+
+        let t1 = std::thread::spawn(move || {
+            flush(
+                &mut |_, _, _, _| {
+                    entered_clone.wait();
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    done_clone.store(true, Ordering::Release);
+                },
+                &mut |_, _| {},
+            );
+        });
+
+        // Wait until t1 is mid-copy inside flush(), then invoke flush() on this thread.
+        entered_copy.wait();
+        flush(&mut |_, _, _, _| {}, &mut |_, _| {});
+        assert!(copy_done.load(Ordering::Acquire), "concurrent flush must not return before in-flight copy finishes");
+        t1.join().unwrap();
+        assert_eq!(paged_released(HEAP), Some((0x9902, None)));
     }
 }
 

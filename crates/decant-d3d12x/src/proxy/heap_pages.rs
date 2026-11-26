@@ -78,9 +78,9 @@ fn extent(list: usize, bind: crate::user_mirror::Bind, index: u32) -> u32 {
 }
 
 /// The PC handle of the table the title binds at `handle` (root parameter `index` of `bind`) on
-/// `list`, `handle` itself outside a paged heap.
-pub(super) fn table_handle(list: usize, bind: crate::user_mirror::Bind, index: u32, handle: u64) -> u64 {
-    host_handle(list, handle, || extent(list, bind, index))
+/// `proxy_list` (backed by PC command list `pc_list`), `handle` itself outside a paged heap.
+pub(super) fn table_handle(proxy_list: usize, pc_list: usize, bind: crate::user_mirror::Bind, index: u32, handle: u64) -> u64 {
+    host_handle(pc_list, handle, || extent(proxy_list, bind, index))
 }
 
 /// The PC handle of the descriptor at the title's GPU handle `handle`, read by `list` for
@@ -179,8 +179,8 @@ pub(super) fn present() {
     for s in title_heap::stats() {
         let highest = s.highest_written.map_or("-".to_owned(), |h| h.to_string());
         xs_log!(
-            "descriptor pages at present {n}: highest console slot written {highest}, pages written {} ({} table, {} index), host pages {} of {} in use (peak {}), evictions {}, taken early {}, refused {}",
-            s.written_pages, s.table_pages, s.index_pages, s.in_use, s.host_pages, s.peak, s.evictions, s.early, s.refused
+            "descriptor pages at present {n}: highest console slot written {highest}, pages written {} ({} table, {} index), host pages {} of {} in use (peak {}), evictions {}, drained {}, taken early {}, refused {}",
+            s.written_pages, s.table_pages, s.index_pages, s.in_use, s.host_pages, s.peak, s.evictions, s.drained, s.early, s.refused
         );
         if s.refused > 0 && s.in_use == s.host_pages {
             xs_log!("descriptor pages: the shader visible heap is full ({} index pages kept for good, {} table pages): the title has more live descriptors than the PC heap holds", s.index_pages, s.table_pages);

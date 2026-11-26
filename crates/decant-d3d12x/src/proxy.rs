@@ -528,7 +528,6 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
         let mut deferred_list_release = false;
         if proxy.kind == Kind::List as i32 || proxy.kind == Kind::DmaList as i32 {
             crate::list_sync::forget(this as usize);
-            crate::title_heap::list_reset(this as usize);
             crate::cbv_copies::forget(this as usize);
             crate::flicker_probe::forget(this as usize);
             let pc_addr = proxy.pc as usize;
@@ -540,12 +539,14 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
                     let _ = take_unclosed(pc);
                     crate::detile::list_reset(pc_addr);
                     crate::present::list_reset(pc_addr);
+                    crate::title_heap::list_reset(pc_addr);
                     // SAFETY: the proxy transferred its sole remaining PC list reference here, and
                     // all queued submissions holding this PC list have already released theirs.
                     unsafe { crate::retire::release(pc, label) };
                 });
             } else {
                 crate::present::list_reset(pc_addr);
+                crate::title_heap::list_reset(pc_addr);
             }
         }
         if proxy.kind == Kind::Resource as i32 {
@@ -3990,6 +3991,7 @@ fn recycle_detached_list(pc_addr: usize, device_id: usize, spec: ListSpec) {
     let was_unclosed = take_unclosed(pc);
     crate::detile::list_reset(pc_addr);
     crate::present::list_reset(pc_addr);
+    crate::title_heap::list_reset(pc_addr);
     if !was_unclosed && with_list_pool(|pool| pool.push(device_id, spec, pc_addr)) {
         return;
     }
@@ -4006,7 +4008,6 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
     let key = this as usize;
     crate::list_sync::forget(key);
     crate::user_mirror::forget(key);
-    crate::title_heap::list_reset(key);
     crate::cbv_copies::forget(key);
     crate::window_service::forget(key);
     crate::rect_list::forget(key);
@@ -4040,6 +4041,7 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
         forget_unclosed(old_pc);
         crate::detile::list_reset(old_addr);
         crate::present::list_reset(old_addr);
+        crate::title_heap::list_reset(old_addr);
         method::<Reset>(old_pc, 10)(old_pc, allocator, pso)
     }
 }
@@ -4257,6 +4259,8 @@ unsafe fn submit_lists(pc: Object, mapped: &[Object], records: ListRecords<'_>, 
             crate::title_mem::sync(pc);
             // the textures the title wrote since its last submission are readable by the GPU before its lists run
             crate::detile::flush(pc);
+            // any descriptors written after draw recording or UAV clears reach the shader visible heap before execution
+            heap_pages::flush();
         }
         crate::draw_diag::submitted(keys);
         // constant buffer copies of these lists take the bytes the title wrote since their recording
@@ -5327,7 +5331,7 @@ fn clear_uav(this: *mut Proxy, gpu: u64, cpu: u64, res: Object, values: *const c
     // SAFETY: `this` is a live command list proxy; the resource is a proxy or a PC object.
     unsafe {
         let pc = (*this).pc;
-        let gpu = heap_pages::host_handle(this as usize, gpu, || 1);
+        let gpu = heap_pages::host_handle(pc as usize, gpu, || 1);
         match clear {
             crate::view_raw::Clear::AsIs => method::<ClearUavView>(pc, if float { 50 } else { 49 })(pc, gpu, cpu as u64, unwrap(res), values, n, rects),
             crate::view_raw::Clear::Words(w) => {
