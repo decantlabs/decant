@@ -311,6 +311,33 @@ impl Track {
         self.pending.len()
     }
 
+    /// Pending pages with at least one view that are not yet marked committed, scanning up to `cap`
+    /// already committed pages.
+    pub fn uncommitted_pending(&self, cap: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut count = 0usize;
+        for &page in &self.pending {
+            if count >= cap {
+                break;
+            }
+            if !self.aliases.contains_key(&page) {
+                continue;
+            }
+            if !self.committed[page as usize] {
+                out.push(page);
+            } else {
+                count += 1;
+            }
+        }
+        out
+    }
+
+    /// Whether `address` currently maps a writable view of a clean page.
+    pub fn is_clean_addr(&self, address: usize) -> bool {
+        let Some(&(page, rw)) = self.addresses.get(&address) else { return false };
+        rw && self.clean[page as usize]
+    }
+
     /// Whether the page has a view with a read write title protection.
     pub fn writable(&self, page: u32) -> bool {
         self.aliases.get(&page).is_some_and(|v| v.iter().any(|a| a.rw))
@@ -627,5 +654,23 @@ mod tests {
         assert_eq!(t.take(now, 2, all).0, vec![2, 3]);
         assert_eq!(t.take(now, 2, all).0, vec![4]);
         assert_eq!(t.pending_len(), 0);
+    }
+
+    #[test]
+    fn uncommitted_pending_and_is_clean_addr_reflect_state() {
+        let mut t = track();
+        let now = Instant::now();
+        t.on_map(0, 0x10_0000, true);
+        t.on_map(1, 0x10_1000, true);
+        t.mark_committed(0);
+        assert_eq!(t.uncommitted_pending(10), vec![1]);
+        assert!(!t.is_clean_addr(0x10_0000));
+        let (taken, protect) = t.take(now, 10, |p| p == 0);
+        assert_eq!(taken, vec![0]);
+        assert_eq!(protect, vec![0x10_0000]);
+        assert!(t.is_clean_addr(0x10_0000));
+        assert!(t.is_clean_addr(0x10_1000));
+        let _ = t.on_fault(0, now);
+        assert!(!t.is_clean_addr(0x10_0000));
     }
 }

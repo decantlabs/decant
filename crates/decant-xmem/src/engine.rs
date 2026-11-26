@@ -582,17 +582,148 @@ struct State {
     /// Commits that `place` backed with pool pages: base address to first frame and page count.
     commits: BTreeMap<usize, (u32, usize)>,
     dirty: Arc<Mutex<Dirty>>,
+    protect_sync: Arc<ProtectSync>,
     /// The commits of `commit_region` by base, with one flag per page: the GPU was given an address in
     /// it (`gpu_use`). Only such pages are tracked and reported to the GPU mirror.
     on_demand: BTreeMap<usize, Vec<bool>>,
 }
 
+const PROTECT_STRIPES: usize = 256;
+const PROTECT_STRIPE_SHIFT: usize = 16;
+const PROTECT_STRIPE_BYTES: usize = 1 << PROTECT_STRIPE_SHIFT;
+
+/// Coordinates page protection changes outside the `dirty` mutex so `VirtualProtect` and
+/// `VirtualQuery` syscalls do not block fault, I/O preparation, or tracking updates.
+struct ProtectSync {
+    locks: Vec<Mutex<()>>,
+    gens: Vec<AtomicU64>,
+    pending: AtomicBool,
+}
+
+impl Default for ProtectSync {
+    fn default() -> Self {
+        let mut locks = Vec::with_capacity(PROTECT_STRIPES);
+        let mut gens = Vec::with_capacity(PROTECT_STRIPES);
+        for _ in 0..PROTECT_STRIPES {
+            locks.push(Mutex::new(()));
+            gens.push(AtomicU64::new(0));
+        }
+        Self { locks, gens, pending: AtomicBool::new(false) }
+    }
+}
+
+impl ProtectSync {
+    fn stripe(addr: usize) -> usize {
+        (addr >> PROTECT_STRIPE_SHIFT) & (PROTECT_STRIPES - 1)
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    fn set_pending(&self, has: bool) {
+        self.pending.store(has, Ordering::Release);
+    }
+
+    fn generation(&self, addr: usize) -> u64 {
+        self.gens[Self::stripe(addr)].load(Ordering::Acquire)
+    }
+
+    fn bump_addrs(&self, addrs: &[usize]) {
+        for &addr in addrs {
+            self.gens[Self::stripe(addr)].fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn split_chunks(start: usize, bytes: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let end = start + bytes;
+        let mut at = start;
+        while at < end {
+            let next_boundary = (at & !(PROTECT_STRIPE_BYTES - 1)) + PROTECT_STRIPE_BYTES;
+            let next = next_boundary.min(end);
+            out.push((at, next - at));
+            at = next;
+        }
+        out
+    }
+
+    fn protect_rw_locked(&self, addrs: Vec<usize>) {
+        for (start, bytes) in track::runs(addrs) {
+            for (cs, cb) in Self::split_chunks(start, bytes) {
+                let _guard = self.locks[Self::stripe(cs)].lock().unwrap_or_else(PoisonError::into_inner);
+                Engine::protect_range(cs, cb, PAGE_READWRITE);
+            }
+        }
+    }
+
+    fn snapshot_chunks(&self, addrs: Vec<usize>) -> Vec<(usize, usize, u64)> {
+        let mut chunks = Vec::new();
+        for (start, bytes) in track::runs(addrs) {
+            for (cs, cb) in Self::split_chunks(start, bytes) {
+                chunks.push((cs, cb, self.generation(cs)));
+            }
+        }
+        chunks
+    }
+
+    fn protect_rw_chunks(&self, chunks: Vec<(usize, usize, u64)>, dirty: &Mutex<Dirty>) {
+        for (cs, cb, expected_gen) in chunks {
+            let stripe = Self::stripe(cs);
+            let guard = self.locks[stripe].lock().unwrap_or_else(PoisonError::into_inner);
+            if self.generation(cs) == expected_gen {
+                Engine::protect_range(cs, cb, PAGE_READWRITE);
+                drop(guard);
+                continue;
+            }
+            drop(guard);
+            let mut pending_addrs: Vec<usize> = (cs..cs + cb).step_by(PAGE_BYTES).collect();
+            loop {
+                let (filtered, fresh_gen) = {
+                    let dirty_guard = dirty.lock().unwrap_or_else(PoisonError::into_inner);
+                    let keep = match dirty_guard.track.as_ref() {
+                        Some(track) => pending_addrs.into_iter().filter(|&addr| !track.is_clean_addr(addr)).collect::<Vec<_>>(),
+                        None => pending_addrs,
+                    };
+                    (keep, self.generation(cs))
+                };
+                if filtered.is_empty() {
+                    break;
+                }
+                let mut retry = Vec::new();
+                for (sub_s, sub_b) in track::runs(filtered) {
+                    let guard = self.locks[stripe].lock().unwrap_or_else(PoisonError::into_inner);
+                    if self.generation(sub_s) == fresh_gen {
+                        Engine::protect_range(sub_s, sub_b, PAGE_READWRITE);
+                    } else {
+                        retry.extend((sub_s..sub_s + sub_b).step_by(PAGE_BYTES));
+                    }
+                    drop(guard);
+                }
+                if retry.is_empty() {
+                    break;
+                }
+                pending_addrs = retry;
+            }
+        }
+    }
+
+    fn ensure_rw(&self, page: usize) -> bool {
+        let _guard = self.locks[Self::stripe(page)].lock().unwrap_or_else(PoisonError::into_inner);
+        if !accessible(page, true) {
+            Engine::protect_range(page, PAGE_BYTES, PAGE_READWRITE);
+        }
+        accessible(page, true)
+    }
+}
+
 /// The tracker and its pool views share a lock separate from address space inspection.
-/// Mutations take the state lock before this lock and keep it through protection changes.
+/// Mutations take the state lock before this lock and release it before protection syscalls.
 #[derive(Default)]
 struct Dirty {
     track: Option<Track>,
     sections: Vec<(usize, usize, usize)>,
+    sync: Arc<ProtectSync>,
 }
 
 thread_local! {
@@ -648,6 +779,7 @@ pub struct Engine {
     /// Boxed so that its address stays put when the engine moves: the fault handler finds it in `STATES`.
     state: Box<Mutex<State>>,
     dirty: Arc<Mutex<Dirty>>,
+    protect_sync: Arc<ProtectSync>,
 }
 
 /// The state of every live engine, by address: the fault handler commits pages of any of them (the one
@@ -745,11 +877,20 @@ impl Engine {
     pub fn load_limited(capacity_pages: usize, limit_pages: usize) -> Result<Engine, EngineError> {
         let api = Api::load()?;
         install_fault_handler();
-        let dirty = Arc::new(Mutex::new(Dirty::default()));
-        let state = State { sections: Vec::new(), pages: PageAllocator::new(capacity_pages), regions: Regions::new(), commits: BTreeMap::new(), dirty: Arc::clone(&dirty), on_demand: BTreeMap::new() };
+        let protect_sync = Arc::new(ProtectSync::default());
+        let dirty = Arc::new(Mutex::new(Dirty { track: None, sections: Vec::new(), sync: Arc::clone(&protect_sync) }));
+        let state = State {
+            sections: Vec::new(),
+            pages: PageAllocator::new(capacity_pages),
+            regions: Regions::new(),
+            commits: BTreeMap::new(),
+            dirty: Arc::clone(&dirty),
+            protect_sync: Arc::clone(&protect_sync),
+            on_demand: BTreeMap::new(),
+        };
         let state = Box::new(Mutex::new(state));
         STATES.lock().unwrap_or_else(PoisonError::into_inner).push(&raw const *state as usize);
-        Ok(Engine { api, limit_pages, tracking: AtomicBool::new(false), journal_seq: AtomicU64::new(0), journal: Mutex::new(Journal::new()), state, dirty })
+        Ok(Engine { api, limit_pages, tracking: AtomicBool::new(false), journal_seq: AtomicU64::new(0), journal: Mutex::new(Journal::new()), state, dirty, protect_sync })
     }
 
     /// The engine of this process. The size of the section is `DECANT_XMEM_PHYSICAL_MIB` MiB when
@@ -1029,15 +1170,23 @@ impl Engine {
             }
         }
         if !mapped.is_empty() {
+            let protect_sync = Arc::clone(&st.protect_sync);
             let dirty_state = Arc::clone(&st.dirty);
-            let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut open = Vec::new();
-            if let Some(track) = dirty_guard.track.as_mut() {
-                for &(addr, page, rw) in &mapped {
-                    open.extend(track.on_map(page, addr, rw));
+            let chunks = {
+                let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut open = Vec::new();
+                if let Some(track) = dirty_guard.track.as_mut() {
+                    for &(addr, page, rw) in &mapped {
+                        open.extend(track.on_map(page, addr, rw));
+                    }
+                    protect_sync.bump_addrs(&open);
+                    if track.pending_len() > 0 {
+                        protect_sync.set_pending(true);
+                    }
                 }
-            }
-            Self::protect_runs(open, PAGE_READWRITE);
+                protect_sync.snapshot_chunks(open)
+            };
+            protect_sync.protect_rw_chunks(chunks, &dirty_state);
         }
         let mut i = 0;
         while i < mapped.len() {
@@ -1554,8 +1703,12 @@ impl Engine {
             for k in (0..count).filter(|&k| shown[k]) {
                 open.extend(track.on_map((first + k) as u32, at + k * PAGE_BYTES, protect == PAGE_READWRITE));
             }
+            dirty.sync.bump_addrs(&open);
+            if track.pending_len() > 0 {
+                dirty.sync.set_pending(true);
+            }
         }
-        Self::protect_runs(open, PAGE_READWRITE);
+        dirty.sync.protect_rw_locked(open);
         let mut k = 0;
         while k < count {
             let n = shown[k..].iter().take_while(|&&s| s == shown[k]).count();
@@ -1576,39 +1729,50 @@ impl Engine {
                     open.extend(track.on_changed(page as u32));
                 }
             }
+            dirty.sync.bump_addrs(&open);
+            if track.pending_len() > 0 {
+                dirty.sync.set_pending(true);
+            }
         }
-        Self::protect_runs(open, PAGE_READWRITE);
+        dirty.sync.protect_rw_locked(open);
+    }
+
+    /// Sets the protection of `[start, start + bytes)` to `protect`. One call cannot cross from one
+    /// view to the next (error 487), so a run over several views is set view by view.
+    fn protect_range(start: usize, bytes: usize, protect: u32) {
+        let mut old = 0u32;
+        // SAFETY: the range is pages of views of the section that the registry holds.
+        if unsafe { VirtualProtect(start as *const c_void, bytes, protect, &mut old) } != 0 {
+            return;
+        }
+        let end = start + bytes;
+        let mut at = start;
+        while at < end {
+            // SAFETY: MEMORY_BASIC_INFORMATION is plain data and VirtualQuery only reads the address space.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            if unsafe { VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) } == 0 {
+                break;
+            }
+            let next = (info.BaseAddress as usize + info.RegionSize).min(end);
+            if info.State == MEM_COMMIT {
+                // SAFETY: as above, a part of the same run that lies inside one view.
+                if unsafe { VirtualProtect(at as *const c_void, next - at, protect, &mut old) } == 0 {
+                    decant_log::trace(&format!("[xmem] VirtualProtect 0x{at:x}, 0x{:x} octets, {protect:#x} a echoue (erreur {})\r\n", next - at, Api::last_error("VirtualProtect").win32_code()));
+                }
+            }
+            at = next;
+        }
     }
 
     /// Sets the protection of the title view pages at `addrs`, adjacent pages in one call. One call
     /// cannot cross from one view to the next (error 487), so a run over several views is set view by
     /// view. A failure is logged: the page then keeps its protection, and the worst case is a lost or
     /// extra fault.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn protect_runs(addrs: Vec<usize>, protect: u32) {
         for (start, bytes) in track::runs(addrs) {
-            let mut old = 0u32;
-            // SAFETY: the range is pages of views of the section that the registry holds.
-            if unsafe { VirtualProtect(start as *const c_void, bytes, protect, &mut old) } != 0 {
-                continue;
-            }
-            let end = start + bytes;
-            let mut at = start;
-            while at < end {
-                // SAFETY: MEMORY_BASIC_INFORMATION is plain data and VirtualQuery only reads the address space.
-                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-                // SAFETY: as above.
-                if unsafe { VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) } == 0 {
-                    break;
-                }
-                let next = (info.BaseAddress as usize + info.RegionSize).min(end);
-                if info.State == MEM_COMMIT {
-                    // SAFETY: as above, a part of the same run that lies inside one view.
-                    if unsafe { VirtualProtect(at as *const c_void, next - at, protect, &mut old) } == 0 {
-                        decant_log::trace(&format!("[xmem] VirtualProtect 0x{at:x}, 0x{:x} octets, {protect:#x} a echoue (erreur {})\r\n", next - at, Api::last_error("VirtualProtect").win32_code()));
-                    }
-                }
-                at = next;
-            }
+            Self::protect_range(start, bytes, protect);
         }
     }
 
@@ -1623,6 +1787,7 @@ impl Engine {
     pub fn set_tracking(&self, on: bool) {
         let st = self.lock();
         let dirty_state = Arc::clone(&st.dirty);
+        let protect_sync = Arc::clone(&st.protect_sync);
         let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
         let dirty = &mut *dirty_guard;
         if on == dirty.track.is_some() {
@@ -1636,9 +1801,13 @@ impl Engine {
                     open.extend((0..region.size / PAGE_BYTES).map(|k| at + k * PAGE_BYTES));
                 }
             }
-            Self::protect_runs(open, PAGE_READWRITE);
+            protect_sync.bump_addrs(&open);
+            let chunks = protect_sync.snapshot_chunks(open);
+            protect_sync.set_pending(false);
             dirty.track = None;
             self.tracking.store(false, Ordering::Release);
+            drop(dirty_guard);
+            protect_sync.protect_rw_chunks(chunks, &dirty_state);
             return;
         }
         let mut track = Track::new(st.pages.capacity());
@@ -1651,6 +1820,7 @@ impl Engine {
                 }
             }
         }
+        protect_sync.set_pending(track.pending_len() > 0);
         dirty.track = Some(track);
         self.tracking.store(true, Ordering::Release);
     }
@@ -1669,31 +1839,44 @@ impl Engine {
             return false;
         }
         let page = address & !(PAGE_BYTES - 1);
-        let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(track) = dirty.track.as_mut() else { return false };
-        let Some(index) = track.writable_page(page) else { return false };
-        if !track.is_committed(index) {
-            // An untouched section page needs the commit path before protection can change.
-            if !accessible(page, false) {
-                return false;
+        let (index, was_held, is_held, chunks) = {
+            let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(track) = dirty.track.as_mut() else { return false };
+            let Some(mut index) = track.writable_page(page) else { return false };
+            if !track.is_committed(index) {
+                drop(dirty);
+                // An untouched section page needs the commit path before protection can change.
+                if !accessible(page, false) {
+                    return false;
+                }
+                dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+                let Some(track) = dirty.track.as_mut() else { return false };
+                let Some(rechecked) = track.writable_page(page) else { return false };
+                index = rechecked;
+                track.mark_committed(index);
             }
-            track.mark_committed(index);
-        }
-        let now = Instant::now();
-        let was_held = track.is_held(index, now);
-        let handled = match track.on_fault(index, now) {
-            Some(open) => {
-                Self::protect_runs(open, PAGE_READWRITE);
+            let Some(track) = dirty.track.as_mut() else { return false };
+            let now = Instant::now();
+            let was_held = track.is_held(index, now);
+            let open = track.on_fault(index, now);
+            let is_held = track.is_held(index, now);
+            let chunks = open.map(|addrs| {
+                self.protect_sync.bump_addrs(&addrs);
+                self.protect_sync.snapshot_chunks(addrs)
+            });
+            if track.pending_len() > 0 {
+                self.protect_sync.set_pending(true);
+            }
+            (index, was_held, is_held, chunks)
+        };
+        let handled = match chunks {
+            Some(chunks) => {
+                self.protect_sync.protect_rw_chunks(chunks, &self.dirty);
                 true
             }
-            None => {
-                if !accessible(page, true) {
-                    Self::protect_runs(vec![page], PAGE_READWRITE);
-                }
-                accessible(page, true)
-            }
+            None => self.protect_sync.ensure_rw(page),
         };
-        if !was_held && track.is_held(index, now) {
+        if !was_held && is_held {
             let hot = HOT.fetch_add(1, Ordering::Relaxed) + 1;
             if hot <= 8 || hot.is_multiple_of(1000) {
                 decant_log::trace(&format!("[xmem] suivi des pages : page {index} (0x{page:x}) ecrite a chaque copie, ouverte et copiee a chaque synchronisation pour {} s ({hot} fois)\r\n", track::hot_hold().as_secs()));
@@ -1742,12 +1925,25 @@ impl Engine {
             return false;
         }
         let dirty_state = Arc::clone(&st.dirty);
-        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(track) = dirty_guard.track.as_mut() {
-            track.mark_committed(index as u32);
-            if let Some(open) = track.on_fault(index as u32, Instant::now()) {
-                Self::protect_runs(open, PAGE_READWRITE);
+        let protect_sync = Arc::clone(&st.protect_sync);
+        drop(st);
+        let chunks = {
+            let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut chunks = None;
+            if let Some(track) = dirty_guard.track.as_mut() {
+                track.mark_committed(index as u32);
+                if let Some(addrs) = track.on_fault(index as u32, Instant::now()) {
+                    protect_sync.bump_addrs(&addrs);
+                    chunks = Some(protect_sync.snapshot_chunks(addrs));
+                }
+                if track.pending_len() > 0 {
+                    protect_sync.set_pending(true);
+                }
             }
+            chunks
+        };
+        if let Some(chunks) = chunks {
+            protect_sync.protect_rw_chunks(chunks, &dirty_state);
         }
         let n = COMMITS.fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_multiple_of(16384) {
@@ -1759,30 +1955,124 @@ impl Engine {
     /// The pool pages whose mirror is stale, at most `cap`, each now protected against writes until the
     /// next one. The caller copies them from the read only view of their section after this returns.
     pub fn take_dirty(&self, cap: usize) -> Vec<u32> {
+        if !self.protect_sync.has_pending() {
+            return Vec::new();
+        }
         let asked = Instant::now();
         let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
         let locked = Instant::now();
-        let Dirty { track, sections } = &mut *dirty;
-        let Some(track) = track.as_mut() else { return Vec::new() };
-        let pending = track.pending_len();
-        if pending == 0 {
-            return Vec::new();
-        }
-        let runs_seen = std::cell::RefCell::new(CommittedRuns::default());
-        let committed = |page: u32| {
-            let i = page as usize;
-            sections
-                .iter()
-                .find(|&&(start, pages, _)| i >= start && i < start + pages)
-                .is_some_and(|&(start, _, view)| runs_seen.borrow_mut().is_committed(view + (i - start) * PAGE_BYTES, query_region))
+        let (pending, candidates) = {
+            let Dirty { track, sections, sync } = &mut *dirty;
+            let Some(track) = track.as_mut() else {
+                sync.set_pending(false);
+                return Vec::new();
+            };
+            let pending = track.pending_len();
+            if pending == 0 {
+                sync.set_pending(false);
+                return Vec::new();
+            }
+            let candidates: Vec<(u32, usize)> = track
+                .uncommitted_pending(cap)
+                .into_iter()
+                .filter_map(|page| {
+                    let i = page as usize;
+                    sections
+                        .iter()
+                        .find(|&&(start, pages, _)| i >= start && i < start + pages)
+                        .map(|&(start, _, view)| (page, view + (i - start) * PAGE_BYTES))
+                })
+                .collect();
+            (pending, candidates)
         };
-        let (pages, protect) = track.take(Instant::now(), cap, committed);
+        let mut queries = 0usize;
+        let mut uncommitted_set = std::collections::HashSet::new();
+        if !candidates.is_empty() {
+            drop(dirty);
+            let mut runs_seen = CommittedRuns::default();
+            let mut committed_pages = Vec::new();
+            for (page, view_addr) in candidates {
+                if runs_seen.is_committed(view_addr, query_region) {
+                    committed_pages.push(page);
+                } else {
+                    uncommitted_set.insert(page);
+                }
+            }
+            queries = runs_seen.queries;
+            dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(track) = dirty.track.as_mut() {
+                for page in committed_pages {
+                    track.mark_committed(page);
+                }
+            }
+        }
+        let (pages, chunks, runs) = {
+            let Dirty { track, sections, sync } = &mut *dirty;
+            let Some(track) = track.as_mut() else {
+                sync.set_pending(false);
+                return Vec::new();
+            };
+            let runs_seen = std::cell::RefCell::new(CommittedRuns::default());
+            let committed = |page: u32| {
+                if uncommitted_set.contains(&page) {
+                    return false;
+                }
+                let i = page as usize;
+                sections
+                    .iter()
+                    .find(|&&(start, pages, _)| i >= start && i < start + pages)
+                    .is_some_and(|&(start, _, view)| runs_seen.borrow_mut().is_committed(view + (i - start) * PAGE_BYTES, query_region))
+            };
+            let (pages, protect) = track.take(Instant::now(), cap, committed);
+            queries += runs_seen.borrow().queries;
+            sync.set_pending(track.pending_len() > 0);
+            sync.bump_addrs(&protect);
+            let runs = protect.len();
+            let chunks = sync.snapshot_chunks(protect);
+            (pages, chunks, runs)
+        };
         let taken = Instant::now();
-        let runs = protect.len();
-        Self::protect_runs(protect, PAGE_READONLY);
-        let done = Instant::now();
         drop(dirty);
-        take_stats(pages.len(), runs, pending, runs_seen.borrow().queries, [locked - asked, taken - locked, done - taken]);
+        for (cs, cb, expected_gen) in chunks {
+            let stripe = ProtectSync::stripe(cs);
+            let guard = self.protect_sync.locks[stripe].lock().unwrap_or_else(PoisonError::into_inner);
+            if self.protect_sync.generation(cs) == expected_gen {
+                Self::protect_range(cs, cb, PAGE_READONLY);
+                drop(guard);
+                continue;
+            }
+            drop(guard);
+            let mut pending_addrs: Vec<usize> = (cs..cs + cb).step_by(PAGE_BYTES).collect();
+            loop {
+                let (filtered, fresh_gen) = {
+                    let dirty_guard = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+                    let keep = match dirty_guard.track.as_ref() {
+                        Some(track) => pending_addrs.into_iter().filter(|&addr| track.is_clean_addr(addr)).collect::<Vec<_>>(),
+                        None => Vec::new(),
+                    };
+                    (keep, self.protect_sync.generation(cs))
+                };
+                if filtered.is_empty() {
+                    break;
+                }
+                let mut retry = Vec::new();
+                for (sub_s, sub_b) in track::runs(filtered) {
+                    let guard = self.protect_sync.locks[stripe].lock().unwrap_or_else(PoisonError::into_inner);
+                    if self.protect_sync.generation(sub_s) == fresh_gen {
+                        Self::protect_range(sub_s, sub_b, PAGE_READONLY);
+                    } else {
+                        retry.extend((sub_s..sub_s + sub_b).step_by(PAGE_BYTES));
+                    }
+                    drop(guard);
+                }
+                if retry.is_empty() {
+                    break;
+                }
+                pending_addrs = retry;
+            }
+        }
+        let done = Instant::now();
+        take_stats(pages.len(), runs, pending, queries, [locked - asked, taken - locked, done - taken]);
         pages
     }
 
@@ -1948,17 +2238,26 @@ impl Engine {
         let committed = Self::commit_uncommitted_runs(&st, &indices);
         let until = Instant::now() + track::io_hold_for(total_bytes);
         let dirty_state = Arc::clone(&st.dirty);
-        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut open = Vec::new();
-        if let Some(track) = dirty_guard.track.as_mut() {
-            for index in committed {
-                track.mark_committed(index);
+        let protect_sync = Arc::clone(&st.protect_sync);
+        drop(st);
+        let chunks = {
+            let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut open = Vec::new();
+            if let Some(track) = dirty_guard.track.as_mut() {
+                for index in committed {
+                    track.mark_committed(index);
+                }
+                for index in indices {
+                    track.prepare_until_into(index, until, &mut open);
+                }
+                protect_sync.bump_addrs(&open);
+                if track.pending_len() > 0 {
+                    protect_sync.set_pending(true);
+                }
             }
-            for index in indices {
-                track.prepare_until_into(index, until, &mut open);
-            }
-        }
-        Self::protect_runs(open, PAGE_READWRITE);
+            protect_sync.snapshot_chunks(open)
+        };
+        protect_sync.protect_rw_chunks(chunks, &dirty_state);
     }
 
     /// Commits and pins the writable view pages in `[address, address + len)` open for an active
@@ -1988,17 +2287,26 @@ impl Engine {
         }
         let committed = Self::commit_uncommitted_runs(&st, &indices);
         let dirty_state = Arc::clone(&st.dirty);
-        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut open = Vec::new();
-        if let Some(track) = dirty_guard.track.as_mut() {
-            for index in committed {
-                track.mark_committed(index);
+        let protect_sync = Arc::clone(&st.protect_sync);
+        drop(st);
+        let chunks = {
+            let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut open = Vec::new();
+            if let Some(track) = dirty_guard.track.as_mut() {
+                for index in committed {
+                    track.mark_committed(index);
+                }
+                for index in indices {
+                    track.begin_write_pin_into(index, &mut open);
+                }
+                protect_sync.bump_addrs(&open);
+                if track.pending_len() > 0 {
+                    protect_sync.set_pending(true);
+                }
             }
-            for index in indices {
-                track.begin_write_pin_into(index, &mut open);
-            }
-        }
-        Self::protect_runs(open, PAGE_READWRITE);
+            protect_sync.snapshot_chunks(open)
+        };
+        protect_sync.protect_rw_chunks(chunks, &dirty_state);
     }
 
     /// Releases one active write pin on each writable view page across all `(address, len)` runs.
@@ -2015,10 +2323,15 @@ impl Engine {
             return;
         }
         let dirty_state = Arc::clone(&st.dirty);
+        let protect_sync = Arc::clone(&st.protect_sync);
+        drop(st);
         let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(track) = dirty_guard.track.as_mut() {
             for index in indices {
                 track.finish_write_pin(index);
+            }
+            if track.pending_len() > 0 {
+                protect_sync.set_pending(true);
             }
         }
     }
@@ -2040,10 +2353,15 @@ impl Engine {
         }
         let until = Instant::now() + track::io_hold_for(total_bytes);
         let dirty_state = Arc::clone(&st.dirty);
+        let protect_sync = Arc::clone(&st.protect_sync);
+        drop(st);
         let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(track) = dirty_guard.track.as_mut() {
             for index in indices {
                 track.convert_pin_to_hold(index, until);
+            }
+            if track.pending_len() > 0 {
+                protect_sync.set_pending(true);
             }
         }
     }
@@ -2062,10 +2380,15 @@ impl Engine {
             return;
         }
         let dirty_state = Arc::clone(&st.dirty);
+        let protect_sync = Arc::clone(&st.protect_sync);
+        drop(st);
         let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(track) = dirty_guard.track.as_mut() {
             for index in indices {
                 track.clear_io_hold(index);
+            }
+            if track.pending_len() > 0 {
+                protect_sync.set_pending(true);
             }
         }
     }
@@ -2078,17 +2401,26 @@ impl Engine {
         }
         let committed = Self::commit_uncommitted_runs(&st, &indices);
         let dirty_state = Arc::clone(&st.dirty);
-        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut open = Vec::new();
-        if let Some(track) = dirty_guard.track.as_mut() {
-            for index in committed {
-                track.mark_committed(index);
+        let protect_sync = Arc::clone(&st.protect_sync);
+        drop(st);
+        let chunks = {
+            let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut open = Vec::new();
+            if let Some(track) = dirty_guard.track.as_mut() {
+                for index in committed {
+                    track.mark_committed(index);
+                }
+                for index in indices {
+                    track.prepare_until_into(index, until, &mut open);
+                }
+                protect_sync.bump_addrs(&open);
+                if track.pending_len() > 0 {
+                    protect_sync.set_pending(true);
+                }
             }
-            for index in indices {
-                track.prepare_until_into(index, until, &mut open);
-            }
-        }
-        Self::protect_runs(open, PAGE_READWRITE);
+            protect_sync.snapshot_chunks(open)
+        };
+        protect_sync.protect_rw_chunks(chunks, &dirty_state);
     }
 
     /// The first page of `[address, address + len)` the kernel cannot write now, with what the engine
@@ -3462,5 +3794,58 @@ mod tests {
         assert_eq!((read(area2, 0), read(area2 + P, 0)), (0x11, 0x22));
         e.release(area2).unwrap();
         e.free_pages(&reused).unwrap();
+    }
+
+    #[test]
+    fn take_dirty_empty_fast_path_does_not_lock_dirty() {
+        let Some(e) = held(|| Engine::load_limited(4, 4)) else { return };
+        e.set_tracking(true);
+        assert!(!e.protect_sync.has_pending());
+        let _guard = e.dirty.lock().unwrap();
+        assert!(e.take_dirty(16).is_empty());
+    }
+
+    #[test]
+    fn concurrent_take_dirty_io_pin_and_write_faults_keep_pinned_pages_writable() {
+        let Some((_guard, e)) = tracked() else { return };
+        let area = e.reserve(0, 32 * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(32).unwrap();
+        e.map_frames(area, &frames).unwrap();
+        for k in 0..32 {
+            write(area + k * P, 0, k as u8);
+        }
+        let _ = e.take_dirty(64);
+
+        let e_ref = e;
+        std::thread::scope(|s| {
+            let io_thread = s.spawn(|| {
+                for round in 0..100 {
+                    let k = round % 16;
+                    let addr = area + k * P;
+                    e_ref.begin_io_write(addr, P);
+                    assert!(accessible(addr, true), "pinned I/O page became non writable at round {round}");
+                    write(addr, 0, (round & 0xff) as u8);
+                    e_ref.finish_io_write(addr, P);
+                }
+            });
+            let fault_thread = s.spawn(|| {
+                for round in 0..150 {
+                    let k = 16 + (round % 16);
+                    let addr = area + k * P;
+                    write(addr, 0, (round & 0xff) as u8);
+                }
+            });
+            let take_thread = s.spawn(|| {
+                for _ in 0..120 {
+                    let _ = e_ref.take_dirty(8);
+                }
+            });
+            io_thread.join().unwrap();
+            fault_thread.join().unwrap();
+            take_thread.join().unwrap();
+        });
+
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
     }
 }
