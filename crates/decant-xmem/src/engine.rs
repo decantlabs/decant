@@ -2149,7 +2149,14 @@ mod tests {
             assert_ne!(unsafe { VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) }, 0);
             (info.State, info.Type, info.AllocationProtect, info.Protect)
         };
-        let Some(e) = engine() else { return };
+        // Only a section of normal pages is reserved until a first access. Large pages (granted when the
+        // process holds the lock memory privilege, as on a player's machine set up for them) and Wine
+        // commit the whole section, so the test asks for normal pages: 65 pages of 64 KiB are no multiple
+        // of the 2 MiB large page granule, and `section` falls back to `SEC_RESERVE`.
+        if on_wine() {
+            return;
+        }
+        let Some(e) = held(|| Engine::load(65)) else { return };
         let (rw, ro) = (e.reserve(0, P, PAGE_READWRITE).unwrap(), e.reserve(0, P, PAGE_READONLY).unwrap());
         let frames = e.allocate_pages(1).unwrap();
         e.map_frames(rw, &frames).unwrap();
