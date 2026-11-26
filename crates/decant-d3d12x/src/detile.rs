@@ -73,7 +73,7 @@ impl Hasher for FastIntHasher {
 type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastIntHasher>>;
 type FastSet<K> = HashSet<K, BuildHasherDefault<FastIntHasher>>;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -925,32 +925,43 @@ fn select_staging_to_trim(frames: impl Iterator<Item = (usize, u64, u64)>, compl
 
 // ==== the registry of placed textures ====
 
-impl Drop for Registry {
-    fn drop(&mut self) {
-        for &res in self.textures.keys() {
-            placed_remove(res);
-        }
-    }
-}
-
 /// Fast path flag indicating whether at least one registered texture may want a fill.
 static HAS_PENDING_FILLS: AtomicBool = AtomicBool::new(false);
-/// Fast path counters to skip `REGISTRY_READ` when no textures or noted transitions exist.
+/// Fast path counter to skip locks when no placed textures are registered.
 static TEXTURE_COUNT: AtomicUsize = AtomicUsize::new(0);
-static INDEX_SETTLED_UNMAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INDEX_SETTLED_UNMAP_GEN: AtomicU64 = AtomicU64::new(0);
+static NOTED_COUNT: AtomicUsize = AtomicUsize::new(0);
+static FLUSHES_COUNT: AtomicU64 = AtomicU64::new(0);
+static DETILED_COUNT: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Cached initialization state of `DETILER`: 0 = uninitialized, 1 = ready, 2 = unavailable.
+static DETILER_READY_STATE: AtomicU8 = AtomicU8::new(0);
+
 const COARSE_TILE_WORDS: usize = 1024;
-static COARSE_TILE_BITS: [std::sync::atomic::AtomicU64; COARSE_TILE_WORDS] = [const { std::sync::atomic::AtomicU64::new(0) }; COARSE_TILE_WORDS];
+const COARSE_TILE_BUCKETS: usize = COARSE_TILE_WORDS * 64;
+static COARSE_TILE_BITS: [AtomicU64; COARSE_TILE_WORDS] = [const { AtomicU64::new(0) }; COARSE_TILE_WORDS];
+
+const COARSE_ADDR_SHIFT: u32 = 16;
+const COARSE_ADDR_WORDS: usize = 1024;
+const COARSE_ADDR_BUCKETS: usize = COARSE_ADDR_WORDS * 64;
+const COARSE_ADDR_MAX_PAGES: u64 = 4096;
+static ADDR_COARSE_BITS: [AtomicU64; COARSE_ADDR_WORDS] = [const { AtomicU64::new(0) }; COARSE_ADDR_WORDS];
+static HUGE_ADDR_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn coarse_tile_bucket(tile: u32) -> usize {
+    ((tile >> 4) as usize) & (COARSE_TILE_BUCKETS - 1)
+}
 
 #[inline]
 fn coarse_tile_bit(tile: u32) -> (usize, u64) {
-    let bucket = ((tile >> 4) as usize) & ((COARSE_TILE_WORDS * 64) - 1);
+    let bucket = coarse_tile_bucket(tile);
     (bucket >> 6, 1u64 << (bucket & 63))
 }
 
 #[inline]
-fn coarse_tile_set(tile: u32) {
-    let (word, mask) = coarse_tile_bit(tile);
-    COARSE_TILE_BITS[word].fetch_or(mask, Ordering::Relaxed);
+fn coarse_addr_bucket(page: u64) -> usize {
+    (page as usize) & (COARSE_ADDR_BUCKETS - 1)
 }
 
 #[inline]
@@ -960,17 +971,6 @@ pub fn may_overlap_tile(tile: u32) -> bool {
     }
     let (word, mask) = coarse_tile_bit(tile);
     (COARSE_TILE_BITS[word].load(Ordering::Relaxed) & mask) != 0
-}
-
-fn rebuild_coarse_tile_bits(tile_to_textures: &FastMap<u32, TileRefs>) {
-    let mut bits = [0u64; COARSE_TILE_WORDS];
-    for &tile in tile_to_textures.keys() {
-        let (word, mask) = coarse_tile_bit(tile);
-        bits[word] |= mask;
-    }
-    for (slot, &val) in COARSE_TILE_BITS.iter().zip(&bits) {
-        slot.store(val, Ordering::Relaxed);
-    }
 }
 
 /// Filters `tiles` in place to those that may overlap a tracked placed texture.
@@ -990,124 +990,439 @@ pub fn filter_overlapping_tiles(tiles: &mut Vec<u32>) -> bool {
     });
     !tiles.is_empty()
 }
-static NOTED_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-const PLACED_SHARDS: usize = 16;
-
-static PLACED_SET: [Mutex<FastSet<usize>>; PLACED_SHARDS] = [const { Mutex::new(HashSet::with_hasher(BuildHasherDefault::new())) }; PLACED_SHARDS];
 
 #[inline]
-fn placed_shard(res: usize) -> usize {
-    (res >> 4) & (PLACED_SHARDS - 1)
+fn may_overlap_addr(va: u64, end: u64) -> bool {
+    if HUGE_ADDR_COUNT.load(Ordering::Acquire) > 0 {
+        return true;
+    }
+    let first_page = va >> COARSE_ADDR_SHIFT;
+    let last_page = (end - 1) >> COARSE_ADDR_SHIFT;
+    if last_page - first_page >= 64 {
+        return true;
+    }
+    for page in first_page..=last_page {
+        let bucket = coarse_addr_bucket(page);
+        if (ADDR_COARSE_BITS[bucket >> 6].load(Ordering::Relaxed) & (1u64 << (bucket & 63))) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+const FLAG_ALIVE: u64 = 1 << 0;
+const FLAG_DIRTY: u64 = 1 << 1;
+const FLAG_QUEUED: u64 = 1 << 2;
+const ATTEMPTS_SHIFT: u32 = 3;
+const ATTEMPTS_MASK: u64 = 0x1F << ATTEMPTS_SHIFT;
+const GEN_SHIFT: u32 = 8;
+const GEN_STEP: u64 = 1 << GEN_SHIFT;
+
+#[inline]
+fn attempts_of(state: u64) -> u32 {
+    ((state & ATTEMPTS_MASK) >> ATTEMPTS_SHIFT) as u32
 }
 
 #[inline]
-fn placed_insert(res: usize) {
-    PLACED_SET[placed_shard(res)].lock().unwrap_or_else(|e| e.into_inner()).insert(res);
+fn wants_fill_state(state: u64) -> bool {
+    (state & FLAG_ALIVE) != 0 && (state & FLAG_DIRTY) != 0 && attempts_of(state) < FILL_RETRIES
 }
 
-#[inline]
-fn placed_remove(res: usize) {
-    PLACED_SET[placed_shard(res)].lock().unwrap_or_else(|e| e.into_inner()).remove(&res);
-}
-
-#[inline]
-fn is_placed(res: usize) -> bool {
-    PLACED_SET[placed_shard(res)].lock().unwrap_or_else(|e| e.into_inner()).contains(&res)
-}
-
-#[inline]
-fn any_placed(transitions: &[(usize, u32, u32)]) -> bool {
-    transitions.iter().any(|&(res, _, _)| is_placed(res))
-}
-
-struct OwnedJob {
-    texture: ID3D12Resource,
-    src_gpu: u64,
-    plan: Arc<Plan>,
-    states: Arc<Vec<u32>>,
-}
-
-/// Scratch buffers owned by [`Registry`] and reused across flushes, transitions, writes and tile
-/// notifications to avoid per call heap allocations.
-#[derive(Default)]
-struct RegistryScratch {
-    ready: Vec<(usize, u64)>,
-    exhausted: Vec<usize>,
-    pending_items: Vec<(usize, u64, u64)>,
-    pending_spans: Vec<(u64, u64)>,
-    translated: Vec<Option<(crate::title_mem::Span, bool)>>,
-    owned_jobs: Vec<OwnedJob>,
-    job_res: Vec<usize>,
-    outcome: Vec<bool>,
-    overlapping: Vec<usize>,
-    changes: Vec<(usize, u32, u32)>,
-}
-
-/// A placed texture the layer fills.
-struct Placed {
+/// A placed texture the layer fills, with lock-free atomic fill state so `note_write`,
+/// `note_tiles`, and `flush` never take a global registry write lock on the hot path.
+struct PlacedEntry {
+    res: usize,
     va: u64,
     plan: Arc<Plan>,
     /// PC allocation size, for the informational owner statistics.
     bytes: u64,
     /// The states of the title's submitted work, one for all subresources or one each.
-    states: Arc<Vec<u32>>,
-    tiles: Option<Vec<u32>>,
-    dirty: bool,
-    attempts: u32,
+    states: Mutex<Arc<Vec<u32>>>,
+    /// Packed atomic state: `FLAG_ALIVE`, `FLAG_DIRTY`, `FLAG_QUEUED`, `attempts`, and `write_gen`.
+    fill_state: AtomicU64,
 }
 
-impl Placed {
-    fn wants_fill(&self) -> bool {
-        self.dirty && self.attempts < FILL_RETRIES
+impl std::fmt::Debug for PlacedEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlacedEntry").field("res", &self.res).field("va", &self.va).finish()
+    }
+}
+
+impl PlacedEntry {
+    fn new(res: usize, va: u64, plan: Arc<Plan>, bytes: u64, state: u32, dirty: bool) -> Self {
+        let initial = FLAG_ALIVE | if dirty { FLAG_DIRTY | GEN_STEP } else { 0 };
+        Self { res, va, plan, bytes, states: Mutex::new(Arc::new(vec![state])), fill_state: AtomicU64::new(initial) }
     }
 
-    /// Records the outcome of a fill. A failed fill stops the retries until the next write.
-    fn settle(&mut self, filled: bool) {
-        if filled {
-            self.dirty = false;
-        } else {
-            self.attempts = FILL_RETRIES;
+    #[inline]
+    fn is_dirty(&self) -> bool {
+        (self.fill_state.load(Ordering::Acquire) & FLAG_DIRTY) != 0
+    }
+
+    #[inline]
+    fn attempts(&self) -> u32 {
+        attempts_of(self.fill_state.load(Ordering::Acquire))
+    }
+
+    #[inline]
+    fn wants_fill(&self) -> bool {
+        wants_fill_state(self.fill_state.load(Ordering::Acquire))
+    }
+
+    #[inline]
+    fn mark_dead(&self) {
+        self.fill_state.fetch_and(!(FLAG_ALIVE | FLAG_DIRTY), Ordering::AcqRel);
+    }
+
+    /// Marks the texture dirty with a fresh retry budget and advances its write generation.
+    /// Returns `true` when `FLAG_QUEUED` transitioned `0 -> 1` so the caller should push it.
+    #[inline]
+    fn invalidate_mark(&self) -> bool {
+        let mut should_enqueue = false;
+        let _ = self.fill_state.try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            if (old & FLAG_ALIVE) == 0 {
+                should_enqueue = false;
+                return None;
+            }
+            should_enqueue = (old & FLAG_QUEUED) == 0;
+            let cleared = old & !ATTEMPTS_MASK;
+            Some((cleared | FLAG_DIRTY | FLAG_QUEUED).wrapping_add(GEN_STEP))
+        });
+        should_enqueue
+    }
+
+    /// Sets `FLAG_QUEUED` if the entry is still alive, dirty, below retry limit, and not queued.
+    #[inline]
+    fn try_set_queued(&self) -> bool {
+        self.fill_state
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                if !wants_fill_state(old) || (old & FLAG_QUEUED) != 0 {
+                    None
+                } else {
+                    Some(old | FLAG_QUEUED)
+                }
+            })
+            .is_ok()
+    }
+
+    /// Clears `FLAG_QUEUED` upon dequeue in `flush` and returns the current `write_gen` if the
+    /// entry still wants a fill.
+    #[inline]
+    fn dequeue_for_flush(&self) -> Option<u64> {
+        let prev = self.fill_state.fetch_and(!FLAG_QUEUED, Ordering::AcqRel);
+        let now = prev & !FLAG_QUEUED;
+        wants_fill_state(now).then_some(now >> GEN_SHIFT)
+    }
+
+    /// Increments retry attempts after an unreachable span if no newer invalidation arrived.
+    /// Returns `true` when the caller should re-enqueue for the next flush.
+    #[inline]
+    fn record_unreachable(&self, snap_gen: u64) -> bool {
+        let mut need_enqueue = false;
+        let _ = self.fill_state.try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            if (old & FLAG_ALIVE) == 0 || (old & FLAG_DIRTY) == 0 || (old >> GEN_SHIFT) != snap_gen {
+                need_enqueue = false;
+                return None;
+            }
+            let att = attempts_of(old);
+            if att >= FILL_RETRIES {
+                need_enqueue = false;
+                return None;
+            }
+            let next_att = att + 1;
+            let updated = (old & !ATTEMPTS_MASK) | (u64::from(next_att) << ATTEMPTS_SHIFT);
+            if next_att < FILL_RETRIES && (updated & FLAG_QUEUED) == 0 {
+                need_enqueue = true;
+                Some(updated | FLAG_QUEUED)
+            } else {
+                need_enqueue = false;
+                Some(updated)
+            }
+        });
+        need_enqueue
+    }
+
+    /// Records the outcome of a GPU fill for `snap_gen`. A concurrent invalidation advances
+    /// `write_gen`, so this never clears a newer write's dirty flag.
+    #[inline]
+    fn settle_gen(&self, snap_gen: u64, filled: bool) {
+        let _ = self.fill_state.try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            if (old & FLAG_ALIVE) == 0 || (old >> GEN_SHIFT) != snap_gen {
+                return None;
+            }
+            if filled {
+                Some(old & !FLAG_DIRTY)
+            } else {
+                Some((old & !ATTEMPTS_MASK) | (u64::from(FILL_RETRIES) << ATTEMPTS_SHIFT))
+            }
+        });
+    }
+}
+
+const TEXTURE_SHARDS: usize = 16;
+
+#[inline]
+fn texture_shard(res: usize) -> usize {
+    (res >> 4) & (TEXTURE_SHARDS - 1)
+}
+
+type TextureShardMap = FastMap<usize, Arc<PlacedEntry>>;
+static TEXTURES: [RwLock<Option<TextureShardMap>>; TEXTURE_SHARDS] = [const { RwLock::new(None) }; TEXTURE_SHARDS];
+
+#[inline]
+fn with_texture_shard_read<R>(res: usize, f: impl FnOnce(&TextureShardMap) -> R) -> Option<R> {
+    let guard = TEXTURES[texture_shard(res)].read().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(f)
+}
+
+#[inline]
+fn with_texture_shard_write<R>(res: usize, f: impl FnOnce(&mut TextureShardMap) -> R) -> R {
+    let mut guard = TEXTURES[texture_shard(res)].write().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(FastMap::default))
+}
+
+#[inline]
+fn is_placed(res: usize) -> bool {
+    with_texture_shard_read(res, |m| m.contains_key(&res)) == Some(true)
+}
+
+fn lookup_placed_entry(res: usize) -> Option<Arc<PlacedEntry>> {
+    with_texture_shard_read(res, |m| m.get(&res).cloned()).flatten()
+}
+
+/// Queue of entries waiting for a detile flush. Each entry appears at most once because
+/// `FLAG_QUEUED` gates insertion.
+static PENDING_FILLS: Mutex<Vec<Arc<PlacedEntry>>> = Mutex::new(Vec::new());
+
+fn enqueue_pending_single(entry: Arc<PlacedEntry>) {
+    let mut q = decant_trace::timed_lock("detile::PENDING", || PENDING_FILLS.lock().unwrap_or_else(|e| e.into_inner()));
+    q.push(entry);
+    HAS_PENDING_FILLS.store(true, Ordering::Release);
+}
+
+fn enqueue_pending_batch(entries: impl Iterator<Item = Arc<PlacedEntry>>) {
+    let mut iter = entries.peekable();
+    if iter.peek().is_none() {
+        return;
+    }
+    let mut q = decant_trace::timed_lock("detile::PENDING", || PENDING_FILLS.lock().unwrap_or_else(|e| e.into_inner()));
+    q.extend(iter);
+    HAS_PENDING_FILLS.store(true, Ordering::Release);
+}
+
+fn drain_pending_entries(out: &mut Vec<Arc<PlacedEntry>>) {
+    out.clear();
+    let mut q = decant_trace::timed_lock("detile::PENDING", || PENDING_FILLS.lock().unwrap_or_else(|e| e.into_inner()));
+    std::mem::swap(&mut *q, out);
+    HAS_PENDING_FILLS.store(false, Ordering::Release);
+}
+
+fn invalidate_entries(entries: &[Arc<PlacedEntry>]) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut to_enqueue: Vec<Arc<PlacedEntry>> = Vec::new();
+    for entry in entries {
+        if entry.invalidate_mark() {
+            to_enqueue.push(Arc::clone(entry));
+        }
+    }
+    if !to_enqueue.is_empty() {
+        enqueue_pending_batch(to_enqueue.into_iter());
+    }
+}
+
+// ==== size-tiered address index for O(log N) `note_write` ====
+
+const SMALL_ADDR_MAX: u64 = 256 << 10;
+const MEDIUM_ADDR_MAX: u64 = 4 << 20;
+
+struct AddrEntry {
+    res: usize,
+    va: u64,
+    end: u64,
+    entry: Arc<PlacedEntry>,
+}
+
+struct AddrMeta {
+    va: u64,
+    size: u64,
+    huge: bool,
+}
+
+/// Separate address index so `note_write` only takes a read lock here and never contends with
+/// `flush`, `note_tiles`, `submitted`, or `note_transitions`.
+struct AddressIndex {
+    small: BTreeMap<u64, Vec<AddrEntry>>,
+    small_largest: u64,
+    medium: BTreeMap<u64, Vec<AddrEntry>>,
+    medium_largest: u64,
+    large: Vec<AddrEntry>,
+    by_res: FastMap<usize, AddrMeta>,
+    coarse_counts: Vec<u32>,
+    sync_globals: bool,
+}
+
+impl Default for AddressIndex {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+impl AddressIndex {
+    fn new(sync_globals: bool) -> Self {
+        Self {
+            small: BTreeMap::new(),
+            small_largest: 0,
+            medium: BTreeMap::new(),
+            medium_largest: 0,
+            large: Vec::new(),
+            by_res: FastMap::default(),
+            coarse_counts: Vec::new(),
+            sync_globals,
         }
     }
 
-    /// The title wrote the memory, so the texture is due again with a fresh set of retries.
-    fn invalidate(&mut self) {
-        self.dirty = true;
-        self.attempts = 0;
-        HAS_PENDING_FILLS.store(true, Ordering::Release);
+    fn update_coarse_bits(&mut self, va: u64, size: u64, add: bool) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let end = va.saturating_add(size);
+        let first_page = va >> COARSE_ADDR_SHIFT;
+        let last_page = (end - 1) >> COARSE_ADDR_SHIFT;
+        let huge = last_page - first_page >= COARSE_ADDR_MAX_PAGES;
+        if !self.sync_globals {
+            return huge;
+        }
+        if huge {
+            if add {
+                HUGE_ADDR_COUNT.fetch_add(1, Ordering::AcqRel);
+            } else {
+                HUGE_ADDR_COUNT.fetch_sub(1, Ordering::AcqRel);
+            }
+            return true;
+        }
+        if self.coarse_counts.is_empty() {
+            if !add {
+                return false;
+            }
+            self.coarse_counts.resize(COARSE_ADDR_BUCKETS, 0);
+        }
+        for page in first_page..=last_page {
+            let bucket = coarse_addr_bucket(page);
+            if add {
+                let c = &mut self.coarse_counts[bucket];
+                if *c == 0 {
+                    ADDR_COARSE_BITS[bucket >> 6].fetch_or(1u64 << (bucket & 63), Ordering::Release);
+                }
+                *c += 1;
+            } else {
+                let c = &mut self.coarse_counts[bucket];
+                if *c > 0 {
+                    *c -= 1;
+                    if *c == 0 {
+                        ADDR_COARSE_BITS[bucket >> 6].fetch_and(!(1u64 << (bucket & 63)), Ordering::Release);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn insert(&mut self, res: usize, va: u64, size: u64, entry: Arc<PlacedEntry>) {
+        self.remove(res);
+        let end = va.saturating_add(size);
+        let huge = self.update_coarse_bits(va, size, true);
+        self.by_res.insert(res, AddrMeta { va, size, huge });
+        let item = AddrEntry { res, va, end, entry };
+        if size <= SMALL_ADDR_MAX {
+            self.small.entry(va).or_default().push(item);
+            self.small_largest = self.small_largest.max(size);
+        } else if size <= MEDIUM_ADDR_MAX {
+            self.medium.entry(va).or_default().push(item);
+            self.medium_largest = self.medium_largest.max(size);
+        } else {
+            self.large.push(item);
+        }
+    }
+
+    fn remove(&mut self, res: usize) -> bool {
+        let Some(meta) = self.by_res.remove(&res) else { return false };
+        if self.sync_globals {
+            if meta.huge {
+                HUGE_ADDR_COUNT.fetch_sub(1, Ordering::AcqRel);
+            } else {
+                self.update_coarse_bits(meta.va, meta.size, false);
+            }
+        }
+        if meta.size <= SMALL_ADDR_MAX {
+            if let Some(list) = self.small.get_mut(&meta.va) {
+                list.retain(|e| e.res != res);
+                if list.is_empty() {
+                    self.small.remove(&meta.va);
+                }
+            }
+        } else if meta.size <= MEDIUM_ADDR_MAX {
+            if let Some(list) = self.medium.get_mut(&meta.va) {
+                list.retain(|e| e.res != res);
+                if list.is_empty() {
+                    self.medium.remove(&meta.va);
+                }
+            }
+        } else {
+            self.large.retain(|e| e.res != res);
+        }
+        true
+    }
+
+    fn collect_overlapping(&self, start: u64, end: u64, out: &mut Vec<Arc<PlacedEntry>>) {
+        out.clear();
+        if !self.small.is_empty() {
+            for (_, list) in self.small.range(start.saturating_sub(self.small_largest)..end) {
+                for e in list {
+                    if start < e.end && e.va < end {
+                        out.push(Arc::clone(&e.entry));
+                    }
+                }
+            }
+        }
+        if !self.medium.is_empty() {
+            for (_, list) in self.medium.range(start.saturating_sub(self.medium_largest)..end) {
+                for e in list {
+                    if start < e.end && e.va < end {
+                        out.push(Arc::clone(&e.entry));
+                    }
+                }
+            }
+        }
+        for e in &self.large {
+            if start < e.end && e.va < end {
+                out.push(Arc::clone(&e.entry));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn overlapping(&self, start: u64, end: u64) -> Vec<usize> {
+        let mut entries = Vec::new();
+        self.collect_overlapping(start, end, &mut entries);
+        entries.into_iter().map(|e| e.res).collect()
     }
 }
 
-#[derive(Default)]
-struct Registry {
-    textures: BTreeMap<usize, Placed>,
-    /// Resources that currently want a fill (`Placed::wants_fill`), so a flush visits only dirty
-    /// textures instead of scanning the whole table.
-    pending: FastSet<usize>,
-    /// Kinds of textures and refusal reasons logged so far, to log each once.
-    logged: HashSet<(u32, u32)>,
-    logged_refused: HashSet<String>,
-    flushes: u64,
-    detiled: u64,
-    /// Textures put off because their span got pages whose mappings are not applied yet.
-    deferred: u64,
-    /// Resources by title address, and the largest span of any of them. A write finds the textures
-    /// it overlaps without scanning the whole table. Scanning tens of thousands of textures under the lock for
-    /// every DirectStorage request once stalled the loading of a large world.
-    by_address: BTreeMap<u64, Vec<usize>>,
-    largest: u64,
-    /// Cached reverse index from mirror tile index to placed texture resources, maintained
-    /// incrementally on insert and remove and rebuilt only when `title_mem::unmap_generation()`
-    /// changes on unmap/release/reset.
-    tile_to_textures: FastMap<u32, TileRefs>,
-    unmapped_textures: FastSet<usize>,
-    pending_index: FastSet<usize>,
-    layout_gen: u64,
-    last_map_gen: u64,
-    last_tile_gen: u64,
-    scratch: RegistryScratch,
+static ADDR_INDEX: RwLock<Option<AddressIndex>> = RwLock::new(None);
+
+fn with_addr_write<R>(f: impl FnOnce(&mut AddressIndex) -> R) -> R {
+    let mut guard = decant_trace::timed_lock("detile::ADDR_WRITE", || ADDR_INDEX.write().unwrap_or_else(|e| e.into_inner()));
+    f(guard.get_or_insert_with(|| AddressIndex::new(true)))
 }
+
+fn with_addr_read<R>(f: impl FnOnce(&AddressIndex) -> R) -> Option<R> {
+    let guard = decant_trace::timed_lock("detile::ADDR_READ", || ADDR_INDEX.read().unwrap_or_else(|e| e.into_inner()));
+    guard.as_ref().map(f)
+}
+
+// ==== reverse tile index for `note_tiles` ====
 
 enum TileRefs {
     One(usize),
@@ -1154,165 +1469,265 @@ impl TileRefs {
     }
 }
 
-impl Registry {
-    fn insert(&mut self, res: usize, texture: Placed) {
-        self.remove(res);
-        self.by_address.entry(texture.va).or_default().push(res);
-        self.largest = self.largest.max(texture.plan.size);
-        self.pending_index.insert(res);
-        if texture.wants_fill() {
-            self.pending.insert(res);
-            HAS_PENDING_FILLS.store(true, Ordering::Release);
+struct TileEntry {
+    va: u64,
+    size: u64,
+    entry: Arc<PlacedEntry>,
+    tiles: Option<Vec<u32>>,
+}
+
+struct PrecomputedFullIndex {
+    tile_to_textures: FastMap<u32, TileRefs>,
+    unmapped_textures: FastSet<usize>,
+    coarse_counts: Vec<u32>,
+    coarse_bits: [u64; COARSE_TILE_WORDS],
+}
+
+#[derive(Debug)]
+enum IndexPlan {
+    Full {
+        unmap_gen: u64,
+        items: Vec<(usize, u64, u64, Arc<PlacedEntry>)>,
+        spans: Vec<(u64, u64)>,
+        cap_hint: usize,
+    },
+    Incremental {
+        unmap_gen: u64,
+        items: Vec<(usize, u64, u64, Arc<PlacedEntry>)>,
+        spans: Vec<(u64, u64)>,
+    },
+}
+
+/// Reverse index from mirror tiles to placed textures, protected by its own `RwLock` so fast-path
+/// `note_tiles` lookups only take a read lock and never contend with `flush`, `note_write`, or `submitted`.
+struct TileIndex {
+    entries: FastMap<usize, TileEntry>,
+    tile_to_textures: FastMap<u32, TileRefs>,
+    unmapped_textures: FastSet<usize>,
+    pending_index: FastSet<usize>,
+    layout_gen: u64,
+    last_map_gen: u64,
+    last_tile_gen: u64,
+    coarse_counts: Vec<u32>,
+    sync_globals: bool,
+}
+
+impl Default for TileIndex {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+impl TileIndex {
+    fn new(sync_globals: bool) -> Self {
+        Self {
+            entries: FastMap::default(),
+            tile_to_textures: FastMap::default(),
+            unmapped_textures: FastSet::default(),
+            pending_index: FastSet::default(),
+            layout_gen: 0,
+            last_map_gen: 0,
+            last_tile_gen: 0,
+            coarse_counts: Vec::new(),
+            sync_globals,
         }
-        crate::mem_owners::add(crate::mem_owners::Kind::DetileTexture, crate::mem_owners::Segment::Local, 1, texture.bytes);
-        self.textures.insert(res, texture);
-        TEXTURE_COUNT.store(self.textures.len(), Ordering::Release);
-        INDEX_SETTLED_UNMAP_GEN.store(0, Ordering::Release);
-        placed_insert(res);
     }
 
-    /// Drops `res`. Whether it was held.
-    fn remove(&mut self, res: usize) -> bool {
-        let Some(texture) = self.textures.remove(&res) else { return false };
-        TEXTURE_COUNT.store(self.textures.len(), Ordering::Release);
-        if self.textures.is_empty() {
+    #[inline]
+    fn add_coarse_tile(&mut self, tile: u32) {
+        if self.coarse_counts.is_empty() {
+            self.coarse_counts.resize(COARSE_TILE_BUCKETS, 0);
+        }
+        let bucket = coarse_tile_bucket(tile);
+        let c = &mut self.coarse_counts[bucket];
+        if *c == 0 && self.sync_globals {
+            COARSE_TILE_BITS[bucket >> 6].fetch_or(1u64 << (bucket & 63), Ordering::Relaxed);
+        }
+        *c += 1;
+    }
+
+    #[inline]
+    fn remove_coarse_tile(&mut self, tile: u32) {
+        if self.coarse_counts.is_empty() {
+            return;
+        }
+        let bucket = coarse_tile_bucket(tile);
+        let c = &mut self.coarse_counts[bucket];
+        if *c > 0 {
+            *c -= 1;
+            if *c == 0 && self.sync_globals {
+                COARSE_TILE_BITS[bucket >> 6].fetch_and(!(1u64 << (bucket & 63)), Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn update_settled_gen(&self) {
+        if !self.sync_globals {
+            return;
+        }
+        let settled = if !self.entries.is_empty() && self.pending_index.is_empty() && self.unmapped_textures.is_empty() {
+            self.layout_gen
+        } else {
+            0
+        };
+        INDEX_SETTLED_UNMAP_GEN.store(settled, Ordering::Release);
+    }
+
+    fn insert(&mut self, res: usize, va: u64, size: u64, entry: Arc<PlacedEntry>) {
+        self.remove(res);
+        self.entries.insert(res, TileEntry { va, size, entry, tiles: None });
+        self.pending_index.insert(res);
+        if self.sync_globals {
             INDEX_SETTLED_UNMAP_GEN.store(0, Ordering::Release);
         }
-        placed_remove(res);
-        self.pending.remove(&res);
+    }
+
+    fn remove(&mut self, res: usize) -> bool {
+        let Some(te) = self.entries.remove(&res) else { return false };
         self.pending_index.remove(&res);
         self.unmapped_textures.remove(&res);
-        if let Some(tiles) = &texture.tiles {
+        if let Some(tiles) = &te.tiles {
             for &tile in tiles {
                 if let Some(refs) = self.tile_to_textures.get_mut(&tile)
                     && refs.retain_not(res)
                 {
                     self.tile_to_textures.remove(&tile);
+                    self.remove_coarse_tile(tile);
                 }
             }
         }
-        if self.pending.is_empty() {
-            HAS_PENDING_FILLS.store(false, Ordering::Release);
-        }
-        crate::mem_owners::remove(crate::mem_owners::Kind::DetileTexture, crate::mem_owners::Segment::Local, 1, texture.bytes);
-        if let Some(at_address) = self.by_address.get_mut(&texture.va) {
-            at_address.retain(|&r| r != res);
-            if at_address.is_empty() {
-                self.by_address.remove(&texture.va);
-            }
-        }
+        self.update_settled_gen();
         true
     }
 
-    /// Marks `res` dirty and adds it to `pending`.
-    fn invalidate_res(&mut self, res: usize) -> bool {
-        if let Some(texture) = self.textures.get_mut(&res) {
-            texture.invalidate();
-            self.pending.insert(res);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Fills `out` with the resources whose memory overlaps `[start, end)`.
-    fn has_overlap(&self, start: u64, end: u64) -> bool {
-        self.by_address
-            .range(start.saturating_sub(self.largest)..end)
-            .any(|(_, resources)| resources.iter().any(|res| self.textures.get(res).is_some_and(|t| start < t.va.saturating_add(t.plan.size))))
-    }
-
-    fn overlapping_into(&self, start: u64, end: u64, out: &mut Vec<usize>) {
-        out.clear();
-        for (_, resources) in self.by_address.range(start.saturating_sub(self.largest)..end) {
-            for &res in resources {
-                if self.textures.get(&res).is_some_and(|t| start < t.va.saturating_add(t.plan.size)) {
-                    out.push(res);
-                }
+    fn remove_many(&mut self, resources: &[usize]) {
+        let mut any = false;
+        for &res in resources {
+            if self.remove(res) {
+                any = true;
             }
         }
+        if any {
+            self.update_settled_gen();
+        }
     }
 
-    /// The resources whose memory overlaps `[start, end)`.
-    fn overlapping(&self, start: u64, end: u64) -> Vec<usize> {
-        let mut out = Vec::new();
-        self.overlapping_into(start, end, &mut out);
-        out
+    #[inline]
+    fn needs_update(&self, current_unmap: u64, current_map: u64, current_tile: u64) -> bool {
+        if self.layout_gen != current_unmap || !self.pending_index.is_empty() {
+            return true;
+        }
+        (current_tile != self.last_tile_gen || current_map != self.last_map_gen) && !self.unmapped_textures.is_empty()
     }
 
-    /// Builds the reverse index maps outside `REGISTRY` so the write lock only swaps pointers and
-    /// moves tile vectors into `Placed::tiles`.
+    fn plan_index_update(&self, current_unmap: u64, current_map: u64, current_tile: u64) -> Option<IndexPlan> {
+        if self.layout_gen != current_unmap {
+            let items: Vec<(usize, u64, u64, Arc<PlacedEntry>)> = self.entries.iter().map(|(&res, t)| (res, t.va, t.size, Arc::clone(&t.entry))).collect();
+            let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len, _)| (va, len)).collect();
+            return Some(IndexPlan::Full {
+                unmap_gen: current_unmap,
+                items,
+                spans,
+                cap_hint: self.tile_to_textures.len(),
+            });
+        }
+        let check_unmapped = (current_tile != self.last_tile_gen || current_map != self.last_map_gen) && !self.unmapped_textures.is_empty();
+        if !self.pending_index.is_empty() || check_unmapped {
+            let mut items = Vec::with_capacity(self.pending_index.len() + if check_unmapped { self.unmapped_textures.len() } else { 0 });
+            for &res in &self.pending_index {
+                if let Some(t) = self.entries.get(&res) {
+                    items.push((res, t.va, t.size, Arc::clone(&t.entry)));
+                }
+            }
+            if check_unmapped {
+                for &res in &self.unmapped_textures {
+                    if !self.pending_index.contains(&res)
+                        && let Some(t) = self.entries.get(&res)
+                    {
+                        items.push((res, t.va, t.size, Arc::clone(&t.entry)));
+                    }
+                }
+            }
+            let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len, _)| (va, len)).collect();
+            return Some(IndexPlan::Incremental { unmap_gen: current_unmap, items, spans });
+        }
+        None
+    }
+
     fn build_full_index_maps(
-        items: &[(usize, u64, u64)],
+        items: &[(usize, u64, u64, Arc<PlacedEntry>)],
         tiles_per_item: &[Option<Vec<u32>>],
         capacity_hint: usize,
-    ) -> (FastMap<u32, TileRefs>, FastSet<usize>) {
-        let mut tile_to_textures: FastMap<u32, TileRefs> =
-            FastMap::with_capacity_and_hasher(capacity_hint.max(items.len() * 2), Default::default());
+    ) -> PrecomputedFullIndex {
+        let mut tile_to_textures: FastMap<u32, TileRefs> = FastMap::with_capacity_and_hasher(capacity_hint.max(items.len() * 2), Default::default());
         let mut unmapped_textures: FastSet<usize> = FastSet::default();
-        for (&(res, _, _), maybe_tiles) in items.iter().zip(tiles_per_item) {
+        let mut coarse_counts = vec![0u32; COARSE_TILE_BUCKETS];
+        let mut coarse_bits = [0u64; COARSE_TILE_WORDS];
+        for ((res, _, _, _), maybe_tiles) in items.iter().zip(tiles_per_item) {
             match maybe_tiles {
                 Some(tiles) => {
                     for &tile in tiles {
                         match tile_to_textures.entry(tile) {
-                            std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(res),
+                            std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(*res),
                             std::collections::hash_map::Entry::Vacant(e) => {
-                                e.insert(TileRefs::One(res));
+                                e.insert(TileRefs::One(*res));
+                                let bucket = coarse_tile_bucket(tile);
+                                if coarse_counts[bucket] == 0 {
+                                    coarse_bits[bucket >> 6] |= 1u64 << (bucket & 63);
+                                }
+                                coarse_counts[bucket] += 1;
                             }
                         }
                     }
                 }
                 None => {
-                    unmapped_textures.insert(res);
+                    unmapped_textures.insert(*res);
                 }
             }
         }
-        (tile_to_textures, unmapped_textures)
+        PrecomputedFullIndex { tile_to_textures, unmapped_textures, coarse_counts, coarse_bits }
     }
 
-    /// Swaps in prebuilt `tile_to_textures` / `unmapped_textures` under the write lock and returns
-    /// the old maps so they can be dropped outside the lock.
     fn apply_precomputed_full_index(
         &mut self,
-        items: &[(usize, u64, u64)],
+        items: &[(usize, u64, u64, Arc<PlacedEntry>)],
         tiles_per_item: Vec<Option<Vec<u32>>>,
-        precomputed: (FastMap<u32, TileRefs>, FastSet<usize>),
+        mut precomputed: PrecomputedFullIndex,
         (layout_gen, map_gen, tile_gen): (u64, u64, u64),
         layout_current: bool,
     ) -> (FastMap<u32, TileRefs>, FastSet<usize>) {
-        let (mut new_tile_to_textures, mut new_unmapped) = precomputed;
-        std::mem::swap(&mut self.tile_to_textures, &mut new_tile_to_textures);
-        std::mem::swap(&mut self.unmapped_textures, &mut new_unmapped);
+        std::mem::swap(&mut self.tile_to_textures, &mut precomputed.tile_to_textures);
+        std::mem::swap(&mut self.unmapped_textures, &mut precomputed.unmapped_textures);
+        std::mem::swap(&mut self.coarse_counts, &mut precomputed.coarse_counts);
+        if self.sync_globals {
+            for (slot, &val) in COARSE_TILE_BITS.iter().zip(&precomputed.coarse_bits) {
+                slot.store(val, Ordering::Relaxed);
+            }
+        }
         let mut live_matched = 0usize;
-        for (&(res, va, _), maybe_tiles) in items.iter().zip(tiles_per_item) {
-            let Some(texture) = self.textures.get_mut(&res).filter(|t| t.va == va) else {
+        for ((res, _, _, entry), maybe_tiles) in items.iter().zip(tiles_per_item) {
+            let Some(te) = self.entries.get_mut(res).filter(|t| Arc::ptr_eq(&t.entry, entry)) else {
                 continue;
             };
             live_matched += 1;
-            self.pending_index.remove(&res);
-            texture.tiles = maybe_tiles;
+            self.pending_index.remove(res);
+            te.tiles = maybe_tiles;
         }
-        if layout_current && live_matched == self.textures.len() {
+        if layout_current && live_matched == self.entries.len() {
             self.layout_gen = layout_gen;
             self.last_map_gen = map_gen;
             self.last_tile_gen = tile_gen;
         } else {
             self.layout_gen = 0;
         }
-        rebuild_coarse_tile_bits(&self.tile_to_textures);
-        let settled = if self.pending_index.is_empty() && self.unmapped_textures.is_empty() {
-            self.layout_gen
-        } else {
-            0
-        };
-        INDEX_SETTLED_UNMAP_GEN.store(settled, Ordering::Release);
-        (new_tile_to_textures, new_unmapped)
+        self.update_settled_gen();
+        (precomputed.tile_to_textures, precomputed.unmapped_textures)
     }
 
     #[cfg(test)]
     fn apply_full_index(
         &mut self,
-        items: &[(usize, u64, u64)],
+        items: &[(usize, u64, u64, Arc<PlacedEntry>)],
         tiles_per_item: &[Option<Vec<u32>>],
         layout_gen: u64,
         map_gen: u64,
@@ -1323,46 +1738,49 @@ impl Registry {
         let _ = self.apply_precomputed_full_index(items, tiles_per_item.to_vec(), precomputed, (layout_gen, map_gen, tile_gen), layout_current);
     }
 
-    /// Incrementally updates `tile_to_textures` for newly inserted or previously unmapped textures.
     fn apply_incremental_index(
         &mut self,
-        items: &[(usize, u64, u64)],
+        items: &[(usize, u64, u64, Arc<PlacedEntry>)],
         tiles_per_item: &[Option<Vec<u32>>],
         map_gen: u64,
         map_current: bool,
         tile_gen: u64,
         tile_current: bool,
     ) {
-        for (&(res, va, _), maybe_tiles) in items.iter().zip(tiles_per_item) {
-            let Some(texture) = self.textures.get_mut(&res).filter(|t| t.va == va) else {
+        for ((res, _, _, entry), maybe_tiles) in items.iter().zip(tiles_per_item) {
+            let Some(te) = self.entries.get_mut(res).filter(|t| Arc::ptr_eq(&t.entry, entry)) else {
                 continue;
             };
-            self.pending_index.remove(&res);
-            self.unmapped_textures.remove(&res);
-            if let Some(old_tiles) = texture.tiles.take() {
+            self.pending_index.remove(res);
+            self.unmapped_textures.remove(res);
+            let old_tiles = te.tiles.take();
+            if let Some(old_tiles) = old_tiles {
                 for tile in old_tiles {
                     if let Some(refs) = self.tile_to_textures.get_mut(&tile)
-                        && refs.retain_not(res)
+                        && refs.retain_not(*res)
                     {
                         self.tile_to_textures.remove(&tile);
+                        self.remove_coarse_tile(tile);
                     }
                 }
             }
             match maybe_tiles {
                 Some(tiles) => {
                     for &tile in tiles {
-                        coarse_tile_set(tile);
                         match self.tile_to_textures.entry(tile) {
-                            std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(res),
+                            std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(*res),
                             std::collections::hash_map::Entry::Vacant(e) => {
-                                e.insert(TileRefs::One(res));
+                                e.insert(TileRefs::One(*res));
+                                self.add_coarse_tile(tile);
                             }
                         }
                     }
-                    texture.tiles = Some(tiles.clone());
+                    if let Some(te) = self.entries.get_mut(res) {
+                        te.tiles = Some(tiles.clone());
+                    }
                 }
                 None => {
-                    self.unmapped_textures.insert(res);
+                    self.unmapped_textures.insert(*res);
                 }
             }
         }
@@ -1372,55 +1790,56 @@ impl Registry {
         if tile_current {
             self.last_tile_gen = tile_gen;
         }
-        let settled = if self.pending_index.is_empty() && self.unmapped_textures.is_empty() {
-            self.layout_gen
-        } else {
-            0
-        };
-        INDEX_SETTLED_UNMAP_GEN.store(settled, Ordering::Release);
+        self.update_settled_gen();
     }
 
-    /// Marks textures whose mirror tiles appear in `tiles` using the cached reverse index.
-    fn mark_tiles_from_index(&mut self, tiles: &[u32], report: bool) -> u32 {
-        if self.tile_to_textures.is_empty() && !report {
-            return 0;
-        }
-        let mut hit = std::mem::take(&mut self.scratch.overlapping);
-        hit.clear();
-        for &tile in tiles {
-            if let Some(refs) = self.tile_to_textures.get(&tile) {
-                hit.extend_from_slice(refs.as_slice());
-            }
-        }
-        if hit.len() > 1 {
-            hit.sort_unstable();
-            hit.dedup();
-        }
-        let mut marked = 0u32;
-        for &res in &hit {
-            if let Some(texture) = self.textures.get_mut(&res) {
-                if !(texture.dirty && texture.attempts == 0) {
-                    texture.invalidate();
-                    self.pending.insert(res);
+    /// Collects unique entries whose mirror tiles appear in `tiles` under a shared read lock.
+    fn collect_hits(&self, tiles: &[u32], report: bool, hit_res: &mut Vec<usize>, out: &mut Vec<Arc<PlacedEntry>>) {
+        hit_res.clear();
+        out.clear();
+        if !self.tile_to_textures.is_empty() {
+            for &tile in tiles {
+                if let Some(refs) = self.tile_to_textures.get(&tile) {
+                    hit_res.extend_from_slice(refs.as_slice());
                 }
-                marked += 1;
+            }
+            if hit_res.len() > 1 {
+                hit_res.sort_unstable();
+                hit_res.dedup();
+            }
+            for &res in hit_res.iter() {
+                if let Some(te) = self.entries.get(&res) {
+                    out.push(Arc::clone(&te.entry));
+                }
             }
         }
-        self.scratch.overlapping = hit;
         if report {
-            let waiting = self.textures.values().filter(|t| t.dirty && t.attempts == 0).count();
-            let filled = self.textures.values().filter(|t| !t.dirty).count() as u32;
+            let waiting = self.entries.values().filter(|t| t.entry.is_dirty() && t.entry.attempts() == 0).count();
+            let filled = self.entries.values().filter(|t| !t.entry.is_dirty()).count() as u32;
             let unmapped = self.unmapped_textures.len() as u32;
-            let first_unmapped = self.unmapped_textures.iter().next().and_then(|res| self.textures.get(res)).map_or(0, |t| t.va);
-            let untouched = (self.textures.len() as u32).saturating_sub(marked + unmapped);
+            let first_unmapped = self.unmapped_textures.iter().next().and_then(|res| self.entries.get(res)).map_or(0, |t| t.va);
+            let marked = out.len() as u32;
+            let untouched = (self.entries.len() as u32).saturating_sub(marked + unmapped);
             xs_log!(
                 "detile: {} textures, {} pages written: {marked} marked, {waiting} wait for a fill, {untouched} not written ({filled} of them filled), {unmapped} with pages that are not mapped (first at {first_unmapped:#x})",
-                self.textures.len(),
+                self.entries.len(),
                 tiles.len()
             );
         }
-        marked
     }
+}
+
+static TILE_INDEX: RwLock<Option<TileIndex>> = RwLock::new(None);
+static INDEX_REBUILD_LOCK: Mutex<()> = Mutex::new(());
+
+fn with_tile_write<R>(f: impl FnOnce(&mut TileIndex) -> R) -> R {
+    let mut guard = decant_trace::timed_lock("detile::TILE_WRITE", || TILE_INDEX.write().unwrap_or_else(|e| e.into_inner()));
+    f(guard.get_or_insert_with(|| TileIndex::new(true)))
+}
+
+fn with_tile_read<R>(f: impl FnOnce(&TileIndex) -> R) -> Option<R> {
+    let guard = decant_trace::timed_lock("detile::TILE_READ", || TILE_INDEX.read().unwrap_or_else(|e| e.into_inner()));
+    guard.as_ref().map(f)
 }
 
 /// Experiments for the removal of the device with block compressed textures, set by environment.
@@ -1450,47 +1869,55 @@ struct DetilerState {
     unavailable: bool,
 }
 
-static REGISTRY: RwLock<Option<Registry>> = RwLock::new(None);
 static DETILER: Mutex<DetilerState> = Mutex::new(DetilerState { detiler: None, unavailable: false });
-
-#[derive(Default)]
-struct NotedState {
-    lists: FastMap<usize, Vec<(usize, u32, u32)>>,
-    scratch: Vec<(usize, u32, u32)>,
-}
-
-static NOTED: Mutex<Option<NotedState>> = Mutex::new(None);
-
-fn with_noted<R>(f: impl FnOnce(&mut NotedState) -> R) -> R {
-    let mut guard = NOTED.lock().unwrap_or_else(|e| e.into_inner());
-    f(guard.get_or_insert_with(NotedState::default))
-}
-
-fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
-    let mut guard = decant_trace::timed_lock("detile::REGISTRY", || REGISTRY.write().unwrap_or_else(|e| e.into_inner()));
-    f(guard.get_or_insert_with(Registry::default))
-}
-
-fn with_registry_read<R>(f: impl FnOnce(&Registry) -> R) -> Option<R> {
-    let guard = decant_trace::timed_lock("detile::REGISTRY_READ", || REGISTRY.read().unwrap_or_else(|e| e.into_inner()));
-    guard.as_ref().map(f)
-}
 
 fn with_detiler<R>(f: impl FnOnce(&mut DetilerState) -> R) -> R {
     let mut guard = decant_trace::timed_lock("detile::DETILER", || DETILER.lock().unwrap_or_else(|e| e.into_inner()));
     f(&mut guard)
 }
 
-/// One line about the detile state for the device removal report. It never blocks, a busy registry
+const NOTED_SHARDS: usize = 16;
+
+#[inline]
+fn noted_shard(list: usize) -> usize {
+    (list >> 4) & (NOTED_SHARDS - 1)
+}
+
+#[derive(Default)]
+struct NotedShard {
+    lists: FastMap<usize, Vec<(usize, u32, u32)>>,
+}
+
+static NOTED: [Mutex<Option<NotedShard>>; NOTED_SHARDS] = [const { Mutex::new(None) }; NOTED_SHARDS];
+
+fn with_noted_shard<R>(list: usize, f: impl FnOnce(&mut NotedShard) -> R) -> R {
+    let mut guard = NOTED[noted_shard(list)].lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(NotedShard::default))
+}
+
+/// One line about the detile state for the device removal report. It never blocks, a busy shard
 /// is reported as such.
 pub fn summary() -> String {
-    let (textures_len, flushes, detiled, deferred, dirty, retried) = {
-        let Ok(guard) = REGISTRY.try_read() else { return "detile: the table is busy".into() };
-        let Some(r) = guard.as_ref() else { return "detile: no table".into() };
-        let dirty = r.textures.values().filter(|t| t.dirty).count();
-        let retried = r.textures.values().filter(|t| t.wants_fill()).count();
-        (r.textures.len(), r.flushes, r.detiled, r.deferred, dirty, retried)
-    };
+    let mut textures_len = 0usize;
+    let mut dirty = 0usize;
+    let mut retried = 0usize;
+    for shard in &TEXTURES {
+        let Ok(guard) = shard.try_read() else { return "detile: the table is busy".into() };
+        if let Some(map) = guard.as_ref() {
+            textures_len += map.len();
+            for entry in map.values() {
+                if entry.is_dirty() {
+                    dirty += 1;
+                }
+                if entry.wants_fill() {
+                    retried += 1;
+                }
+            }
+        }
+    }
+    let flushes = FLUSHES_COUNT.load(Ordering::Relaxed);
+    let detiled = DETILED_COUNT.load(Ordering::Relaxed);
+    let deferred = DEFERRED_COUNT.load(Ordering::Relaxed);
     let (frames, queues, staging) = DETILER
         .try_lock()
         .ok()
@@ -1521,6 +1948,11 @@ fn le_u32(raw: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(raw[at..at + 4].try_into().unwrap_or_default())
 }
 
+static LOGGED_KINDS_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LOGGED_KINDS: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+static LOGGED_REFUSED_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LOGGED_REFUSED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
 /// The title placed a texture at `va` (device slots 44 and 133). `res` is the PC resource, `raw` the
 /// description the title passed, `state` the initial state and `bytes` the PC allocation size. A
 /// texture whose layout cannot be detiled is logged with its reason.
@@ -1530,32 +1962,56 @@ pub fn register(res: usize, va: u64, raw: &[u8; 0x38], state: u32, bytes: u64) {
     }
     let v4 = hardware_v4();
     match detile_plan::plan_shared(raw, v4) {
-        Ok(plan) => with_registry(|r| {
+        Ok(plan) => {
             let format = le_u32(raw, 0x20);
-            if r.logged.len() < 64 && r.logged.insert((format, plan.mode)) {
-                let width = u64::from_le_bytes(raw[0x10..0x18].try_into().unwrap_or_default());
-                xs_log!(
-                    "detile: a texture to detile, ok format {format} mode {} {width}x{} mips {} slices {} v4 {v4} at {va:#x}, {} bytes",
-                    plan.mode,
-                    le_u32(raw, 0x18),
-                    plan.mips.len(),
-                    plan.slices,
-                    plan.size
-                );
+            if LOGGED_KINDS_COUNT.load(Ordering::Relaxed) < 64 {
+                let mut guard = LOGGED_KINDS.lock().unwrap_or_else(|e| e.into_inner());
+                let set = guard.get_or_insert_with(HashSet::new);
+                if set.len() < 64 && set.insert((format, plan.mode)) {
+                    LOGGED_KINDS_COUNT.store(set.len(), Ordering::Relaxed);
+                    let width = u64::from_le_bytes(raw[0x10..0x18].try_into().unwrap_or_default());
+                    xs_log!(
+                        "detile: a texture to detile, ok format {format} mode {} {width}x{} mips {} slices {} v4 {v4} at {va:#x}, {} bytes",
+                        plan.mode,
+                        le_u32(raw, 0x18),
+                        plan.mips.len(),
+                        plan.slices,
+                        plan.size
+                    );
+                }
             }
-            r.insert(res, Placed { va, plan, bytes, states: Arc::new(vec![state]), tiles: None, dirty: true, attempts: 0 });
-        }),
+            let size = plan.size;
+            let entry = Arc::new(PlacedEntry::new(res, va, plan, bytes, state, true));
+            let old = with_texture_shard_write(res, |shard| {
+                let prev = shard.insert(res, Arc::clone(&entry));
+                if prev.is_none() {
+                    TEXTURE_COUNT.fetch_add(1, Ordering::AcqRel);
+                }
+                prev
+            });
+            if let Some(prev) = old {
+                prev.mark_dead();
+                crate::mem_owners::remove(crate::mem_owners::Kind::DetileTexture, crate::mem_owners::Segment::Local, 1, prev.bytes);
+            }
+            crate::mem_owners::add(crate::mem_owners::Kind::DetileTexture, crate::mem_owners::Segment::Local, 1, bytes);
+            with_addr_write(|addr| addr.insert(res, va, size, Arc::clone(&entry)));
+            with_tile_write(|ti| ti.insert(res, va, size, Arc::clone(&entry)));
+            if entry.try_set_queued() {
+                enqueue_pending_single(entry);
+            }
+        }
         Err(why) => {
-            let reason = why.split(':').next().unwrap_or("");
-            if with_registry_read(|r| r.logged_refused.len() < 64 && !r.logged_refused.contains(reason)) == Some(false) {
+            if LOGGED_REFUSED_COUNT.load(Ordering::Relaxed) >= 64 {
                 return;
             }
-            with_registry(|r| {
-                if r.logged_refused.len() < 64 && !r.logged_refused.contains(reason) {
-                    r.logged_refused.insert(reason.to_string());
-                    xs_log!("detile: a placed texture at {va:#x} is not detiled: {why}");
-                }
-            });
+            let reason = why.split(':').next().unwrap_or("");
+            let mut guard = LOGGED_REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+            let set = guard.get_or_insert_with(HashSet::new);
+            if set.len() < 64 && !set.contains(reason) {
+                set.insert(reason.to_string());
+                LOGGED_REFUSED_COUNT.store(set.len(), Ordering::Relaxed);
+                xs_log!("detile: a placed texture at {va:#x} is not detiled: {why}");
+            }
         }
     }
 }
@@ -1564,7 +2020,8 @@ pub fn register(res: usize, va: u64, raw: &[u8; 0x38], state: u32, bytes: u64) {
 /// address and size, whether its pages are mapped, whether it waits for a fill and how many of the
 /// first 64 KiB of its bytes are not zero. `None` for a resource the registry does not hold.
 pub fn describe(res: usize) -> Option<String> {
-    let (va, size, mode, dirty, attempts) = with_registry_read(|r| r.textures.get(&res).map(|t| (t.va, t.plan.size, t.plan.mode, t.dirty, t.attempts))).flatten()?;
+    let entry = lookup_placed_entry(res)?;
+    let (va, size, mode, dirty, attempts) = (entry.va, entry.plan.size, entry.plan.mode, entry.is_dirty(), entry.attempts());
     let mapped = crate::title_mem::tiles_of(va, size).is_some();
     let probe = size.min(64 << 10) as usize;
     let content = if crate::title_mem::writable(va as usize, probe) {
@@ -1578,41 +2035,83 @@ pub fn describe(res: usize) -> Option<String> {
     Some(format!("detile va {va:#x} {size} bytes mode {mode}, pages {}, {fill}, {content}", if mapped { "mapped" } else { "NOT mapped" }))
 }
 
-/// The resource was released.
-pub fn forget(res: usize) {
-    if TEXTURE_COUNT.load(Ordering::Acquire) == 0 || !is_placed(res) {
-        return;
+fn remove_resource_everywhere(res: usize) -> bool {
+    if !is_placed(res) {
+        return false;
     }
-    if with_registry_read(|r| r.textures.contains_key(&res)) != Some(true) {
-        return;
-    }
-    with_registry(|r| {
-        r.remove(res);
+    let removed = with_texture_shard_write(res, |shard| {
+        let entry = shard.remove(&res)?;
+        entry.mark_dead();
+        let remaining = TEXTURE_COUNT.fetch_sub(1, Ordering::AcqRel) - 1;
+        if remaining == 0 {
+            INDEX_SETTLED_UNMAP_GEN.store(0, Ordering::Release);
+        }
+        Some(entry)
     });
+    let Some(entry) = removed else { return false };
+    crate::mem_owners::remove(crate::mem_owners::Kind::DetileTexture, crate::mem_owners::Segment::Local, 1, entry.bytes);
+    with_addr_write(|addr| addr.remove(res));
+    with_tile_write(|ti| ti.remove(res));
+    true
 }
 
-/// Removes a batch of released resources under a single `REGISTRY` lock acquisition.
-pub fn forget_many(resources: &[usize]) {
-    if resources.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 || !resources.iter().any(|&res| is_placed(res)) {
+/// The resource was released.
+pub fn forget(res: usize) {
+    if TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
-    with_registry(|r| {
-        for &res in resources {
-            r.remove(res);
+    let _ = remove_resource_everywhere(res);
+}
+
+/// Removes a batch of released resources under single `ADDR_INDEX` and `TILE_INDEX` write locks.
+pub fn forget_many(resources: &[usize]) {
+    if resources.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut removed_ids: Vec<usize> = Vec::new();
+    let mut removed_bytes = 0u64;
+    let mut removed_count = 0usize;
+    for &res in resources {
+        if !is_placed(res) {
+            continue;
         }
-        rebuild_coarse_tile_bits(&r.tile_to_textures);
-        let settled = if !r.textures.is_empty() && r.pending_index.is_empty() && r.unmapped_textures.is_empty() {
-            r.layout_gen
-        } else {
-            0
-        };
-        INDEX_SETTLED_UNMAP_GEN.store(settled, Ordering::Release);
+        let entry = with_texture_shard_write(res, |shard| {
+            let entry = shard.remove(&res)?;
+            entry.mark_dead();
+            Some(entry)
+        });
+        if let Some(entry) = entry {
+            removed_ids.push(res);
+            removed_bytes += entry.bytes;
+            removed_count += 1;
+        }
+    }
+    if removed_ids.is_empty() {
+        return;
+    }
+    let prev = TEXTURE_COUNT.fetch_sub(removed_count, Ordering::AcqRel);
+    if prev <= removed_count {
+        INDEX_SETTLED_UNMAP_GEN.store(0, Ordering::Release);
+    }
+    crate::mem_owners::remove(crate::mem_owners::Kind::DetileTexture, crate::mem_owners::Segment::Local, removed_count as u64, removed_bytes);
+    with_addr_write(|addr| {
+        for &res in &removed_ids {
+            addr.remove(res);
+        }
     });
+    with_tile_write(|ti| ti.remove_many(&removed_ids));
 }
 
 /// Existing view and Unmap callers report possible writes. The placed memory is tracked by
 /// `note_tiles` and explicit writes arrive through `note_write`, so nothing is left to do here.
 pub fn mark_resource(_res: usize) {}
+
+std::thread_local! {
+    static ADDR_HIT_SCRATCH: std::cell::RefCell<Vec<Arc<PlacedEntry>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TILE_RES_SCRATCH: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TILE_HIT_SCRATCH: std::cell::RefCell<Vec<Arc<PlacedEntry>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SUBMITTED_SCRATCH: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// The title or a layer wrote `len` bytes at title address `va` (a DirectStorage completion or a
 /// copy).
@@ -1621,16 +2120,17 @@ pub fn note_write(va: u64, len: u64) {
         return;
     }
     let end = va.saturating_add(len);
-    if with_registry_read(|r| r.has_overlap(va, end)) != Some(true) {
+    if !may_overlap_addr(va, end) {
         return;
     }
-    with_registry(|r| {
-        let mut hit = std::mem::take(&mut r.scratch.overlapping);
-        r.overlapping_into(va, end, &mut hit);
-        for &res in &hit {
-            r.invalidate_res(res);
+    ADDR_HIT_SCRATCH.with(|cell| {
+        let mut hits = cell.borrow_mut();
+        hits.clear();
+        let _ = with_addr_read(|addr| addr.collect_overlapping(va, end, &mut hits));
+        if !hits.is_empty() {
+            invalidate_entries(&hits);
+            hits.clear();
         }
-        r.scratch.overlapping = hit;
     });
 }
 
@@ -1652,7 +2152,7 @@ fn probe_line_due() -> bool {
 type DropPayload = (FastMap<u32, TileRefs>, FastSet<usize>);
 
 fn background_drop_sender() -> Option<&'static std::sync::mpsc::Sender<DropPayload>> {
-    static DROP_TX: std::sync::OnceLock<Option<std::sync::mpsc::Sender<DropPayload>>> = std::sync::OnceLock::new();
+    static DROP_TX: OnceLock<Option<std::sync::mpsc::Sender<DropPayload>>> = OnceLock::new();
     DROP_TX
         .get_or_init(|| {
             let (tx, rx) = std::sync::mpsc::channel::<DropPayload>();
@@ -1682,61 +2182,6 @@ fn enqueue_background_drop(old_map: FastMap<u32, TileRefs>, old_unmapped: FastSe
     drop(old_unmapped);
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum IndexPlan {
-    Full {
-        unmap_gen: u64,
-        items: Vec<(usize, u64, u64)>,
-        spans: Vec<(u64, u64)>,
-        cap_hint: usize,
-    },
-    Incremental {
-        unmap_gen: u64,
-        items: Vec<(usize, u64, u64)>,
-        spans: Vec<(u64, u64)>,
-    },
-}
-
-impl Registry {
-    fn plan_index_update(&self, current_unmap: u64, current_map: u64, current_tile: u64) -> Option<IndexPlan> {
-        if self.layout_gen != current_unmap {
-            let items: Vec<(usize, u64, u64)> = self.textures.iter().map(|(&res, t)| (res, t.va, t.plan.size)).collect();
-            let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
-            return Some(IndexPlan::Full {
-                unmap_gen: current_unmap,
-                items,
-                spans,
-                cap_hint: self.tile_to_textures.len(),
-            });
-        }
-        let check_unmapped = (current_tile != self.last_tile_gen || current_map != self.last_map_gen) && !self.unmapped_textures.is_empty();
-        if !self.pending_index.is_empty() || check_unmapped {
-            let mut items = Vec::with_capacity(self.pending_index.len() + if check_unmapped { self.unmapped_textures.len() } else { 0 });
-            for &res in &self.pending_index {
-                if let Some(t) = self.textures.get(&res) {
-                    items.push((res, t.va, t.plan.size));
-                }
-            }
-            if check_unmapped {
-                for &res in &self.unmapped_textures {
-                    if !self.pending_index.contains(&res)
-                        && let Some(t) = self.textures.get(&res)
-                    {
-                        items.push((res, t.va, t.plan.size));
-                    }
-                }
-            }
-            let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
-            return Some(IndexPlan::Incremental {
-                unmap_gen: current_unmap,
-                items,
-                spans,
-            });
-        }
-        None
-    }
-}
-
 fn tiles_of_batch_parallel(spans: &[(u64, u64)], tiles_out: &mut Vec<Option<Vec<u32>>>) {
     crate::title_mem::tiles_of_batch(spans, tiles_out);
 }
@@ -1753,69 +2198,94 @@ pub fn note_tiles(tiles: &[u32]) {
     let current_unmap = crate::title_mem::unmap_generation();
     let current_map = crate::title_mem::mapping_generation();
     let current_tile = crate::title_mem::tile_generation();
-    let Some(fast) = with_registry_read(|r| {
-        if r.textures.is_empty() {
-            return Ok(false);
-        }
-        if let Some(plan) = r.plan_index_update(current_unmap, current_map, current_tile) {
-            return Err(plan);
-        }
-        Ok(report
-            || tiles.iter().any(|t| {
-                r.tile_to_textures
-                    .get(t)
-                    .is_some_and(|refs| refs.as_slice().iter().any(|res| r.textures.get(res).is_some_and(|tex| !(tex.dirty && tex.attempts == 0))))
-            }))
-    }) else {
-        return;
-    };
-    let marked = match fast {
-        Ok(false) => 0,
-        Ok(true) => with_registry(|r| r.mark_tiles_from_index(tiles, report)),
-        Err(plan) => {
-            let build_unmap = crate::title_mem::unmap_generation();
-            let build_map = crate::title_mem::mapping_generation();
-            let build_tile = crate::title_mem::tile_generation();
-            let mut tiles_out = Vec::new();
-            match plan {
-                IndexPlan::Full { unmap_gen: _, items, spans, cap_hint } => {
-                    tiles_of_batch_parallel(&spans, &mut tiles_out);
-                    let precomputed = Registry::build_full_index_maps(&items, &tiles_out, cap_hint);
-                    let (old_map, old_unmapped, marked) = with_registry(|r| {
-                        let (old_map, old_unmapped) = r.apply_precomputed_full_index(
-                            &items,
-                            tiles_out,
-                            precomputed,
-                            (build_unmap, build_map, build_tile),
-                            crate::title_mem::unmap_generation() == build_unmap,
-                        );
-                        let marked = r.mark_tiles_from_index(tiles, report);
-                        (old_map, old_unmapped, marked)
-                    });
-                    enqueue_background_drop(old_map, old_unmapped);
-                    marked
+
+    let marked = TILE_RES_SCRATCH.with(|res_cell| {
+        TILE_HIT_SCRATCH.with(|hit_cell| {
+            let mut hit_res = res_cell.borrow_mut();
+            let mut hits = hit_cell.borrow_mut();
+            hit_res.clear();
+            hits.clear();
+
+            let fast = with_tile_read(|ti| {
+                if ti.entries.is_empty() {
+                    return Ok(());
                 }
-                IndexPlan::Incremental { unmap_gen: snap_unmap, items, spans } => {
-                    tiles_of_batch_parallel(&spans, &mut tiles_out);
-                    with_registry(|r| {
-                        if crate::title_mem::unmap_generation() != snap_unmap {
-                            r.layout_gen = 0;
-                        } else {
-                            r.apply_incremental_index(
-                                &items,
-                                &tiles_out,
-                                build_map,
-                                crate::title_mem::mapping_generation() == build_map,
-                                build_tile,
-                                crate::title_mem::tile_generation() == build_tile,
-                            );
+                if ti.needs_update(current_unmap, current_map, current_tile) {
+                    return Err(());
+                }
+                ti.collect_hits(tiles, report, &mut hit_res, &mut hits);
+                Ok(())
+            });
+            match fast {
+                None => return 0usize,
+                Some(Ok(())) => {}
+                Some(Err(())) => {
+                    let _rebuild_guard = decant_trace::timed_lock("detile::TILE_REBUILD", || INDEX_REBUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+                    let build_unmap = crate::title_mem::unmap_generation();
+                    let build_map = crate::title_mem::mapping_generation();
+                    let build_tile = crate::title_mem::tile_generation();
+                    let plan_or_done = with_tile_read(|ti| {
+                        if ti.entries.is_empty() {
+                            return None;
                         }
-                        r.mark_tiles_from_index(tiles, report)
+                        if let Some(plan) = ti.plan_index_update(build_unmap, build_map, build_tile) {
+                            return Some(plan);
+                        }
+                        ti.collect_hits(tiles, report, &mut hit_res, &mut hits);
+                        None
                     })
+                    .flatten();
+                    if let Some(plan) = plan_or_done {
+                        let mut tiles_out = Vec::new();
+                        match plan {
+                            IndexPlan::Full { unmap_gen: _, items, spans, cap_hint } => {
+                                tiles_of_batch_parallel(&spans, &mut tiles_out);
+                                let precomputed = TileIndex::build_full_index_maps(&items, &tiles_out, cap_hint);
+                                let (old_map, old_unmapped) = with_tile_write(|ti| {
+                                    let old = ti.apply_precomputed_full_index(
+                                        &items,
+                                        tiles_out,
+                                        precomputed,
+                                        (build_unmap, build_map, build_tile),
+                                        crate::title_mem::unmap_generation() == build_unmap,
+                                    );
+                                    ti.collect_hits(tiles, report, &mut hit_res, &mut hits);
+                                    old
+                                });
+                                enqueue_background_drop(old_map, old_unmapped);
+                            }
+                            IndexPlan::Incremental { unmap_gen: snap_unmap, items, spans } => {
+                                tiles_of_batch_parallel(&spans, &mut tiles_out);
+                                with_tile_write(|ti| {
+                                    if crate::title_mem::unmap_generation() != snap_unmap {
+                                        ti.layout_gen = 0;
+                                    } else {
+                                        ti.apply_incremental_index(
+                                            &items,
+                                            &tiles_out,
+                                            build_map,
+                                            crate::title_mem::mapping_generation() == build_map,
+                                            build_tile,
+                                            crate::title_mem::tile_generation() == build_tile,
+                                        );
+                                    }
+                                    ti.collect_hits(tiles, report, &mut hit_res, &mut hits);
+                                });
+                            }
+                        }
+                    }
                 }
             }
-        }
-    };
+
+            let count = hits.len();
+            if count > 0 {
+                invalidate_entries(&hits);
+                hits.clear();
+            }
+            hit_res.clear();
+            count
+        })
+    });
     if marked > 0 && ANNOUNCED.fetch_add(1, Ordering::Relaxed) < 8 {
         xs_log!("detile: {marked} textures whose memory the title wrote ({} pages written) are filled again", tiles.len());
     }
@@ -1824,37 +2294,46 @@ pub fn note_tiles(tiles: &[u32]) {
 /// The title's GPU work writes into the texture (a copy). The CPU view is stale from then on, so
 /// the texture is not detiled any more.
 pub fn note_gpu_write(res: usize) {
-    if TEXTURE_COUNT.load(Ordering::Acquire) == 0 || !is_placed(res) {
+    if TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
-    if with_registry_read(|r| r.textures.contains_key(&res)) != Some(true) {
-        return;
-    }
-    with_registry(|r| {
-        if r.remove(res) {
-            static ANNOUNCED: AtomicU32 = AtomicU32::new(0);
-            if ANNOUNCED.fetch_add(1, Ordering::Relaxed) < 4 {
-                xs_log!("detile: a texture the title copies into on the GPU is no longer detiled");
-            }
+    if remove_resource_everywhere(res) {
+        static ANNOUNCED: AtomicU32 = AtomicU32::new(0);
+        if ANNOUNCED.fetch_add(1, Ordering::Relaxed) < 4 {
+            xs_log!("detile: a texture the title copies into on the GPU is no longer detiled");
         }
-    });
+    }
 }
 
 /// The title recorded `transitions` (resource, subresource, state after) on PC list `list`.
 pub fn note_transitions(list: usize, transitions: &[(usize, u32, u32)]) {
-    if !enabled() || transitions.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 || !any_placed(transitions) {
+    if !enabled() || transitions.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
-    let filtered: Vec<(usize, u32, u32)> = with_registry_read(|r| {
-        transitions.iter().filter(|(res, _, _)| r.textures.contains_key(res)).copied().collect()
-    })
-    .unwrap_or_default();
+    let mut filtered: Vec<(usize, u32, u32)> = Vec::new();
+    let mut last = (0usize, false);
+    for &(res, sub, after) in transitions {
+        let placed = if res == last.0 && res != 0 {
+            last.1
+        } else {
+            let p = is_placed(res);
+            last = (res, p);
+            p
+        };
+        if placed {
+            filtered.push((res, sub, after));
+        }
+    }
     if filtered.is_empty() {
         return;
     }
-    with_noted(|n| {
-        n.lists.entry(list).or_default().extend(filtered);
-        NOTED_COUNT.store(n.lists.len(), Ordering::Release);
+    with_noted_shard(list, |n| {
+        let entry = n.lists.entry(list);
+        let was_absent = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
+        entry.or_default().extend(filtered);
+        if was_absent {
+            NOTED_COUNT.fetch_add(1, Ordering::Release);
+        }
     });
 }
 
@@ -1863,7 +2342,7 @@ pub fn list_reset(list: usize) {
     if NOTED_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
-    with_noted(|n| {
+    with_noted_shard(list, |n| {
         if let Some(entries) = n.lists.get_mut(&list) {
             entries.clear();
         }
@@ -1898,86 +2377,75 @@ pub fn submitted(lists: &[usize]) {
     if lists.is_empty() || NOTED_COUNT.load(Ordering::Acquire) == 0 || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
-    let mut changes = with_noted(|n| {
-        let mut out = std::mem::take(&mut n.scratch);
-        out.clear();
-        for list in lists {
-            if let Some(entries) = n.lists.get(list) {
-                out.extend_from_slice(entries);
+    SUBMITTED_SCRATCH.with(|cell| {
+        let mut changes = cell.borrow_mut();
+        changes.clear();
+        for &list in lists {
+            with_noted_shard(list, |n| {
+                if let Some(entries) = n.lists.get(&list) {
+                    changes.extend_from_slice(entries);
+                }
+            });
+        }
+        if changes.is_empty() {
+            return;
+        }
+        let mut last: Option<(usize, Arc<PlacedEntry>)> = None;
+        for &(res, sub, after) in changes.iter() {
+            let entry = match &last {
+                Some((prev_res, prev_entry)) if *prev_res == res => Some(Arc::clone(prev_entry)),
+                _ => {
+                    let found = lookup_placed_entry(res);
+                    if let Some(ref e) = found {
+                        last = Some((res, Arc::clone(e)));
+                    }
+                    found
+                }
+            };
+            if let Some(entry) = entry {
+                let count = (entry.plan.mips.len() as u32 * entry.plan.slices) as usize;
+                let mut states = entry.states.lock().unwrap_or_else(|e| e.into_inner());
+                apply_transition(Arc::make_mut(&mut *states), count, sub, after);
             }
         }
-        out
+        changes.clear();
     });
-    if changes.is_empty() {
-        with_noted(|n| n.scratch = changes);
-        return;
-    }
-    with_registry(|r| {
-        for &(res, sub, after) in &changes {
-            if let Some(texture) = r.textures.get_mut(&res) {
-                let count = (texture.plan.mips.len() as u32 * texture.plan.slices) as usize;
-                apply_transition(Arc::make_mut(&mut texture.states), count, sub, after);
-            }
-        }
-    });
-    changes.clear();
-    with_noted(|n| n.scratch = changes);
 }
 
-/// Detiles every dirty texture on the PC direct queue `queue`, ahead of the title's lists that run
-/// on it.
-///
-/// # Safety
-/// `queue` is a live PC command queue.
 fn needs_fresh_sync(defer_fresh_spans: bool, translated: &[Option<(crate::title_mem::Span, bool)>]) -> bool {
     !defer_fresh_spans && translated.iter().any(|m| matches!(m, Some((_, true))))
 }
 
-fn collect_pending_items(r: &mut Registry, pending_items: &mut Vec<(usize, u64, u64)>, pending_spans: &mut Vec<(u64, u64)>, exhausted: &mut Vec<usize>) {
-    pending_items.clear();
-    pending_spans.clear();
-    exhausted.clear();
-    for &res in &r.pending {
-        let Some(texture) = r.textures.get(&res) else {
-            exhausted.push(res);
-            continue;
-        };
-        if !texture.wants_fill() {
-            exhausted.push(res);
-            continue;
-        }
-        pending_items.push((res, texture.va, texture.plan.size));
-        pending_spans.push((texture.va, texture.plan.size));
-    }
-    for &res in exhausted.iter() {
-        r.pending.remove(&res);
-    }
-    if r.pending.is_empty() {
-        HAS_PENDING_FILLS.store(false, Ordering::Release);
-    }
+struct OwnedJob {
+    texture: ID3D12Resource,
+    src_gpu: u64,
+    plan: Arc<Plan>,
+    states: Arc<Vec<u32>>,
 }
 
 #[derive(Default)]
 struct FlushScratch {
-    pending_items: Vec<(usize, u64, u64)>,
+    pending_entries: Vec<Arc<PlacedEntry>>,
+    pending_items: Vec<(Arc<PlacedEntry>, u64)>,
     pending_spans: Vec<(u64, u64)>,
-    exhausted: Vec<usize>,
     translated: Vec<Option<(crate::title_mem::Span, bool)>>,
-    ready: Vec<(usize, u64)>,
+    ready_entries: Vec<(Arc<PlacedEntry>, u64, u64)>,
+    requeue: Vec<Arc<PlacedEntry>>,
     owned_jobs: Vec<OwnedJob>,
-    job_res: Vec<usize>,
+    settled_entries: Vec<(Arc<PlacedEntry>, u64)>,
     outcome: Vec<bool>,
 }
 
 impl FlushScratch {
     fn clear_all(&mut self) {
+        self.pending_entries.clear();
         self.pending_items.clear();
         self.pending_spans.clear();
-        self.exhausted.clear();
         self.translated.clear();
-        self.ready.clear();
+        self.ready_entries.clear();
+        self.requeue.clear();
         self.owned_jobs.clear();
-        self.job_res.clear();
+        self.settled_entries.clear();
         self.outcome.clear();
     }
 }
@@ -2006,6 +2474,23 @@ impl Drop for FlushScratchGuard {
     }
 }
 
+fn collect_pending_for_flush(s: &mut FlushScratch) {
+    drain_pending_entries(&mut s.pending_entries);
+    s.pending_items.clear();
+    s.pending_spans.clear();
+    for entry in s.pending_entries.drain(..) {
+        if let Some(snap_gen) = entry.dequeue_for_flush() {
+            s.pending_spans.push((entry.va, entry.plan.size));
+            s.pending_items.push((entry, snap_gen));
+        }
+    }
+}
+
+/// Detiles every dirty texture on the PC direct queue `queue`, ahead of the title's lists that run
+/// on it.
+///
+/// # Safety
+/// `queue` is a live PC command queue.
 pub unsafe fn flush(queue: *mut c_void) {
     if !enabled() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 || !HAS_PENDING_FILLS.load(Ordering::Acquire) {
         return;
@@ -2021,121 +2506,131 @@ pub unsafe fn flush(queue: *mut c_void) {
     let started = Instant::now();
     let tuning = tuning();
     if !crate::title_mem::enabled() {
-        with_detiler(|d| {
-            if !d.unavailable {
-                d.unavailable = true;
-                xs_log!("detile: title memory is off (DECANT_D3D12X_TITLE_MEM=1), placed textures stay unfilled");
-            }
-        });
+        if DETILER_READY_STATE.load(Ordering::Acquire) != 2 {
+            with_detiler(|d| {
+                if !d.unavailable {
+                    d.unavailable = true;
+                    DETILER_READY_STATE.store(2, Ordering::Release);
+                    xs_log!("detile: title memory is off (DECANT_D3D12X_TITLE_MEM=1), placed textures stay unfilled");
+                }
+            });
+        }
         return;
     }
     let Some(device) = crate::title_mem::device() else { return };
-    let detiler_ready = with_detiler(|d| {
-        if d.unavailable {
-            return false;
-        }
-        if d.detiler.is_none() {
-            d.detiler = Detiler::new(&device);
-            if d.detiler.is_none() {
-                d.unavailable = true;
-                xs_log!("detile: not available, placed textures stay unfilled");
+    let detiler_state = DETILER_READY_STATE.load(Ordering::Acquire);
+    if detiler_state == 2 {
+        return;
+    }
+    if detiler_state == 0 {
+        let ready = with_detiler(|d| {
+            if d.unavailable {
+                DETILER_READY_STATE.store(2, Ordering::Release);
                 return false;
             }
+            if d.detiler.is_none() {
+                d.detiler = Detiler::new(&device);
+                if d.detiler.is_none() {
+                    d.unavailable = true;
+                    DETILER_READY_STATE.store(2, Ordering::Release);
+                    xs_log!("detile: not available, placed textures stay unfilled");
+                    return false;
+                }
+            }
+            DETILER_READY_STATE.store(1, Ordering::Release);
+            true
+        });
+        if !ready {
+            return;
         }
-        true
-    });
-    if !detiler_ready {
-        return;
     }
 
     let mut scratch_guard = FlushScratchGuard::take();
     let s = &mut scratch_guard.0;
 
-    let Some(has_exhausted) = with_registry_read(|r| {
-        if r.pending.is_empty() {
-            HAS_PENDING_FILLS.store(false, Ordering::Release);
-            return false;
-        }
-        let mut has_exhausted = false;
-        for &res in &r.pending {
-            if let Some(texture) = r.textures.get(&res).filter(|t| t.wants_fill()) {
-                s.pending_items.push((res, texture.va, texture.plan.size));
-                s.pending_spans.push((texture.va, texture.plan.size));
-            } else {
-                has_exhausted = true;
-            }
-        }
-        has_exhausted
-    }) else {
-        return;
-    };
+    collect_pending_for_flush(s);
     if s.pending_items.is_empty() {
-        if has_exhausted {
-            with_registry(|r| collect_pending_items(r, &mut s.pending_items, &mut s.pending_spans, &mut s.exhausted));
-        }
         return;
     }
 
-    // Translate outside REGISTRY so title_mem::STATE never nests under REGISTRY.
+    // Translate outside all registry/index locks so title_mem::STATE never nests under detile locks.
     crate::title_mem::translate_fresh_batch(&s.pending_spans, &mut s.translated);
     if needs_fresh_sync(tuning.defer_fresh_spans, &s.translated) {
-        // SAFETY: `queue_raw` is a live direct queue and REGISTRY is not held.
+        enqueue_pending_batch(s.pending_items.drain(..).filter_map(|(entry, _)| entry.try_set_queued().then_some(entry)));
+        s.pending_spans.clear();
+        // SAFETY: `queue_raw` is a live direct queue and no detile locks are held.
         unsafe { crate::title_mem::sync(queue_raw) };
-        with_registry(|r| collect_pending_items(r, &mut s.pending_items, &mut s.pending_spans, &mut s.exhausted));
+        collect_pending_for_flush(s);
+        if s.pending_items.is_empty() {
+            return;
+        }
         crate::title_mem::translate_fresh_batch(&s.pending_spans, &mut s.translated);
     }
 
-    let ready_count = with_registry(|r| {
-        let mut unreachable = 0u32;
-        s.exhausted.clear();
-        for (&(res, _, _), mapped) in s.pending_items.iter().zip(&s.translated) {
-            if !r.textures.get(&res).is_some_and(Placed::wants_fill) {
-                continue;
+    let mut unreachable = 0u32;
+    let mut deferred_here = 0u64;
+    for ((entry, snap_gen), mapped) in s.pending_items.drain(..).zip(&s.translated) {
+        if !entry.wants_fill() {
+            continue;
+        }
+        match mapped {
+            // Fresh mappings go out with the next sync, before the next submission.
+            Some((_, true)) if tuning.defer_fresh_spans => {
+                deferred_here += 1;
+                if entry.try_set_queued() {
+                    s.requeue.push(entry);
+                }
             }
-            match mapped {
-                // Fresh mappings go out with the next sync, before the next submission.
-                Some((_, true)) if tuning.defer_fresh_spans => r.deferred += 1,
-                Some((span, _)) => s.ready.push((res, span.gpu)),
-                None => {
-                    unreachable += 1;
-                    if let Some(texture) = r.textures.get_mut(&res) {
-                        texture.attempts += 1;
-                        if !texture.wants_fill() {
-                            s.exhausted.push(res);
-                        }
-                    }
+            Some((span, _)) => {
+                s.ready_entries.push((entry, snap_gen, span.gpu));
+            }
+            None => {
+                unreachable += 1;
+                if entry.record_unreachable(snap_gen) {
+                    s.requeue.push(entry);
                 }
             }
         }
-        for &res in &s.exhausted {
-            r.pending.remove(&res);
-        }
-        if r.pending.is_empty() {
-            HAS_PENDING_FILLS.store(false, Ordering::Release);
-        }
-        if unreachable > 0 && r.flushes < 4 {
-            xs_log!("detile: {unreachable} textures have no GPU address for their memory yet");
-        }
-        if s.ready.is_empty() {
-            return 0;
-        }
-        s.ready.sort_unstable_by_key(|&(res, _)| res);
-        for &(res, gpu) in &s.ready {
-            let raw = res as *mut c_void;
-            // SAFETY: the registry holds the entry, so the title still owns the resource (it is forgotten before it is released).
-            if let (Some(texture), Some(placed)) = (unsafe { ID3D12Resource::from_raw_borrowed(&raw) }.cloned(), r.textures.get(&res)) {
-                s.owned_jobs.push(OwnedJob { texture, src_gpu: gpu, plan: Arc::clone(&placed.plan), states: Arc::clone(&placed.states) });
-                s.job_res.push(res);
+    }
+    if deferred_here > 0 {
+        DEFERRED_COUNT.fetch_add(deferred_here, Ordering::Relaxed);
+    }
+    if !s.requeue.is_empty() {
+        enqueue_pending_batch(s.requeue.drain(..));
+    }
+    if unreachable > 0 && FLUSHES_COUNT.load(Ordering::Relaxed) < 4 {
+        xs_log!("detile: {unreachable} textures have no GPU address for their memory yet");
+    }
+    if s.ready_entries.is_empty() {
+        return;
+    }
+
+    s.ready_entries.sort_unstable_by_key(|(entry, _, _)| entry.res);
+    for (entry, snap_gen, gpu) in s.ready_entries.drain(..) {
+        let raw = entry.res as *mut c_void;
+        let cloned = with_texture_shard_read(entry.res, |shard| {
+            let live = shard.get(&entry.res)?;
+            if !Arc::ptr_eq(live, &entry) {
+                return None;
             }
+            // SAFETY: the shard holds `entry`, so `forget` / `forget_many` cannot return and
+            // release the resource while this read guard is held.
+            unsafe { ID3D12Resource::from_raw_borrowed(&raw) }.cloned()
+        })
+        .flatten();
+        if let Some(texture) = cloned {
+            let states = entry.states.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            s.owned_jobs.push(OwnedJob { texture, src_gpu: gpu, plan: Arc::clone(&entry.plan), states });
+            s.settled_entries.push((entry, snap_gen));
         }
-        s.ready.len()
-    });
+    }
+    let ready_count = s.settled_entries.len();
     if ready_count == 0 {
         return;
     }
 
-    // Execute GPU detile work under DETILER without holding REGISTRY so note_tiles,
-    // note_write, and register never contend with command list recording.
+    // Execute GPU detile work under DETILER without holding any registry/index locks so
+    // note_tiles, note_write, register, and submitted never contend with command list recording.
     let jobs: Vec<Job<'_>> = s
         .owned_jobs
         .iter()
@@ -2152,40 +2647,30 @@ pub unsafe fn flush(queue: *mut c_void) {
         return;
     };
 
-    let streaming_units = with_registry(|r| {
-        let mut filled_bytes = 0u64;
-        for (&res, &ok) in s.job_res.iter().zip(&s.outcome) {
-            if let Some(texture) = r.textures.get_mut(&res) {
-                texture.settle(ok);
-                if !texture.wants_fill() {
-                    r.pending.remove(&res);
-                }
-                if ok {
-                    filled_bytes += texture.plan.size;
-                    r.detiled += 1;
-                }
-            } else {
-                r.pending.remove(&res);
-            }
+    let mut filled_bytes = 0u64;
+    let mut detiled_here = 0u64;
+    for ((entry, snap_gen), &ok) in s.settled_entries.drain(..).zip(&s.outcome) {
+        entry.settle_gen(snap_gen, ok);
+        if ok {
+            filled_bytes += entry.plan.size;
+            detiled_here += 1;
         }
-        if r.pending.is_empty() {
-            HAS_PENDING_FILLS.store(false, Ordering::Release);
-        }
-        r.flushes += 1;
-        if r.flushes <= 10 || r.flushes.is_multiple_of(100) {
-            xs_log!(
-                "detile: flush {}: {} textures ({} MiB of tiled memory) in {} ms, {} in all, {} put off, {frames} lists on {queues} queues with {} MiB of staging",
-                r.flushes,
-                ready_count,
-                filled_bytes >> 20,
-                started.elapsed().as_millis(),
-                r.detiled,
-                r.deferred,
-                staging >> 20
-            );
-        }
-        (ready_count as u64).max(filled_bytes >> 20)
-    });
+    }
+    if detiled_here > 0 {
+        DETILED_COUNT.fetch_add(detiled_here, Ordering::Relaxed);
+    }
+    let flush_num = FLUSHES_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if flush_num <= 10 || flush_num.is_multiple_of(100) {
+        let detiled_total = DETILED_COUNT.load(Ordering::Relaxed);
+        let deferred_total = DEFERRED_COUNT.load(Ordering::Relaxed);
+        xs_log!(
+            "detile: flush {flush_num}: {ready_count} textures ({} MiB of tiled memory) in {} ms, {detiled_total} in all, {deferred_total} put off, {frames} lists on {queues} queues with {} MiB of staging",
+            filled_bytes >> 20,
+            started.elapsed().as_millis(),
+            staging >> 20
+        );
+    }
+    let streaming_units = (ready_count as u64).max(filled_bytes >> 20);
     crate::title_mem::note_streaming_work(streaming_units);
 }
 
@@ -2197,33 +2682,64 @@ mod tests {
         Plan { bytes_per_element: 4, linear: true, mode: 0, block_bits: 0, block_width: 1, block_height: 1, slice_size: 0, slices: 1, mips: Vec::new(), terms: Vec::new(), size }
     }
 
-    fn placed(va: u64, size: u64) -> Placed {
-        Placed { va, plan: Arc::new(flat_plan(size)), bytes: size, states: Arc::new(vec![0]), tiles: None, dirty: false, attempts: 0 }
+    fn placed_entry(res: usize, va: u64, size: u64, dirty: bool) -> Arc<PlacedEntry> {
+        Arc::new(PlacedEntry::new(res, va, Arc::new(flat_plan(size)), size, 0, dirty))
+    }
+
+    fn test_insert_global(res: usize, va: u64, size: u64, dirty: bool) -> Arc<PlacedEntry> {
+        let entry = placed_entry(res, va, size, dirty);
+        with_texture_shard_write(res, |shard| {
+            if shard.insert(res, Arc::clone(&entry)).is_none() {
+                TEXTURE_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        with_addr_write(|addr| addr.insert(res, va, size, Arc::clone(&entry)));
+        with_tile_write(|ti| ti.insert(res, va, size, Arc::clone(&entry)));
+        if dirty && entry.try_set_queued() {
+            enqueue_pending_single(Arc::clone(&entry));
+        }
+        entry
+    }
+
+    fn clear_global_pending_for(res: usize) {
+        let mut drained = Vec::new();
+        drain_pending_entries(&mut drained);
+        let mut keep = Vec::new();
+        for e in drained {
+            if e.res == res {
+                let _ = e.dequeue_for_flush();
+            } else {
+                keep.push(e);
+            }
+        }
+        if !keep.is_empty() {
+            enqueue_pending_batch(keep.into_iter());
+        }
     }
 
     #[test]
     fn overlap_search_includes_a_big_texture_that_starts_far_below() {
-        let mut r = Registry::default();
-        r.insert(1, placed(0x1000, 0x10_0000));
-        r.insert(2, placed(0x8_0000, 0x100));
-        r.insert(3, placed(0x20_0000, 0x100));
-        let mut hit = r.overlapping(0x8_0080, 0x8_0081);
+        let mut idx = AddressIndex::new(false);
+        idx.insert(1, 0x1000, 0x10_0000, placed_entry(1, 0x1000, 0x10_0000, false));
+        idx.insert(2, 0x8_0000, 0x100, placed_entry(2, 0x8_0000, 0x100, false));
+        idx.insert(3, 0x20_0000, 0x100, placed_entry(3, 0x20_0000, 0x100, false));
+        let mut hit = idx.overlapping(0x8_0080, 0x8_0081);
         hit.sort_unstable();
         assert_eq!(hit, [1, 2]);
-        assert!(r.overlapping(0x20_0100, 0x20_0200).is_empty(), "a write right behind a texture misses it");
+        assert!(idx.overlapping(0x20_0100, 0x20_0200).is_empty(), "a write right behind a texture misses it");
     }
 
     #[test]
     fn inserting_again_moves_the_texture_and_removing_forgets_the_address() {
-        let mut r = Registry::default();
-        r.insert(1, placed(0x1000, 0x1000));
-        r.insert(2, placed(0x8_0000, 0x100));
-        r.insert(1, placed(0x30_0000, 0x10));
-        assert_eq!(r.overlapping(0x1000, 0x1100), Vec::<usize>::new());
-        assert_eq!(r.overlapping(0x30_0000, 0x30_0001), [1]);
-        assert!(r.remove(2));
-        assert!(!r.remove(2));
-        assert!(!r.by_address.contains_key(&0x8_0000));
+        let mut idx = AddressIndex::new(false);
+        idx.insert(1, 0x1000, 0x1000, placed_entry(1, 0x1000, 0x1000, false));
+        idx.insert(2, 0x8_0000, 0x100, placed_entry(2, 0x8_0000, 0x100, false));
+        idx.insert(1, 0x30_0000, 0x10, placed_entry(1, 0x30_0000, 0x10, false));
+        assert_eq!(idx.overlapping(0x1000, 0x1100), Vec::<usize>::new());
+        assert_eq!(idx.overlapping(0x30_0000, 0x30_0001), [1]);
+        assert!(idx.remove(2));
+        assert!(!idx.remove(2));
+        assert!(!idx.small.contains_key(&0x8_0000));
     }
 
     #[test]
@@ -2301,14 +2817,11 @@ mod tests {
         register(res, 0x10_0000, &raw, 0, 64 * 64 * 4);
         // One pass of a flush that always succeeds: how many textures it fills.
         let fill_pass = || {
-            with_registry(|r| match r.textures.get_mut(&res) {
-                Some(t) if t.wants_fill() => {
-                    t.settle(true);
-                    r.pending.remove(&res);
-                    1
-                }
-                _ => 0,
-            })
+            let Some(entry) = lookup_placed_entry(res) else { return 0 };
+            let Some(snap_gen) = entry.dequeue_for_flush() else { return 0 };
+            clear_global_pending_for(res);
+            entry.settle_gen(snap_gen, true);
+            1
         };
         assert_eq!(fill_pass(), 1, "the first fill");
         assert_eq!(fill_pass(), 0, "nothing changed since");
@@ -2320,18 +2833,18 @@ mod tests {
         mark_resource(res);
         assert_eq!(fill_pass(), 0, "resource marks alone do not matter");
         note_gpu_write(res);
-        assert!(with_registry(|r| !r.textures.contains_key(&res)));
+        assert!(!is_placed(res));
     }
 
     #[test]
     fn a_failed_fill_stops_the_retries_until_the_next_write() {
-        let mut texture = placed(0x1000, 0x100);
-        texture.dirty = true;
-        assert!(texture.wants_fill());
-        texture.settle(false);
-        assert!(!texture.wants_fill());
-        texture.invalidate();
-        assert!(texture.wants_fill());
+        let entry = placed_entry(1, 0x1000, 0x100, true);
+        assert!(entry.wants_fill());
+        let snap = entry.dequeue_for_flush().expect("dirty");
+        entry.settle_gen(snap, false);
+        assert!(!entry.wants_fill());
+        assert!(entry.invalidate_mark());
+        assert!(entry.wants_fill());
     }
 
     #[test]
@@ -2359,64 +2872,87 @@ mod tests {
 
     #[test]
     fn pending_set_tracks_dirty_textures_through_inserts_writes_and_removals() {
-        let mut r = Registry::default();
-        let mut dirty_one = placed(0x1000, 0x1000);
-        dirty_one.dirty = true;
-        r.insert(10, dirty_one);
-        r.insert(20, placed(0x4000, 0x1000));
-        assert!(r.pending.contains(&10) && !r.pending.contains(&20));
-        assert!(r.invalidate_res(20));
-        assert!(r.pending.contains(&20));
-        assert!(r.remove(10));
-        assert!(!r.pending.contains(&10) && r.pending.contains(&20));
-        assert!(r.remove(20));
-        assert!(r.pending.is_empty());
+        let dirty_one = placed_entry(10, 0x1000, 0x1000, true);
+        let clean_two = placed_entry(20, 0x4000, 0x1000, false);
+        assert!(dirty_one.wants_fill() && !clean_two.wants_fill());
+        assert!(clean_two.invalidate_mark());
+        assert!(clean_two.wants_fill());
+        assert!(!clean_two.invalidate_mark(), "already queued");
+        dirty_one.mark_dead();
+        clean_two.mark_dead();
+        assert!(!dirty_one.wants_fill() && !clean_two.wants_fill());
     }
 
     #[test]
     fn reverse_tile_index_updates_incrementally_and_rebuilds_on_layout_change() {
-        let mut r = Registry::default();
-        r.insert(1, placed(0x1000, 0x1000));
-        r.insert(2, placed(0x4000, 0x1000));
-        assert!(r.pending_index.contains(&1) && r.pending_index.contains(&2));
+        let mut ti = TileIndex::new(false);
+        let e1 = placed_entry(1, 0x1000, 0x1000, false);
+        let e2 = placed_entry(2, 0x4000, 0x1000, false);
+        let e3 = placed_entry(3, 0x8000, 0x1000, false);
+        ti.insert(1, 0x1000, 0x1000, Arc::clone(&e1));
+        ti.insert(2, 0x4000, 0x1000, Arc::clone(&e2));
+        assert!(ti.pending_index.contains(&1) && ti.pending_index.contains(&2));
 
         // Initial full build at unmap_gen 7, map_gen 10, tile_gen 3.
-        let items = vec![(1, 0x1000, 0x1000), (2, 0x4000, 0x1000)];
-        r.apply_full_index(&items, &[Some(vec![10, 11]), None], 7, 10, 3, true);
-        assert!(r.pending_index.is_empty());
-        assert_eq!(r.layout_gen, 7);
-        assert_eq!(r.last_map_gen, 10);
-        assert_eq!(r.last_tile_gen, 3);
-        assert!(r.unmapped_textures.contains(&2) && !r.unmapped_textures.contains(&1));
+        let items = vec![(1, 0x1000, 0x1000, Arc::clone(&e1)), (2, 0x4000, 0x1000, Arc::clone(&e2))];
+        ti.apply_full_index(&items, &[Some(vec![10, 11]), None], 7, 10, 3, true);
+        assert!(ti.pending_index.is_empty());
+        assert_eq!(ti.layout_gen, 7);
+        assert_eq!(ti.last_map_gen, 10);
+        assert_eq!(ti.last_tile_gen, 3);
+        assert!(ti.unmapped_textures.contains(&2) && !ti.unmapped_textures.contains(&1));
 
         // Inserting a new texture only adds it to pending_index without invalidating layout_gen.
-        r.insert(3, placed(0x8000, 0x1000));
-        assert_eq!(r.layout_gen, 7);
-        assert!(r.pending_index.contains(&3));
+        ti.insert(3, 0x8000, 0x1000, Arc::clone(&e3));
+        assert_eq!(ti.layout_gen, 7);
+        assert!(ti.pending_index.contains(&3));
 
         // Incremental update resolves texture 3 and previously unmapped texture 2 at map_gen 11, tile_gen 4.
-        r.apply_incremental_index(&[(3, 0x8000, 0x1000), (2, 0x4000, 0x1000)], &[Some(vec![12]), Some(vec![11, 13])], 11, true, 4, true);
-        assert!(r.pending_index.is_empty());
-        assert!(r.unmapped_textures.is_empty());
-        assert_eq!(r.last_map_gen, 11);
-        assert_eq!(r.last_tile_gen, 4);
+        ti.apply_incremental_index(
+            &[(3, 0x8000, 0x1000, Arc::clone(&e3)), (2, 0x4000, 0x1000, Arc::clone(&e2))],
+            &[Some(vec![12]), Some(vec![11, 13])],
+            11,
+            true,
+            4,
+            true,
+        );
+        assert!(ti.pending_index.is_empty());
+        assert!(ti.unmapped_textures.is_empty());
+        assert_eq!(ti.last_map_gen, 11);
+        assert_eq!(ti.last_tile_gen, 4);
 
-        // Writing tile 99 marks nothing, and writing tiles 10 and 11 marks textures 1 and 2.
-        assert_eq!(r.mark_tiles_from_index(&[99], false), 0);
-        assert_eq!(r.mark_tiles_from_index(&[10, 11], false), 2);
-        assert!(r.pending.contains(&1) && r.pending.contains(&2) && !r.pending.contains(&3));
+        let mut hit_res = Vec::new();
+        let mut hits = Vec::new();
+        ti.collect_hits(&[99], false, &mut hit_res, &mut hits);
+        assert!(hits.is_empty());
+        ti.collect_hits(&[10, 11], false, &mut hit_res, &mut hits);
+        assert_eq!(hits.len(), 2);
+        for h in &hits {
+            let _ = h.invalidate_mark();
+        }
+        assert!(e1.wants_fill() && e2.wants_fill() && !e3.wants_fill());
 
         // Removing texture 2 cleans tile_to_textures incrementally without invalidating layout_gen.
-        assert!(r.remove(2));
-        assert_eq!(r.layout_gen, 7);
-        assert!(!r.tile_to_textures.contains_key(&13));
-        assert_eq!(r.mark_tiles_from_index(&[11, 13], false), 1);
+        assert!(ti.remove(2));
+        assert_eq!(ti.layout_gen, 7);
+        assert!(!ti.tile_to_textures.contains_key(&13));
+        ti.collect_hits(&[11, 13], false, &mut hit_res, &mut hits);
+        assert_eq!(hits.len(), 1);
 
         // Structural layout rebuild replaces all mappings at unmap_gen 8.
-        r.apply_full_index(&[(1, 0x1000, 0x1000), (3, 0x8000, 0x1000)], &[Some(vec![20]), Some(vec![21])], 8, 12, 5, true);
-        assert_eq!(r.layout_gen, 8);
-        assert_eq!(r.mark_tiles_from_index(&[10], false), 0);
-        assert_eq!(r.mark_tiles_from_index(&[20, 21], false), 2);
+        ti.apply_full_index(
+            &[(1, 0x1000, 0x1000, Arc::clone(&e1)), (3, 0x8000, 0x1000, Arc::clone(&e3))],
+            &[Some(vec![20]), Some(vec![21])],
+            8,
+            12,
+            5,
+            true,
+        );
+        assert_eq!(ti.layout_gen, 8);
+        ti.collect_hits(&[10], false, &mut hit_res, &mut hits);
+        assert!(hits.is_empty());
+        ti.collect_hits(&[20, 21], false, &mut hit_res, &mut hits);
+        assert_eq!(hits.len(), 2);
     }
 
     #[test]
@@ -2425,11 +2961,6 @@ mod tests {
         assert_eq!(staging_cap_from(Some("0")), 0);
         assert_eq!(staging_cap_from(Some(" 128 ")), 128 << 20);
 
-        // Frame 0: busy (done_at 10 > completed 5), 256 MiB
-        // Frame 1: idle, 128 MiB
-        // Frame 2: idle, 512 MiB
-        // Frame 3: idle, 128 MiB
-        // Total = 1024 MiB, cap = 256 MiB -> drop Frame 2 (512 MiB) and Frame 1 (128 MiB) -> 384 -> drop Frame 3 (128 MiB) -> 256 MiB.
         let frames = [(1, 10, 256 << 20), (1, 4, 128 << 20), (1, 3, 512 << 20), (1, 5, 128 << 20)];
         let trimmed = select_staging_to_trim(frames.into_iter(), |_| 5, 256 << 20);
         assert_eq!(trimmed, vec![2, 1, 3], "busy frame 0 stays untouched, largest idle frames go first");
@@ -2450,36 +2981,49 @@ mod tests {
     #[test]
     fn detiler_lock_does_not_block_registry_access() {
         let _detiler_guard = DETILER.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = std::thread::spawn(|| with_registry_read(|r| r.textures.len())).join().unwrap();
+        std::thread::spawn(|| {
+            let _ = with_tile_read(|ti| ti.entries.len());
+            let _ = with_addr_read(|addr| addr.by_res.len());
+        })
+        .join()
+        .unwrap();
         assert!(!summary().is_empty());
     }
 
     #[test]
     fn fast_tile_index_handles_empty_and_deduplicates_multi_tile_hits() {
-        let mut r = Registry::default();
-        assert_eq!(r.mark_tiles_from_index(&[1, 2, 3], false), 0);
-        r.insert(1, placed(0x1000, 0x2000));
-        r.apply_incremental_index(&[(1, 0x1000, 0x2000)], &[Some(vec![40, 41, 42])], 1, true, 1, true);
-        assert_eq!(r.mark_tiles_from_index(&[40, 41, 41, 42], false), 1);
-        assert!(r.pending.contains(&1));
+        let mut ti = TileIndex::new(false);
+        let mut hit_res = Vec::new();
+        let mut hits = Vec::new();
+        ti.collect_hits(&[1, 2, 3], false, &mut hit_res, &mut hits);
+        assert!(hits.is_empty());
+        let e1 = placed_entry(1, 0x1000, 0x2000, false);
+        ti.insert(1, 0x1000, 0x2000, Arc::clone(&e1));
+        ti.apply_incremental_index(&[(1, 0x1000, 0x2000, Arc::clone(&e1))], &[Some(vec![40, 41, 42])], 1, true, 1, true);
+        ti.collect_hits(&[40, 41, 41, 42], false, &mut hit_res, &mut hits);
+        assert_eq!(hits.len(), 1);
+        assert!(e1.invalidate_mark());
+        assert!(e1.wants_fill());
     }
 
     #[test]
     fn arc_plan_and_states_snapshot_share_without_deep_copy_and_cow_on_transition() {
-        let mut p = placed(0x1000, 0x2000);
+        let p = placed_entry(1, 0x1000, 0x2000, false);
         let plan_snap = Arc::clone(&p.plan);
-        let states_snap = Arc::clone(&p.states);
+        let states_snap = p.states.lock().unwrap().clone();
         assert!(Arc::ptr_eq(&p.plan, &plan_snap));
-        assert!(Arc::ptr_eq(&p.states, &states_snap));
-        apply_transition(Arc::make_mut(&mut p.states), 1, 0, 7);
+        {
+            let mut guard = p.states.lock().unwrap();
+            apply_transition(Arc::make_mut(&mut *guard), 1, 0, 7);
+            assert!(!Arc::ptr_eq(&*guard, &states_snap));
+            assert_eq!(**guard, [7]);
+        }
         assert_eq!(*states_snap, [0]);
-        assert_eq!(*p.states, [7]);
-        assert!(!Arc::ptr_eq(&p.states, &states_snap));
     }
 
     #[test]
     fn registry_rwlock_allows_concurrent_reads_and_fast_misses() {
-        let local: RwLock<Option<Registry>> = RwLock::new(Some(Registry::default()));
+        let local: RwLock<Option<TileIndex>> = RwLock::new(Some(TileIndex::new(false)));
         let r1 = local.read().unwrap_or_else(|e| e.into_inner());
         let r2 = std::thread::scope(|s| s.spawn(|| local.read().unwrap_or_else(|e| e.into_inner()).is_some()).join().unwrap());
         assert!(r1.is_some() && r2);
@@ -2494,40 +3038,44 @@ mod tests {
 
     #[test]
     fn precomputed_full_index_swaps_maps_and_preserves_concurrent_pending_index() {
-        let mut r = Registry::default();
-        r.insert(1, placed(0x1000, 0x1000));
-        r.insert(2, placed(0x2000, 0x1000));
-        let items = vec![(1, 0x1000, 0x1000), (2, 0x2000, 0x1000)];
+        let mut ti = TileIndex::new(false);
+        let e1 = placed_entry(1, 0x1000, 0x1000, false);
+        let e2 = placed_entry(2, 0x2000, 0x1000, false);
+        let e3 = placed_entry(3, 0x3000, 0x1000, false);
+        ti.insert(1, 0x1000, 0x1000, Arc::clone(&e1));
+        ti.insert(2, 0x2000, 0x1000, Arc::clone(&e2));
+        let items = vec![(1, 0x1000, 0x1000, Arc::clone(&e1)), (2, 0x2000, 0x1000, Arc::clone(&e2))];
         let tiles_out = vec![Some(vec![10, 11]), None];
-        let precomputed = Registry::build_full_index_maps(&items, &tiles_out, 0);
+        let precomputed = TileIndex::build_full_index_maps(&items, &tiles_out, 0);
         // Simulate a new texture registered concurrently while tiles_of_batch ran.
-        r.insert(3, placed(0x3000, 0x1000));
-        let (old_map, old_unmapped) = r.apply_precomputed_full_index(&items, tiles_out, precomputed, (42, 7, 7), true);
+        ti.insert(3, 0x3000, 0x1000, Arc::clone(&e3));
+        let (old_map, old_unmapped) = ti.apply_precomputed_full_index(&items, tiles_out, precomputed, (42, 7, 7), true);
         assert!(old_map.is_empty() && old_unmapped.is_empty());
-        assert_eq!(r.tile_to_textures.get(&10).map(TileRefs::as_slice), Some(&[1][..]));
-        assert!(r.unmapped_textures.contains(&2));
-        assert!(!r.pending_index.contains(&1) && !r.pending_index.contains(&2));
-        assert!(r.pending_index.contains(&3), "concurrently inserted texture stays queued");
-        assert_eq!(r.layout_gen, 0, "live_matched != r.textures.len() keeps layout_gen 0");
+        assert_eq!(ti.tile_to_textures.get(&10).map(TileRefs::as_slice), Some(&[1][..]));
+        assert!(ti.unmapped_textures.contains(&2));
+        assert!(!ti.pending_index.contains(&1) && !ti.pending_index.contains(&2));
+        assert!(ti.pending_index.contains(&3), "concurrently inserted texture stays queued");
+        assert_eq!(ti.layout_gen, 0, "live_matched != entries.len() keeps layout_gen 0");
     }
 
     #[test]
     fn mark_tiles_from_index_keeps_already_dirty_zero_attempt_and_requeues_settled() {
-        let mut r = Registry::default();
-        let mut p1 = placed(0x1000, 0x1000);
-        p1.dirty = true;
-        p1.attempts = 0;
-        r.insert(1, p1);
-        let mut p2 = placed(0x2000, 0x1000);
-        p2.dirty = false;
-        p2.attempts = 0;
-        r.insert(2, p2);
-        r.tile_to_textures.insert(5, TileRefs::Two([1, 2]));
-        let marked = r.mark_tiles_from_index(&[5], false);
-        assert_eq!(marked, 2);
-        assert!(r.pending.contains(&1));
-        assert!(r.pending.contains(&2));
-        assert!(r.textures[&2].dirty);
+        let mut ti = TileIndex::new(false);
+        let p1 = placed_entry(1, 0x1000, 0x1000, true);
+        let p2 = placed_entry(2, 0x2000, 0x1000, false);
+        ti.insert(1, 0x1000, 0x1000, Arc::clone(&p1));
+        ti.insert(2, 0x2000, 0x1000, Arc::clone(&p2));
+        ti.tile_to_textures.insert(5, TileRefs::Two([1, 2]));
+        let mut hit_res = Vec::new();
+        let mut hits = Vec::new();
+        ti.collect_hits(&[5], false, &mut hit_res, &mut hits);
+        assert_eq!(hits.len(), 2);
+        for h in &hits {
+            let _ = h.invalidate_mark();
+        }
+        assert!(p1.wants_fill());
+        assert!(p2.wants_fill());
+        assert!(p2.is_dirty());
     }
 
     #[test]
@@ -2542,25 +3090,28 @@ mod tests {
 
     #[test]
     fn map_uses_incremental_unmapped_resolution_while_unmap_triggers_full_rebuild() {
-        let mut r = Registry::default();
-        r.insert(1, placed(0x1000, 0x1000));
-        r.insert(2, placed(0x4000, 0x1000));
-        let items = vec![(1, 0x1000, 0x1000), (2, 0x4000, 0x1000)];
-        r.apply_full_index(&items, &[Some(vec![10]), None], 1, 1, 1, true);
-        assert!(r.unmapped_textures.contains(&2));
-        assert_eq!(r.plan_index_update(1, 1, 1), None);
+        let mut ti = TileIndex::new(false);
+        let e1 = placed_entry(1, 0x1000, 0x1000, false);
+        let e2 = placed_entry(2, 0x4000, 0x1000, false);
+        ti.insert(1, 0x1000, 0x1000, Arc::clone(&e1));
+        ti.insert(2, 0x4000, 0x1000, Arc::clone(&e2));
+        let items = vec![(1, 0x1000, 0x1000, Arc::clone(&e1)), (2, 0x4000, 0x1000, Arc::clone(&e2))];
+        ti.apply_full_index(&items, &[Some(vec![10]), None], 1, 1, 1, true);
+        assert!(ti.unmapped_textures.contains(&2));
+        assert!(ti.plan_index_update(1, 1, 1).is_none());
 
         // MAP bumps mapping_generation without bumping unmap_generation: only unmapped texture 2 is checked.
-        match r.plan_index_update(1, 2, 1) {
+        match ti.plan_index_update(1, 2, 1) {
             Some(IndexPlan::Incremental { unmap_gen, items, .. }) => {
                 assert_eq!(unmap_gen, 1);
-                assert_eq!(items, vec![(2, 0x4000, 0x1000)]);
+                assert_eq!(items.len(), 1);
+                assert_eq!((items[0].0, items[0].1, items[0].2), (2, 0x4000, 0x1000));
             }
             other => panic!("expected incremental unmapped plan on MAP, got {other:?}"),
         }
 
         // UNMAP/RELEASE bumps unmap_generation: full rebuild covers all placed textures.
-        match r.plan_index_update(2, 3, 1) {
+        match ti.plan_index_update(2, 3, 1) {
             Some(IndexPlan::Full { unmap_gen, items, .. }) => {
                 assert_eq!(unmap_gen, 2);
                 assert_eq!(items.len(), 2);
@@ -2585,72 +3136,57 @@ mod tests {
 
     #[test]
     fn forget_many_removes_listed_resources_and_preserves_remaining() {
-        let mut r = Registry::default();
-        r.insert(1, placed(0x1000, 0x1000));
-        r.insert(2, placed(0x2000, 0x1000));
-        r.insert(3, placed(0x3000, 0x1000));
-        for res in [1, 3] {
-            r.remove(res);
-        }
-        assert!(!r.textures.contains_key(&1));
-        assert!(r.textures.contains_key(&2));
-        assert!(!r.textures.contains_key(&3));
+        let mut ti = TileIndex::new(false);
+        ti.insert(1, 0x1000, 0x1000, placed_entry(1, 0x1000, 0x1000, false));
+        ti.insert(2, 0x2000, 0x1000, placed_entry(2, 0x2000, 0x1000, false));
+        ti.insert(3, 0x3000, 0x1000, placed_entry(3, 0x3000, 0x1000, false));
+        ti.remove_many(&[1, 3]);
+        assert!(!ti.entries.contains_key(&1));
+        assert!(ti.entries.contains_key(&2));
+        assert!(!ti.entries.contains_key(&3));
 
-        // Also exercise the public forget_many helper through REGISTRY.
-        with_registry(|reg| {
-            reg.insert(101, placed(0x1000, 0x1000));
-            reg.insert(102, placed(0x2000, 0x1000));
-            reg.insert(103, placed(0x3000, 0x1000));
-        });
+        // Also exercise the public forget_many helper through the global split registry.
+        test_insert_global(101, 0x1000, 0x1000, false);
+        test_insert_global(102, 0x2000, 0x1000, false);
+        test_insert_global(103, 0x3000, 0x1000, false);
         forget_many(&[101, 103]);
-        let (has_101, has_102, has_103) = with_registry_read(|reg| {
-            (
-                reg.textures.contains_key(&101),
-                reg.textures.contains_key(&102),
-                reg.textures.contains_key(&103),
-            )
-        })
-        .unwrap();
-        assert!(!has_101 && has_102 && !has_103);
+        assert!(!is_placed(101) && is_placed(102) && !is_placed(103));
         forget_many(&[102]);
     }
 
     #[test]
     fn noted_transitions_are_isolated_from_registry_and_reset_clears_list() {
-        with_noted(|n| n.lists.clear());
+        with_noted_shard(0xABCD, |n| n.lists.clear());
         NOTED_COUNT.store(0, Ordering::Release);
         list_reset(0xABCD);
         submitted(&[0xABCD]);
-        with_noted(|n| {
+        with_noted_shard(0xABCD, |n| {
             n.lists.insert(0xABCD, vec![(0x1111, 0, 1)]);
-            NOTED_COUNT.store(n.lists.len(), Ordering::Release);
+            NOTED_COUNT.fetch_add(1, Ordering::Release);
         });
         list_reset(0xABCD);
-        assert!(with_noted(|n| n.lists.get(&0xABCD).is_some_and(Vec::is_empty)));
+        assert!(with_noted_shard(0xABCD, |n| n.lists.get(&0xABCD).is_some_and(Vec::is_empty)));
     }
 
     #[test]
     fn placed_set_tracks_insert_remove_forget_many_and_skips_registry_for_non_placed() {
-        let _guard = REGISTRY.write().unwrap_or_else(|e| e.into_inner());
-        drop(_guard);
-
-        with_registry(|r| {
-            r.insert(0x2010, placed(0x1000, 0x1000));
-            r.insert(0x2020, placed(0x2000, 0x1000));
-            r.insert(0x2030, placed(0x3000, 0x1000));
-        });
+        test_insert_global(0x2010, 0x1000, 0x1000, false);
+        test_insert_global(0x2020, 0x2000, 0x1000, false);
+        test_insert_global(0x2030, 0x3000, 0x1000, false);
         assert!(is_placed(0x2010) && is_placed(0x2020) && is_placed(0x2030));
         assert!(!is_placed(0x9990));
 
-        // Hold REGISTRY exclusive write lock: non-placed callers must return without blocking.
-        let write_guard = REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+        // Hold ADDR_INDEX and TILE_INDEX exclusive write locks: non-placed callers must return without blocking.
+        let addr_guard = ADDR_INDEX.write().unwrap_or_else(|e| e.into_inner());
+        let tile_guard = TILE_INDEX.write().unwrap_or_else(|e| e.into_inner());
         forget(0x9990);
         note_gpu_write(0x9990);
         note_transitions(0x7777, &[(0x9990, 0, 1), (0x99A0, 0, 2)]);
         forget_many(&[0x9990, 0x99A0]);
-        drop(write_guard);
+        drop(tile_guard);
+        drop(addr_guard);
 
-        with_registry(|r| assert!(r.remove(0x2010)));
+        assert!(remove_resource_everywhere(0x2010));
         assert!(!is_placed(0x2010));
         assert!(is_placed(0x2020) && is_placed(0x2030));
 
@@ -2664,23 +3200,18 @@ mod tests {
         let map_gen = crate::title_mem::mapping_generation();
         let tile_gen = crate::title_mem::tile_generation();
 
-        // Empty registry: filter rejects all tiles.
         let mut empty_tiles = vec![0x10, 0x20];
         assert!(!filter_overlapping_tiles(&mut empty_tiles));
 
-        // Register a pending texture: INDEX_SETTLED_UNMAP_GEN is 0, so filter keeps all tiles.
-        with_registry(|r| {
-            r.insert(0x3010, placed(0x1000, 0x1000));
-            r.insert(0x3020, placed(0x2000, 0x1000));
-        });
+        let e1 = test_insert_global(0x3010, 0x1000, 0x1000, false);
+        let e2 = test_insert_global(0x3020, 0x2000, 0x1000, false);
         let mut pending_tiles = vec![0x10, 0x400];
         assert!(filter_overlapping_tiles(&mut pending_tiles));
         assert_eq!(pending_tiles, vec![0x10, 0x400]);
 
-        // Index both textures: 0x3010 -> tile 0x10, 0x3020 -> tile 0x200.
-        with_registry(|r| {
-            r.apply_full_index(
-                &[(0x3010, 0x1000, 0x1000), (0x3020, 0x2000, 0x1000)],
+        with_tile_write(|ti| {
+            ti.apply_full_index(
+                &[(0x3010, 0x1000, 0x1000, e1), (0x3020, 0x2000, 0x1000, e2)],
                 &[Some(vec![0x10]), Some(vec![0x200])],
                 unmap_gen,
                 map_gen,
@@ -2692,7 +3223,6 @@ mod tests {
         assert!(may_overlap_tile(0x200));
         assert!(!may_overlap_tile(0x400));
 
-        // Unrelated tiles are rejected; overlapping tiles are retained with zero false negatives.
         let mut unrelated = vec![0x400, 0x800];
         assert!(!filter_overlapping_tiles(&mut unrelated));
         assert!(unrelated.is_empty());
@@ -2701,12 +3231,118 @@ mod tests {
         assert!(filter_overlapping_tiles(&mut mixed));
         assert_eq!(mixed, vec![0x10, 0x200]);
 
-        // forget_many rebuilds the coarse bitset cleanly.
         forget_many(&[0x3010]);
         assert!(!may_overlap_tile(0x10));
         assert!(may_overlap_tile(0x200));
 
         forget_many(&[0x3020]);
         assert!(!may_overlap_tile(0x200));
+    }
+
+    #[test]
+    fn split_locks_allow_concurrent_note_write_submitted_and_tile_reads_without_blocking() {
+        let e1 = test_insert_global(0x4010, 0x1_0000_0000, 0x10000, false);
+        let e2 = test_insert_global(0x4020, 0x2_0000_0000, 0x80_0000, false); // > 4 MiB (large tier)
+
+        // Hold TILE_INDEX write lock on thread 0: note_write, note_transitions, submitted, and describe must NOT block.
+        let tile_write_guard = TILE_INDEX.write().unwrap_or_else(|e| e.into_inner());
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                note_write(0x3_0000_0000, 0x1000); // coarse miss
+                note_write(0x1_0000_1000, 0x1000); // hits small tier
+                note_write(0x2_0040_0000, 0x1000); // hits large tier
+                note_transitions(0x4000, &[(0x4010, 0, 0x80)]);
+                submitted(&[0x4000]);
+                list_reset(0x4000);
+            })
+            .join()
+            .unwrap();
+        });
+        drop(tile_write_guard);
+
+        assert!(e1.wants_fill());
+        assert!(e2.wants_fill());
+        assert_eq!(e1.states.lock().unwrap().as_slice(), &[0x80]);
+
+        // Hold ADDR_INDEX write lock: note_tiles (fast path), submitted, and describe must NOT block.
+        let addr_write_guard = ADDR_INDEX.write().unwrap_or_else(|e| e.into_inner());
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                note_transitions(0x4001, &[(0x4020, 0, 0x400)]);
+                submitted(&[0x4001]);
+                list_reset(0x4001);
+            })
+            .join()
+            .unwrap();
+        });
+        drop(addr_write_guard);
+        assert_eq!(e2.states.lock().unwrap().as_slice(), &[0x400]);
+
+        clear_global_pending_for(0x4010);
+        clear_global_pending_for(0x4020);
+        forget_many(&[0x4010, 0x4020]);
+        assert!(!may_overlap_addr(0x1_0000_1000, 0x1_0000_2000));
+        assert!(!may_overlap_addr(0x2_0040_0000, 0x2_0040_1000));
+    }
+
+    #[test]
+    fn concurrent_invalidation_during_flush_preserves_dirty_state() {
+        let entry = test_insert_global(0x5010, 0x4_0000_0000, 0x10000, true);
+        let snap_gen = entry.dequeue_for_flush().expect("initial dirty");
+        clear_global_pending_for(0x5010);
+
+        // Simulate a concurrent note_write arriving while flush is detiling `snap_gen`.
+        note_write(0x4_0000_0000, 4096);
+        // Flush finishes the old `snap_gen` and settles it: newer write must remain dirty and queued.
+        entry.settle_gen(snap_gen, true);
+        assert!(entry.wants_fill(), "newer write must not be cleared by older snap_gen settle");
+        assert!(HAS_PENDING_FILLS.load(Ordering::Acquire));
+
+        let next_gen = entry.dequeue_for_flush().expect("requeued newer write");
+        assert!(next_gen > snap_gen);
+        clear_global_pending_for(0x5010);
+        entry.settle_gen(next_gen, true);
+        assert!(!entry.wants_fill());
+
+        forget_many(&[0x5010]);
+    }
+
+    #[test]
+    fn concurrent_workers_stress_note_write_transitions_and_pending_queue() {
+        let base_res = 0x6000usize;
+        let count = 32usize;
+        for i in 0..count {
+            test_insert_global(base_res + i * 16, 0x5_0000_0000 + (i as u64) * 0x2_0000, 0x10000, false);
+        }
+        std::thread::scope(|s| {
+            for t in 0..8usize {
+                s.spawn(move || {
+                    for iter in 0..200usize {
+                        let idx = (t * 7 + iter) % count;
+                        let res = base_res + idx * 16;
+                        let va = 0x5_0000_0000 + (idx as u64) * 0x2_0000;
+                        note_write(va, 4096);
+                        note_write(0x9_0000_0000 + (iter as u64) * 4096, 4096);
+                        let list = 0x8000 + t * 16;
+                        note_transitions(list, &[(res, 0, (iter as u32) & 0x7)]);
+                        submitted(&[list]);
+                        list_reset(list);
+                        if iter % 10 == 0 {
+                            let mut drained = Vec::new();
+                            drain_pending_entries(&mut drained);
+                            for e in drained {
+                                if let Some(g) = e.dequeue_for_flush() {
+                                    e.settle_gen(g, true);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let ids: Vec<usize> = (0..count).map(|i| base_res + i * 16).collect();
+        let mut drained = Vec::new();
+        drain_pending_entries(&mut drained);
+        forget_many(&ids);
     }
 }
