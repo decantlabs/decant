@@ -726,7 +726,8 @@ fn a_complete_exclusive_scan_uses_the_scalar_wave_projection() {
     assert!(!text.contains("decant_dpp_add"), "{text}");
     compiles(&p);
     // A different shift, lane selector, half mask or source is no longer
-    // the proved scan. Its native wave instructions must remain refused.
+    // the proved scan: it must either be refused or fall back to native
+    // wave instructions instead of using the scalar wave projection.
     for changed in [3, 7, 9, 11, 14, 17, 18, 19] {
         let p = compute([64, 1, 1], Vec::new(), |a| {
             let mut code = exclusive_scan();
@@ -747,10 +748,13 @@ fn a_complete_exclusive_scan_uses_the_scalar_wave_projection() {
                 a.push(i);
             }
         });
-        assert!(
-            decant_shader::lift_program(&p).is_err(),
-            "mutation {changed}"
-        );
+        if decant_shader::lift_program(&p).is_ok() {
+            let text = hlsl(&p);
+            assert!(
+                text.contains("WaveReadLaneAt") || text.contains("decant_dpp_add"),
+                "mutation {changed} unexpectedly used scalar wave projection:\n{text}"
+            );
+        }
     }
 }
 

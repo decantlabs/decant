@@ -773,13 +773,12 @@ pub(crate) fn check_dpp_context(
                         || insn.dst == Operand::Reg(Reg::ExecLo)
                         || insn.src.contains(&Operand::Reg(Reg::ExecLo))
             )
-            || matches!(
-                insn.op,
-                Op::v_readlane_b32_e64
-                    | Op::v_writelane_b32_e64
-                    | Op::v_mbcnt_lo_u32_b32
-                    | Op::v_mbcnt_hi_u32_b32_e64
-            )
+            || matches!(insn.op, Op::v_writelane_b32_e64)
+            || (matches!(insn.op, Op::v_mbcnt_lo_u32_b32 | Op::v_mbcnt_hi_u32_b32_e64)
+                && !matches!(insn.src[0], Operand::Int(0 | -1)))
+            || (insn.op == Op::v_readlane_b32_e64
+                && (reads_mask_operand(masks, insn.src[0])
+                    || !matches!(insn.src[1], Operand::Int(l) if (0..32).contains(&l))))
         {
             return Err(refuse(insn, "dpp-scalar-wave"));
         }
@@ -1401,5 +1400,62 @@ mod tests {
         let prog = crate::api::StageProgram::new(Stage::Compute, a.finish());
         let lifted = crate::lift_program(&prog).expect("64 lane s_mov_b32 of mask word lifts cleanly");
         assert_eq!(lifted.lanes, 64);
+    }
+
+    #[test]
+    fn compute_dpp_allows_const_mbcnt_and_low_non_mask_readlane() {
+        let mut mbcnt = Asm::new();
+        mbcnt.push(dpp16(Op::v_add_u32, v(2), v(0), v(1), 0xff08_b100));
+        mbcnt.push(vop3(Op::v_mbcnt_lo_u32_b32, v(3), int(-1), int(0), Operand::None));
+        mbcnt.push(sopp(Op::s_endpgm, 0));
+        let mbcnt_prog = crate::api::StageProgram::new(Stage::Compute, mbcnt.finish());
+        assert!(crate::lift_program(&mbcnt_prog).is_ok());
+
+        let mut readlane = Asm::new();
+        readlane.push(dpp16(Op::v_add_u32, v(2), v(0), v(1), 0xff08_b100));
+        readlane.push(vop3(Op::v_readlane_b32_e64, s(2), v(2), int(31), Operand::None));
+        readlane.push(sopp(Op::s_endpgm, 0));
+        let readlane_prog = crate::api::StageProgram::new(Stage::Compute, readlane.finish());
+        assert!(crate::lift_program(&readlane_prog).is_ok());
+    }
+
+    #[test]
+    fn compute_dpp_still_refuses_mask_mbcnt_writelane_and_unsafe_readlane() {
+        let assert_dpp_scalar_wave = |insn: Insn, prep: Option<Insn>| {
+            let mut a = Asm::new();
+            if let Some(p) = prep {
+                a.push(p);
+            }
+            a.push(dpp16(Op::v_add_u32, v(2), v(0), v(1), 0xff08_b100));
+            a.push(insn);
+            a.push(sopp(Op::s_endpgm, 0));
+            let prog = crate::api::StageProgram::new(Stage::Compute, a.finish());
+            let err = crate::lift_program(&prog).unwrap_err();
+            assert_eq!(err.kind, crate::refusal::RefusalKind::Exec("dpp-scalar-wave"), "expected exec:dpp-scalar-wave, got {err:?}");
+        };
+
+        // Non-const mask in v_mbcnt_lo_u32_b32.
+        assert_dpp_scalar_wave(vop3(Op::v_mbcnt_lo_u32_b32, v(3), v(1), int(0), Operand::None), None);
+        // v_readlane_b32_e64 with lane >= 32.
+        assert_dpp_scalar_wave(vop3(Op::v_readlane_b32_e64, s(2), v(2), int(32), Operand::None), None);
+        // v_readlane_b32_e64 with dynamic lane.
+        assert_dpp_scalar_wave(vop3(Op::v_readlane_b32_e64, s(2), v(2), s(3), Operand::None), None);
+        // v_readlane_b32_e64 with mask source operand (refused by exec analysis or dpp context).
+        let mut mask_readlane = Asm::new();
+        mask_readlane.push(sop1(Op::s_mov_b32, s(0), EXEC));
+        mask_readlane.push(dpp16(Op::v_add_u32, v(2), v(0), v(1), 0xff08_b100));
+        mask_readlane.push(vop3(Op::v_readlane_b32_e64, s(2), EXEC, int(0), Operand::None));
+        mask_readlane.push(sopp(Op::s_endpgm, 0));
+        let mask_prog = crate::api::StageProgram::new(Stage::Compute, mask_readlane.finish());
+        let mask_err = crate::lift_program(&mask_prog).unwrap_err();
+        assert!(
+            matches!(
+                mask_err.kind,
+                crate::refusal::RefusalKind::Exec("dpp-scalar-wave" | "mask-as-data")
+            ),
+            "expected exec refusal, got {mask_err:?}"
+        );
+        // v_writelane_b32_e64.
+        assert_dpp_scalar_wave(vop3(Op::v_writelane_b32_e64, v(3), s(2), int(0), Operand::None), None);
     }
 }
