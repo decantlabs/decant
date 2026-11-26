@@ -304,9 +304,18 @@ impl ViewTextures {
     /// Bytes the cache holds in memory: each heap with a live texture at `heap_bytes`, and the committed
     /// textures at their size. A heap with no live texture is free to be filled again and is not counted.
     pub fn held_bytes(&self, heap_bytes: u64) -> u64 {
+        with_detiled_copies(|copy| self.held_bytes_with(heap_bytes, copy))
+    }
+
+    /// [`held_bytes`] with the detiled copies counted by `copy` (the bytes of the copy of resource `res`,
+    /// 0 when there is none). The detiled copies of the views are held memory too, and the budget counts
+    /// them, which the heaps alone did not.
+    pub fn held_bytes_with(&self, heap_bytes: u64, copy: &dyn Fn(usize) -> u64) -> u64 {
         let mut heaps = std::collections::HashSet::new();
         let mut committed = 0u64;
+        let mut copies = 0u64;
         for e in self.made.values().chain(self.stale.iter()) {
+            copies += copy(e.res);
             match e.heap {
                 Some(h) => {
                     heaps.insert(h);
@@ -314,7 +323,7 @@ impl ViewTextures {
                 None => committed += e.bytes,
             }
         }
-        heaps.len() as u64 * heap_bytes + committed
+        heaps.len() as u64 * heap_bytes + committed + copies
     }
 
     /// Takes out the textures to give back when the cache holds more than `cap` bytes ([`held_bytes`],
@@ -325,7 +334,13 @@ impl ViewTextures {
     /// the same two conditions. It stops once the cache is back at `cap`, at most [`MAX_PER_PASS`] textures. The
     /// caller releases them through `retire` (after the submissions in flight).
     pub fn collect(&mut self, cap: u64, heap_bytes: u64, present: u64, ms: u64, referenced: &std::collections::HashSet<usize>) -> Pass {
-        let mut pass = Pass { held_before: self.held_bytes(heap_bytes), ..Pass::default() };
+        with_detiled_copies(|copy| self.collect_with(cap, heap_bytes, present, ms, referenced, copy))
+    }
+
+    /// [`collect`] with the detiled copies counted by `copy` (see [`held_bytes_with`]): a heap or a committed
+    /// texture given back gives back its copy too.
+    fn collect_with(&mut self, cap: u64, heap_bytes: u64, present: u64, ms: u64, referenced: &std::collections::HashSet<usize>, copy: &dyn Fn(usize) -> u64) -> Pass {
+        let mut pass = Pass { held_before: self.held_bytes_with(heap_bytes, copy), ..Pass::default() };
         pass.held_after = pass.held_before;
         if cap == 0 || pass.held_before <= cap {
             return pass;
@@ -351,9 +366,9 @@ impl ViewTextures {
             if pass.held_after <= target || taken >= MAX_PER_PASS {
                 break;
             }
-            let n = self.made.values().chain(self.stale.iter()).filter(|e| e.heap == Some(h)).count();
+            let (n, copies) = self.made.values().chain(self.stale.iter()).filter(|e| e.heap == Some(h)).fold((0usize, 0u64), |(n, c), e| (n + 1, c + copy(e.res)));
             taken += n;
-            pass.held_after = pass.held_after.saturating_sub(heap_bytes);
+            pass.held_after = pass.held_after.saturating_sub(heap_bytes + copies);
             gone_heaps.push(h);
         }
         for h in &gone_heaps {
@@ -386,12 +401,12 @@ impl ViewTextures {
                 }
                 if let Some(e) = self.made.remove(&va) {
                     self.live_bytes = self.live_bytes.saturating_sub(e.bytes);
-                    pass.held_after = pass.held_after.saturating_sub(e.bytes);
+                    pass.held_after = pass.held_after.saturating_sub(e.bytes + copy(e.res));
                     pass.freed.push(e);
                 }
             }
         }
-        pass.heaps_in_use = self.held_bytes(heap_bytes).div_ceil(heap_bytes.max(1)) as usize;
+        pass.heaps_in_use = self.held_bytes_with(heap_bytes, copy).div_ceil(heap_bytes.max(1)) as usize;
         pass.stuck = pass.freed.is_empty() && pass.held_before > cap + cap / 2;
         pass
     }
@@ -448,6 +463,19 @@ impl ViewTextures {
         pass.heaps_in_use = pass.held_after.div_ceil(heap_bytes.max(1)) as usize;
         pass.stuck = pass.freed.is_empty() && self.live_bytes > budget;
         pass
+    }
+}
+
+/// Runs `f` with the bytes of the detiled copy of each resource (`detile`, which exists on Windows only:
+/// elsewhere no resource has a copy).
+fn with_detiled_copies<R>(f: impl FnOnce(&dyn Fn(usize) -> u64) -> R) -> R {
+    #[cfg(windows)]
+    {
+        crate::detile::with_copies(f)
+    }
+    #[cfg(not(windows))]
+    {
+        f(&|_| 0)
     }
 }
 
@@ -806,5 +834,23 @@ mod tests {
 
         // Budget 0 disables eviction.
         assert!(t.collect_budget(0, 1000, p + 10, ms + 10, &held).freed.is_empty());
+    }
+    /// The budget counts the detiled copies of the views too. Two heaps of 1000 bytes with two
+    /// textures each, and a copy of 500 bytes for each texture: 4000 bytes held, over a cap of 2500. The
+    /// least recently used heap goes whole with its copies (2000 left). Without the copies the same cache
+    /// is 2000 bytes, under the cap, and nothing goes.
+    #[test]
+    fn the_budget_counts_the_detiled_copies_of_the_views() {
+        use super::{MIN_IDLE_MS, MIN_IDLE_PRESENTS};
+        let (p, ms) = (MIN_IDLE_PRESENTS + 100, MIN_IDLE_MS + 1000);
+        let none = std::collections::HashSet::new();
+        let with_copies = |_res: usize| 500u64;
+        let mut t = cache(2, 2, |_| (0, 0));
+        assert_eq!(t.held_bytes_with(1000, &with_copies), 4000);
+        let pass = t.collect_with(2500, 1000, p, ms, &none, &with_copies);
+        assert_eq!(pass.freed.len(), 2, "heap 0 goes whole, with its two copies");
+        assert_eq!((pass.held_before, pass.held_after), (4000, 2000));
+        let mut without = cache(2, 2, |_| (0, 0));
+        assert!(without.collect_with(2500, 1000, p, ms, &none, &|_| 0).freed.is_empty(), "without the copies it is under the cap");
     }
 }

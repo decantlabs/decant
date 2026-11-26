@@ -1300,6 +1300,16 @@ pub fn describe(res: usize) -> Option<String> {
     Some(format!("detile va {va:#x} {size} bytes mode {mode}, pages {}, {fill}, {content}", if mapped { "mapped" } else { "NOT mapped" }))
 }
 
+/// Runs `f` with a lookup of the bytes of the detiled copy of each resource (0 for one without a copy),
+/// holding the registry for the whole call (one lock for many lookups). The view texture budget counts
+/// these copies (`views_at::ViewTextures::held_bytes`).
+pub fn with_copies<R>(f: impl FnOnce(&dyn Fn(usize) -> u64) -> R) -> R {
+    with_registry(|r| {
+        let lookup = |res: usize| r.textures.get(&res).map_or(0, |t| t.bytes);
+        f(&lookup)
+    })
+}
+
 /// The resource was released.
 pub fn forget(res: usize) {
     with_registry(|r| {
