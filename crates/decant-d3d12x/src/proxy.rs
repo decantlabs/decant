@@ -220,17 +220,56 @@ struct Side {
     placed: Option<(mem_owners::Segment, u64)>,
 }
 
-static SIDE: std::sync::Mutex<Option<std::collections::HashMap<usize, Side>>> = std::sync::Mutex::new(None);
+#[derive(Default)]
+struct FastUsizeHasher(u64);
+
+impl std::hash::Hasher for FastUsizeHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(b);
+            self.0 = self.0.wrapping_mul(0x517C_C1B7_2722_0A95);
+        }
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type FastUsizeMap<V> = std::collections::HashMap<usize, V, std::hash::BuildHasherDefault<FastUsizeHasher>>;
+
+static SIDE: std::sync::Mutex<Option<FastUsizeMap<Side>>> = std::sync::Mutex::new(None);
+static SIDE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn side_set(proxy: *mut Proxy, f: impl FnOnce(&mut Side)) {
     let mut g = SIDE.lock().unwrap_or_else(|e| e.into_inner());
-    let e = g.get_or_insert_with(Default::default).entry(proxy as usize).or_default();
+    let map = g.get_or_insert_with(Default::default);
+    let len_before = map.len();
+    let e = map.entry(proxy as usize).or_default();
     f(e);
+    if map.len() != len_before {
+        SIDE_COUNT.store(map.len(), Ordering::Relaxed);
+    }
 }
 
 fn side_take(proxy: *mut Proxy) -> Side {
+    if SIDE_COUNT.load(Ordering::Relaxed) == 0 {
+        return Side::default();
+    }
     let mut g = SIDE.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_mut().and_then(|m| m.remove(&(proxy as usize))).unwrap_or_default()
+    let Some(map) = g.as_mut() else {
+        return Side::default();
+    };
+    let side = map.remove(&(proxy as usize)).unwrap_or_default();
+    SIDE_COUNT.store(map.len(), Ordering::Relaxed);
+    side
 }
 
 /// A resource placed at a console address (device slots 44 and 133): the proxy header, then the
@@ -3751,6 +3790,7 @@ extern "system" fn list_reset_late(this: *mut Proxy, allocator: Object, pso: Obj
 /// PC command lists whose last Close failed. Native D3D12 removes the device when such a list is
 /// executed, so they are left out until a Reset records them anew.
 static UNCLOSED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static UNCLOSED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Console list slot 9: Close (PC order). A refusal is logged and remembered (`UNCLOSED`).
 extern "system" fn list_close(this: *mut Proxy) -> HRESULT {
@@ -3761,7 +3801,9 @@ extern "system" fn list_close(this: *mut Proxy) -> HRESULT {
         crate::capture::flush(this as usize, pc);
         let hr = method::<unsafe extern "system" fn(Object) -> HRESULT>(pc, 9)(pc);
         if hr < 0 {
-            UNCLOSED.lock().unwrap_or_else(|e| e.into_inner()).push(pc as usize);
+            let mut unclosed = UNCLOSED.lock().unwrap_or_else(|e| e.into_inner());
+            unclosed.push(pc as usize);
+            UNCLOSED_COUNT.store(unclosed.len(), Ordering::Relaxed);
             if log_due(&N) {
                 xs_log!("console command list {}: Close refused by the PC runtime, hr=0x{:08X}; left out of its submissions", p(pc), hr as u32);
             }
@@ -3772,7 +3814,12 @@ extern "system" fn list_close(this: *mut Proxy) -> HRESULT {
 
 /// A list was reset: whatever its last Close did no longer matters.
 fn forget_unclosed(pc_list: Object) {
-    UNCLOSED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&l| l != pc_list as usize);
+    if UNCLOSED_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut unclosed = UNCLOSED.lock().unwrap_or_else(|e| e.into_inner());
+    unclosed.retain(|&l| l != pc_list as usize);
+    UNCLOSED_COUNT.store(unclosed.len(), Ordering::Relaxed);
 }
 
 /// ExecuteCommandLists (PC 10) of the PC lists `lists` on PC queue `pc`, without the ones whose
@@ -3785,6 +3832,12 @@ unsafe fn execute_closed(pc: Object, lists: &[Object]) {
     // the title may have written memory while its lists waited behind a memory wait
     // SAFETY: by the contract above.
     unsafe { crate::title_mem::sync(pc) };
+    if UNCLOSED_COUNT.load(Ordering::Relaxed) == 0 {
+        // SAFETY: by the contract above.
+        unsafe { method::<Execute>(pc, 10)(pc, lists.len() as u32, lists.as_ptr()) };
+        crate::diagnose::removed_after(|| format!("a title submission of {} lists on queue {pc:p}", lists.len()));
+        return;
+    }
     let kept: Vec<Object> = {
         let unclosed = UNCLOSED.lock().unwrap_or_else(|e| e.into_inner());
         lists.iter().copied().filter(|l| !unclosed.contains(&(*l as usize))).collect()
@@ -3798,10 +3851,22 @@ unsafe fn execute_closed(pc: Object, lists: &[Object]) {
 }
 
 extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object) {
+    const STACK_LISTS: usize = 16;
     let _pc_call = crate::watchdog_hold::pc_call();
     // SAFETY: `this` is a live proxy, `lists` points to `n` objects.
     unsafe {
-        let mapped = unwrap_array(n, lists);
+        let count = n as usize;
+        let mut mapped_stack = [std::ptr::null_mut(); STACK_LISTS];
+        let mapped_heap;
+        let mapped: &[Object] = if count <= STACK_LISTS {
+            for (i, slot) in mapped_stack[..count].iter_mut().enumerate() {
+                *slot = if lists.is_null() { std::ptr::null_mut() } else { unwrap(*lists.add(i)) };
+            }
+            &mapped_stack[..count]
+        } else {
+            mapped_heap = unwrap_array(n, lists);
+            &mapped_heap
+        };
         let pc = (*this).pc;
         // objects released from now on wait for this submission
         let tracked = crate::retire::begin(pc);
@@ -3811,17 +3876,29 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
         crate::title_mem::sync(pc);
         // the textures the title wrote since its last submission are readable by the GPU before its lists run
         crate::detile::flush(pc);
-        let keys: Vec<usize> = if n > 0 && !lists.is_null() { (0..n as usize).map(|i| *lists.add(i) as usize).collect() } else { Vec::new() };
-        crate::draw_diag::submitted(&keys);
+        let mut keys_stack = [0usize; STACK_LISTS];
+        let keys_heap;
+        let keys: &[usize] = if count == 0 || lists.is_null() {
+            &[]
+        } else if count <= STACK_LISTS {
+            for (i, slot) in keys_stack[..count].iter_mut().enumerate() {
+                *slot = *lists.add(i) as usize;
+            }
+            &keys_stack[..count]
+        } else {
+            keys_heap = (0..count).map(|i| *lists.add(i) as usize).collect::<Vec<_>>();
+            &keys_heap
+        };
+        crate::draw_diag::submitted(keys);
         // constant buffer copies of these lists take the bytes the title wrote since their recording
-        let refresh = crate::cbv_copies::submitted(&keys);
+        let refresh = crate::cbv_copies::submitted(keys);
         if refresh.stale > 0 || refresh.kept > 0 {
             static STALE: AtomicI32 = AtomicI32::new(0);
             if log_due(&STALE) {
                 xs_log!("console queue: {} constant buffer copies of {} lists, {} changed since recording and taken again, {} of lists submitted again left as they are", refresh.copies, keys.len(), refresh.stale, refresh.kept);
             }
         }
-        let watched = crate::flicker_probe::submitting(pc, &keys, suspects);
+        let watched = crate::flicker_probe::submitting(pc, keys, suspects);
         // a list whose memory waits are not met runs after the lists before it, once they are
         // (the GPU has to run those first); the wait holds it back for at most WAIT_TIMEOUT
         let mut start = 0usize;
@@ -3847,12 +3924,23 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
             execute_closed(pc, &mapped[start..]);
         }
         crate::flicker_probe::submitted(pc, watched);
-        crate::detile::submitted(&mapped.iter().map(|&l| l as usize).collect::<Vec<_>>());
-        crate::present::list_submitted(&mapped.iter().map(|&l| l as usize).collect::<Vec<_>>());
-        crate::rt_diag::executed(&keys);
+        let mut mapped_keys_stack = [0usize; STACK_LISTS];
+        let mapped_keys_heap;
+        let mapped_keys: &[usize] = if mapped.len() <= STACK_LISTS {
+            for (i, &l) in mapped.iter().enumerate() {
+                mapped_keys_stack[i] = l as usize;
+            }
+            &mapped_keys_stack[..mapped.len()]
+        } else {
+            mapped_keys_heap = mapped.iter().map(|&l| l as usize).collect::<Vec<_>>();
+            &mapped_keys_heap
+        };
+        crate::detile::submitted(mapped_keys);
+        crate::present::list_submitted(mapped_keys);
+        crate::rt_diag::executed(keys);
         // the lists' bottom-of-pipe writes into title memory: done once the GPU has finished this
         if !keys.is_empty() {
-            let writes = crate::list_sync::cpu_writes_of(&keys);
+            let writes = crate::list_sync::cpu_writes_of(keys);
             static N: AtomicI32 = AtomicI32::new(0);
             if log_due(&N) {
                 let waits: usize = keys.iter().map(|&k| crate::list_sync::waits_of(k).len()).sum();
@@ -4392,6 +4480,7 @@ extern "system" fn list_resolve_subresource(this: *mut Proxy, dst: Object, dst_s
 /// Console list slot 26 (ResourceBarrier, PC 26): the barriers go to PC as a copy with their
 /// resources unwrapped.
 extern "system" fn list_resource_barrier(this: *mut Proxy, n: u32, barriers: *const c_void) {
+    const STACK_BARRIERS: usize = 8;
     // SAFETY: `this` is a live command list proxy; `barriers` is null or `n` readable barriers.
     unsafe {
         let pc = (*this).pc;
@@ -4400,19 +4489,42 @@ extern "system" fn list_resource_barrier(this: *mut Proxy, n: u32, barriers: *co
             method::<Barriers>(pc, 26)(pc, n, barriers);
             return;
         }
-        let mut copy: Vec<[u8; BARRIER_BYTES]> = (0..n as usize)
-            .map(|i| std::ptr::read_unaligned(barriers.cast::<u8>().add(i * BARRIER_BYTES).cast()))
-            .collect();
-        for barrier in &mut copy {
+        let count = n as usize;
+        let mut copy_stack = [[0u8; BARRIER_BYTES]; STACK_BARRIERS];
+        let mut copy_heap;
+        let copy: &mut [[u8; BARRIER_BYTES]] = if count <= STACK_BARRIERS {
+            for (i, slot) in copy_stack[..count].iter_mut().enumerate() {
+                *slot = std::ptr::read_unaligned(barriers.cast::<u8>().add(i * BARRIER_BYTES).cast());
+            }
+            &mut copy_stack[..count]
+        } else {
+            copy_heap = (0..count)
+                .map(|i| std::ptr::read_unaligned(barriers.cast::<u8>().add(i * BARRIER_BYTES).cast()))
+                .collect::<Vec<_>>();
+            &mut copy_heap
+        };
+        let mut noted_stack = [(0usize, 0u32, 0u32); STACK_BARRIERS];
+        let mut noted_heap = Vec::new();
+        let mut noted_len = 0usize;
+        for barrier in copy.iter_mut() {
             resource_args::unwrap_barrier(barrier, |p| pc_pointer(p));
+            if u32::from_le_bytes([barrier[0], barrier[1], barrier[2], barrier[3]]) == 0 {
+                let entry = (
+                    u64::from_le_bytes(barrier[8..16].try_into().unwrap_or([0; 8])) as usize,
+                    u32::from_le_bytes([barrier[16], barrier[17], barrier[18], barrier[19]]),
+                    u32::from_le_bytes([barrier[24], barrier[25], barrier[26], barrier[27]]),
+                );
+                if count <= STACK_BARRIERS {
+                    noted_stack[noted_len] = entry;
+                    noted_len += 1;
+                } else {
+                    noted_heap.push(entry);
+                }
+            }
         }
-        let noted: Vec<(usize, u32, u32)> = copy
-            .iter()
-            .filter(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == 0)
-            .map(|b| (u64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8])) as usize, u32::from_le_bytes([b[16], b[17], b[18], b[19]]), u32::from_le_bytes([b[24], b[25], b[26], b[27]])))
-            .collect();
-        crate::detile::note_transitions(pc as usize, &noted);
-        crate::present::note_list_transitions(pc as usize, &noted);
+        let noted = if count <= STACK_BARRIERS { &noted_stack[..noted_len] } else { &noted_heap };
+        crate::detile::note_transitions(pc as usize, noted);
+        crate::present::note_list_transitions(pc as usize, noted);
         method::<Barriers>(pc, 26)(pc, n, copy.as_ptr().cast());
     }
 }
@@ -4439,17 +4551,32 @@ extern "system" fn list_set_predication(this: *mut Proxy, buffer: Object, off: u
 /// handles point into title memory (`title_heap`) and are translated to the host heap, as the
 /// device's CreateRenderTargetView already does. With `single` set, one handle starts a range.
 extern "system" fn list_om_set_render_targets(this: *mut Proxy, n: u32, rts: *const usize, single: i32, dsv: *const usize) {
+    const STACK_RTS: usize = 8;
     // SAFETY: `this` is a live command list proxy; `rts` holds `n` handles (one when `single`), `dsv` one or null.
     unsafe {
         let count = if rts.is_null() { 0 } else if single != 0 { n.min(1) } else { n } as usize;
-        let mut host = Vec::with_capacity(count);
-        for i in 0..count {
-            let Some(t) = crate::title_heap::translate_cpu(*rts.add(i)) else {
-                crate::rt_diag::count(&crate::rt_diag::RT_SET_UNTRANSLATED);
-                return;
-            };
-            host.push(t);
-        }
+        let mut host_stack = [0usize; STACK_RTS];
+        let mut host_heap = Vec::new();
+        let host: &[usize] = if count <= STACK_RTS {
+            for (i, slot) in host_stack[..count].iter_mut().enumerate() {
+                let Some(t) = crate::title_heap::translate_cpu(*rts.add(i)) else {
+                    crate::rt_diag::count(&crate::rt_diag::RT_SET_UNTRANSLATED);
+                    return;
+                };
+                *slot = t;
+            }
+            &host_stack[..count]
+        } else {
+            host_heap.reserve_exact(count);
+            for i in 0..count {
+                let Some(t) = crate::title_heap::translate_cpu(*rts.add(i)) else {
+                    crate::rt_diag::count(&crate::rt_diag::RT_SET_UNTRANSLATED);
+                    return;
+                };
+                host_heap.push(t);
+            }
+            &host_heap
+        };
         let mut host_dsv = 0usize;
         if !dsv.is_null() {
             let Some(t) = crate::title_heap::translate_cpu(*dsv) else {
@@ -4458,10 +4585,10 @@ extern "system" fn list_om_set_render_targets(this: *mut Proxy, n: u32, rts: *co
             };
             host_dsv = t;
         }
-        crate::rt_diag::bound(this as usize, &host);
+        crate::rt_diag::bound(this as usize, host);
         let pc = (*this).pc;
         crate::capture::flush(this as usize, pc);
-        crate::capture::bound(this as usize, &host);
+        crate::capture::bound(this as usize, host);
         method::<unsafe extern "system" fn(Object, u32, *const usize, i32, *const usize)>(pc, 46)(
             pc,
             n,
@@ -4526,8 +4653,8 @@ fn clear_uav(this: *mut Proxy, gpu: u64, cpu: u64, res: Object, values: *const c
         crate::view_raw::clear_words(row, words.map(value))
     };
     // SAFETY: a clear has `n` rectangles of four words at `rects`.
-    let title_rects: Vec<[i32; 4]> = if rects.is_null() || n == 0 { Vec::new() } else { unsafe { std::slice::from_raw_parts(rects.cast::<[i32; 4]>(), n as usize) }.to_vec() };
-    let moved = crate::view_raw::clear_rects(row, &title_rects);
+    let title_rects: &[[i32; 4]] = if rects.is_null() || n == 0 { &[] } else { unsafe { std::slice::from_raw_parts(rects.cast::<[i32; 4]>(), n as usize) } };
+    let moved = crate::view_raw::clear_rects(row, title_rects);
     let (n, rects) = match &moved {
         crate::view_raw::Rects::Moved(r) => (r.len() as u32, r.as_ptr().cast::<c_void>()),
         _ => (n, rects),
@@ -4591,12 +4718,31 @@ extern "system" fn list_set_pipeline_state(this: *mut Proxy, pso: Object) {
     }
 }
 
+struct StackBarriers {
+    buf: [[u8; BARRIER_BYTES]; 2],
+    len: usize,
+}
+
+impl StackBarriers {
+    const fn empty() -> Self {
+        Self { buf: [[0u8; BARRIER_BYTES]; 2], len: 0 }
+    }
+}
+
+impl std::ops::Deref for StackBarriers {
+    type Target = [[u8; BARRIER_BYTES]];
+
+    fn deref(&self) -> &Self::Target {
+        &self.buf[..self.len]
+    }
+}
+
 /// Builds the `COMMON -> INDIRECT_ARGUMENT` (before) and `INDIRECT_ARGUMENT -> COMMON` (after)
 /// transition barriers for an `ExecuteIndirect` on the argument buffer `arg` and the count buffer
 /// `count`. A buffer is left out when it is null, when it may not be transitioned
 /// (`*_needs_barrier` false, as an upload heap buffer), and the count buffer also when it is the
 /// argument buffer, which already has its barrier.
-fn indirect_argument_barriers(arg: u64, arg_needs_barrier: bool, count: u64, count_needs_barrier: bool) -> (Vec<[u8; BARRIER_BYTES]>, Vec<[u8; BARRIER_BYTES]>) {
+fn indirect_argument_barriers(arg: u64, arg_needs_barrier: bool, count: u64, count_needs_barrier: bool) -> (StackBarriers, StackBarriers) {
     const ALL_SUBRESOURCES: u32 = 0xFFFF_FFFF;
     const STATE_COMMON: u32 = 0;
     const STATE_INDIRECT_ARGUMENT: u32 = 0x200;
@@ -4611,12 +4757,17 @@ fn indirect_argument_barriers(arg: u64, arg_needs_barrier: bool, count: u64, cou
         barrier
     };
 
-    let wanted = [(arg, arg_needs_barrier), (count, count_needs_barrier && count != arg)];
-    wanted
-        .into_iter()
-        .filter(|&(resource, allowed)| resource != 0 && allowed)
-        .map(|(resource, _)| (transition(resource, STATE_COMMON, STATE_INDIRECT_ARGUMENT), transition(resource, STATE_INDIRECT_ARGUMENT, STATE_COMMON)))
-        .unzip()
+    let mut before = StackBarriers::empty();
+    let mut after = StackBarriers::empty();
+    for (resource, allowed) in [(arg, arg_needs_barrier), (count, count_needs_barrier && count != arg)] {
+        if resource != 0 && allowed {
+            before.buf[before.len] = transition(resource, STATE_COMMON, STATE_INDIRECT_ARGUMENT);
+            before.len += 1;
+            after.buf[after.len] = transition(resource, STATE_INDIRECT_ARGUMENT, STATE_COMMON);
+            after.len += 1;
+        }
+    }
+    (before, after)
 }
 
 /// True when `pc_res` is non-null and not on an upload or readback heap (those heaps have fixed
@@ -4660,7 +4811,7 @@ extern "system" fn list_execute_indirect(this: *mut Proxy, sig: Object, max: u32
         let (before, after) = if record_barriers {
             indirect_argument_barriers(pc_arg as u64, needs_indirect_barrier(pc_arg), pc_count as u64, needs_indirect_barrier(pc_count))
         } else {
-            (Vec::new(), Vec::new())
+            (StackBarriers::empty(), StackBarriers::empty())
         };
         if !before.is_empty() {
             method::<Barriers>(pc, 26)(pc, before.len() as u32, before.as_ptr().cast());
@@ -5182,5 +5333,21 @@ mod tests {
         assert_eq!(super::next_trim_present(100, false), 160);
         assert_eq!(super::next_trim_present(100, true), 400);
         assert_eq!(super::next_trim_present(u64::MAX - 10, true), u64::MAX);
+    }
+
+    #[test]
+    fn side_count_tracks_insertions_and_removals() {
+        let p = 0xDEAD_BEEF_0000usize as *mut super::Proxy;
+        assert!(super::side_take(p).placed.is_none());
+        super::side_set(p, |s| s.placed = Some((super::mem_owners::Segment::Local, 4096)));
+        assert_eq!(super::side_take(p).placed, Some((super::mem_owners::Segment::Local, 4096)));
+        assert!(super::side_take(p).placed.is_none());
+    }
+
+    #[test]
+    fn stack_barriers_empty_has_zero_length() {
+        let empty = super::StackBarriers::empty();
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
     }
 }
