@@ -724,8 +724,76 @@ impl VramBudget {
 }
 
 const STAGING_BYTES: usize = 64 << 20;
+const STAGING_BYTES_32G: usize = 32 << 20;
 const STAGING_MAX_PAGES: usize = STAGING_BYTES / PAGE as usize;
 const STAGING_ALLOCATORS: usize = 8;
+const HOST_RAM_32G_THRESHOLD: u64 = 33_554 << 20;
+const COMMIT_FLOOR_BYTES: u64 = 4_096 << 20;
+
+fn parse_mirror_l0_mib(env: Option<&str>) -> Option<u64> {
+    env.and_then(|v| v.trim().parse::<u64>().ok()).map(|mib| mib << 20)
+}
+
+fn host_ram_status() -> Option<(u64, u64, u64)> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut mem = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `mem.dwLength` is initialized to the exact struct size.
+    if unsafe { GlobalMemoryStatusEx(&mut mem) } != 0 {
+        Some((mem.ullTotalPhys, mem.ullAvailPhys, mem.ullAvailPageFile))
+    } else {
+        None
+    }
+}
+
+fn host_ram_l0_cap(
+    total_phys: u64,
+    avail_phys: u64,
+    avail_pagefile: u64,
+    override_cap: Option<u64>,
+) -> u64 {
+    if let Some(cap) = override_cap {
+        return cap;
+    }
+    if total_phys <= HOST_RAM_32G_THRESHOLD {
+        let base = if total_phys <= (16_384 << 20) {
+            1_024 << 20
+        } else {
+            2_048 << 20
+        };
+        if avail_phys < (2_560 << 20) || avail_pagefile < (2_048 << 20) {
+            base.min(512 << 20)
+        } else if avail_phys < (4_096 << 20) || avail_pagefile < (4_096 << 20) {
+            base.min(1_024 << 20)
+        } else {
+            base
+        }
+    } else {
+        let twenty_pct = ((total_phys >> 20) * 20 / 100) << 20;
+        (6_144 << 20).min(twenty_pct)
+    }
+}
+
+fn staging_ring_bytes(total_phys: u64) -> usize {
+    if total_phys > 0 && total_phys <= HOST_RAM_32G_THRESHOLD {
+        STAGING_BYTES_32G
+    } else {
+        STAGING_BYTES
+    }
+}
+
+fn can_grow_l0(
+    l0_mirror_bytes: u64,
+    l0_cap: u64,
+    avail_phys: u64,
+    avail_pagefile: u64,
+) -> bool {
+    l0_mirror_bytes.saturating_add(POOL_HEAP_BYTES) <= l0_cap
+        && avail_phys >= COMMIT_FLOOR_BYTES
+        && avail_pagefile >= (2_048 << 20)
+}
 
 fn parse_mirror_pool_mode(env: Option<&str>) -> MirrorPoolMode {
     if let Some(val) = env {
@@ -1043,7 +1111,7 @@ fn wait_fence(fence: &ID3D12Fence, event: usize, target: u64) {
 }
 
 impl StagingRing {
-    fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
+    fn new(device: &ID3D12Device, size_bytes: usize) -> windows::core::Result<Self> {
         let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
         let mut buffer: Option<ID3D12Resource> = None;
         // SAFETY: plain D3D12 upload buffer creation on a live device.
@@ -1051,7 +1119,7 @@ impl StagingRing {
             device.CreateCommittedResource(
                 &props,
                 D3D12_HEAP_FLAG_NONE,
-                &buffer_desc(STAGING_BYTES as u64, D3D12_RESOURCE_FLAG_NONE),
+                &buffer_desc(size_bytes as u64, D3D12_RESOURCE_FLAG_NONE),
                 D3D12_RESOURCE_STATE_GENERIC_READ,
                 None,
                 &mut buffer,
@@ -1079,7 +1147,7 @@ impl StagingRing {
         Ok(Self {
             buffer,
             ptr: ptr as usize,
-            size: STAGING_BYTES,
+            size: size_bytes,
             head: 0,
             in_flight: VecDeque::new(),
             allocators,
@@ -1212,6 +1280,7 @@ struct State {
     pool_mode: MirrorPoolMode,
     fallback_budget: u64,
     m_cap_override: Option<u64>,
+    l0_cap_override: Option<u64>,
     l1_heaps: u64,
     l0_heaps: u64,
     has_staging: bool,
@@ -1596,6 +1665,30 @@ impl State {
                     }
                 }
             } else {
+                let allow_l0 = if let Some((total_phys, avail_phys, avail_pagefile)) = host_ram_status() {
+                    let l0_cap = host_ram_l0_cap(total_phys, avail_phys, avail_pagefile, self.l0_cap_override);
+                    let l0_bytes = self.l0_heaps * POOL_HEAP_BYTES;
+                    let ok = can_grow_l0(l0_bytes, l0_cap, avail_phys, avail_pagefile);
+                    if !ok {
+                        static L0_PRESSURE_LOGGED: std::sync::Once = std::sync::Once::new();
+                        L0_PRESSURE_LOGGED.call_once(|| {
+                            xs_log!(
+                                "title memory: L0 host RAM cap reached ({} MiB / {} MiB, avail phys {} MiB, avail pagefile {} MiB), skipping further L0 heap growth",
+                                l0_bytes >> 20,
+                                l0_cap >> 20,
+                                avail_phys >> 20,
+                                avail_pagefile >> 20
+                            );
+                        });
+                    }
+                    ok
+                } else {
+                    true
+                };
+                if !allow_l0 {
+                    self.failed.insert(index);
+                    return None;
+                }
                 make_heap(&self.device, index, MirrorPool::L0)
             };
             match made {
@@ -1904,20 +1997,25 @@ pub unsafe fn device_created(device: *mut c_void) {
     };
     let env_pool = std::env::var("DECANT_D3D12X_MIRROR_POOL").ok();
     let env_l1_mib = std::env::var("DECANT_D3D12X_MIRROR_L1_MIB").ok();
+    let env_l0_mib = std::env::var("DECANT_D3D12X_MIRROR_L0_MIB").ok();
     let adapter = local_adapter(&device);
     let dedicated = dedicated_vram(adapter.as_ref());
     let (budget, _) = adapter.as_ref().and_then(local_vram_info).unwrap_or((dedicated, 0));
     let mut pool_mode = parse_mirror_pool_mode(env_pool.as_deref());
     let m_cap_override = parse_mirror_l1_mib(env_l1_mib.as_deref());
+    let l0_cap_override = parse_mirror_l0_mib(env_l0_mib.as_deref());
     let vram_budget = VramBudget::from_budget(budget);
     let effective_m_cap = m_cap_override.unwrap_or(vram_budget.m_cap);
+    let (total_phys, avail_phys, avail_pagefile) = host_ram_status().unwrap_or((u64::MAX, u64::MAX, u64::MAX));
+    let l0_cap = host_ram_l0_cap(total_phys, avail_phys, avail_pagefile, l0_cap_override);
+    let ring_bytes = staging_ring_bytes(total_phys);
     let needs_staging = match pool_mode {
         MirrorPoolMode::StrictL0 => false,
         MirrorPoolMode::Auto => effective_m_cap > 0,
         MirrorPoolMode::PreferL1 => true,
     };
     let staging = if needs_staging {
-        match StagingRing::new(&device) {
+        match StagingRing::new(&device, ring_bytes) {
             Ok(ring) => Some(ring),
             Err(e) => {
                 xs_log!("title memory: L1 staging ring cannot be made ({e}), falling back to L0 mirror heaps");
@@ -1929,13 +2027,15 @@ pub unsafe fn device_created(device: *mut c_void) {
         None
     };
     xs_log!(
-        "title memory: mirror mode {:?} (dedicated {} MiB, budget {} MiB, hwm {} MiB, lwm {} MiB, l1 cap {} MiB)",
+        "title memory: mirror mode {:?} (dedicated {} MiB, budget {} MiB, hwm {} MiB, lwm {} MiB, l1 cap {} MiB, l0 cap {} MiB, staging {} MiB)",
         pool_mode,
         dedicated >> 20,
         budget >> 20,
         vram_budget.hwm_total >> 20,
         vram_budget.lwm_total >> 20,
-        effective_m_cap >> 20
+        effective_m_cap >> 20,
+        l0_cap >> 20,
+        staging.as_ref().map_or(0, |r| r.size >> 20)
     );
     let has_staging = staging.is_some();
     let mut sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1964,6 +2064,7 @@ pub unsafe fn device_created(device: *mut c_void) {
         pool_mode,
         fallback_budget: budget,
         m_cap_override,
+        l0_cap_override,
         l1_heaps: 0,
         l0_heaps: 0,
         has_staging,
@@ -2412,11 +2513,12 @@ pub unsafe fn sync(queue: *mut c_void) {
     let mut total_pages = 0u64;
     let mut total_ranges = 0u64;
     let mut run_guard = false;
+    let max_batch_pages = staging.as_ref().map_or(STAGING_MAX_PAGES, |r| r.size / PAGE as usize);
     let mut first_batch = true;
     let mut chunk_start = 0usize;
     while first_batch || chunk_start < dirty.len() {
         first_batch = false;
-        let chunk_end = (chunk_start + STAGING_MAX_PAGES).min(dirty.len());
+        let chunk_end = (chunk_start + max_batch_pages).min(dirty.len());
         let batch_pages = &dirty[chunk_start..chunk_end];
         chunk_start = chunk_end;
         jobs.clear();
@@ -3196,5 +3298,33 @@ mod tests {
         let mut third_tiles = Vec::new();
         collect_changed_l1_tiles(&runs, &mut third_tiles);
         assert_eq!(third_tiles, vec![523]);
+    }
+
+    #[test]
+    fn host_ram_l0_cap_handles_16_32_64_gib_and_pressure_tiers() {
+        let g16 = 16_384 << 20;
+        let g32 = 32_768 << 20;
+        let g64 = 65_536 << 20;
+        assert_eq!(host_ram_l0_cap(g16, 8_000 << 20, 8_000 << 20, None), 1_024 << 20);
+        assert_eq!(host_ram_l0_cap(g32, 12_000 << 20, 12_000 << 20, None), 2_048 << 20);
+        assert_eq!(host_ram_l0_cap(g32, 3_500 << 20, 12_000 << 20, None), 1_024 << 20);
+        assert_eq!(host_ram_l0_cap(g32, 12_000 << 20, 3_500 << 20, None), 1_024 << 20);
+        assert_eq!(host_ram_l0_cap(g32, 2_000 << 20, 12_000 << 20, None), 512 << 20);
+        assert_eq!(host_ram_l0_cap(g32, 12_000 << 20, 1_500 << 20, None), 512 << 20);
+        assert_eq!(host_ram_l0_cap(g64, 30_000 << 20, 30_000 << 20, None), 6_144 << 20);
+        assert_eq!(host_ram_l0_cap(g32, 2_000 << 20, 1_500 << 20, Some(768 << 20)), 768 << 20);
+        assert_eq!(parse_mirror_l0_mib(Some("1536")), Some(1536 << 20));
+        assert!(can_grow_l0(1_024 << 20, 2_048 << 20, 6_000 << 20, 6_000 << 20));
+        assert!(!can_grow_l0(2_048 << 20, 2_048 << 20, 6_000 << 20, 6_000 << 20));
+        assert!(!can_grow_l0(512 << 20, 2_048 << 20, 3_900 << 20, 6_000 << 20));
+        assert!(!can_grow_l0(512 << 20, 2_048 << 20, 6_000 << 20, 1_900 << 20));
+    }
+
+    #[test]
+    fn staging_ring_bytes_halves_to_32_mib_on_32_gib_hosts() {
+        assert_eq!(staging_ring_bytes(16_384 << 20), 32 << 20);
+        assert_eq!(staging_ring_bytes(32_768 << 20), 32 << 20);
+        assert_eq!(staging_ring_bytes(65_536 << 20), 64 << 20);
+        assert_eq!(staging_ring_bytes(0), 64 << 20);
     }
 }
