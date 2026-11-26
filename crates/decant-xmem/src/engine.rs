@@ -950,6 +950,8 @@ pub struct Engine {
     state: Box<Mutex<State>>,
     dirty: Arc<Mutex<Dirty>>,
     protect_sync: Arc<ProtectSync>,
+    /// Minimum interval in milliseconds between batched re-protection waves.
+    reprotect_interval_ms: AtomicU64,
 }
 
 /// The state of every live engine, by address: the fault handler commits pages of any of them (the one
@@ -1060,7 +1062,8 @@ impl Engine {
         };
         let state = Box::new(Mutex::new(state));
         STATES.lock().unwrap_or_else(PoisonError::into_inner).push(&raw const *state as usize);
-        Ok(Engine { api, limit_pages, tracking: AtomicBool::new(false), journal_seq: AtomicU64::new(0), journal: Mutex::new(Journal::new()), state, dirty, protect_sync })
+        let reprotect_interval_ms = AtomicU64::new(track::reprotect_interval().as_millis() as u64);
+        Ok(Engine { api, limit_pages, tracking: AtomicBool::new(false), journal_seq: AtomicU64::new(0), journal: Mutex::new(Journal::new()), state, dirty, protect_sync, reprotect_interval_ms })
     }
 
     /// The engine of this process. The size of the section is `DECANT_XMEM_PHYSICAL_MIB` MiB when
@@ -2194,7 +2197,9 @@ impl Engine {
                     .find(|&&(start, pages, _)| i >= start && i < start + pages)
                     .is_some_and(|&(start, _, view)| runs_seen.borrow_mut().is_committed(view + (i - start) * PAGE_BYTES, query_region))
             };
-            let (pages, protect) = track.take(Instant::now(), cap, committed);
+            let interval = std::time::Duration::from_millis(self.reprotect_interval_ms.load(Ordering::Relaxed));
+            let (pages, protect) = track.take_batched(Instant::now(), cap, interval, committed);
+            let protect = track.bridge_clean_gaps(protect, 4);
             queries += runs_seen.borrow().queries;
             sync.set_pending(track.pending_len() > 0);
             sync.bump_addrs(&protect);
@@ -2751,7 +2756,10 @@ mod tests {
 
     fn held(load: impl FnOnce() -> Result<Engine, EngineError>) -> Option<Held> {
         let guard = ADDRESS_SPACE.lock().unwrap_or_else(PoisonError::into_inner);
-        load().ok().map(|engine| Held { engine, _guard: guard })
+        load().ok().map(|engine| {
+            engine.reprotect_interval_ms.store(0, Ordering::Relaxed);
+            Held { engine, _guard: guard }
+        })
     }
 
     fn engine() -> Option<Held> {
@@ -3250,6 +3258,7 @@ mod tests {
         let guard = ADDRESS_SPACE.lock().unwrap_or_else(PoisonError::into_inner);
         let engine = Engine::global().ok()?;
         engine.set_tracking(true);
+        engine.reprotect_interval_ms.store(0, Ordering::Relaxed);
         Some((guard, engine))
     }
 

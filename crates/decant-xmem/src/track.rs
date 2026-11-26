@@ -28,6 +28,10 @@ pub const HOT_FAULTS: u8 = 3;
 pub const HOT_HOLD: Duration = Duration::from_millis(250);
 /// Minimum writable rest after a CPU write fault before `take` re-protects the page by default.
 pub const GUARD_REST: Duration = Duration::from_millis(8);
+/// Minimum interval between `VirtualProtect(PAGE_READONLY)` waves in `Engine::take_dirty` by default.
+pub const REPROTECT_INTERVAL: Duration = Duration::from_millis(12);
+/// Pending page count that forces an immediate re-protect wave regardless of `REPROTECT_INTERVAL`.
+pub const REPROTECT_WATERMARK: usize = 1024;
 
 /// Parses a hold duration in milliseconds from an optional string, falling back to `default`.
 fn parse_hold_ms(raw: Option<&str>, default: Duration) -> Duration {
@@ -50,6 +54,17 @@ pub fn parse_io_hold_ms(raw: Option<&str>) -> Duration {
 /// Parses `DECANT_XMEM_GUARD_REST_MS` from an optional string, falling back to [`GUARD_REST`].
 pub fn parse_guard_rest_ms(raw: Option<&str>) -> Duration {
     parse_hold_ms(raw, GUARD_REST)
+}
+
+/// Parses `DECANT_XMEM_REPROTECT_MS` from an optional string, falling back to [`REPROTECT_INTERVAL`].
+pub fn parse_reprotect_ms(raw: Option<&str>) -> Duration {
+    parse_hold_ms(raw, REPROTECT_INTERVAL)
+}
+
+/// Minimum interval between batched re-protection waves.
+pub fn reprotect_interval() -> Duration {
+    static INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| parse_reprotect_ms(std::env::var("DECANT_XMEM_REPROTECT_MS").ok().as_deref()))
 }
 
 /// How long a hot page stays unprotected and is copied at every sync.
@@ -182,6 +197,8 @@ pub struct Track {
     protect_scratch: Vec<usize>,
     /// Whether `pending` may contain uncommitted pages.
     has_uncommitted_pending: bool,
+    /// Last timestamp when `take_batched` emitted a protection wave.
+    last_reprotect: Option<Instant>,
 }
 
 /// The pages of `addrs` (title view page addresses) as runs `(start, bytes)`, adjacent pages merged.
@@ -521,6 +538,22 @@ impl Track {
     /// clean without a copy and without protection (it cannot be protected), and its first access, which
     /// commits it, makes it dirty (`on_fault`).
     pub fn take(&mut self, now: Instant, cap: usize, committed: impl Fn(u32) -> bool) -> (Vec<u32>, Vec<usize>) {
+        self.take_batched(now, cap, Duration::ZERO, committed)
+    }
+
+    /// Like `take`, but defers returning `protect` addresses until `interval` has elapsed since
+    /// the last protection wave or `pending` reaches `REPROTECT_WATERMARK`. While deferred, dirty
+    /// pages stay queued in `pending` and are still returned in `taken` for GPU coherency.
+    pub fn take_batched(
+        &mut self,
+        now: Instant,
+        cap: usize,
+        interval: Duration,
+        committed: impl Fn(u32) -> bool,
+    ) -> (Vec<u32>, Vec<usize>) {
+        let protect_now = interval.is_zero()
+            || self.pending.len() >= REPROTECT_WATERMARK
+            || self.last_reprotect.is_none_or(|last| now >= last + interval);
         let mut taken = Vec::new();
         let mut protect = std::mem::take(&mut self.protect_scratch);
         protect.clear();
@@ -540,7 +573,10 @@ impl Track {
             } else if (self.flags[i] & FLAG_COMMITTED) == 0 && !committed(page) {
                 self.flags[i] |= FLAG_CLEAN;
                 self.flags[i] &= !FLAG_QUEUED;
-            } else if self.active_writes[i] > 0 || (self.held_until_us[i] != 0 && now_us < self.held_until_us[i]) {
+            } else if !protect_now
+                || self.active_writes[i] > 0
+                || (self.held_until_us[i] != 0 && now_us < self.held_until_us[i])
+            {
                 self.flags[i] |= FLAG_COMMITTED;
                 taken.push(page);
                 keep.push(page);
@@ -555,8 +591,13 @@ impl Track {
                 taken.push(page);
             }
         }
-        if !hit_cap {
-            self.has_uncommitted_pending = false;
+        if protect_now {
+            if !hit_cap {
+                self.has_uncommitted_pending = false;
+            }
+            if !protect.is_empty() || self.last_reprotect.is_none() {
+                self.last_reprotect = Some(now);
+            }
         }
         pending.clear();
         self.keep_scratch = pending;
@@ -565,6 +606,63 @@ impl Track {
         protect.clear();
         self.protect_scratch = protect;
         (taken, out_protect)
+    }
+
+    fn is_bridgeable_clean_page(&self, addr: usize, expected_page: u32) -> bool {
+        let Some(&(page, rw)) = self.addresses.get(&addr) else {
+            return false;
+        };
+        if !rw || page != expected_page {
+            return false;
+        }
+        let i = page as usize;
+        let mask = FLAG_CLEAN | FLAG_COMMITTED | FLAG_QUEUED | FLAG_IO_HELD;
+        if (self.flags[i] & mask) != (FLAG_CLEAN | FLAG_COMMITTED) {
+            return false;
+        }
+        if self.active_writes[i] != 0 {
+            return false;
+        }
+        self.aliases[i]
+            .as_slice()
+            .iter()
+            .any(|a| a.addr == addr && a.rw && !a.open)
+    }
+
+    /// Bridges `1..=max_gap` clean, committed, guarded, non-queued, non-held pages between two
+    /// adjacent protect addresses from the same contiguous pool-page view so `VirtualProtect` runs
+    /// coalesce without changing protection semantics.
+    pub fn bridge_clean_gaps(&self, mut addrs: Vec<usize>, max_gap: usize) -> Vec<usize> {
+        if addrs.len() < 2 || max_gap == 0 {
+            return addrs;
+        }
+        addrs.sort_unstable();
+        addrs.dedup();
+        let mut out = Vec::with_capacity(addrs.len() + addrs.len() / 2);
+        for i in 0..addrs.len() {
+            let cur = addrs[i];
+            if i > 0 {
+                let prev = addrs[i - 1];
+                if cur > prev {
+                    let diff = cur - prev;
+                    if diff.is_multiple_of(PAGE_BYTES) {
+                        let gap = diff / PAGE_BYTES - 1;
+                        if (1..=max_gap).contains(&gap)
+                            && let Some(&(prev_page, true)) = self.addresses.get(&prev)
+                            && let Some(&(cur_page, true)) = self.addresses.get(&cur)
+                            && cur_page == prev_page + (gap as u32 + 1)
+                            && (1..=gap).all(|k| self.is_bridgeable_clean_page(prev + k * PAGE_BYTES, prev_page + k as u32))
+                        {
+                            for k in 1..=gap {
+                                out.push(prev + k * PAGE_BYTES);
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(cur);
+        }
+        out
     }
 }
 
@@ -908,5 +1006,89 @@ mod tests {
         // Once guard rest elapses, take copies and protects it again.
         assert_eq!(t.take(t0 + GUARD_REST, 10, all), (vec![1], vec![0x10_0000]));
         assert_eq!(t.take(t0 + GUARD_REST, 10, all), (vec![], vec![]));
+    }
+
+    #[test]
+    fn batched_reprotect_defers_protection_until_interval_or_watermark() {
+        assert_eq!(REPROTECT_INTERVAL, Duration::from_millis(12));
+        assert_eq!(parse_reprotect_ms(None), REPROTECT_INTERVAL);
+        assert_eq!(parse_reprotect_ms(Some("0")), Duration::ZERO);
+        assert_eq!(parse_reprotect_ms(Some(" 20 ")), Duration::from_millis(20));
+
+        let mut t = track();
+        let t0 = Instant::now();
+        t.on_map(1, 0x10_0000, true);
+        // First wave protects immediately.
+        assert_eq!(t.take_batched(t0, 10, REPROTECT_INTERVAL, all), (vec![1], vec![0x10_0000]));
+
+        // Map page 2 within the interval: taken is returned every call, protect is deferred.
+        t.on_map(2, 0x11_0000, true);
+        assert_eq!(t.take_batched(t0 + Duration::from_millis(2), 10, REPROTECT_INTERVAL, all), (vec![2], vec![]));
+        assert!(!t.is_clean_addr(0x11_0000));
+        assert_eq!(t.take_batched(t0 + Duration::from_millis(6), 10, REPROTECT_INTERVAL, all), (vec![2], vec![]));
+
+        // Once the 12 ms interval elapses, protection runs and marks page 2 clean.
+        assert_eq!(t.take_batched(t0 + REPROTECT_INTERVAL, 10, REPROTECT_INTERVAL, all), (vec![2], vec![0x11_0000]));
+        assert!(t.is_clean_addr(0x11_0000));
+        assert_eq!(t.take_batched(t0 + REPROTECT_INTERVAL + Duration::from_millis(1), 10, REPROTECT_INTERVAL, all), (vec![], vec![]));
+
+        // Watermark forces immediate protection even before the interval elapses.
+        let mut big = Track::new(REPROTECT_WATERMARK + 4);
+        big.on_map(0, 0x20_0000, true);
+        assert_eq!(big.take_batched(t0, 10, REPROTECT_INTERVAL, all), (vec![0], vec![0x20_0000]));
+        for p in 1..=REPROTECT_WATERMARK as u32 {
+            big.on_map(p, 0x20_0000 + p as usize * P, true);
+        }
+        let (taken, protect) = big.take_batched(t0 + Duration::from_millis(1), REPROTECT_WATERMARK + 4, REPROTECT_INTERVAL, all);
+        assert_eq!(taken.len(), REPROTECT_WATERMARK);
+        assert_eq!(protect.len(), REPROTECT_WATERMARK);
+    }
+
+    #[test]
+    fn bridge_clean_gaps_bridges_only_safe_clean_committed_guarded_pages() {
+        let mut t = Track::new(16);
+        let t0 = Instant::now();
+        for p in 0..7u32 {
+            t.on_map(p, 0x10_0000 + p as usize * P, true);
+        }
+        let _ = t.take(t0, 16, all);
+
+        // Bridge a 3 page clean committed guarded gap between pages 0 and 4.
+        assert_eq!(
+            t.bridge_clean_gaps(vec![0x10_0000, 0x14_0000], 4),
+            vec![0x10_0000, 0x11_0000, 0x12_0000, 0x13_0000, 0x14_0000]
+        );
+
+        // Do not bridge when gap exceeds max_gap.
+        assert_eq!(t.bridge_clean_gaps(vec![0x10_0000, 0x16_0000], 4), vec![0x10_0000, 0x16_0000]);
+
+        // Do not bridge across active_writes > 0.
+        t.begin_write_pin(2);
+        assert_eq!(t.bridge_clean_gaps(vec![0x10_0000, 0x14_0000], 4), vec![0x10_0000, 0x14_0000]);
+        t.finish_write_pin(2);
+        let _ = t.take(t0 + Duration::from_millis(1), 16, all);
+
+        // Do not bridge across dirty or queued pages.
+        let _ = t.on_changed(2);
+        assert_eq!(t.bridge_clean_gaps(vec![0x10_0000, 0x14_0000], 4), vec![0x10_0000, 0x14_0000]);
+        let _ = t.take(t0 + Duration::from_millis(2), 16, all);
+
+        // Do not bridge across unmapped pages.
+        t.on_unmap(2, 0x12_0000);
+        assert_eq!(t.bridge_clean_gaps(vec![0x10_0000, 0x14_0000], 4), vec![0x10_0000, 0x14_0000]);
+
+        // Do not bridge across uncommitted pages.
+        t.on_map(8, 0x30_0000, true);
+        t.on_map(9, 0x31_0000, true);
+        t.on_map(10, 0x32_0000, true);
+        let _ = t.take(t0 + Duration::from_millis(3), 16, |p| p != 9);
+        assert_eq!(t.bridge_clean_gaps(vec![0x30_0000, 0x32_0000], 4), vec![0x30_0000, 0x32_0000]);
+
+        // Do not bridge across non contiguous pool page mappings.
+        t.on_map(12, 0x40_0000, true);
+        t.on_map(14, 0x41_0000, true);
+        t.on_map(13, 0x42_0000, true);
+        let _ = t.take(t0 + Duration::from_millis(4), 16, all);
+        assert_eq!(t.bridge_clean_gaps(vec![0x40_0000, 0x42_0000], 4), vec![0x40_0000, 0x42_0000]);
     }
 }
