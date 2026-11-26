@@ -5,9 +5,10 @@
 //! `Windows Kits\10\bin\<version>\x64` (newest version first), then through the normal DLL search path.
 #![allow(unsafe_code)]
 
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::ffi::c_void;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D::Dxc::{CLSID_DxcValidator, DxcValidatorFlags_InPlaceEdit, IDxcBlob, IDxcBlob_Impl, IDxcValidator};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -69,48 +70,75 @@ impl IDxcBlob_Impl for Blob_Impl {
 
 type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
-fn create_validator() -> Result<IDxcValidator, ValidateError> {
-    let path = find_dxil().ok_or_else(|| ValidateError::Missing("dxil.dll not found (set DECANT_SHADER_DXIL_DLL)".into()))?;
-    let wide: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: the DLL stays loaded for the life of the process, the entry point has the documented signature.
-    unsafe {
-        let module = LoadLibraryW(PCWSTR(wide.as_ptr())).map_err(|e| ValidateError::Missing(format!("{}: {e}", path.display())))?;
-        let proc = GetProcAddress(module, PCSTR(c"DxcCreateInstance".as_ptr().cast())).ok_or_else(|| ValidateError::Missing("DxcCreateInstance is not exported".into()))?;
-        let create: CreateInstance = std::mem::transmute(proc);
-        let mut out: *mut c_void = std::ptr::null_mut();
-        let hr = create(&CLSID_DxcValidator, &IDxcValidator::IID, &mut out);
-        if hr.is_err() || out.is_null() {
-            return Err(ValidateError::Missing(format!("DxcCreateInstance(CLSID_DxcValidator) failed with {:#010x}", hr.0)));
+static DXC_CREATE: OnceLock<Result<CreateInstance, ValidateError>> = OnceLock::new();
+
+thread_local! {
+    static VALIDATOR: RefCell<Option<Result<IDxcValidator, ValidateError>>> = const { RefCell::new(None) };
+}
+
+fn load_create_instance() -> Result<CreateInstance, ValidateError> {
+    DXC_CREATE
+        .get_or_init(|| {
+            let path = find_dxil().ok_or_else(|| ValidateError::Missing("dxil.dll not found (set DECANT_SHADER_DXIL_DLL)".into()))?;
+            let wide: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: the DLL stays loaded for the life of the process, the entry point has the documented signature.
+            unsafe {
+                let module = LoadLibraryW(PCWSTR(wide.as_ptr())).map_err(|e| ValidateError::Missing(format!("{}: {e}", path.display())))?;
+                let proc = GetProcAddress(module, PCSTR(c"DxcCreateInstance".as_ptr().cast())).ok_or_else(|| ValidateError::Missing("DxcCreateInstance is not exported".into()))?;
+                Ok(std::mem::transmute::<unsafe extern "system" fn() -> isize, CreateInstance>(proc))
+            }
+        })
+        .clone()
+}
+
+fn with_validator<T>(f: impl FnOnce(&IDxcValidator) -> Result<T, ValidateError>) -> Result<T, ValidateError> {
+    VALIDATOR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let res = slot.get_or_insert_with(|| {
+            let create = load_create_instance()?;
+            // SAFETY: `create` is the `DxcCreateInstance` entry point of `dxil.dll`.
+            unsafe {
+                let mut out: *mut c_void = std::ptr::null_mut();
+                let hr = create(&CLSID_DxcValidator, &IDxcValidator::IID, &mut out);
+                if hr.is_err() || out.is_null() {
+                    return Err(ValidateError::Missing(format!("DxcCreateInstance(CLSID_DxcValidator) failed with {:#010x}", hr.0)));
+                }
+                Ok(IDxcValidator::from_raw(out))
+            }
+        });
+        match res {
+            Ok(v) => f(v),
+            Err(e) => Err(e.clone()),
         }
-        Ok(IDxcValidator::from_raw(out))
-    }
+    })
 }
 
 /// Validates `container` with `DxcValidatorFlags_InPlaceEdit`. The validator writes the container
 /// digest it computes into the bytes of `container` (and may touch other bytes it owns), so the
 /// slice is updated.
 pub fn validate_in_place(container: &mut [u8]) -> Result<(), ValidateError> {
-    let validator = create_validator()?;
-    let blob: IDxcBlob = Blob(UnsafeCell::new(container.to_vec())).into();
-    // SAFETY: the blob is a valid COM object that outlives the call.
-    unsafe {
-        let result = validator.Validate(&blob, DxcValidatorFlags_InPlaceEdit).map_err(|e| ValidateError::Rejected(format!("Validate failed: {e}")))?;
-        let status = result.GetStatus().map_err(|e| ValidateError::Rejected(format!("GetStatus failed: {e}")))?;
-        if status.is_err() {
-            let text = match result.GetErrorBuffer() {
-                Ok(buf) => {
-                    let b: IDxcBlob = buf.cast().expect("an encoding blob is a blob");
-                    let (p, n) = (b.GetBufferPointer(), b.GetBufferSize());
-                    if p.is_null() { String::new() } else { String::from_utf8_lossy(std::slice::from_raw_parts(p.cast::<u8>(), n)).into_owned() }
-                }
-                Err(_) => String::new(),
-            };
-            return Err(ValidateError::Rejected(format!("status {:#010x}: {}", status.0, text.trim())));
+    with_validator(|validator| {
+        let blob: IDxcBlob = Blob(UnsafeCell::new(container.to_vec())).into();
+        // SAFETY: the blob is a valid COM object that outlives the call.
+        unsafe {
+            let result = validator.Validate(&blob, DxcValidatorFlags_InPlaceEdit).map_err(|e| ValidateError::Rejected(format!("Validate failed: {e}")))?;
+            let status = result.GetStatus().map_err(|e| ValidateError::Rejected(format!("GetStatus failed: {e}")))?;
+            if status.is_err() {
+                let text = match result.GetErrorBuffer() {
+                    Ok(buf) => {
+                        let b: IDxcBlob = buf.cast().expect("an encoding blob is a blob");
+                        let (p, n) = (b.GetBufferPointer(), b.GetBufferSize());
+                        if p.is_null() { String::new() } else { String::from_utf8_lossy(std::slice::from_raw_parts(p.cast::<u8>(), n)).into_owned() }
+                    }
+                    Err(_) => String::new(),
+                };
+                return Err(ValidateError::Rejected(format!("status {:#010x}: {}", status.0, text.trim())));
+            }
+            let (p, n) = (blob.GetBufferPointer(), blob.GetBufferSize());
+            if n == container.len() {
+                container.copy_from_slice(std::slice::from_raw_parts(p.cast::<u8>(), n));
+            }
         }
-        let (p, n) = (blob.GetBufferPointer(), blob.GetBufferSize());
-        if n == container.len() {
-            container.copy_from_slice(std::slice::from_raw_parts(p.cast::<u8>(), n));
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }

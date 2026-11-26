@@ -33,7 +33,19 @@ impl Bits {
         changed
     }
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.0.len() * 64).filter(|&i| self.get(i))
+        self.0.iter().enumerate().flat_map(|(wi, &word)| {
+            let mut w = word;
+            let base = wi * 64;
+            std::iter::from_fn(move || {
+                if w == 0 {
+                    None
+                } else {
+                    let tz = w.trailing_zeros() as usize;
+                    w &= w - 1;
+                    Some(base + tz)
+                }
+            })
+        })
     }
 }
 
@@ -79,14 +91,25 @@ fn scalar_count(elems: &[SigElement]) -> u32 {
     elems.iter().filter_map(|e| scalar(e, e.rows - 1, e.cols as u32 - 1)).map(|s| s + 1).max().unwrap_or(0)
 }
 
+#[inline]
+fn succ_slice(b: &Block, buf: &mut [usize; 2]) -> usize {
+    match &b.term {
+        Terminator::Br(t) => {
+            buf[0] = t.0 as usize;
+            1
+        }
+        Terminator::CondBr(_, a, c) => {
+            buf[0] = a.0 as usize;
+            buf[1] = c.0 as usize;
+            2
+        }
+        Terminator::Ret => 0,
+    }
+}
+
 /// Postdominator sets: `pdom[b]` holds the blocks that every path from `b` to a return passes.
 fn postdominators(shader: &Shader) -> Vec<Bits> {
     let n = shader.blocks.len();
-    let succ = |b: &Block| match &b.term {
-        Terminator::Br(t) => vec![t.0 as usize],
-        Terminator::CondBr(_, a, c) => vec![a.0 as usize, c.0 as usize],
-        Terminator::Ret => vec![],
-    };
     let mut all = Bits::default();
     for i in 0..n {
         all.set(i);
@@ -103,15 +126,16 @@ fn postdominators(shader: &Shader) -> Vec<Bits> {
         })
         .collect();
     let mut changed = true;
+    let mut s_buf = [0usize; 2];
     while changed {
         changed = false;
         for i in (0..n).rev() {
-            let s = succ(&shader.blocks[i]);
-            if s.is_empty() {
+            let slen = succ_slice(&shader.blocks[i], &mut s_buf);
+            if slen == 0 {
                 continue;
             }
-            let mut inter = pdom[s[0]].clone();
-            for &t in &s[1..] {
+            let mut inter = pdom[s_buf[0]].clone();
+            for &t in &s_buf[1..slen] {
                 for w in 0..inter.0.len() {
                     inter.0[w] &= pdom[t].0.get(w).copied().unwrap_or(0);
                 }
@@ -126,12 +150,41 @@ fn postdominators(shader: &Shader) -> Vec<Bits> {
     pdom
 }
 
-/// The rows of `e` an access with this row operand touches.
-fn hit_rows(e: &SigElement, row: &Operand) -> Vec<usize> {
+/// Calls `f` for each row of `e` that an access with `row` touches.
+#[inline]
+fn for_each_hit_row(e: &SigElement, row: &Operand, mut f: impl FnMut(usize)) {
     match row {
-        Operand::Const(Const::I32(r)) if *r < e.rows => vec![*r as usize],
-        _ => (0..e.rows as usize).collect(),
+        Operand::Const(Const::I32(r)) if *r < e.rows => f(*r as usize),
+        _ => {
+            for r in 0..e.rows as usize {
+                f(r);
+            }
+        }
     }
+}
+
+/// Calls `f` for each scalar index in `elems[elem]` touched by `(row, col)`.
+#[inline]
+fn for_each_elem_scalar(elems: &[SigElement], elem: u32, row: &Operand, col: u32, mut f: impl FnMut(u32)) -> Result<(), Error> {
+    let e = elems.get(elem as usize).ok_or_else(|| Error::Invalid(format!("signature element {elem} does not exist")))?;
+    match row {
+        Operand::Const(Const::I32(r)) => {
+            if *r >= e.rows {
+                return Err(Error::Invalid(format!("row {r} of element {} ({}) is out of range", elem, e.name)));
+            }
+            if let Some(sc) = scalar(e, *r, col) {
+                f(sc);
+            }
+        }
+        _ => {
+            for r in 0..e.rows {
+                if let Some(sc) = scalar(e, r, col) {
+                    f(sc);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Analyses the signature use of a normalised graphics shader.
@@ -140,17 +193,14 @@ pub fn analyze(shader: &Shader) -> Result<SigData, Error> {
     let n = shader.blocks.len();
     let pdom = postdominators(shader);
     // Blocks control dependent on a branch block: `cd[b]` lists the branches `b` depends on.
-    let succ = |b: &Block| match &b.term {
-        Terminator::Br(t) => vec![t.0 as usize],
-        Terminator::CondBr(_, a, c) => vec![a.0 as usize, c.0 as usize],
-        Terminator::Ret => vec![],
-    };
     let mut cd: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut s_buf = [0usize; 2];
     for a in 0..n {
-        let s = succ(&shader.blocks[a]);
-        if s.len() < 2 {
+        let slen = succ_slice(&shader.blocks[a], &mut s_buf);
+        if slen < 2 {
             continue;
         }
+        let s = &s_buf[..slen];
         for (b, deps_of_b) in cd.iter_mut().enumerate() {
             let postdominates_a_strictly = b != a && pdom[a].get(b);
             if !postdominates_a_strictly && s.iter().any(|&t| pdom[t].get(b)) {
@@ -180,62 +230,55 @@ pub fn analyze(shader: &Shader) -> Result<SigData, Error> {
 
     let mut deps: std::collections::HashMap<u32, Bits> = std::collections::HashMap::new();
     let mut out_deps: Vec<Bits> = vec![Bits::default(); out_scalars as usize];
-    let value_deps = |deps: &std::collections::HashMap<u32, Bits>, o: &Operand| -> Bits {
-        match o {
-            Operand::Value(v) => deps.get(&v.0).cloned().unwrap_or_default(),
-            Operand::Const(_) => Bits::default(),
+    let value_deps = |deps: &std::collections::HashMap<u32, Bits>, o: &Operand, out: &mut Bits| {
+        if let Operand::Value(v) = o
+            && let Some(b) = deps.get(&v.0)
+        {
+            out.union(b);
         }
-    };
-    let elem_range = |elems: &[SigElement], elem: u32, row: &Operand, col: u32| -> Result<Vec<u32>, Error> {
-        let e = elems.get(elem as usize).ok_or_else(|| Error::Invalid(format!("signature element {elem} does not exist")))?;
-        let rows: Vec<u32> = match row {
-            Operand::Const(Const::I32(r)) => vec![*r],
-            _ => (0..e.rows).collect(),
-        };
-        for &r in &rows {
-            if r >= e.rows {
-                return Err(Error::Invalid(format!("row {r} of element {} ({}) is out of range", elem, e.name)));
-            }
-        }
-        Ok(rows.into_iter().filter_map(|r| scalar(e, r, col)).collect())
     };
     let mut changed = true;
     let mut first = true;
+    let mut cond_deps: Vec<Bits> = vec![Bits::default(); n];
+    let mut ctrl = Bits::default();
+    let mut scratch = Bits::default();
     while changed {
         changed = false;
         // Dependence of the branch conditions, as known now.
-        let cond_deps: Vec<Bits> = shader
-            .blocks
-            .iter()
-            .map(|b| if let Terminator::CondBr(c, _, _) = &b.term { value_deps(&deps, c) } else { Bits::default() })
-            .collect();
+        for (i, b) in shader.blocks.iter().enumerate() {
+            cond_deps[i].0.clear();
+            if let Terminator::CondBr(c, _, _) = &b.term {
+                value_deps(&deps, c, &mut cond_deps[i]);
+            }
+        }
         for (bi, b) in shader.blocks.iter().enumerate() {
-            let mut ctrl = Bits::default();
+            ctrl.0.clear();
             for &a in &cd[bi] {
                 ctrl.union(&cond_deps[a]);
             }
             for phi in &b.phis {
-                let mut d = ctrl.clone();
+                scratch.0.clear();
+                scratch.union(&ctrl);
                 for (q, o) in &phi.incoming {
-                    d.union(&value_deps(&deps, o));
+                    value_deps(&deps, o, &mut scratch);
                     for &a in &cd[q.0 as usize] {
-                        d.union(&cond_deps[a]);
+                        scratch.union(&cond_deps[a]);
                     }
                 }
-                changed |= deps.entry(phi.dst.0).or_default().union(&d);
+                changed |= deps.entry(phi.dst.0).or_default().union(&scratch);
             }
             let always_runs = pdom[0].get(bi);
             for inst in &b.insts {
-                let mut d = Bits::default();
+                scratch.0.clear();
                 crate::lower::for_each_operand(&inst.op, &mut |o| {
-                    d.union(&value_deps(&deps, o));
+                    value_deps(&deps, o, &mut scratch);
                 });
                 match &inst.op {
                     Op::LoadInput { elem, row, col } => {
                         shader.inputs.get(*elem as usize).ok_or_else(|| Error::Invalid(format!("input element {elem} does not exist")))?;
-                        for sc in elem_range(&shader.inputs, *elem, row, *col as u32)? {
-                            d.set(sc as usize);
-                        }
+                        for_each_elem_scalar(&shader.inputs, *elem, row, *col as u32, |sc| {
+                            scratch.set(sc as usize);
+                        })?;
                         if first && (shader.inputs[*elem as usize].allocated() || shader.inputs[*elem as usize].semantic != Semantic::SampleIndex) {
                             let bit = 1u8 << col;
                             let e = &shader.inputs[*elem as usize];
@@ -245,12 +288,12 @@ pub fn analyze(shader: &Shader) -> Result<SigData, Error> {
                             if dynamic {
                                 u.dynamic |= bit;
                             }
-                            for r in hit_rows(e, row) {
+                            for_each_hit_row(e, row, |r| {
                                 u.row_used[r] |= bit;
                                 if always_runs {
                                     u.row_always[r] |= bit;
                                 }
-                            }
+                            });
                             if always_runs {
                                 u.always |= bit;
                             }
@@ -258,11 +301,12 @@ pub fn analyze(shader: &Shader) -> Result<SigData, Error> {
                     }
                     Op::StoreOutput { elem, row, col, value } => {
                         shader.outputs.get(*elem as usize).ok_or_else(|| Error::Invalid(format!("output element {elem} does not exist")))?;
-                        let mut v = value_deps(&deps, value);
-                        v.union(&ctrl);
-                        for sc in elem_range(&shader.outputs, *elem, row, *col as u32)? {
-                            changed |= out_deps[sc as usize].union(&v);
-                        }
+                        scratch.0.clear();
+                        value_deps(&deps, value, &mut scratch);
+                        scratch.union(&ctrl);
+                        for_each_elem_scalar(&shader.outputs, *elem, row, *col as u32, |sc| {
+                            changed |= out_deps[sc as usize].union(&scratch);
+                        })?;
                         if first {
                             let e = &shader.outputs[*elem as usize];
                             let u = &mut data.outputs[*elem as usize];
@@ -270,15 +314,15 @@ pub fn analyze(shader: &Shader) -> Result<SigData, Error> {
                             if !matches!(row, Operand::Const(_)) {
                                 u.dynamic |= 1u8 << col;
                             }
-                            for r in hit_rows(e, row) {
+                            for_each_hit_row(e, row, |r| {
                                 u.row_used[r] |= 1u8 << col;
-                            }
+                            });
                         }
                     }
                     _ => {}
                 }
                 for dst in &inst.dsts {
-                    changed |= deps.entry(dst.0).or_default().union(&d);
+                    changed |= deps.entry(dst.0).or_default().union(&scratch);
                 }
             }
         }
@@ -524,4 +568,93 @@ pub fn psv0_graphics(g: &PsvGraphics, resources: &[PsvResource]) -> Vec<u8> {
         put(&mut v, *w);
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elem(name: &str, index: u32, semantic: Semantic, component: ComponentType, rows: u32, cols: u8, start_row: u32) -> SigElement {
+        SigElement {
+            name: name.to_owned(),
+            index,
+            semantic,
+            component,
+            interp: Interp::Linear,
+            rows,
+            cols,
+            start_row,
+            start_col: 0,
+        }
+    }
+
+    #[test]
+    fn dynamic_array_input_and_unallocated_system_values_propagate_view_id() {
+        // Simulates a cutscene pixel shader with:
+        // - SV_Position (row 0, 4 cols)
+        // - TEXCOORD[0..3] (4-row array at rows 1..5, dynamically indexed by SV_SampleIndex)
+        // - SV_SampleIndex (unallocated)
+        // - SV_IsFrontFace (unallocated)
+        // Outputs:
+        // - SV_Target0 (row 0, 4 cols)
+        // - SV_Target1 (row 1, 4 cols, written conditionally on IsFrontFace)
+        let mut sample_idx = elem("SV_SampleIndex", 0, Semantic::SampleIndex, ComponentType::U32, 1, 1, SigElement::UNALLOCATED);
+        sample_idx.interp = Interp::Undefined;
+        let mut front_face = elem("SV_IsFrontFace", 0, Semantic::IsFrontFace, ComponentType::U32, 1, 1, SigElement::UNALLOCATED);
+        front_face.interp = Interp::Undefined;
+        let inputs = vec![
+            elem("SV_Position", 0, Semantic::Position, ComponentType::F32, 1, 4, 0),
+            elem("TEXCOORD", 0, Semantic::Arbitrary, ComponentType::F32, 4, 2, 1),
+            sample_idx,
+            front_face,
+        ];
+        let mut out0 = elem("SV_Target", 0, Semantic::Target, ComponentType::F32, 1, 4, 0);
+        out0.interp = Interp::Undefined;
+        let mut out1 = elem("SV_Target", 1, Semantic::Target, ComponentType::F32, 1, 4, 1);
+        out1.interp = Interp::Undefined;
+        let outputs = vec![out0, out1];
+
+        let b0 = Block::new(
+            vec![
+                Inst::new(&[0], Op::LoadInput { elem: 2, row: Operand::i32(0), col: 0 }),
+                Inst::new(&[1], Op::LoadInput { elem: 1, row: Operand::value(0), col: 0 }),
+                Inst::new(&[2], Op::LoadInput { elem: 3, row: Operand::i32(0), col: 0 }),
+                Inst::new(&[3], Op::ICmp(IPred::Ne, Operand::value(2), Operand::i32(0))),
+                Inst::new(&[], Op::StoreOutput { elem: 0, row: Operand::i32(0), col: 0, value: Operand::value(1) }),
+            ],
+            Terminator::CondBr(Operand::value(3), BlockId(1), BlockId(2)),
+        );
+        let b1 = Block::new(
+            vec![Inst::new(&[], Op::StoreOutput { elem: 1, row: Operand::i32(0), col: 0, value: Operand::f32(1.0) })],
+            Terminator::Br(BlockId(2)),
+        );
+        let b2 = Block::new(vec![], Terminator::Ret);
+
+        let mut sh = Shader::pixel(vec![b0, b1, b2]);
+        sh.inputs = inputs;
+        sh.outputs = outputs;
+        crate::cfg::normalize(&mut sh).unwrap();
+        let data = analyze(&sh).unwrap();
+
+        // TEXCOORD col 0 was dynamically indexed, so all 4 rows are marked used and dynamic.
+        assert_eq!(data.inputs[1].used, 1);
+        assert_eq!(data.inputs[1].dynamic, 1);
+        assert_eq!(data.inputs[1].row_used, [1, 1, 1, 1]);
+        assert_eq!(data.inputs[1].row_always, [1, 1, 1, 1]);
+        // SV_SampleIndex is unallocated and excluded from `used`, while SV_IsFrontFace is marked used.
+        assert_eq!(data.inputs[2].used, 0);
+        assert_eq!(data.inputs[3].used, 1);
+        assert_eq!(data.in_vectors, 5);
+        assert_eq!(data.out_vectors, 2);
+
+        // Every row of TEXCOORD.x (scalars 4, 8, 12, 16) feeds SV_Target0.x (scalar 0).
+        let words = data.out_scalars.div_ceil(32) as usize;
+        for r in 0..4 {
+            let sc = (1 + r) * 4;
+            assert_ne!(data.table[sc * words] & 1, 0, "row {r} feeds Target0.x");
+        }
+        // PSV0 graphics serializes cleanly with non-empty dynamic mask and sample-rate flag.
+        let psv = psv0_graphics(&PsvGraphics { pixel: true, inputs: &sh.inputs, outputs: &sh.outputs, data: &data }, &[]);
+        assert_eq!(psv[4 + 1], 1, "sample-rate pixel shader flag set");
+    }
 }

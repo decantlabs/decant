@@ -255,10 +255,6 @@ const FIXED_KINDS: [&str; 14] = [
     "dereferenceable_or_null",
 ];
 
-fn chars(s: &str) -> Vec<u64> {
-    s.bytes().map(u64::from).collect()
-}
-
 impl Module {
     fn attr_groups(&self) -> Vec<Attr> {
         let mut used = Vec::new();
@@ -289,9 +285,7 @@ impl Module {
                     Attr::ReadOnly => &[0, 18, 0, 21],
                     Attr::NoDuplicate => &[0, 18, 0, 12],
                 };
-                let mut ops = vec![i as u64 + 1, 0xFFFF_FFFF];
-                ops.extend_from_slice(attrs);
-                w.record(code::PARAMATTR_GRP_ENTRY, &ops);
+                w.record_len(code::PARAMATTR_GRP_ENTRY, 2 + attrs.len(), [i as u64 + 1, 0xFFFF_FFFF].into_iter().chain(attrs.iter().copied()));
             }
             w.end_block();
             w.enter_block(block::PARAMATTR, 3);
@@ -302,8 +296,8 @@ impl Module {
         }
 
         self.write_types(&mut w);
-        w.record(code::MODULE_TRIPLE, &chars(TRIPLE));
-        w.record(code::MODULE_DATALAYOUT, &chars(DATALAYOUT));
+        w.record_iter(code::MODULE_TRIPLE, TRIPLE.bytes().map(u64::from));
+        w.record_iter(code::MODULE_DATALAYOUT, DATALAYOUT.bytes().map(u64::from));
 
         let ng = self.globals.len() as u64;
         let nf = self.funcs.len() as u64;
@@ -340,14 +334,10 @@ impl Module {
 
         w.enter_block(block::VALUE_SYMTAB, 4);
         for (i, g) in self.globals.iter().enumerate() {
-            let mut ops = vec![i as u64];
-            ops.extend(chars(&g.name));
-            w.record(code::VST_ENTRY, &ops);
+            w.record_len(code::VST_ENTRY, 1 + g.name.len(), std::iter::once(i as u64).chain(g.name.bytes().map(u64::from)));
         }
         for (i, f) in self.funcs.iter().enumerate() {
-            let mut ops = vec![ng + i as u64];
-            ops.extend(chars(&f.name));
-            w.record(code::VST_ENTRY, &ops);
+            w.record_len(code::VST_ENTRY, 1 + f.name.len(), std::iter::once(ng + i as u64).chain(f.name.bytes().map(u64::from)));
         }
         w.end_block();
 
@@ -355,8 +345,9 @@ impl Module {
         w.enter_block(block::FUNCTION, 4);
         w.record(code::FUNC_DECLAREBLOCKS, &[self.block_count as u64]);
         let mut cur = base_inst;
+        let mut ops = Vec::with_capacity(16);
         for inst in &self.body {
-            let mut ops = Vec::with_capacity(inst.ops.len());
+            ops.clear();
             for op in &inst.ops {
                 ops.push(match *op {
                     LOp::Imm(v) => v,
@@ -392,20 +383,17 @@ impl Module {
                 Type::Ptr(to, a) => w.record(code::TYPE_POINTER, &[*to as u64, *a as u64]),
                 Type::Array(n, e) => w.record(code::TYPE_ARRAY, &[*n, *e as u64]),
                 Type::Struct { name, fields } => {
-                    let mut ops = vec![0u64];
-                    ops.extend(fields.iter().map(|&f| f as u64));
+                    let ops = std::iter::once(0u64).chain(fields.iter().map(|&f| f as u64));
                     match name {
                         Some(n) => {
-                            w.record(code::TYPE_STRUCT_NAME, &chars(n));
-                            w.record(code::TYPE_STRUCT_NAMED, &ops);
+                            w.record_iter(code::TYPE_STRUCT_NAME, n.bytes().map(u64::from));
+                            w.record_len(code::TYPE_STRUCT_NAMED, 1 + fields.len(), ops);
                         }
-                        None => w.record(code::TYPE_STRUCT_ANON, &ops),
+                        None => w.record_len(code::TYPE_STRUCT_ANON, 1 + fields.len(), ops),
                     }
                 }
                 Type::Func { ret, params } => {
-                    let mut ops = vec![0u64, *ret as u64];
-                    ops.extend(params.iter().map(|&p| p as u64));
-                    w.record(code::TYPE_FUNCTION, &ops);
+                    w.record_len(code::TYPE_FUNCTION, 2 + params.len(), [0u64, *ret as u64].into_iter().chain(params.iter().map(|&p| p as u64)));
                 }
             }
         }
@@ -431,8 +419,7 @@ impl Module {
                 ConstKind::Int(v) => w.record(code::CST_INTEGER, &[signed(*v)]),
                 ConstKind::Float(bits) => w.record(code::CST_FLOAT, &[*bits]),
                 ConstKind::Aggregate(elems) => {
-                    let ops: Vec<u64> = elems.iter().map(|&e| first + pos[e as usize]).collect();
-                    w.record(code::CST_AGGREGATE, &ops);
+                    w.record_iter(code::CST_AGGREGATE, elems.iter().map(|&e| first + pos[e as usize]));
                 }
             }
         }
@@ -444,27 +431,23 @@ impl Module {
             w.enter_block(block::METADATA, 3);
             for md in &self.md.list {
                 match md {
-                    Md::Str(s) => w.record(code::MD_STRING, &chars(s)),
+                    Md::Str(s) => w.record_iter(code::MD_STRING, s.bytes().map(u64::from)),
                     Md::Value(ty, r) => w.record(code::MD_VALUE, &[*ty as u64, abs(*r)?]),
                     Md::Node(ops) => {
-                        let ops: Vec<u64> = ops.iter().map(|o| o.map_or(0, |id| id as u64 + 1)).collect();
-                        w.record(code::MD_NODE, &ops);
+                        w.record_iter(code::MD_NODE, ops.iter().map(|o| o.map_or(0, |id| id as u64 + 1)));
                     }
                 }
             }
             for (name, ids) in &self.md.named {
-                w.record(code::MD_NAME, &chars(name));
-                let ops: Vec<u64> = ids.iter().map(|&i| i as u64).collect();
-                w.record(code::MD_NAMED_NODE, &ops);
+                w.record_iter(code::MD_NAME, name.bytes().map(u64::from));
+                w.record_iter(code::MD_NAMED_NODE, ids.iter().map(|&i| i as u64));
             }
             w.end_block();
         }
         if kinds {
             w.enter_block(block::METADATA, 3);
             for (i, k) in FIXED_KINDS.iter().enumerate() {
-                let mut ops = vec![i as u64];
-                ops.extend(chars(k));
-                w.record(code::MD_KIND, &ops);
+                w.record_len(code::MD_KIND, 1 + k.len(), std::iter::once(i as u64).chain(k.bytes().map(u64::from)));
             }
             w.end_block();
         }

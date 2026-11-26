@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crate::Error;
-use crate::dxop::{self, Attr, DxOp};
+use crate::dxop::{self, DxOp};
 use crate::ir::*;
 use crate::module::*;
 
@@ -129,14 +129,36 @@ pub(crate) fn for_each_operand(op: &Op, f: &mut dyn FnMut(&Operand)) {
     }
 }
 
-/// The resources an instruction names.
-fn res_refs(op: &Op) -> Vec<&ResRef> {
-    match op {
-        Op::CbufLoad { res, .. } | Op::BufLoad { res, .. } | Op::BufStore { res, .. } | Op::BufAtomic { res, .. } | Op::BufCmpXchg { res, .. } => vec![res],
-        Op::TexLoad { tex, .. } | Op::TexStore { tex, .. } | Op::TexAtomic { tex, .. } | Op::TexCmpXchg { tex, .. } | Op::GetDimensions { tex, .. } => vec![tex],
-        Op::Sample { tex, sampler, .. } | Op::Gather { tex, sampler, .. } | Op::CalculateLod { tex, sampler, .. } => vec![tex, sampler],
-        _ => Vec::new(),
+struct ResRefs<'a> {
+    items: [Option<&'a ResRef>; 2],
+    idx: usize,
+}
+
+impl<'a> Iterator for ResRefs<'a> {
+    type Item = &'a ResRef;
+    #[inline]
+    fn next(&mut self) -> Option<&'a ResRef> {
+        while self.idx < 2 {
+            let item = self.items[self.idx];
+            self.idx += 1;
+            if item.is_some() {
+                return item;
+            }
+        }
+        None
     }
+}
+
+/// The resources an instruction names.
+#[inline]
+fn res_refs(op: &Op) -> ResRefs<'_> {
+    let items = match op {
+        Op::CbufLoad { res, .. } | Op::BufLoad { res, .. } | Op::BufStore { res, .. } | Op::BufAtomic { res, .. } | Op::BufCmpXchg { res, .. } => [Some(res), None],
+        Op::TexLoad { tex, .. } | Op::TexStore { tex, .. } | Op::TexAtomic { tex, .. } | Op::TexCmpXchg { tex, .. } | Op::GetDimensions { tex, .. } => [Some(tex), None],
+        Op::Sample { tex, sampler, .. } | Op::Gather { tex, sampler, .. } | Op::CalculateLod { tex, sampler, .. } => [Some(tex), Some(sampler)],
+        _ => [None, None],
+    };
+    ResRefs { items, idx: 0 }
 }
 
 /// The last register of a range (the range can be unbounded: `u32::MAX` registers).
@@ -178,19 +200,51 @@ mod fc {
     pub const CMPXCHG: u32 = 46;
 }
 
+struct ValMap {
+    dense: Vec<Option<(Ref, Ty)>>,
+    sparse: HashMap<u32, (Ref, Ty)>,
+}
+
+impl ValMap {
+    fn new(max_dense: usize) -> Self {
+        Self { dense: vec![None; max_dense], sparse: HashMap::new() }
+    }
+    #[inline]
+    fn get(&self, id: u32) -> Option<(Ref, Ty)> {
+        let idx = id as usize;
+        if idx < self.dense.len() { self.dense[idx] } else { self.sparse.get(&id).copied() }
+    }
+    #[inline]
+    fn insert(&mut self, id: u32, val: (Ref, Ty)) -> Option<(Ref, Ty)> {
+        let idx = id as usize;
+        if idx < self.dense.len() {
+            self.dense[idx].replace(val)
+        } else {
+            self.sparse.insert(id, val)
+        }
+    }
+}
+
 struct Lower<'a> {
     sh: &'a Shader,
     m: Module,
-    vals: HashMap<u32, (Ref, Ty)>,
+    vals: ValMap,
     next_inst: u32,
     handles: Vec<Option<Ref>>,
-    funcs: HashMap<String, u32>,
+    dx_funcs: HashMap<(&'static str, Option<&'static str>), u32>,
     gs: Vec<u32>,
     flags: u64,
     features: u64,
     resource_heap: bool,
     sampler_heap: bool,
     sig: Option<crate::sig::SigData>,
+    handle_ty_id: Option<TypeId>,
+    resbind_ty_id: Option<TypeId>,
+    props_ty_id: Option<TypeId>,
+    cbufret_f32_id: Option<TypeId>,
+    cbufret_i32_id: Option<TypeId>,
+    resret_f32_id: Option<TypeId>,
+    resret_i32_id: Option<TypeId>,
 }
 
 fn suffix(t: Ty) -> &'static str {
@@ -276,10 +330,11 @@ impl<'a> Lower<'a> {
         Ok((r, t))
     }
 
+    #[inline]
     fn opnd(&mut self, o: &Operand) -> Result<(Ref, Ty), Error> {
         match o {
             Operand::Const(c) => self.constant(*c),
-            Operand::Value(v) => self.vals.get(&v.0).copied().ok_or_else(|| Error::UseBeforeDef(format!("value {} is used before its definition", v.0))),
+            Operand::Value(v) => self.vals.get(v.0).ok_or_else(|| Error::UseBeforeDef(format!("value {} is used before its definition", v.0))),
         }
     }
 
@@ -315,65 +370,128 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Declares (once) and calls the function `name`.
-    fn call(&mut self, name: &str, attr: Attr, ret: TypeId, args: &[(TypeId, Ref)]) -> Option<Ref> {
-        let idx = match self.funcs.get(name) {
+    /// A `dx.op` call: the opcode is the first argument.
+    fn dx(&mut self, op: DxOp, overload: Option<&'static str>, ret: TypeId, args: &[(TypeId, Ref)]) -> Option<Ref> {
+        let i32t = self.m.types.int(32);
+        let code = self.i32c(op.opcode);
+        let idx = match self.dx_funcs.get(&(op.class, overload)) {
             Some(&i) => i,
             None => {
-                let fty = self.m.types.func(ret, args.iter().map(|a| a.0).collect());
+                let name = match overload {
+                    Some(o) => format!("dx.op.{}.{o}", op.class),
+                    None => format!("dx.op.{}", op.class),
+                };
+                let mut params = Vec::with_capacity(1 + args.len());
+                params.push(i32t);
+                params.extend(args.iter().map(|a| a.0));
+                let fty = self.m.types.func(ret, params);
                 self.m.types.ptr(fty, 0);
                 let i = self.m.funcs.len() as u32;
-                self.m.funcs.push(Func { name: name.to_owned(), ty: fty, attr: Some(attr), proto: true });
-                self.funcs.insert(name.to_owned(), i);
+                self.m.funcs.push(Func { name, ty: fty, attr: Some(op.attr), proto: true });
+                self.dx_funcs.insert((op.class, overload), i);
                 i
             }
         };
         let fty = self.m.funcs[idx as usize].ty;
         let void = self.m.types.void();
-        let mut ops = vec![LOp::Imm(0), LOp::Imm(1 << 15), LOp::Imm(fty as u64), LOp::Rel(Ref::Func(idx))];
+        let mut ops = Vec::with_capacity(5 + args.len());
+        ops.push(LOp::Imm(0));
+        ops.push(LOp::Imm(1 << 15));
+        ops.push(LOp::Imm(fty as u64));
+        ops.push(LOp::Rel(Ref::Func(idx)));
+        ops.push(LOp::Rel(code));
         ops.extend(args.iter().map(|a| LOp::Rel(a.1)));
         self.emit(fc::CALL, ops, ret != void)
     }
 
-    /// A `dx.op` call: the opcode is the first argument.
-    fn dx(&mut self, op: DxOp, overload: Option<&str>, ret: TypeId, args: &[(TypeId, Ref)]) -> Option<Ref> {
-        let name = match overload {
-            Some(o) => format!("dx.op.{}.{o}", op.class),
-            None => format!("dx.op.{}", op.class),
-        };
-        let i32t = self.m.types.int(32);
-        let code = self.i32c(op.opcode);
-        let mut all = vec![(i32t, code)];
-        all.extend_from_slice(args);
-        self.call(&name, op.attr, ret, &all)
-    }
-
+    #[inline]
     fn extract(&mut self, agg: Ref, idx: u64) -> Ref {
         self.emit(fc::EXTRACTVAL, vec![LOp::Rel(agg), LOp::Imm(idx)], true).expect("has a value")
     }
 
-    // DXIL types.
+    // DXIL types (cached on `Lower`).
     fn handle_ty(&mut self) -> TypeId {
+        if let Some(id) = self.handle_ty_id {
+            return id;
+        }
         let i8t = self.m.types.int(8);
         let p = self.m.types.ptr(i8t, 0);
-        self.m.types.named("dx.types.Handle", vec![p])
+        let id = self.m.types.named("dx.types.Handle", vec![p]);
+        self.handle_ty_id = Some(id);
+        id
     }
     fn resbind_ty(&mut self) -> TypeId {
+        if let Some(id) = self.resbind_ty_id {
+            return id;
+        }
         let (i32t, i8t) = (self.m.types.int(32), self.m.types.int(8));
-        self.m.types.named("dx.types.ResBind", vec![i32t, i32t, i32t, i8t])
+        let id = self.m.types.named("dx.types.ResBind", vec![i32t, i32t, i32t, i8t]);
+        self.resbind_ty_id = Some(id);
+        id
     }
     fn props_ty(&mut self) -> TypeId {
+        if let Some(id) = self.props_ty_id {
+            return id;
+        }
         let i32t = self.m.types.int(32);
-        self.m.types.named("dx.types.ResourceProperties", vec![i32t, i32t])
+        let id = self.m.types.named("dx.types.ResourceProperties", vec![i32t, i32t]);
+        self.props_ty_id = Some(id);
+        id
     }
     fn cbufret_ty(&mut self, t: Ty) -> Result<TypeId, Error> {
-        let e = self.ty(t)?;
-        Ok(self.m.types.named(&format!("dx.types.CBufRet.{}", suffix(t)), vec![e; 4]))
+        match t {
+            Ty::F32 => {
+                if let Some(id) = self.cbufret_f32_id {
+                    return Ok(id);
+                }
+                let e = self.ty(t)?;
+                let id = self.m.types.named("dx.types.CBufRet.f32", vec![e; 4]);
+                self.cbufret_f32_id = Some(id);
+                Ok(id)
+            }
+            Ty::I32 => {
+                if let Some(id) = self.cbufret_i32_id {
+                    return Ok(id);
+                }
+                let e = self.ty(t)?;
+                let id = self.m.types.named("dx.types.CBufRet.i32", vec![e; 4]);
+                self.cbufret_i32_id = Some(id);
+                Ok(id)
+            }
+            _ => {
+                let e = self.ty(t)?;
+                Ok(self.m.types.named(&format!("dx.types.CBufRet.{}", suffix(t)), vec![e; 4]))
+            }
+        }
     }
     fn resret_ty(&mut self, t: Ty) -> Result<TypeId, Error> {
-        let e = self.ty(t)?;
-        let i32t = self.m.types.int(32);
-        Ok(self.m.types.named(&format!("dx.types.ResRet.{}", suffix(t)), vec![e, e, e, e, i32t]))
+        match t {
+            Ty::F32 => {
+                if let Some(id) = self.resret_f32_id {
+                    return Ok(id);
+                }
+                let e = self.ty(t)?;
+                let i32t = self.m.types.int(32);
+                let id = self.m.types.named("dx.types.ResRet.f32", vec![e, e, e, e, i32t]);
+                self.resret_f32_id = Some(id);
+                Ok(id)
+            }
+            Ty::I32 => {
+                if let Some(id) = self.resret_i32_id {
+                    return Ok(id);
+                }
+                let e = self.ty(t)?;
+                let i32t = self.m.types.int(32);
+                let id = self.m.types.named("dx.types.ResRet.i32", vec![e, e, e, e, i32t]);
+                self.resret_i32_id = Some(id);
+                Ok(id)
+            }
+            _ => {
+                let e = self.ty(t)?;
+                let i32t = self.m.types.int(32);
+                Ok(self.m.types.named(&format!("dx.types.ResRet.{}", suffix(t)), vec![e, e, e, e, i32t]))
+            }
+        }
     }
 
     /// The handles of the bound resources: `createHandleFromBinding` then `annotateHandle`, once per
@@ -1554,7 +1672,7 @@ impl<'a> Lower<'a> {
                             }
                             r
                         }
-                        Operand::Value(v) => self.vals.get(&v.0).map_or(Ref::Late(v.0), |x| x.0),
+                        Operand::Value(v) => self.vals.get(v.0).map_or(Ref::Late(v.0), |x| x.0),
                     };
                     ops.push(LOp::SRel(r));
                     ops.push(LOp::Imm(blk.0 as u64));
@@ -1585,8 +1703,8 @@ impl<'a> Lower<'a> {
         for inst in &mut self.m.body {
             for op in &mut inst.ops {
                 if let LOp::SRel(Ref::Late(v)) = op {
-                    let (r, _) = vals.get(v).ok_or_else(|| Error::UseBeforeDef(format!("phi input value {v} is never defined")))?;
-                    *op = LOp::SRel(*r);
+                    let (r, _) = vals.get(*v).ok_or_else(|| Error::UseBeforeDef(format!("phi input value {v} is never defined")))?;
+                    *op = LOp::SRel(r);
                 }
             }
         }
@@ -1825,19 +1943,37 @@ pub fn lower(shader: &Shader) -> Result<Lowered, Error> {
     if !graphics && (!shader.inputs.is_empty() || !shader.outputs.is_empty()) {
         return Err(Error::Invalid("a compute shader has no signature".into()));
     }
+    let mut max_val = 0u32;
+    for b in &shader.blocks {
+        for p in &b.phis {
+            max_val = max_val.max(p.dst.0 + 1);
+        }
+        for i in &b.insts {
+            for d in &i.dsts {
+                max_val = max_val.max(d.0 + 1);
+            }
+        }
+    }
     let mut l = Lower {
         sh: shader,
         m: Module::default(),
-        vals: HashMap::new(),
+        vals: ValMap::new((max_val as usize).min(262_144)),
         next_inst: 0,
         handles: vec![None; shader.resources.len()],
-        funcs: HashMap::new(),
+        dx_funcs: HashMap::new(),
         gs: Vec::new(),
         flags: 0,
         features: 0,
         resource_heap: false,
         sampler_heap: false,
         sig: None,
+        handle_ty_id: None,
+        resbind_ty_id: None,
+        props_ty_id: None,
+        cbufret_f32_id: None,
+        cbufret_i32_id: None,
+        resret_f32_id: None,
+        resret_i32_id: None,
     };
     // The entry function is function 0.
     let void = l.m.types.void();
@@ -2008,5 +2144,130 @@ mod tests {
         assert_eq!(add.code, fc::BINOP);
         assert!(matches!(add.ops[2], LOp::Imm(0)));
         assert!(matches!(add.ops[1], LOp::Rel(Ref::Const(c)) if matches!(m.consts.list[c as usize].1, ConstKind::Int(8))));
+    }
+
+    #[test]
+    fn cutscene_pixel_shader_with_mrt_packed_half_derivatives_loop_and_heap_lowers_and_validates() {
+        let pos_in = SigElement::new("SV_Position", 0, Semantic::Position, ComponentType::F32, Interp::LinearNoperspective, 0, 4);
+        let uv_in = SigElement::new("TEXCOORD", 0, Semantic::Arbitrary, ComponentType::F32, Interp::Linear, 1, 2);
+        let t0 = SigElement::new("SV_Target", 0, Semantic::Target, ComponentType::F32, Interp::Undefined, 0, 4);
+        let t1 = SigElement::new("SV_Target", 1, Semantic::Target, ComponentType::F32, Interp::Undefined, 1, 4);
+        let depth_out = SigElement::new("SV_Depth", 0, Semantic::Depth, ComponentType::F32, Interp::Undefined, SigElement::UNALLOCATED, 1);
+
+        // Resources:
+        // 0: bound cbuffer b0 (space 0)
+        // 1: bound Texture2D array t4..t7 (range_size 4, space 1)
+        // 2: bound Sampler s0 (space 0)
+        // 3: heap Texture2D
+        // 4: heap Sampler
+        let tex_elem = Element { component: ComponentType::F32, count: 4 };
+        let mut tex_arr = Resource::texture(ResourceClass::Srv, ResourceKind::Texture2D, 1, 4, tex_elem);
+        tex_arr.range_size = 4;
+        let mut heap_tex = Resource::texture(ResourceClass::Srv, ResourceKind::Texture2D, 0, 0, tex_elem);
+        heap_tex.binding = Binding::Heap;
+        let mut heap_smp = Resource::sampler(0, 0, false);
+        heap_smp.binding = Binding::Heap;
+
+        let arr_ref = ResRef { res: 1, index: Some(Operand::i32(2)), non_uniform: true };
+        let heap_tex_ref = ResRef { res: 3, index: Some(Operand::i32(5)), non_uniform: false };
+        let heap_smp_ref = ResRef { res: 4, index: Some(Operand::i32(1)), non_uniform: false };
+
+        let b0 = Block::new(
+            vec![
+                Inst::new(&[0], Op::LoadInput { elem: 1, row: Operand::i32(0), col: 0 }),
+                Inst::new(&[1], Op::LoadInput { elem: 1, row: Operand::i32(0), col: 1 }),
+                Inst::new(&[2], Op::CbufLoad { res: ResRef::bound(0), row: Operand::i32(0), comps: vec![0], ty: Ty::F32 }),
+                Inst::new(&[3], Op::Un(UnOp::DdxFine, Operand::value(0))),
+                Inst::new(&[4], Op::Un(UnOp::DdyFine, Operand::value(1))),
+                Inst::new(&[5], Op::IsHelperLane),
+                Inst::new(&[6], Op::Select(Operand::value(5), Operand::f32(0.0), Operand::value(3))),
+                Inst::new(&[7, 8, 9, 10], Op::Sample {
+                    tex: arr_ref,
+                    sampler: ResRef::bound(2),
+                    coords: vec![Operand::value(0), Operand::value(1)],
+                    offsets: vec![],
+                    mode: SampleMode::Grad { ddx: vec![Operand::value(6), Operand::f32(0.0)], ddy: vec![Operand::f32(0.0), Operand::value(4)] },
+                    clamp: None,
+                    ty: Ty::F32,
+                }),
+                // Packed half-float encode/decode + bitfield ops.
+                Inst::new(&[11], Op::Un(UnOp::F32ToF16Bits, Operand::value(7))),
+                Inst::new(&[12], Op::BitfieldInsert { width: Operand::i32(16), offset: Operand::i32(16), insert: Operand::value(11), base: Operand::value(11) }),
+                Inst::new(&[13], Op::BitfieldExtract { signed: false, width: Operand::i32(16), offset: Operand::i32(16), value: Operand::value(12) }),
+                Inst::new(&[14], Op::Un(UnOp::F16BitsToF32, Operand::value(13))),
+                Inst::new(&[15, 16, 17, 18], Op::Sample {
+                    tex: heap_tex_ref,
+                    sampler: heap_smp_ref,
+                    coords: vec![Operand::value(0), Operand::value(1)],
+                    offsets: vec![],
+                    mode: SampleMode::Level(Operand::f32(0.0)),
+                    clamp: None,
+                    ty: Ty::F32,
+                }),
+                Inst::new(&[19], Op::FCmp(FPred::Olt, Operand::value(15), Operand::f32(0.01))),
+                Inst::new(&[], Op::Discard(Operand::value(19))),
+            ],
+            Terminator::Br(BlockId(1)),
+        );
+
+        // Loop with forward phi (value 21 defined after phi 20 in block 1).
+        let mut b1 = Block::new(
+            vec![
+                Inst::new(&[21], Op::Bin(BinOp::Add, Operand::value(20), Operand::i32(1))),
+                Inst::new(&[22], Op::ICmp(IPred::Ult, Operand::value(21), Operand::i32(4))),
+            ],
+            Terminator::CondBr(Operand::value(22), BlockId(1), BlockId(2)),
+        );
+        b1.phis.push(Phi {
+            dst: ValueId(20),
+            ty: Ty::I32,
+            incoming: vec![(BlockId(0), Operand::i32(0)), (BlockId(1), Operand::value(21))],
+        });
+
+        let b2 = Block::new(
+            vec![
+                Inst::new(&[23], Op::Cast(CastOp::UiToFp, Operand::value(20), Ty::F32)),
+                Inst::new(&[24], Op::Bin(BinOp::FAdd, Operand::value(14), Operand::value(2))),
+                Inst::new(&[], Op::StoreOutput { elem: 0, row: Operand::i32(0), col: 0, value: Operand::value(24) }),
+                Inst::new(&[], Op::StoreOutput { elem: 1, row: Operand::i32(0), col: 0, value: Operand::value(23) }),
+                Inst::new(&[], Op::StoreOutput { elem: 2, row: Operand::i32(0), col: 0, value: Operand::f32(0.5) }),
+            ],
+            Terminator::Ret,
+        );
+
+        let mut sh = Shader::pixel(vec![b0, b1, b2]);
+        sh.inputs = vec![pos_in, uv_in];
+        sh.outputs = vec![t0, t1, depth_out];
+        sh.resources.push(Resource::cbuffer(0, 0, 64));
+        sh.resources.push(tex_arr);
+        sh.resources.push(Resource::sampler(0, 0, false));
+        sh.resources.push(heap_tex);
+        sh.resources.push(heap_smp);
+
+        let mut out = crate::write(&sh).expect("writes cutscene pixel shader");
+        assert!(out.report.resource_heap);
+        assert!(out.report.sampler_heap);
+        assert_eq!(out.report.bound.len(), 3);
+        let sum = crate::container::digest(&out.container);
+        assert!((0..4).all(|i| crate::container::rd32(&out.container, 4 + 4 * i) == sum[i]));
+
+        #[cfg(windows)]
+        if let Err(e) = crate::validate::validate_in_place(&mut out.container)
+            && !matches!(e, crate::validate::ValidateError::Missing(_))
+        {
+            panic!("dxil validator rejected cutscene pixel shader: {e}");
+        }
+    }
+
+    #[test]
+    fn sparse_high_value_ids_lower_correctly() {
+        let insts = vec![
+            Inst::new(&[300_000], Op::ThreadId(ThreadComponentKind::Dispatch, 0)),
+            Inst::new(&[], Op::BufStore { res: ResRef::bound(0), index: Operand::value(300_000), offset: None, values: vec![Operand::value(300_000)] }),
+        ];
+        let mut s = Shader::compute([1, 1, 1], vec![Block::new(insts, Terminator::Ret)]);
+        s.resources.push(Resource::raw(ResourceClass::Uav, 0, 0));
+        let out = crate::write(&s).expect("lowers sparse high value ids");
+        assert!(!out.container.is_empty());
     }
 }

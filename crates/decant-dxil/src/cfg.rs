@@ -17,11 +17,55 @@
 use crate::Error;
 use crate::ir::{Block, BlockId, Operand, Phi, Shader, Terminator, ValueId};
 
-fn succs(term: &Terminator) -> Vec<usize> {
+#[derive(Clone, Copy)]
+struct Succs {
+    items: [usize; 2],
+    len: usize,
+}
+
+impl std::ops::Deref for Succs {
+    type Target = [usize];
+    #[inline]
+    fn deref(&self) -> &[usize] {
+        &self.items[..self.len]
+    }
+}
+
+struct SuccsIter {
+    items: [usize; 2],
+    idx: usize,
+    len: usize,
+}
+
+impl Iterator for SuccsIter {
+    type Item = usize;
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        if self.idx < self.len {
+            let v = self.items[self.idx];
+            self.idx += 1;
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
+impl IntoIterator for Succs {
+    type Item = usize;
+    type IntoIter = SuccsIter;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        SuccsIter { items: self.items, idx: 0, len: self.len }
+    }
+}
+
+#[inline]
+fn succs(term: &Terminator) -> Succs {
     match term {
-        Terminator::Br(t) => vec![t.0 as usize],
-        Terminator::CondBr(_, a, b) => vec![a.0 as usize, b.0 as usize],
-        Terminator::Ret => Vec::new(),
+        Terminator::Br(t) => Succs { items: [t.0 as usize, 0], len: 1 },
+        Terminator::CondBr(_, a, b) => Succs { items: [a.0 as usize, b.0 as usize], len: 2 },
+        Terminator::Ret => Succs { items: [0, 0], len: 0 },
     }
 }
 
@@ -66,28 +110,27 @@ impl Analysis {
     pub fn new(blocks: &[Block]) -> Analysis {
         let n = blocks.len();
         let mut color = vec![0u8; n];
-        let mut post = Vec::new();
+        let mut post = Vec::with_capacity(n);
         let mut retreating = Vec::new();
-        // Iterative DFS. Successors are visited false target first, so that the true target comes
-        // first in reverse postorder.
-        let mut stack: Vec<(usize, Vec<usize>)> = Vec::new();
+        // Iterative DFS. Successors are visited true target first (idx 0, then 1), so that in
+        // reverse postorder the true target comes first.
+        let mut stack: Vec<(usize, usize)> = Vec::with_capacity(n.min(64));
         if n > 0 {
             color[0] = 1;
-            let mut s = succs(&blocks[0].term);
-            s.reverse();
-            stack.push((0, s));
+            stack.push((0, 0));
         }
-        while let Some((b, rest)) = stack.last_mut() {
+        while let Some((b, idx)) = stack.last_mut() {
             let b = *b;
-            if let Some(s) = rest.pop() {
-                match color[s] {
+            let s = succs(&blocks[b].term);
+            if *idx < s.len {
+                let target = s.items[*idx];
+                *idx += 1;
+                match color[target] {
                     0 => {
-                        color[s] = 1;
-                        let mut ss = succs(&blocks[s].term);
-                        ss.reverse();
-                        stack.push((s, ss));
+                        color[target] = 1;
+                        stack.push((target, 0));
                     }
-                    1 => retreating.push((b, s)),
+                    1 => retreating.push((b, target)),
                     _ => {}
                 }
             } else {
@@ -398,6 +441,65 @@ fn uses(op: &Operand, mark: &mut impl FnMut(ValueId)) {
 
 /// Removes phis that nothing reads, iterated through chains of phis.
 fn remove_dead_phis(blocks: &mut [Block]) {
+    let mut max_id = 0u32;
+    for b in blocks.iter() {
+        for p in &b.phis {
+            max_id = max_id.max(p.dst.0 + 1);
+        }
+    }
+    if max_id == 0 {
+        return;
+    }
+    if max_id < 262_144 {
+        let mut live = vec![0u64; (max_id as usize).div_ceil(64)];
+        let mark = |live: &mut [u64], v: ValueId| -> bool {
+            let idx = v.0 as usize;
+            if idx < max_id as usize {
+                let w = &mut live[idx / 64];
+                let bit = 1u64 << (idx % 64);
+                let added = (*w & bit) == 0;
+                *w |= bit;
+                added
+            } else {
+                false
+            }
+        };
+        let is_live = |live: &[u64], v: ValueId| -> bool {
+            let idx = v.0 as usize;
+            idx < max_id as usize && (live[idx / 64] & (1u64 << (idx % 64))) != 0
+        };
+        for b in blocks.iter() {
+            for i in &b.insts {
+                crate::lower::for_each_operand(&i.op, &mut |o| uses(o, &mut |v| {
+                    mark(&mut live, v);
+                }));
+            }
+            if let Terminator::CondBr(c, _, _) = &b.term {
+                uses(c, &mut |v| {
+                    mark(&mut live, v);
+                });
+            }
+        }
+        loop {
+            let mut grew = false;
+            for b in blocks.iter() {
+                for phi in &b.phis {
+                    if is_live(&live, phi.dst) {
+                        for (_, o) in &phi.incoming {
+                            uses(o, &mut |v| grew |= mark(&mut live, v));
+                        }
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        for b in blocks.iter_mut() {
+            b.phis.retain(|p| is_live(&live, p.dst));
+        }
+        return;
+    }
     let mut live = std::collections::HashSet::new();
     for b in blocks.iter() {
         for i in &b.insts {
@@ -510,6 +612,34 @@ mod tests {
         s.blocks[1].phis.push(Phi { dst: ValueId(0), ty: Ty::I32, incoming: vec![(BlockId(0), c), (BlockId(1), Operand::Value(ValueId(1)))] });
         s.blocks[1].phis.push(Phi { dst: ValueId(1), ty: Ty::I32, incoming: vec![(BlockId(0), c), (BlockId(1), Operand::Value(ValueId(0)))] });
         normalize(&mut s).unwrap();
+        assert!(s.blocks.iter().all(|b| b.phis.is_empty()));
+    }
+
+    #[test]
+    fn nested_loops_equal_condbr_and_sparse_dead_phis_normalize() {
+        // 0: cond(1, 1) -> normalized to br(1)
+        // 1: outer header -> cond(2, 5)
+        // 2: inner header -> cond(3, 4)
+        // 3: inner body -> br(2)
+        // 4: outer latch -> br(1)
+        // 5: ret
+        // 6: unreachable -> br(5)
+        let mut s = shader(vec![cond(1, 1), cond(2, 5), cond(3, 4), br(2), br(1), Terminator::Ret, br(5)]);
+        s.blocks[3].insts.push(Inst::new(&[], Op::Barrier { flags: 1 }));
+        let c = Operand::Const(Const::I32(0));
+        // Sparse dead phi chain (>= 262_144) on inner header.
+        s.blocks[2].phis.push(Phi {
+            dst: ValueId(300_000),
+            ty: Ty::I32,
+            incoming: vec![(BlockId(1), c), (BlockId(3), Operand::Value(ValueId(300_001)))],
+        });
+        s.blocks[2].phis.push(Phi {
+            dst: ValueId(300_001),
+            ty: Ty::I32,
+            incoming: vec![(BlockId(1), c), (BlockId(3), Operand::Value(ValueId(300_000)))],
+        });
+        normalize(&mut s).unwrap();
+        assert_layout_ok(&s);
         assert!(s.blocks.iter().all(|b| b.phis.is_empty()));
     }
 }

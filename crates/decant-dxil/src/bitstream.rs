@@ -20,14 +20,13 @@ pub struct BitWriter {
 impl BitWriter {
     /// A writer at top level (abbreviation width 2) that already holds the magic `BC C0DE`.
     pub fn new() -> BitWriter {
-        let mut w = BitWriter { width: 2, ..Default::default() };
-        for b in [b'B', b'C', 0xC0, 0xDE] {
-            w.fixed(b as u64, 8);
-        }
+        let mut w = BitWriter { bytes: Vec::with_capacity(4096), cur: 0, nbits: 0, stack: Vec::with_capacity(8), width: 2 };
+        w.bytes.extend_from_slice(&[b'B', b'C', 0xC0, 0xDE]);
         w
     }
 
     /// Writes the low `n` bits of `value`, `n <= 32`.
+    #[inline]
     pub fn fixed(&mut self, value: u64, n: u32) {
         debug_assert!(n <= 32 && (n == 32 || value >> n == 0), "value {value} does not fit {n} bits");
         if n == 0 {
@@ -35,6 +34,11 @@ impl BitWriter {
         }
         self.cur |= value << self.nbits;
         self.nbits += n;
+        if self.nbits >= 32 {
+            self.bytes.extend_from_slice(&(self.cur as u32).to_le_bytes());
+            self.cur >>= 32;
+            self.nbits -= 32;
+        }
         while self.nbits >= 8 {
             self.bytes.push(self.cur as u8);
             self.cur >>= 8;
@@ -43,8 +47,13 @@ impl BitWriter {
     }
 
     /// Writes `value` as a VBR with chunks of `n` bits (`n - 1` payload bits and a continuation bit).
+    #[inline]
     pub fn vbr(&mut self, mut value: u64, n: u32) {
         let hi = 1u64 << (n - 1);
+        if value < hi {
+            self.fixed(value, n);
+            return;
+        }
         while value >= hi {
             self.fixed((value & (hi - 1)) | hi, n);
             value >>= n - 1;
@@ -53,6 +62,7 @@ impl BitWriter {
     }
 
     /// Writes `value` as a signed VBR: the sign goes into the lowest bit (BitCodeFormat, "Signed VBRs").
+    #[inline]
     pub fn svbr(&mut self, value: i64, n: u32) {
         self.vbr(signed(value), n);
     }
@@ -90,11 +100,34 @@ impl BitWriter {
     }
 
     /// An unabbreviated record: code and operand count as VBR6, each operand as VBR6.
+    #[inline]
     pub fn record(&mut self, code: u32, ops: &[u64]) {
         self.fixed(UNABBREV_RECORD, self.width);
         self.vbr(code as u64, 6);
         self.vbr(ops.len() as u64, 6);
         for &op in ops {
+            self.vbr(op, 6);
+        }
+    }
+
+    /// An unabbreviated record from an exact-size iterator, avoiding temporary allocations.
+    #[inline]
+    pub fn record_iter<I>(&mut self, code: u32, ops: I)
+    where
+        I: IntoIterator<Item = u64>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let iter = ops.into_iter();
+        self.record_len(code, iter.len(), iter);
+    }
+
+    /// An unabbreviated record with an explicit operand count and iterator, avoiding allocations.
+    #[inline]
+    pub fn record_len(&mut self, code: u32, len: usize, ops: impl IntoIterator<Item = u64>) {
+        self.fixed(UNABBREV_RECORD, self.width);
+        self.vbr(code as u64, 6);
+        self.vbr(len as u64, 6);
+        for op in ops {
             self.vbr(op, 6);
         }
     }
@@ -108,6 +141,7 @@ impl BitWriter {
 }
 
 /// The signed VBR transform: `v << 1` for `v >= 0`, `(-v << 1) | 1` otherwise.
+#[inline]
 pub fn signed(value: i64) -> u64 {
     if value >= 0 { (value as u64) << 1 } else { ((value.wrapping_neg() as u64) << 1) | 1 }
 }
@@ -277,5 +311,37 @@ mod tests {
         // magic (4), then abbrev id, block id, width and padding (4), the length word at 8.
         let words = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         assert_eq!(bytes.len(), 12 + 4 * words);
+    }
+
+    #[test]
+    fn record_iter_and_record_len_match_record_across_32bit_boundaries() {
+        let ops = [0u64, 1, 31, 32, 63, 64, 1 << 20, 1 << 40];
+        let mut a = BitWriter::new();
+        a.enter_block(8, 3);
+        a.record(7, &ops);
+        a.record(3, &[1, 2, 3]);
+        a.end_block();
+        let ba = a.finish();
+
+        let mut b = BitWriter::new();
+        b.enter_block(8, 3);
+        b.record_iter(7, ops.iter().copied());
+        b.record_len(3, 3, [1u64].into_iter().chain([2, 3]));
+        b.end_block();
+        let bb = b.finish();
+
+        assert_eq!(ba, bb);
+        let decoded = read(&bb).unwrap();
+        assert_eq!(
+            decoded,
+            vec![Item::Block {
+                id: 8,
+                width: 3,
+                items: vec![
+                    Item::Record { code: 7, ops: ops.to_vec() },
+                    Item::Record { code: 3, ops: vec![1, 2, 3] },
+                ],
+            }]
+        );
     }
 }

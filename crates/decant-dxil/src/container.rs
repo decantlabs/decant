@@ -5,11 +5,13 @@
 //! from RFC 1321 and the public description of the DXBC hash). `d3d12-xs` is left untouched for now.
 
 /// A little endian u32 at `at`.
+#[inline]
 pub fn rd32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
 /// Writes a little endian u32 at `at`.
+#[inline]
 pub fn wr32(bytes: &mut [u8], at: usize, value: u32) {
     bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -31,6 +33,7 @@ const R: [u32; 64] = [
 ];
 
 /// One MD5 block.
+#[inline]
 fn md5_block(state: &mut [u32; 4], block: &[u8]) {
     let mut m = [0u32; 16];
     for (i, word) in m.iter_mut().enumerate() {
@@ -102,7 +105,8 @@ pub fn sign(container: &mut [u8]) {
 pub fn assemble(parts: &[([u8; 4], Vec<u8>)]) -> Vec<u8> {
     let header = 32 + 4 * parts.len();
     let total = header + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
-    let mut out = vec![0u8; header];
+    let mut out = Vec::with_capacity(total);
+    out.resize(header, 0);
     out[..4].copy_from_slice(b"DXBC");
     out[20] = 1; // major version 1, minor 0
     wr32(&mut out, 24, total as u32);
