@@ -221,6 +221,17 @@ pub struct StutterFrame {
     pub locks: Vec<(String, f64)>,
 }
 
+/// Aggregate of the counter samples that share a name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CounterStat {
+    pub name: String,
+    pub count: u64,
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+    pub last: f64,
+}
+
 /// The result of reading a trace.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Summary {
@@ -238,10 +249,21 @@ pub struct Summary {
     pub windows: Vec<WindowStat>,
     /// Top 15 worst stutter frames (`> 50 ms`).
     pub stutters: Vec<StutterFrame>,
+    /// Counter aggregates, ordered by name.
+    pub counters: Vec<CounterStat>,
     /// Number of frame marks.
     pub frames: u64,
     /// Mean time between frame marks in microseconds, 0 for fewer than two frames.
     pub frame_mean_us: f64,
+    /// Overall frames per second across the frame span.
+    pub fps: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    pub hitches_50ms: u64,
+    pub hitches_100ms: u64,
+    pub hitches_500ms: u64,
     /// Number of counter samples.
     pub counter_samples: u64,
     /// Events the recorder dropped because a thread buffer was full.
@@ -410,6 +432,7 @@ pub fn summarize_range(json: &str, from_s: Option<f64>, to_s: Option<f64>) -> Re
 
     let mut spans: BTreeMap<(String, String), Agg> = BTreeMap::new();
     let mut locks: BTreeMap<String, Agg> = BTreeMap::new();
+    let mut counters: BTreeMap<String, (u64, f64, f64, f64, f64)> = BTreeMap::new();
     let mut threads: BTreeMap<(u64, u64), ThreadAcc> = BTreeMap::new();
     let mut names: BTreeMap<(u64, u64), String> = BTreeMap::new();
     let mut frame_ts: Vec<f64> = Vec::new();
@@ -452,7 +475,23 @@ pub fn summarize_range(json: &str, from_s: Option<f64>, to_s: Option<f64>) -> Re
                     span_intervals.push((ts, ts + dur, false, format!("{cat}:{name}")));
                 }
             }
-            "C" => s.counter_samples += 1,
+            "C" => {
+                s.counter_samples += 1;
+                let cname = text(e, "name");
+                if !cname.is_empty() {
+                    let val = e.get("args").and_then(|a| a.get("value")).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(0.0);
+                    counters
+                        .entry(cname.to_owned())
+                        .and_modify(|(cnt, min, max, sum, last_v)| {
+                            *cnt += 1;
+                            *min = min.min(val);
+                            *max = max.max(val);
+                            *sum += val;
+                            *last_v = val;
+                        })
+                        .or_insert((1, val, val, val, val));
+                }
+            }
             "i" | "I" if text(e, "cat") == FRAME_CAT => frame_ts.push(ts),
             "i" | "I" => {}
             _ => continue,
@@ -464,6 +503,17 @@ pub fn summarize_range(json: &str, from_s: Option<f64>, to_s: Option<f64>) -> Re
     s.wall_us = if first.is_finite() { (last - first).max(0.0) } else { 0.0 };
     s.spans = spans.into_iter().map(|((cat, name), a)| SpanStat { cat, name, count: a.count, total_us: a.total, max_us: a.max }).collect();
     s.locks = locks.into_iter().map(|(name, a)| LockStat { name, count: a.count, total_us: a.total, max_us: a.max }).collect();
+    s.counters = counters
+        .into_iter()
+        .map(|(name, (count, min, max, sum, last))| CounterStat {
+            name,
+            count,
+            min,
+            max,
+            mean: sum / count.max(1) as f64,
+            last,
+        })
+        .collect();
     s.threads = threads
         .into_iter()
         .map(|(key, mut acc)| ThreadStat {
@@ -482,6 +532,27 @@ pub fn summarize_range(json: &str, from_s: Option<f64>, to_s: Option<f64>) -> Re
         && frame_ts.len() > 1
     {
         s.frame_mean_us = (hi - lo) / (frame_ts.len() - 1) as f64;
+        let span_s = (hi - lo) / 1_000_000.0;
+        if span_s > 0.0 {
+            s.fps = (frame_ts.len() - 1) as f64 / span_s;
+        }
+        let mut all_dts: Vec<f64> = frame_ts.windows(2).map(|w| (w[1] - w[0]).max(0.0) / 1_000.0).collect();
+        for &dt in &all_dts {
+            if dt > 50.0 {
+                s.hitches_50ms += 1;
+            }
+            if dt > 100.0 {
+                s.hitches_100ms += 1;
+            }
+            if dt > 500.0 {
+                s.hitches_500ms += 1;
+            }
+        }
+        all_dts.sort_by(f64::total_cmp);
+        s.p50_ms = percentile(&all_dts, 0.50);
+        s.p95_ms = percentile(&all_dts, 0.95);
+        s.p99_ms = percentile(&all_dts, 0.99);
+        s.max_ms = all_dts.last().copied().unwrap_or(0.0);
     }
     let origin = if t0.is_finite() { t0 } else { 0.0 };
     s.windows = compute_windows(&frame_ts, origin);
@@ -574,8 +645,243 @@ impl Summary {
                 let _ = writeln!(o, "{:>9.3} {:>9.2}  {}", st.at_s, st.dur_ms, detail);
             }
         }
+        if !self.counters.is_empty() {
+            let _ = writeln!(o, "\ncounter summaries");
+            let _ = writeln!(o, "{:>8} {:>12} {:>12} {:>12} {:>12}  counter", "count", "min", "mean", "max", "last");
+            for c in &self.counters {
+                let _ = writeln!(o, "{:>8} {:>12.2} {:>12.2} {:>12.2} {:>12.2}  {}", c.count, c.min, c.mean, c.max, c.last, c.name);
+            }
+        }
         o
     }
+
+    /// Serializes this summary to a structured `metrics.json` string.
+    pub fn to_metrics_json(&self, top: usize) -> String {
+        let top_spans: Vec<Value> = self
+            .top_by_total(top)
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "cat": r.cat,
+                    "name": r.name,
+                    "count": r.count,
+                    "total_ms": r.total_us / 1000.0,
+                    "mean_ms": r.total_us / r.count.max(1) as f64 / 1000.0,
+                    "max_ms": r.max_us / 1000.0,
+                })
+            })
+            .collect();
+        let top_locks: Vec<Value> = self
+            .top_locks(top)
+            .into_iter()
+            .map(|l| {
+                serde_json::json!({
+                    "name": l.name,
+                    "count": l.count,
+                    "total_ms": l.total_us / 1000.0,
+                    "max_ms": l.max_us / 1000.0,
+                })
+            })
+            .collect();
+        let windows: Vec<Value> = self
+            .windows
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "start_s": w.start_s,
+                    "end_s": w.end_s,
+                    "frames": w.frames,
+                    "fps": w.fps,
+                    "p50_ms": w.p50_ms,
+                    "p95_ms": w.p95_ms,
+                    "p99_ms": w.p99_ms,
+                    "max_ms": w.max_ms,
+                })
+            })
+            .collect();
+        let top_stutters: Vec<Value> = self
+            .stutters
+            .iter()
+            .map(|st| {
+                let spans: Vec<Value> = st.spans.iter().map(|(label, ms)| serde_json::json!({"label": label, "overlap_ms": ms})).collect();
+                let locks: Vec<Value> = st.locks.iter().map(|(name, ms)| serde_json::json!({"name": name, "overlap_ms": ms})).collect();
+                serde_json::json!({
+                    "at_s": st.at_s,
+                    "dur_ms": st.dur_ms,
+                    "spans": spans,
+                    "locks": locks,
+                })
+            })
+            .collect();
+        let counters: Vec<Value> = self
+            .counters
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "count": c.count,
+                    "min": c.min,
+                    "mean": c.mean,
+                    "max": c.max,
+                    "last": c.last,
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "overall": {
+                "frames": self.frames,
+                "fps": self.fps,
+                "mean_ms": self.frame_mean_us / 1000.0,
+                "p50_ms": self.p50_ms,
+                "p95_ms": self.p95_ms,
+                "p99_ms": self.p99_ms,
+                "max_ms": self.max_ms,
+                "hitches_50ms": self.hitches_50ms,
+                "hitches_100ms": self.hitches_100ms,
+                "hitches_500ms": self.hitches_500ms,
+                "wall_ms": self.wall_us / 1000.0,
+                "events": self.events,
+                "dropped": self.dropped,
+            },
+            "windows": windows,
+            "top_spans": top_spans,
+            "top_locks": top_locks,
+            "top_stutters": top_stutters,
+            "counters": counters,
+        });
+        serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_owned())
+    }
+
+    /// Compares two `metrics.json` documents produced by [`Summary::to_metrics_json`] and formats a diff table.
+    pub fn compare_metrics_json(base_json: &str, head_json: &str) -> Result<String, String> {
+        compare_metrics_json_impl(base_json, head_json)
+    }
+}
+
+fn pct_delta(base: f64, head: f64) -> String {
+    if base.abs() < 1e-9 {
+        if (head - base).abs() < 1e-9 { "0.0%".to_owned() } else { "n/a".to_owned() }
+    } else {
+        format!("{:+.1}%", (head - base) / base * 100.0)
+    }
+}
+
+fn compare_metrics_json_impl(base_json: &str, head_json: &str) -> Result<String, String> {
+    let base: Value = serde_json::from_str(base_json).map_err(|e| format!("base metrics.json invalid: {e}"))?;
+    let head: Value = serde_json::from_str(head_json).map_err(|e| format!("head metrics.json invalid: {e}"))?;
+    let bo = base.get("overall").ok_or("base missing overall")?;
+    let ho = head.get("overall").ok_or("head missing overall")?;
+    let mut o = String::new();
+    let _ = writeln!(o, "overall comparison (base vs head)");
+    let _ = writeln!(o, "{:<16} {:>12} {:>12} {:>12} {:>9}", "metric", "base", "head", "delta", "change");
+    for (key, label, prec) in [
+        ("frames", "frames", 0usize),
+        ("fps", "FPS", 2),
+        ("mean_ms", "mean_ms", 3),
+        ("p50_ms", "p50_ms", 2),
+        ("p95_ms", "p95_ms", 2),
+        ("p99_ms", "p99_ms", 2),
+        ("max_ms", "max_ms", 2),
+        ("hitches_50ms", "hitches>50ms", 0),
+        ("hitches_100ms", "hitches>100ms", 0),
+        ("hitches_500ms", "hitches>500ms", 0),
+    ] {
+        let bv = num(bo, key);
+        let hv = num(ho, key);
+        let dv = hv - bv;
+        let _ = writeln!(
+            o,
+            "{:<16} {:>12.*} {:>12.*} {:>+12.*} {:>9}",
+            label,
+            prec,
+            bv,
+            prec,
+            hv,
+            prec,
+            dv,
+            pct_delta(bv, hv)
+        );
+    }
+
+    let mut bw: BTreeMap<(u64, u64), &Value> = BTreeMap::new();
+    if let Some(arr) = base.get("windows").and_then(Value::as_array) {
+        for w in arr {
+            bw.insert((id(w, "start_s"), id(w, "end_s")), w);
+        }
+    }
+    let mut hw: BTreeMap<(u64, u64), &Value> = BTreeMap::new();
+    if let Some(arr) = head.get("windows").and_then(Value::as_array) {
+        for w in arr {
+            hw.insert((id(w, "start_s"), id(w, "end_s")), w);
+        }
+    }
+    if !bw.is_empty() || !hw.is_empty() {
+        let mut keys: Vec<(u64, u64)> = bw.keys().chain(hw.keys()).copied().collect();
+        keys.sort();
+        keys.dedup();
+        let _ = writeln!(o, "\nwindow comparison (10s)");
+        let _ = writeln!(
+            o,
+            "{:>11} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "window", "base fps", "head fps", "fps %", "base p95", "head p95", "p95 %", "base max", "head max"
+        );
+        for k in keys {
+            let b_fps = bw.get(&k).map_or(0.0, |w| num(w, "fps"));
+            let h_fps = hw.get(&k).map_or(0.0, |w| num(w, "fps"));
+            let b_p95 = bw.get(&k).map_or(0.0, |w| num(w, "p95_ms"));
+            let h_p95 = hw.get(&k).map_or(0.0, |w| num(w, "p95_ms"));
+            let b_max = bw.get(&k).map_or(0.0, |w| num(w, "max_ms"));
+            let h_max = hw.get(&k).map_or(0.0, |w| num(w, "max_ms"));
+            let label = format!("{}..{}s", k.0, k.1);
+            let _ = writeln!(
+                o,
+                "{:>11} {:>8.1} {:>8.1} {:>9} {:>9.2} {:>9.2} {:>9} {:>9.2} {:>9.2}",
+                label,
+                b_fps,
+                h_fps,
+                pct_delta(b_fps, h_fps),
+                b_p95,
+                h_p95,
+                pct_delta(b_p95, h_p95),
+                b_max,
+                h_max
+            );
+        }
+    }
+
+    let mut bc: BTreeMap<&str, &Value> = BTreeMap::new();
+    if let Some(arr) = base.get("counters").and_then(Value::as_array) {
+        for c in arr {
+            let n = text(c, "name");
+            if !n.is_empty() {
+                bc.insert(n, c);
+            }
+        }
+    }
+    let mut hc: BTreeMap<&str, &Value> = BTreeMap::new();
+    if let Some(arr) = head.get("counters").and_then(Value::as_array) {
+        for c in arr {
+            let n = text(c, "name");
+            if !n.is_empty() {
+                hc.insert(n, c);
+            }
+        }
+    }
+    if !bc.is_empty() || !hc.is_empty() {
+        let mut names: Vec<&str> = bc.keys().chain(hc.keys()).copied().collect();
+        names.sort();
+        names.dedup();
+        let _ = writeln!(o, "\ncounter comparison");
+        let _ = writeln!(o, "{:<28} {:>10} {:>10} {:>9} {:>10} {:>10}", "counter", "base mean", "head mean", "mean %", "base max", "head max");
+        for n in names {
+            let bm = bc.get(n).map_or(0.0, |c| num(c, "mean"));
+            let hm = hc.get(n).map_or(0.0, |c| num(c, "mean"));
+            let bx = bc.get(n).map_or(0.0, |c| num(c, "max"));
+            let hx = hc.get(n).map_or(0.0, |c| num(c, "max"));
+            let _ = writeln!(o, "{:<28} {:>10.2} {:>10.2} {:>9} {:>10.2} {:>10.2}", n, bm, hm, pct_delta(bm, hm), bx, hx);
+        }
+    }
+    Ok(o)
 }
 
 #[cfg(test)]
@@ -729,5 +1035,36 @@ mod tests {
         assert_eq!(ranged.frames, 1);
         assert_eq!(ranged.spans.len(), 1);
         assert_eq!(ranged.spans[0].name, "late");
+    }
+
+    #[test]
+    fn metrics_json_round_trip_and_compare_diff() {
+        let base_trace = r#"{"traceEvents":[
+            {"name":"frame","cat":"frame","ph":"i","s":"g","ts":0,"pid":1,"tid":1},
+            {"name":"frame","cat":"frame","ph":"i","s":"g","ts":40000,"pid":1,"tid":1},
+            {"name":"frame","cat":"frame","ph":"i","s":"g","ts":120000,"pid":1,"tid":1},
+            {"name":"WorkingSetMiB","cat":"counter","ph":"C","ts":10000,"pid":1,"tid":1,"args":{"value":1000.0}}
+        ]}"#;
+        let head_trace = r#"{"traceEvents":[
+            {"name":"frame","cat":"frame","ph":"i","s":"g","ts":0,"pid":1,"tid":1},
+            {"name":"frame","cat":"frame","ph":"i","s":"g","ts":20000,"pid":1,"tid":1},
+            {"name":"frame","cat":"frame","ph":"i","s":"g","ts":40000,"pid":1,"tid":1},
+            {"name":"WorkingSetMiB","cat":"counter","ph":"C","ts":10000,"pid":1,"tid":1,"args":{"value":800.0}}
+        ]}"#;
+        let base_s = summarize(base_trace).unwrap();
+        assert_eq!(base_s.hitches_50ms, 1);
+        assert_eq!(base_s.counters.len(), 1);
+        let base_json = base_s.to_metrics_json(5);
+        let head_json = summarize(head_trace).unwrap().to_metrics_json(5);
+        let parsed: Value = serde_json::from_str(&base_json).unwrap();
+        assert_eq!(parsed["overall"]["frames"], 3);
+        assert_eq!(parsed["overall"]["hitches_50ms"], 1);
+        assert_eq!(parsed["counters"][0]["name"], "WorkingSetMiB");
+
+        let diff = Summary::compare_metrics_json(&base_json, &head_json).unwrap();
+        assert!(diff.contains("overall comparison"), "{diff}");
+        assert!(diff.contains("hitches>50ms"), "{diff}");
+        assert!(diff.contains("WorkingSetMiB"), "{diff}");
+        assert!(diff.contains("-20.0%"), "{diff}");
     }
 }

@@ -138,6 +138,8 @@ fn subtract(value: &AtomicU64, amount: u64) {
 static OWNERS: Accounting = Accounting::new();
 
 pub(crate) fn add(kind: Kind, segment: Segment, count: u64, bytes: u64) {
+    #[cfg(all(windows, not(test)))]
+    trace_sampler::maybe_start();
     OWNERS.add(kind, segment, count, bytes);
 }
 
@@ -436,6 +438,206 @@ pub(crate) fn format(snapshot: &Snapshot, local_usage: Option<u64>) -> String {
     out
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProcessRamSample {
+    working_set_bytes: u64,
+    private_commit_bytes: u64,
+    avail_phys_bytes: u64,
+    page_fault_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DstorageMetricsSnapshot {
+    requests: u64,
+    bytes_read: u64,
+    active_read_ns: u64,
+    decode_ns: u64,
+    write_ns: u64,
+    in_flight: u64,
+    batches: u64,
+}
+
+fn emit_trace_counters(
+    snapshot: &Snapshot,
+    ram: Option<ProcessRamSample>,
+    prev_faults: &mut Option<u32>,
+    elapsed_s: f64,
+    vram_local_mib: Option<f64>,
+    vram_nonlocal_mib: Option<f64>,
+    dstorage: Option<DstorageMetricsSnapshot>,
+) {
+    let mib_f = |b: u64| b as f64 / MIB as f64;
+    if let Some(r) = ram {
+        decant_trace::record_counter("WorkingSetMiB", mib_f(r.working_set_bytes));
+        decant_trace::record_counter("PrivateCommitMiB", mib_f(r.private_commit_bytes));
+        if r.avail_phys_bytes > 0 {
+            decant_trace::record_counter("AvailRamMiB", mib_f(r.avail_phys_bytes));
+        }
+        let faults_per_sec = if let Some(prev) = *prev_faults
+            && elapsed_s > 0.0
+        {
+            f64::from(r.page_fault_count.saturating_sub(prev)) / elapsed_s
+        } else {
+            0.0
+        };
+        *prev_faults = Some(r.page_fault_count);
+        decant_trace::record_counter("PageFaultsPerSec", faults_per_sec);
+    }
+    if let Some(v) = vram_local_mib {
+        decant_trace::record_counter("VramLocalMiB", v);
+    }
+    if let Some(v) = vram_nonlocal_mib {
+        decant_trace::record_counter("VramNonLocalMiB", v);
+    }
+    if let Some(ds) = dstorage {
+        let total_mib = mib_f(ds.bytes_read);
+        let active_read_mb_s = if ds.active_read_ns > 0 { total_mib / (ds.active_read_ns as f64 / 1_000_000_000.0) } else { 0.0 };
+        let decode_mb_s = if ds.decode_ns > 0 { total_mib / (ds.decode_ns as f64 / 1_000_000_000.0) } else { 0.0 };
+        decant_trace::record_counter("dstorage_active_read_mb_s", active_read_mb_s);
+        decant_trace::record_counter("dstorage_decode_mb_s", decode_mb_s);
+        decant_trace::record_counter("dstorage_total_read_mib", total_mib);
+        decant_trace::record_counter("dstorage_in_flight", ds.in_flight as f64);
+    }
+    decant_trace::record_counter("OwnerViewTexturesMiB", mib_f(snapshot.total(Kind::ViewTexture).bytes));
+    decant_trace::record_counter("OwnerViewHeapsMiB", mib_f(snapshot.total(Kind::ViewHeap).bytes));
+    decant_trace::record_counter("OwnerTitleMirrorMiB", mib_f(snapshot.total(Kind::TitleMirrorHeap).bytes));
+    decant_trace::record_counter("OwnerUploadMiB", mib_f(snapshot.total(Kind::UploadChunk).bytes));
+    decant_trace::record_counter("OwnerLocalAccountedMiB", mib_f(snapshot.local_accounted()));
+}
+
+#[cfg(all(windows, not(test)))]
+#[allow(unsafe_code)]
+mod trace_sampler {
+    use super::{DstorageMetricsSnapshot, MIB, ProcessRamSample, emit_trace_counters, snapshot};
+    use std::sync::Once;
+    use std::time::{Duration, Instant};
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+        DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3, IDXGIFactory4,
+    };
+    use windows::core::Interface;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCountersEx {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
+
+    type GetProcessMemoryInfoFn = unsafe extern "system" fn(HANDLE, *mut ProcessMemoryCountersEx, u32) -> i32;
+    type DecantDstorageMetricsFn = unsafe extern "C" fn(*mut DstorageMetricsSnapshot) -> u32;
+
+    fn query_ram() -> Option<ProcessRamSample> {
+        static FN: std::sync::OnceLock<Option<GetProcessMemoryInfoFn>> = std::sync::OnceLock::new();
+        let func = (*FN.get_or_init(|| unsafe {
+            let k32 = GetModuleHandleA(c"kernel32.dll".as_ptr().cast());
+            let proc = if !k32.is_null() {
+                GetProcAddress(k32, c"K32GetProcessMemoryInfo".as_ptr().cast())
+            } else {
+                None
+            };
+            proc.map(|p| std::mem::transmute::<unsafe extern "system" fn() -> isize, GetProcessMemoryInfoFn>(p))
+        }))?;
+        let mut pmc = ProcessMemoryCountersEx {
+            cb: std::mem::size_of::<ProcessMemoryCountersEx>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: valid handle and buffer size.
+        let ok = unsafe { func(GetCurrentProcess(), &mut pmc, pmc.cb) };
+        if ok == 0 {
+            return None;
+        }
+        let mut mem_status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: valid `MEMORYSTATUSEX` struct with `dwLength` initialized.
+        let avail_phys_bytes = if unsafe { GlobalMemoryStatusEx(&mut mem_status) } != 0 {
+            mem_status.ullAvailPhys
+        } else {
+            0
+        };
+        Some(ProcessRamSample {
+            working_set_bytes: pmc.working_set_size as u64,
+            private_commit_bytes: pmc.private_usage as u64,
+            avail_phys_bytes,
+            page_fault_count: pmc.page_fault_count,
+        })
+    }
+
+    fn query_dstorage() -> Option<DstorageMetricsSnapshot> {
+        // SAFETY: queries an already-loaded `dstorage_xs.dll` if present in the process.
+        let func = unsafe {
+            let module = GetModuleHandleA(c"dstorage_xs.dll".as_ptr().cast());
+            if module.is_null() {
+                return None;
+            }
+            let proc = GetProcAddress(module, c"DecantDstorageMetrics".as_ptr().cast())?;
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, DecantDstorageMetricsFn>(proc)
+        };
+        let mut out = DstorageMetricsSnapshot::default();
+        // SAFETY: `out` is a valid `#[repr(C)]` `DstorageMetricsSnapshot`.
+        (unsafe { func(&mut out) } != 0).then_some(out)
+    }
+
+    fn query_vram(adapter: Option<&IDXGIAdapter3>) -> (Option<f64>, Option<f64>) {
+        let Some(a) = adapter else {
+            return (None, None);
+        };
+        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: live adapter and valid out structs.
+        let l = unsafe { a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local) }
+            .ok()
+            .map(|()| local.CurrentUsage as f64 / MIB as f64);
+        let nl = unsafe { a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local) }
+            .ok()
+            .map(|()| non_local.CurrentUsage as f64 / MIB as f64);
+        (l, nl)
+    }
+
+    pub fn maybe_start() {
+        if !decant_trace::enabled() {
+            return;
+        }
+        static STARTED: Once = Once::new();
+        STARTED.call_once(|| {
+            let _ = std::thread::Builder::new().name("d3d12xs-trace-counters".into()).spawn(|| {
+                let adapter: Option<IDXGIAdapter3> = unsafe {
+                    CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                        .ok()
+                        .and_then(|f| f.EnumAdapters1(0).ok())
+                        .and_then(|a| a.cast::<IDXGIAdapter3>().ok())
+                };
+                let mut prev_faults = None;
+                let mut last = Instant::now();
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let now = Instant::now();
+                    let dt = now.duration_since(last).as_secs_f64();
+                    last = now;
+                    let (vram_local, vram_nonlocal) = query_vram(adapter.as_ref());
+                    emit_trace_counters(&snapshot(), query_ram(), &mut prev_faults, dt, vram_local, vram_nonlocal, query_dstorage());
+                }
+            });
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +736,31 @@ mod tests {
         accounting.add(Kind::Readback, Segment::System, 2, 16 * MIB);
         accounting.remove(Kind::Readback, Segment::System, 0, 0);
         assert_eq!(accounting.snapshot().total(Kind::Readback), OwnerValue { count: 2, bytes: 16 * MIB });
+    }
+
+    #[test]
+    fn trace_counter_emission_updates_prev_faults_safely() {
+        let mut prev = None;
+        let snap = sample();
+        emit_trace_counters(
+            &snap,
+            Some(ProcessRamSample { working_set_bytes: 1024 * MIB, private_commit_bytes: 2048 * MIB, avail_phys_bytes: 16384 * MIB, page_fault_count: 500 }),
+            &mut prev,
+            1.0,
+            Some(4000.0),
+            Some(500.0),
+            Some(DstorageMetricsSnapshot { requests: 10, bytes_read: 64 * MIB, active_read_ns: 500_000_000, decode_ns: 250_000_000, write_ns: 100_000_000, in_flight: 2, batches: 3 }),
+        );
+        assert_eq!(prev, Some(500));
+        emit_trace_counters(
+            &snap,
+            Some(ProcessRamSample { working_set_bytes: 1024 * MIB, private_commit_bytes: 2048 * MIB, avail_phys_bytes: 16000 * MIB, page_fault_count: 750 }),
+            &mut prev,
+            1.0,
+            Some(4100.0),
+            Some(500.0),
+            None,
+        );
+        assert_eq!(prev, Some(750));
     }
 }
