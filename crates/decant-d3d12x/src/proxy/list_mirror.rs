@@ -605,13 +605,16 @@ fn sync_tables(this: *mut Proxy, bind: Bind) {
     }
 }
 
-/// Whether the `size` bytes of a constant buffer at title address `va` that a slot took before can be read
-/// now: title memory `xmem.dll` maps, or the memory of a title heap (the title's constants of a draw lie
-/// beside the table of the draw).
-fn readable(va: u64, size: u32) -> bool {
+fn readable_with(va: u64, size: u32, in_heap: impl Fn(usize) -> bool, writable: impl FnOnce(usize, usize) -> bool) -> bool {
     let (va, size) = (va as usize, size as usize);
-    let in_heap = |a: usize| crate::title_heap::translate_cpu(a) != Some(a);
-    crate::title_mem::writable(va, size) || (in_heap(va) && in_heap(va + size.max(1) - 1))
+    let end = va.saturating_add(size.max(1) - 1);
+    (in_heap(va) && in_heap(end)) || writable(va, size)
+}
+
+/// Whether the `size` bytes of a constant buffer at title address `va` that a slot took before can be read
+/// now: the memory of a title heap (checked first without locking `xmem`), or title memory `xmem.dll` maps.
+fn readable(va: u64, size: u32) -> bool {
+    readable_with(va, size, |a| crate::title_heap::translate_cpu(a) != Some(a), crate::title_mem::writable)
 }
 
 /// Counts and logs (rate limited) a tag of the window of the table at `handle` (host handle `host`)
@@ -983,5 +986,32 @@ mod tests {
         assert_eq!(state, (None, Some(RootViewBind::Fallback(0xFB00_0000))));
         assert_eq!(bound, vec![(7, 0xFB00_0000)]);
         assert_eq!(fallback_calls, 1);
+    }
+
+    #[test]
+    fn readable_checks_in_heap_before_writable_and_falls_back_when_outside_heap() {
+        let mut writable_calls = 0usize;
+        let in_range = |a: usize| (0x1000..0x2000).contains(&a);
+
+        // Both endpoints in heap: short-circuits without calling `writable`.
+        assert!(readable_with(0x1100, 256, in_range, |_, _| {
+            writable_calls += 1;
+            false
+        }));
+        assert_eq!(writable_calls, 0);
+
+        // Straddling or outside heap: falls back to `writable`.
+        assert!(readable_with(0x1F80, 256, in_range, |va, size| {
+            writable_calls += 1;
+            assert_eq!((va, size), (0x1F80, 256));
+            true
+        }));
+        assert_eq!(writable_calls, 1);
+
+        assert!(!readable_with(0x3000, 64, in_range, |_, _| {
+            writable_calls += 1;
+            false
+        }));
+        assert_eq!(writable_calls, 2);
     }
 }
