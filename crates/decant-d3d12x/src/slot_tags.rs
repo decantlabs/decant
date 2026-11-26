@@ -15,11 +15,51 @@
 //! what it took, as the console's table does ([`sync`]).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const SHIFT: u32 = 48;
 const HOST: u64 = (1 << SHIFT) - 1;
+const SHARDS: usize = 64;
+const SHARD_MASK: usize = SHARDS - 1;
+
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(b);
+            self.0 = self.0.wrapping_mul(0x517C_C1B7_2722_0A95);
+        }
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+
+#[inline]
+fn shard_of(slot: usize) -> usize {
+    // Host descriptor handles are strided by descriptor increment (typically 32+ bytes),
+    // so mix into the upper bits to distribute uniformly across all shards.
+    ((slot.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u64) >> (64 - 6)) as usize & SHARD_MASK
+}
 
 /// The host slot a tag word names.
 pub fn host_of(word: u64) -> usize {
@@ -78,8 +118,8 @@ pub fn sync(state: State, now: Option<(u64, u32)>, live: impl Fn(&Took) -> bool)
 /// The numbers of the source slots and what the table slots took. Pure, for the tests.
 #[derive(Default)]
 pub struct Tags {
-    numbers: HashMap<usize, u16>,
-    took: HashMap<usize, Took>,
+    numbers: FastMap<usize, u16>,
+    took: FastMap<usize, Took>,
 }
 
 impl Tags {
@@ -94,8 +134,8 @@ impl Tags {
     /// Host slot `host` was written without a tag of its own (a copy through the API): its older tags
     /// no longer name what it holds.
     pub fn overwritten(&mut self, host: usize) {
-        if self.numbers.contains_key(&host) {
-            self.made(host);
+        if let Some(n) = self.numbers.get_mut(&host) {
+            *n = n.checked_add(1).unwrap_or(1);
         }
     }
 
@@ -117,30 +157,80 @@ impl Tags {
     }
 }
 
-static TAGS: Mutex<Option<Tags>> = Mutex::new(None);
+static NUMBERS: [RwLock<Option<FastMap<usize, u16>>>; SHARDS] = [const { RwLock::new(None) }; SHARDS];
+static TOOK: [RwLock<Option<FastMap<usize, Took>>>; SHARDS] = [const { RwLock::new(None) }; SHARDS];
 
-fn with<R>(f: impl FnOnce(&mut Tags) -> R) -> R {
-    f(TAGS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Tags::default))
+#[inline]
+fn with_numbers_write<R>(slot: usize, f: impl FnOnce(&mut FastMap<usize, u16>) -> R) -> R {
+    let mut guard = NUMBERS[shard_of(slot)].write().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(Default::default))
+}
+
+#[inline]
+fn with_numbers_read<R>(slot: usize, f: impl FnOnce(Option<&FastMap<usize, u16>>) -> R) -> R {
+    let guard = NUMBERS[shard_of(slot)].read().unwrap_or_else(|e| e.into_inner());
+    f(guard.as_ref())
+}
+
+#[inline]
+fn with_took_write<R>(dst: usize, f: impl FnOnce(&mut FastMap<usize, Took>) -> R) -> R {
+    let mut guard = TOOK[shard_of(dst)].write().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(Default::default))
+}
+
+#[inline]
+fn with_took_read<R>(dst: usize, f: impl FnOnce(Option<&FastMap<usize, Took>>) -> R) -> R {
+    let guard = TOOK[shard_of(dst)].read().unwrap_or_else(|e| e.into_inner());
+    f(guard.as_ref())
 }
 
 /// A view was made in host slot `host`: the word of its tag.
 pub fn made(host: usize) -> u64 {
-    with(|t| t.made(host))
+    with_numbers_write(host, |numbers| {
+        let n = numbers.entry(host).or_insert(0);
+        // 0 is a tag without a number
+        *n = n.checked_add(1).unwrap_or(1);
+        (host as u64 & HOST) | u64::from(*n) << SHIFT
+    })
 }
 
 /// The `n` host slots from `host`, `increment` bytes each, were written by a copy through the API.
 pub fn overwritten(host: usize, n: u32, increment: u32) {
-    with(|t| (0..n as usize).for_each(|i| t.overwritten(host + i * increment as usize)));
+    let inc = increment as usize;
+    for i in 0..n as usize {
+        let slot = host + i * inc;
+        with_numbers_write(slot, |numbers| {
+            if let Some(num) = numbers.get_mut(&slot) {
+                *num = num.checked_add(1).unwrap_or(1);
+            }
+        });
+    }
 }
 
 /// What tag `word` in table slot `dst` means.
 pub fn state(dst: usize, word: u64) -> State {
-    with(|t| t.state(dst, word))
+    let number = (word >> SHIFT) as u16;
+    if number == 0 {
+        return State::Current;
+    }
+    let src = host_of(word);
+    let current = with_numbers_read(src, |numbers| {
+        numbers.is_none_or(|map| map.get(&src).is_none_or(|&n| n == number))
+    });
+    if current {
+        return State::Current;
+    }
+    with_took_read(dst, |took| match took.and_then(|map| map.get(&dst)) {
+        Some(t) if t.word == word => State::Held(*t),
+        _ => State::Lost,
+    })
 }
 
 /// Table slot `dst` took what `took` says.
 pub fn taken(dst: usize, took: Took) {
-    with(|t| t.taken(dst, took));
+    with_took_write(dst, |map| {
+        map.insert(dst, took);
+    });
 }
 
 /// How often the table syncs met an old tag, for the log.
@@ -258,5 +348,31 @@ mod tests {
     fn the_number_never_becomes_zero() {
         let mut t = Tags::default();
         assert!((0..=u32::from(u16::MAX) + 1).all(|_| t.made(S) >> SHIFT != 0));
+    }
+
+    #[test]
+    fn global_sharded_tags_handle_concurrent_strided_slots() {
+        let base_src = 0x70E5_1000_0000usize;
+        let base_dst = 0x7F44_1000_0000usize;
+        std::thread::scope(|scope| {
+            for t in 0..4usize {
+                scope.spawn(move || {
+                    for i in 0..64usize {
+                        let src = base_src + (t * 64 + i) * 32;
+                        let dst = base_dst + (t * 64 + i) * 32;
+                        let w1 = made(src);
+                        assert_eq!(state(dst, w1), State::Current);
+                        let tk = Took { word: w1, list: t + 1, present: 1, buffer: None, recording: 0 };
+                        taken(dst, tk);
+                        let w2 = made(src);
+                        assert_ne!(w1, w2);
+                        assert_eq!(state(dst, w1), State::Held(tk));
+                        assert_eq!(state(dst, w2), State::Current);
+                        overwritten(src, 1, 32);
+                        assert_eq!(state(dst, w2), State::Lost);
+                    }
+                });
+            }
+        });
     }
 }

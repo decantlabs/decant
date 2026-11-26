@@ -17,8 +17,47 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const SHARDS: usize = 64;
+const SHARD_MASK: usize = SHARDS - 1;
+
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(b);
+            self.0 = self.0.wrapping_mul(0x517C_C1B7_2722_0A95);
+        }
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+
+#[inline]
+fn shard_of(list: usize) -> usize {
+    ((list.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u64) >> (64 - 6)) as usize & SHARD_MASK
+}
 
 /// One copy: the host slot that points at it, the title's range, the copy's CPU address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +72,7 @@ pub(crate) struct CbvCopy {
 #[derive(Default)]
 struct ListCopies {
     copies: Vec<(CbvCopy, u64)>,
-    destinations: HashMap<usize, Destination>,
+    destinations: FastMap<usize, Destination>,
     /// The number of this recording of the list (`Ledger::recording`), 0 when nobody asked.
     recording: u64,
     submitted: bool,
@@ -66,12 +105,14 @@ pub(crate) struct Refresh {
 }
 
 /// The copies of every list, apart from any memory access (tested on synthetic data).
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct Ledger {
-    lists: HashMap<usize, ListCopies>,
+    lists: FastMap<usize, ListCopies>,
     recordings: u64,
 }
 
+#[cfg(test)]
 impl Ledger {
     /// Notes a copy recorded in `list`; true when its host slot already pointed at another copy of
     /// a different title range in this list (the GPU reads only the last).
@@ -143,9 +184,13 @@ impl Ledger {
     }
 }
 
-fn ledger() -> &'static Mutex<Ledger> {
-    static L: std::sync::OnceLock<Mutex<Ledger>> = std::sync::OnceLock::new();
-    L.get_or_init(|| Mutex::new(Ledger::default()))
+static LEDGER_SHARDS: [Mutex<Option<FastMap<usize, ListCopies>>>; SHARDS] = [const { Mutex::new(None) }; SHARDS];
+static RECORDINGS: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn with_shard<R>(list: usize, f: impl FnOnce(&mut FastMap<usize, ListCopies>) -> R) -> R {
+    let mut guard = LEDGER_SHARDS[shard_of(list)].lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(Default::default))
 }
 
 /// Copy `copy` was recorded in list `list`; true when its host slot was already written by another
@@ -154,49 +199,98 @@ pub(crate) fn recorded(list: usize, copy: CbvCopy) -> bool {
     // SAFETY: the caller just copied this readable title range while recording the draw.
     let title = unsafe { std::slice::from_raw_parts(copy.va as *const u8, copy.size as usize) };
     let hash = fingerprint(title);
-    ledger().lock().unwrap_or_else(|e| e.into_inner()).recorded(list, copy, hash)
+    with_shard(list, |lists| {
+        let l = lists.entry(list).or_default();
+        let range = (copy.va, copy.size);
+        let dst = l.destinations.entry(copy.dst).or_insert(Destination { first: range, mixed: false });
+        dst.mixed = dst.conflicts(range);
+        l.copies.push((copy, hash));
+        dst.mixed
+    })
 }
 
 fn fingerprint(bytes: &[u8]) -> u64 {
-    let mut hash = DefaultHasher::new();
-    bytes.hash(&mut hash);
-    hash.finish()
+    let mut h = (bytes.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x517C_C1B7_2722_0A95;
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        let v = u64::from_le_bytes(*chunk);
+        h = (h ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(27);
+    }
+    if !rem.is_empty() {
+        let mut tail = 0u64;
+        for (i, &b) in rem.iter().enumerate() {
+            tail |= u64::from(b) << (i * 8);
+        }
+        h = (h ^ tail).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(27);
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    h
 }
 
 /// Whether a copy of `va` into host slot `dst` would change what an earlier draw of `list` reads.
 pub(crate) fn conflicts(list: usize, dst: usize, va: u64, size: u32) -> bool {
-    ledger().lock().unwrap_or_else(|e| e.into_inner()).conflicts(list, dst, va, size)
+    with_shard(list, |lists| lists.get(&list).and_then(|l| l.destinations.get(&dst)).is_some_and(|d| d.conflicts((va, size))))
 }
 
 /// The number of the recording `list` is in.
 pub(crate) fn recording(list: usize) -> u64 {
-    ledger().lock().unwrap_or_else(|e| e.into_inner()).recording(list)
+    with_shard(list, |lists| {
+        let l = lists.entry(list).or_default();
+        if l.recording == 0 {
+            l.recording = RECORDINGS.fetch_add(1, Ordering::Relaxed);
+        }
+        l.recording
+    })
 }
 
 /// Whether `list` is still in recording `recording` or that one was not reset yet.
 pub(crate) fn is_live(list: usize, recording: u64) -> bool {
-    ledger().lock().unwrap_or_else(|e| e.into_inner()).is_live(list, recording)
+    if recording == 0 {
+        return false;
+    }
+    with_shard(list, |lists| lists.get(&list).is_some_and(|l| l.recording == recording))
 }
 
 /// The table at `from` of `bind` was moved to `to` for the next draw of `list`.
 pub(crate) fn moved(list: usize, bind: usize, from: u64, to: u64) {
-    ledger().lock().unwrap_or_else(|e| e.into_inner()).moved(list, bind, from, to);
+    with_shard(list, |lists| lists.entry(list).or_default().moved[bind].push((from, to)));
 }
 
 /// The tables of `bind` moved for the last draw of `list`.
 pub(crate) fn take_moved(list: usize, bind: usize) -> Vec<(u64, u64)> {
-    ledger().lock().unwrap_or_else(|e| e.into_inner()).take_moved(list, bind)
+    with_shard(list, |lists| lists.get_mut(&list).map(|l| std::mem::take(&mut l.moved[bind])).unwrap_or_default())
 }
 
 /// List `list` was reset.
 pub(crate) fn forget(list: usize) {
-    ledger().lock().unwrap_or_else(|e| e.into_inner()).forget(list);
+    with_shard(list, |lists| {
+        lists.remove(&list);
+    });
 }
 
 /// The lists `lists` (console list proxies) are about to be submitted: their copies are brought up
 /// to date with the title's bytes.
 pub(crate) fn submitted(lists: &[usize]) -> Refresh {
-    ledger().lock().unwrap_or_else(|e| e.into_inner()).submitted(lists, refresh_copy)
+    let mut r = Refresh::default();
+    for &list in lists {
+        with_shard(list, |shard| {
+            let Some(l) = shard.get_mut(&list) else { return };
+            if l.submitted {
+                r.kept += l.copies.len();
+                return;
+            }
+            l.submitted = true;
+            for (c, hash) in &l.copies {
+                r.copies += 1;
+                if refresh_copy(c, *hash) {
+                    r.stale += 1;
+                }
+            }
+        });
+    }
+    r
 }
 
 fn refresh_copy(copy: &CbvCopy, recorded_hash: u64) -> bool {
@@ -320,5 +414,45 @@ mod tests {
         l.forget(1);
         l.recorded(1, copy(10, 0x100), 0);
         assert_eq!(l.submitted(&[1], |_, _| false), Refresh { copies: 1, stale: 0, kept: 0 });
+    }
+
+    #[test]
+    fn fingerprint_detects_single_byte_changes_across_unaligned_lengths() {
+        for len in [1usize, 7, 8, 9, 15, 16, 31, 64, 127] {
+            let base = vec![0xA5u8; len];
+            let base_hash = fingerprint(&base);
+            for pos in 0..len {
+                let mut mutated = base.clone();
+                mutated[pos] ^= 0x01;
+                assert_ne!(fingerprint(&mutated), base_hash, "len {len} pos {pos}");
+            }
+        }
+    }
+
+    #[test]
+    fn global_sharded_ledger_isolates_concurrent_lists() {
+        std::thread::scope(|scope| {
+            for t in 0..4usize {
+                scope.spawn(move || {
+                    let list = 0x5000_0000 + t * 32;
+                    let rec = recording(list);
+                    assert!(is_live(list, rec));
+                    let mut title = [1u8; 32];
+                    let mut upload = [1u8; 32];
+                    let c = CbvCopy { dst: 0x100 + t, va: title.as_ptr() as u64, size: 32, cpu: upload.as_mut_ptr() as usize };
+                    assert!(!recorded(list, c));
+                    assert!(!conflicts(list, 0x100 + t, title.as_ptr() as u64, 32));
+                    assert!(conflicts(list, 0x100 + t, 0xDEAD, 32));
+                    moved(list, 0, 0x10, 0x20);
+                    assert_eq!(take_moved(list, 0), [(0x10, 0x20)]);
+                    title[17] = 9;
+                    let r = submitted(&[list]);
+                    assert_eq!(r, Refresh { copies: 1, stale: 1, kept: 0 });
+                    assert_eq!(upload, title);
+                    forget(list);
+                    assert!(!is_live(list, rec));
+                });
+            }
+        });
     }
 }

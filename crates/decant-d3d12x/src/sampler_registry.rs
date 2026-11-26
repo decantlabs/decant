@@ -16,9 +16,46 @@
 //! A list on which the title binds view heaps without a sampler heap gets a sampler heap of the
 //! layer added (`proxy`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
+
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(b);
+            self.0 = self.0.wrapping_mul(0x517C_C1B7_2722_0A95);
+        }
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0 ^ (i as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (self.0 ^ u64::from(i)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+type FastSet<K> = HashSet<K, BuildHasherDefault<FastHasher>>;
 
 /// The size of a shader visible sampler heap under the direct path (`D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE`).
 pub const HEAP_SIZE: u32 = 2048;
@@ -38,7 +75,7 @@ pub type Words = [u32; 4];
 #[derive(Default)]
 pub struct Registry {
     words: Vec<Words>,
-    index: HashMap<Words, u32>,
+    index: FastMap<Words, u32>,
     file: Option<PathBuf>,
 }
 
@@ -273,7 +310,7 @@ pub struct Entry {
 pub fn decode(words: Words) -> [u8; 0x34] {
     let (decoded, gaps) = decode_words(words);
     if !gaps.is_empty() {
-        static SEEN: Mutex<Option<std::collections::HashSet<Gap>>> = Mutex::new(None);
+        static SEEN: Mutex<Option<FastSet<Gap>>> = Mutex::new(None);
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         let seen = seen.get_or_insert_with(Default::default);
         for gap in gaps {
@@ -318,25 +355,38 @@ pub type Write = fn(usize, &[u8; 0x34], usize);
 struct Global {
     registry: Registry,
     /// Sampler heaps with a tail.
-    tails: HashMap<usize, Tail>,
+    tails: FastMap<usize, Tail>,
     /// Sampler heaps without one (too big).
-    others: std::collections::HashSet<usize>,
+    others: FastSet<usize>,
     /// How samplers are written, from the first heap.
     write: Option<Write>,
 }
 
-static GLOBAL: Mutex<Option<Global>> = Mutex::new(None);
+static GLOBAL: RwLock<Option<Global>> = RwLock::new(None);
 
-fn with<R>(f: impl FnOnce(&mut Global) -> R) -> R {
-    let mut g = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
-    f(g.get_or_insert_with(|| Global { registry: Registry::open(default_file()), tails: HashMap::new(), others: Default::default(), write: None }))
+fn with_write<R>(f: impl FnOnce(&mut Global) -> R) -> R {
+    let mut g = GLOBAL.write().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(|| Global { registry: Registry::open(default_file()), tails: FastMap::default(), others: FastSet::default(), write: None }))
+}
+
+#[inline]
+fn force_unnormalized_of(words: Words) -> bool {
+    words[0] & (1 << 15) != 0
 }
 
 /// The entry of `words` for the translator (heap index offset from [`HEAP_BASE`], and whether the
 /// sampler is unnormalised), registered when new and then written to every sampler heap with a
 /// tail. `None` when the tail is full.
 pub fn index_of(words: Words) -> Option<Entry> {
-    with(|g| {
+    {
+        let g = GLOBAL.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(g) = g.as_ref()
+            && let Some(&index) = g.registry.index.get(&words)
+        {
+            return Some(Entry { index, force_unnormalized: force_unnormalized_of(words) });
+        }
+    }
+    with_write(|g| {
         let (i, fresh) = g.registry.index_of(words)?;
         if let (true, Some(write)) = (fresh, g.write) {
             let desc = decode(words);
@@ -344,14 +394,14 @@ pub fn index_of(words: Words) -> Option<Entry> {
                 write(t.device, &desc, t.handle(i));
             }
         }
-        Some(Entry { index: i, force_unnormalized: decode_words(words).0.force_unnormalized })
+        Some(Entry { index: i, force_unnormalized: force_unnormalized_of(words) })
     })
 }
 
 /// A sampler heap `heap` was made, with a tail or without (`None`). A tail is filled with every
 /// registered sampler by `write`, which also writes the ones registered later.
 pub fn heap_created(heap: usize, tail: Option<Tail>, write: Write) {
-    with(|g| {
+    with_write(|g| {
         g.write = Some(write);
         let Some(tail) = tail else {
             g.others.insert(heap);
@@ -366,7 +416,8 @@ pub fn heap_created(heap: usize, tail: Option<Tail>, write: Write) {
 
 /// Whether `heap` is a sampler heap made under the direct path.
 pub fn is_sampler_heap(heap: usize) -> bool {
-    with(|g| g.tails.contains_key(&heap) || g.others.contains(&heap))
+    let g = GLOBAL.read().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().is_some_and(|g| g.tails.contains_key(&heap) || g.others.contains(&heap))
 }
 
 #[cfg(test)]
@@ -615,5 +666,29 @@ mod tests {
         let d = decode([0; 4]);
         assert_eq!(u32::from_le_bytes(d[4..8].try_into().expect("4 bytes")), 1, "address mode WRAP");
         assert_eq!(f32::from_bits(u32::from_le_bytes(d[0x30..0x34].try_into().expect("4 bytes"))), 0.0, "no mips: base level only");
+    }
+
+    #[test]
+    fn concurrent_index_of_and_heap_queries_agree() {
+        let w_norm = W::new().address(1, 2, 0).0;
+        let w_unnorm = W::new().address(1, 2, 0).bit0(15).0;
+        let expected_norm = index_of(w_norm).expect("room");
+        let expected_unnorm = index_of(w_unnorm).expect("room");
+        assert!(!expected_norm.force_unnormalized);
+        assert!(expected_unnorm.force_unnormalized);
+        fn noop_write(_device: usize, _desc: &[u8; 0x34], _cpu: usize) {}
+        let heap = 0x7777_0000usize;
+        heap_created(heap, None, noop_write);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..32 {
+                        assert_eq!(index_of(w_norm), Some(expected_norm));
+                        assert_eq!(index_of(w_unnorm), Some(expected_unnorm));
+                        assert!(is_sampler_heap(heap));
+                    }
+                });
+            }
+        });
     }
 }
