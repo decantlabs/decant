@@ -14,15 +14,16 @@
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, OPEN_EXISTING, ReadFile};
 use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, INFINITE, SetEvent, WaitForSingleObject};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, INFINITE, ResetEvent, SetEvent, WaitForSingleObject};
 
 use crate::codecs;
 use crate::log::storage_log;
@@ -60,10 +61,13 @@ impl<T> Sendable<T> {
 // SAFETY: the engine's contract is that the caller retains the buffers a read points to until
 // completion, and the worker thread is the only one that uses them while the read runs.
 unsafe impl<T> Send for Sendable<T> {}
+// SAFETY: `Sendable<T>` is only shared across threads when `T` itself is `Sync`.
+unsafe impl<T: Sync> Sync for Sendable<T> {}
 
 // ---- File ----
 
 /// An open file: a Win32 handle on the CPU backend, a PC DirectStorage file otherwise.
+#[repr(C)]
 pub struct File {
     #[allow(dead_code)] // the first word of the object, read by callers through the vtable
     vtbl: &'static UnknownVtbl,
@@ -71,6 +75,7 @@ pub struct File {
     backend: Arc<Backend>,
     handle: Handle,
     native: Option<Pc>,
+    byte_length: Option<u64>,
 }
 
 static FILE_VTBL: UnknownVtbl = UnknownVtbl { query_interface: query_interface::<File>, add_ref: add_ref::<File>, release: release_object::<File> };
@@ -148,9 +153,23 @@ impl Status {
 
 // ---- Queue ----
 
-/// One recorded operation. It gets the queue's shared state and whether the queue is being
-/// closed: a cancelled operation does nothing but release what it holds.
-type Operation = Box<dyn FnOnce(&Arc<Core>, bool) -> HRESULT + Send>;
+struct ReadOp {
+    file: Ref<File>,
+    read: Sendable<DecantRead>,
+    pages: Option<PageTarget>,
+}
+
+type BarrierOp = Box<dyn FnOnce(&Arc<Core>, bool) -> HRESULT + Send>;
+
+/// One recorded operation. A `Read` may be batched with consecutive reads, while a `Barrier`
+/// settles all preceding decodes before signalling status, events, or fences.
+enum QueueOp {
+    Read(ReadOp),
+    Barrier(BarrierOp),
+}
+
+/// Maximum consecutive reads batched into one submission or parallel CPU read pass.
+const READ_BATCH_LIMIT: usize = 64;
 
 /// The PC DirectStorage queue behind a project queue, with its status array and completion event.
 struct Native {
@@ -236,7 +255,7 @@ impl Timing {
 
 #[derive(Default)]
 struct WorkState {
-    submitted: VecDeque<Operation>,
+    submitted: VecDeque<QueueOp>,
     stopping: bool,
 }
 
@@ -253,7 +272,7 @@ pub struct Queue {
     core: Arc<Core>,
     work: Arc<Work>,
     /// Recorded, not yet submitted.
-    pending: Mutex<VecDeque<Operation>>,
+    pending: Mutex<VecDeque<QueueOp>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -327,44 +346,65 @@ impl Drop for Fence {
     }
 }
 
-/// Tells `d3d12_xs.dll`, when it is loaded, that `len` bytes at `destination` were written: the textures the title placed there
-/// are detiled again before its next submission (`DecantD3D12XNoteWrite`).
-fn note_written(destination: *mut c_void, len: u32) {
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-    // SAFETY: lookups by name in a module that is loaded or not, and a call of the export found, which takes (address, length).
+type WriteHookFn = unsafe extern "system" fn(usize, usize);
+
+fn resolve_hook(slot: &OnceLock<WriteHookFn>, module_name: *const u16, proc_name: &std::ffi::CStr) -> Option<WriteHookFn> {
+    if let Some(&f) = slot.get() {
+        return Some(f);
+    }
+    // SAFETY: `module_name` and `proc_name` are NUL terminated constants.
     unsafe {
-        let module = GetModuleHandleW(windows_sys::w!("d3d12_xs.dll"));
+        let module = GetModuleHandleW(module_name);
         if module.is_null() {
-            return;
+            return None;
         }
-        if let Some(f) = GetProcAddress(module, c"DecantD3D12XNoteWrite".as_ptr().cast()) {
-            let f: unsafe extern "system" fn(usize, usize) = std::mem::transmute(f);
-            f(destination as usize, len as usize);
-        }
+        let proc = GetProcAddress(module, proc_name.as_ptr().cast())?;
+        let f: WriteHookFn = std::mem::transmute(proc);
+        let _ = slot.set(f);
+        Some(f)
     }
 }
 
-/// Tells `xmem.dll`, when it is loaded, that the kernel or a decoder is about to write `len` bytes at
-/// `destination`: pages the GPU mirror protected become writable and stay so a while
-/// (`DecantXmemPrepareWrite`). Without it a write into such a page fails with `ERROR_NOACCESS`.
-fn prepare_written(destination: *mut c_void, len: u32) {
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-    // SAFETY: lookups by name in a module that is loaded or not, and a call of the export found, which takes (address, length) and only looks the range up.
-    unsafe {
-        let module = GetModuleHandleW(windows_sys::w!("xmem.dll"));
-        if module.is_null() {
-            return;
-        }
-        if let Some(f) = GetProcAddress(module, c"DecantXmemPrepareWrite".as_ptr().cast()) {
-            let f: unsafe extern "system" fn(usize, usize) = std::mem::transmute(f);
-            f(destination as usize, len as usize);
-        }
+/// Tells `d3d12_xs.dll`, when it is loaded, that `len` bytes at `destination` were written: the textures the title placed there
+/// are detiled again before its next submission (`DecantD3D12XNoteWrite`).
+fn note_written(destination: *mut c_void, len: u32) {
+    static HOOK: OnceLock<WriteHookFn> = OnceLock::new();
+    if let Some(f) = resolve_hook(&HOOK, windows_sys::w!("d3d12_xs.dll"), c"DecantD3D12XNoteWrite") {
+        // SAFETY: `f` takes `(address, length)` and only looks the range up.
+        unsafe { f(destination as usize, len as usize) };
+    }
+}
+
+/// Pins `len` bytes at `destination` writable in `xmem.dll` using `DecantXmemBeginWrite` when
+/// available, or falls back to `DecantXmemPrepareWrite`. Returns true if `finish_written` should
+/// release the pin after the write completes.
+fn begin_written(destination: *mut c_void, len: u32) -> bool {
+    static BEGIN_HOOK: OnceLock<WriteHookFn> = OnceLock::new();
+    if let Some(f) = resolve_hook(&BEGIN_HOOK, windows_sys::w!("xmem.dll"), c"DecantXmemBeginWrite") {
+        // SAFETY: `f` takes `(address, length)` and pins the range writable.
+        unsafe { f(destination as usize, len as usize) };
+        return true;
+    }
+    static PREPARE_HOOK: OnceLock<WriteHookFn> = OnceLock::new();
+    if let Some(f) = resolve_hook(&PREPARE_HOOK, windows_sys::w!("xmem.dll"), c"DecantXmemPrepareWrite") {
+        // SAFETY: `f` takes `(address, length)` and marks the range writable.
+        unsafe { f(destination as usize, len as usize) };
+    }
+    false
+}
+
+/// Releases a write pin acquired with `begin_written`.
+fn finish_written(destination: *mut c_void, len: u32) {
+    static FINISH_HOOK: OnceLock<WriteHookFn> = OnceLock::new();
+    if let Some(f) = resolve_hook(&FINISH_HOOK, windows_sys::w!("xmem.dll"), c"DecantXmemFinishWrite") {
+        // SAFETY: `f` takes `(address, length)` and releases the pin.
+        unsafe { f(destination as usize, len as usize) };
     }
 }
 
 /// Decodes handed on by one queue that may wait or run at once. The queue's worker waits beyond
 /// that, so the buffers they hold stay bounded.
-const MAX_IN_FLIGHT: usize = 16;
+const MAX_IN_FLIGHT: usize = 128;
 
 /// A read whose bytes are in, to be decoded or written into physical pages on the decode pool.
 struct Staged {
@@ -386,29 +426,34 @@ impl Staged {
         let destination = *self.destination.get();
         let Some(target) = self.pages else {
             let write_started = Instant::now();
-            prepare_written(destination, self.destination_size);
+            let pinned = begin_written(destination, self.destination_size);
             let mut write_time = write_started.elapsed();
             // SAFETY: `input` holds the source bytes, and the title keeps `destination_size` bytes writable at the destination until the completion it waits for, which comes after this decode.
             let decode_started = Instant::now();
             let hr = unsafe { codecs::decode(self.codec, self.bc_mode, self.input.as_ptr(), self.input.len() as u32, destination.cast(), self.destination_size) };
             let decode_time = decode_started.elapsed();
-            if hr >= 0 {
-                let write_started = Instant::now();
-                note_written(destination, self.destination_size);
-                write_time += write_started.elapsed();
+            let write_started = Instant::now();
+            if pinned {
+                finish_written(destination, self.destination_size);
             }
+            if hr >= 0 {
+                note_written(destination, self.destination_size);
+            }
+            write_time += write_started.elapsed();
             self.core_timing.record_and_log(self.source_bytes, self.destination_size, self.read_time, decode_time, write_time);
             return hr;
         };
         let output = if self.decode {
-            let Ok(mut output) = buffer_of(self.destination_size) else { return E_OUTOFMEMORY };
-            // SAFETY: `input` holds the source bytes and `output` `destination_size` bytes.
+            let Ok(mut output) = buffer_capacity(self.destination_size) else { return E_OUTOFMEMORY };
+            // SAFETY: `input` holds the source bytes and `output` has capacity for `destination_size` bytes.
             let decode_started = Instant::now();
             let hr = unsafe { codecs::decode(self.codec, self.bc_mode, self.input.as_ptr(), self.input.len() as u32, output.as_mut_ptr(), self.destination_size) };
             let decode_time = decode_started.elapsed();
             if hr < 0 {
                 return hr;
             }
+            // SAFETY: `codecs::decode` initialized all `destination_size` bytes on success.
+            unsafe { output.set_len(self.destination_size as usize) };
             (output, decode_time)
         } else {
             (self.input, Duration::ZERO)
@@ -466,41 +511,21 @@ impl Core {
         }
     }
 
-    /// Runs one read. The bytes are read here, on the queue's worker. A decode, and the write
-    /// into physical pages, go to the decode pool, so the worker reads the next request
-    /// meanwhile. With `pages` the bytes go to those physical pages and `r.destination` is not used.
-    fn read(self: &Arc<Self>, file: &File, r: &DecantRead, pages: Option<PageTarget>) -> HRESULT {
-        if !matches!(r.codec, codec::COPY | codec::ZLIB | codec::GDEFLATE | codec::BCPACK) {
-            decant_log::calls::record_with(decant_log::calls::Kind::NotImplemented, || format!("read with codec {}", r.codec));
-            return E_NOTIMPL;
-        }
-        if r.codec == codec::COPY && r.source_size != r.destination_size {
-            return E_INVALIDARG;
-        }
-        let decode = r.codec == codec::ZLIB || r.codec == codec::BCPACK || (self.native.get().is_none() && r.codec == codec::GDEFLATE);
-        if !decode && pages.is_none() {
-            // Straight into the destination.
-            prepare_written(r.destination, r.destination_size);
-            let read_started = Instant::now();
-            let hr = self.fetch(file, r, r.destination, r.destination_size);
-            let read_time = read_started.elapsed();
-            let write_started = Instant::now();
-            if hr >= 0 {
-                note_written(r.destination, r.destination_size);
-                self.timing.record_and_log(r.source_size, r.destination_size, read_time, Duration::ZERO, write_started.elapsed());
-            }
-            return hr;
-        }
-        // Into a buffer of ours first.
-        let len = if decode { r.source_size } else { r.destination_size };
-        let Ok(mut input) = buffer_of(len) else { return E_OUTOFMEMORY };
-        let read_started = Instant::now();
-        let hr = self.fetch(file, r, input.as_mut_ptr().cast(), len);
-        let read_time = read_started.elapsed();
-        if hr < 0 {
-            return hr;
-        }
-        let staged = Staged { input, codec: r.codec, bc_mode: r.bc_mode, decode, destination: Sendable(r.destination), destination_size: r.destination_size, pages, core_timing: self.timing.clone(), source_bytes: r.source_size, read_time };
+    /// Dispatches a completed read buffer to the shared decode pool.
+    fn dispatch_staged(self: &Arc<Self>, op: &mut ReadOp, input: Vec<u8>, decode: bool, read_time: Duration) {
+        let r = *op.read.get();
+        let staged = Staged {
+            input,
+            codec: r.codec,
+            bc_mode: r.bc_mode,
+            decode,
+            destination: Sendable(r.destination),
+            destination_size: r.destination_size,
+            pages: op.pages.take(),
+            core_timing: self.timing.clone(),
+            source_bytes: r.source_size,
+            read_time,
+        };
         {
             let mut in_flight = lock(&self.in_flight);
             while *in_flight >= MAX_IN_FLIGHT {
@@ -509,7 +534,7 @@ impl Core {
             *in_flight += 1;
         }
         let core = self.clone();
-        let read = Sendable(*r);
+        let read = Sendable(r);
         crate::pool::run(Box::new(move || {
             let to_pages = staged.pages.is_some();
             let hr = staged.finish(core.pages.as_ref());
@@ -520,72 +545,353 @@ impl Core {
             *lock(&core.in_flight) -= 1;
             core.settled.notify_all();
         }));
-        S_OK
     }
 
-    /// Reads `r.source_size` bytes of the file at `r.offset` into `buffer`, which holds `len`
-    /// bytes (on PC DirectStorage a GDeflate read lands decompressed, `len` being the destination
-    /// size).
-    fn fetch(&self, file: &File, r: &DecantRead, buffer: *mut c_void, len: u32) -> HRESULT {
+    /// Runs a batch of up to `READ_BATCH_LIMIT` consecutive reads on the active backend.
+    fn read_batch(self: &Arc<Self>, batch: &mut [ReadOp]) {
+        if batch.is_empty() {
+            return;
+        }
         if let Some(native) = self.native.get() {
-            let Some(file_native) = file.native.as_ref() else { return E_INVALIDARG };
-            // SAFETY: a zeroed structure of integers.
-            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-            // SAFETY: the file is an `IDStorageFile` and `info` is writable.
-            let hr = unsafe { (file_native.vtbl::<pc::FileVtbl>().get_file_information)(file_native.as_ptr(), &mut info) };
+            self.read_batch_native(native, batch);
+            return;
+        }
+        if batch.len() == 1 {
+            let op = &mut batch[0];
+            let to_pages = op.pages.is_some();
+            let hr = self.read_cpu(op);
             if hr < 0 {
-                return hr;
+                log_failure(op.read.get(), to_pages, hr);
+                self.fail(hr);
             }
-            let length = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
-            if r.offset > length || u64::from(r.source_size) > length - r.offset {
-                return hresult_from_win32(ERROR_HANDLE_EOF);
+            return;
+        }
+        let base = batch.as_mut_ptr() as usize;
+        let core = Sendable(self.clone());
+        io_pool().run(batch.len(), |index| {
+            // SAFETY: each `index` is unique across all threads in `IoPool::run`, and `batch` lives until `run` returns.
+            let op = unsafe { &mut *(base as *mut ReadOp).add(index) };
+            let to_pages = op.pages.is_some();
+            let hr = core.get().read_cpu(op);
+            if hr < 0 {
+                log_failure(op.read.get(), to_pages, hr);
+                core.get().fail(hr);
             }
+        });
+    }
+
+    /// Batches up to `READ_BATCH_LIMIT` consecutive reads into one `IDStorageQueue1` submission.
+    fn read_batch_native(self: &Arc<Self>, native: &Native, batch: &mut [ReadOp]) {
+        enum PendingNative {
+            Direct { destination: *mut c_void, destination_size: u32, source_size: u32, pinned: bool },
+            Staged { index: usize, input: Vec<u8>, len: u32, decode: bool },
+        }
+
+        let mut pending = Vec::with_capacity(batch.len());
+        let queue = native.queue.as_ptr();
+        // SAFETY: `native.queue` is a live `IDStorageQueue1` owned by `Core`.
+        let vtbl = unsafe { native.queue.vtbl::<pc::QueueVtbl>() };
+        let started = Instant::now();
+
+        for (index, op) in batch.iter().enumerate() {
+            let r = op.read.get();
+            if !matches!(r.codec, codec::COPY | codec::ZLIB | codec::GDEFLATE | codec::BCPACK) {
+                decant_log::calls::record_with(decant_log::calls::Kind::NotImplemented, || format!("read with codec {}", r.codec));
+                log_failure(r, op.pages.is_some(), E_NOTIMPL);
+                self.fail(E_NOTIMPL);
+                continue;
+            }
+            if r.codec == codec::COPY && r.source_size != r.destination_size {
+                log_failure(r, op.pages.is_some(), E_INVALIDARG);
+                self.fail(E_INVALIDARG);
+                continue;
+            }
+            let Some(file_native) = op.file.native.as_ref() else {
+                log_failure(r, op.pages.is_some(), E_INVALIDARG);
+                self.fail(E_INVALIDARG);
+                continue;
+            };
+            if let Some(length) = op.file.byte_length
+                && (r.offset > length || u64::from(r.source_size) > length - r.offset)
+            {
+                let eof = hresult_from_win32(ERROR_HANDLE_EOF);
+                log_failure(r, op.pages.is_some(), eof);
+                self.fail(eof);
+                continue;
+            }
+            let decode = r.codec == codec::ZLIB || r.codec == codec::BCPACK;
             let compression = if r.codec == codec::GDEFLATE { pc::COMPRESSION_GDEFLATE } else { 0 };
-            let request = pc::RawRequest::file_to_memory(compression, file_native.as_ptr(), r.offset, r.source_size, buffer, len);
-            let queue = native.queue.as_ptr();
-            // SAFETY: the queue is an `IDStorageQueue1` and the status array an `IDStorageStatusArray`, created by `init`. The buffer and the file stay valid until the wait below returns.
-            unsafe {
-                let vtbl = native.queue.vtbl::<pc::QueueVtbl>();
-                (vtbl.enqueue_request)(queue, &request);
-                (vtbl.enqueue_status)(queue, native.status.as_ptr(), 0);
-                (vtbl.enqueue_set_event)(queue, native.done.0);
-                (vtbl.submit)(queue);
-                if WaitForSingleObject(native.done.0, INFINITE) != WAIT_OBJECT_0 {
-                    return last_error();
+            if !decode && op.pages.is_none() {
+                let pinned = begin_written(r.destination, r.destination_size);
+                let request = pc::RawRequest::file_to_memory(compression, file_native.as_ptr(), r.offset, r.source_size, r.destination, r.destination_size);
+                // SAFETY: `r.destination` remains valid until the completion wait below returns.
+                unsafe { (vtbl.enqueue_request)(queue, &request) };
+                pending.push(PendingNative::Direct { destination: r.destination, destination_size: r.destination_size, source_size: r.source_size, pinned });
+            } else {
+                let len = if decode { r.source_size } else { r.destination_size };
+                let Ok(mut input) = buffer_capacity(len) else {
+                    log_failure(r, op.pages.is_some(), E_OUTOFMEMORY);
+                    self.fail(E_OUTOFMEMORY);
+                    continue;
+                };
+                let request = pc::RawRequest::file_to_memory(compression, file_native.as_ptr(), r.offset, r.source_size, input.as_mut_ptr().cast(), len);
+                // SAFETY: `input` buffer stays alive in `pending` until the wait below returns.
+                unsafe { (vtbl.enqueue_request)(queue, &request) };
+                pending.push(PendingNative::Staged { index, input, len, decode });
+            }
+        }
+
+        if pending.is_empty() {
+            return;
+        }
+
+        // SAFETY: `native.queue`, `native.status`, and `native.done` are live objects created in `Queue::create`.
+        let hr = unsafe {
+            (vtbl.enqueue_status)(queue, native.status.as_ptr(), 0);
+            (vtbl.enqueue_set_event)(queue, native.done.0);
+            (vtbl.submit)(queue);
+            if WaitForSingleObject(native.done.0, INFINITE) != WAIT_OBJECT_0 {
+                last_error()
+            } else {
+                (native.status.vtbl::<pc::StatusArrayVtbl>().get_hresult)(native.status.as_ptr(), 0).min(S_OK)
+            }
+        };
+        let batch_read_time = started.elapsed();
+        let per_read_time = batch_read_time / (pending.len() as u32).max(1);
+        if hr < 0 {
+            self.fail(hr);
+        }
+
+        for item in pending {
+            match item {
+                PendingNative::Direct { destination, destination_size, source_size, pinned } => {
+                    let write_started = Instant::now();
+                    if pinned {
+                        finish_written(destination, destination_size);
+                    }
+                    if hr >= 0 {
+                        note_written(destination, destination_size);
+                        self.timing.record_and_log(source_size, destination_size, per_read_time, Duration::ZERO, write_started.elapsed());
+                    }
                 }
-                return (native.status.vtbl::<pc::StatusArrayVtbl>().get_hresult)(native.status.as_ptr(), 0).min(S_OK);
+                PendingNative::Staged { index, mut input, len, decode } => {
+                    if hr < 0 {
+                        continue;
+                    }
+                    // SAFETY: `IDStorageQueue1` wrote all `len` bytes into `input` before signalling `native.done`.
+                    unsafe { input.set_len(len as usize) };
+                    self.dispatch_staged(&mut batch[index], input, decode, per_read_time);
+                }
             }
         }
-        // SAFETY: plain Win32 calls, the buffer, the handle and the OVERLAPPED stay valid until `GetOverlappedResult` has waited for the read.
-        unsafe {
-            let event = Handle(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()));
-            if event.0.is_null() {
-                return last_error();
-            }
-            let mut overlapped: OVERLAPPED = std::mem::zeroed();
-            overlapped.hEvent = event.0;
-            overlapped.Anonymous.Anonymous.Offset = r.offset as u32;
-            overlapped.Anonymous.Anonymous.OffsetHigh = (r.offset >> 32) as u32;
-            let mut got = 0u32;
-            if ReadFile(file.handle.0, buffer.cast(), r.source_size, std::ptr::null_mut(), &mut overlapped) == 0 && windows_sys::Win32::Foundation::GetLastError() != ERROR_IO_PENDING {
-                return last_error();
-            }
-            if GetOverlappedResult(file.handle.0, &overlapped, &mut got, 1) == 0 {
-                return last_error();
-            }
-            if got != r.source_size {
-                return hresult_from_win32(ERROR_HANDLE_EOF);
-            }
+    }
+
+    /// Runs one read on the Win32 CPU backend using a reusable thread local event handle.
+    fn read_cpu(self: &Arc<Self>, op: &mut ReadOp) -> HRESULT {
+        let r = op.read.get();
+        if !matches!(r.codec, codec::COPY | codec::ZLIB | codec::GDEFLATE | codec::BCPACK) {
+            decant_log::calls::record_with(decant_log::calls::Kind::NotImplemented, || format!("read with codec {}", r.codec));
+            return E_NOTIMPL;
         }
+        if r.codec == codec::COPY && r.source_size != r.destination_size {
+            return E_INVALIDARG;
+        }
+        let decode = r.codec != codec::COPY;
+        if !decode && op.pages.is_none() {
+            let write_started = Instant::now();
+            let pinned = begin_written(r.destination, r.destination_size);
+            let mut write_time = write_started.elapsed();
+            let read_started = Instant::now();
+            let hr = read_file_cpu(op.file.handle.0, r.offset, r.source_size, r.destination);
+            let read_time = read_started.elapsed();
+            let write_started = Instant::now();
+            if pinned {
+                finish_written(r.destination, r.destination_size);
+            }
+            if hr >= 0 {
+                note_written(r.destination, r.destination_size);
+            }
+            write_time += write_started.elapsed();
+            if hr >= 0 {
+                self.timing.record_and_log(r.source_size, r.destination_size, read_time, Duration::ZERO, write_time);
+            }
+            return hr;
+        }
+        let len = if decode { r.source_size } else { r.destination_size };
+        let Ok(mut input) = buffer_capacity(len) else { return E_OUTOFMEMORY };
+        let read_started = Instant::now();
+        let hr = read_file_cpu(op.file.handle.0, r.offset, r.source_size, input.as_mut_ptr().cast());
+        let read_time = read_started.elapsed();
+        if hr < 0 {
+            return hr;
+        }
+        // SAFETY: `read_file_cpu` verified `got == r.source_size` (`len` bytes initialized).
+        unsafe { input.set_len(len as usize) };
+        self.dispatch_staged(op, input, decode, read_time);
         S_OK
     }
 }
 
-/// A zeroed buffer of `len` bytes, or `Err` when it cannot be allocated.
-fn buffer_of(len: u32) -> Result<Vec<u8>, ()> {
+struct ThreadEvent(HANDLE);
+
+impl Drop for ThreadEvent {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: owned Win32 event handle created by this thread.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+thread_local! {
+    static CPU_READ_EVENT: ThreadEvent = {
+        // SAFETY: plain Win32 manual reset event created once per worker thread.
+        ThreadEvent(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) })
+    };
+}
+
+fn read_file_cpu(handle: HANDLE, offset: u64, source_size: u32, buffer: *mut c_void) -> HRESULT {
+    let event = CPU_READ_EVENT.with(|e| e.0);
+    if event.is_null() {
+        return last_error();
+    }
+    // SAFETY: `buffer` is writable for `source_size` bytes and `event` is a live thread local event.
+    unsafe {
+        let _ = ResetEvent(event);
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        overlapped.hEvent = event;
+        overlapped.Anonymous.Anonymous.Offset = offset as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        let mut got = 0u32;
+        if ReadFile(handle, buffer.cast(), source_size, std::ptr::null_mut(), &mut overlapped) == 0 && windows_sys::Win32::Foundation::GetLastError() != ERROR_IO_PENDING {
+            return last_error();
+        }
+        if GetOverlappedResult(handle, &overlapped, &mut got, 1) == 0 {
+            return last_error();
+        }
+        if got != source_size {
+            return hresult_from_win32(ERROR_HANDLE_EOF);
+        }
+    }
+    S_OK
+}
+
+struct IoBatchState {
+    fn_ptr: usize,
+    fn_data: usize,
+    total: usize,
+    workers_to_take: usize,
+    active_workers: usize,
+    epoch: u64,
+}
+
+struct IoPoolShared {
+    state: Mutex<IoBatchState>,
+    next: AtomicUsize,
+    cv_work: Condvar,
+    cv_done: Condvar,
+}
+
+struct IoPool {
+    workers: usize,
+    run_lock: Mutex<()>,
+    shared: Arc<IoPoolShared>,
+}
+
+impl IoPool {
+    fn new(workers: usize) -> Self {
+        let shared = Arc::new(IoPoolShared {
+            state: Mutex::new(IoBatchState { fn_ptr: 0, fn_data: 0, total: 0, workers_to_take: 0, active_workers: 0, epoch: 0 }),
+            next: AtomicUsize::new(0),
+            cv_work: Condvar::new(),
+            cv_done: Condvar::new(),
+        });
+        for i in 0..workers {
+            let shared = Arc::clone(&shared);
+            let _ = std::thread::Builder::new().name(format!("dstorage io {i}")).spawn(move || {
+                let mut seen_epoch = 0u64;
+                loop {
+                    let (fn_ptr, fn_data, total) = {
+                        let mut st = lock(&shared.state);
+                        while st.epoch == seen_epoch || st.workers_to_take == 0 {
+                            st = shared.cv_work.wait(st).unwrap_or_else(PoisonError::into_inner);
+                        }
+                        seen_epoch = st.epoch;
+                        st.workers_to_take -= 1;
+                        (st.fn_ptr, st.fn_data, st.total)
+                    };
+                    loop {
+                        let idx = shared.next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= total {
+                            break;
+                        }
+                        // SAFETY: `run` keeps the closure alive until `active_workers` drops to 0.
+                        unsafe {
+                            let call: fn(usize, usize) = std::mem::transmute(fn_ptr);
+                            call(fn_data, idx);
+                        }
+                    }
+                    let mut st = lock(&shared.state);
+                    st.active_workers -= 1;
+                    if st.active_workers == 0 {
+                        shared.cv_done.notify_one();
+                    }
+                }
+            });
+        }
+        Self { workers, run_lock: Mutex::new(()), shared }
+    }
+
+    fn run<F: Fn(usize) + Sync>(&self, total: usize, f: F) {
+        fn invoke<F: Fn(usize) + Sync>(data: usize, index: usize) {
+            // SAFETY: `data` points to `f` for the entire duration of `run`.
+            unsafe { (*(data as *const F))(index) };
+        }
+        let _guard = lock(&self.run_lock);
+        let worker_count = total.saturating_sub(1).min(self.workers);
+        if worker_count == 0 {
+            for i in 0..total {
+                f(i);
+            }
+            return;
+        }
+        {
+            let mut st = lock(&self.shared.state);
+            st.fn_ptr = invoke::<F> as *const () as usize;
+            st.fn_data = std::ptr::from_ref(&f) as usize;
+            st.total = total;
+            self.shared.next.store(0, Ordering::Relaxed);
+            st.workers_to_take = worker_count;
+            st.active_workers = worker_count;
+            st.epoch += 1;
+            self.shared.cv_work.notify_all();
+        }
+        loop {
+            let idx = self.shared.next.fetch_add(1, Ordering::Relaxed);
+            if idx >= total {
+                break;
+            }
+            f(idx);
+        }
+        let mut st = lock(&self.shared.state);
+        while st.active_workers > 0 {
+            st = self.shared.cv_done.wait(st).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+fn io_pool() -> &'static IoPool {
+    static POOL: OnceLock<IoPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).clamp(8, 16);
+        IoPool::new(threads)
+    })
+}
+
+/// An uninitialized buffer with capacity for `len` bytes, or `Err` when it cannot be allocated.
+fn buffer_capacity(len: u32) -> Result<Vec<u8>, ()> {
     let mut buffer: Vec<u8> = Vec::new();
     buffer.try_reserve_exact(len as usize).map_err(|_| ())?;
-    buffer.resize(len as usize, 0);
     Ok(buffer)
 }
 
@@ -633,13 +939,15 @@ impl Queue {
     }
 
     /// Hands every recorded operation to the worker. The caller holds the lock of `pending`.
-    fn submit_locked(&self, pending: &mut VecDeque<Operation>) -> HRESULT {
+    fn submit_locked(&self, pending: &mut VecDeque<QueueOp>) -> HRESULT {
         let mut batch = std::mem::take(pending);
         let mut state = lock(&self.work.state);
         if state.submitted.try_reserve(batch.len()).is_err() {
             drop(state);
             for operation in batch.drain(..) {
-                operation(&self.core, true);
+                if let QueueOp::Barrier(barrier) = operation {
+                    barrier(&self.core, true);
+                }
             }
             self.work.ready.notify_one();
             return E_OUTOFMEMORY;
@@ -651,7 +959,7 @@ impl Queue {
     }
 
     /// Records an operation, and submits when half the capacity is recorded.
-    fn append(&self, pending: &mut VecDeque<Operation>, operation: Operation) -> HRESULT {
+    fn append(&self, pending: &mut VecDeque<QueueOp>, operation: QueueOp) -> HRESULT {
         if pending.try_reserve(1).is_err() {
             return E_OUTOFMEMORY;
         }
@@ -678,23 +986,8 @@ impl Queue {
         if !Arc::ptr_eq(&file.backend, &self.core.backend) {
             return E_INVALIDARG;
         }
-        let read = Sendable(r);
         let mut pending = lock(&self.pending);
-        self.append(
-            &mut pending,
-            Box::new(move |core, cancel| {
-                if cancel {
-                    return S_OK;
-                }
-                let r = read.get();
-                let to_pages = pages.is_some();
-                let hr = core.read(&file, r, pages);
-                if hr < 0 {
-                    log_failure(r, to_pages, hr);
-                }
-                hr
-            }),
-        )
+        self.append(&mut pending, QueueOp::Read(ReadOp { file, read: Sendable(r), pages }))
     }
 
     /// `EnqueueStatus`: slot `index` of the status array gets the first failure since the last
@@ -718,12 +1011,12 @@ impl Queue {
             status.finish(index, E_OUTOFMEMORY);
             return E_OUTOFMEMORY;
         }
-        pending.push_back(Box::new(move |core, cancel| {
+        pending.push_back(QueueOp::Barrier(Box::new(move |core, cancel| {
             core.settle();
             status.finish(index, if cancel { hresult_from_win32(ERROR_CANCELLED) } else { core.interval.load(Ordering::Acquire) });
             core.interval.store(S_OK, Ordering::Release);
             S_OK
-        }));
+        })));
         if pending.len() >= usize::from(self.capacity).div_ceil(2) { self.submit_locked(&mut pending) } else { S_OK }
     }
 
@@ -740,11 +1033,11 @@ impl Queue {
         let mut pending = lock(&self.pending);
         self.append(
             &mut pending,
-            Box::new(move |core, cancel| {
+            QueueOp::Barrier(Box::new(move |core, cancel| {
                 core.settle();
                 // SAFETY: the duplicate is owned by `hold`.
                 if cancel || unsafe { SetEvent(hold.get()) } != 0 { S_OK } else { last_error() }
-            }),
+            })),
         )
     }
 
@@ -763,7 +1056,7 @@ impl Queue {
         let mut pending = lock(&self.pending);
         self.append(
             &mut pending,
-            Box::new(move |core, cancel| {
+            QueueOp::Barrier(Box::new(move |core, cancel| {
                 core.settle();
                 if cancel {
                     return S_OK;
@@ -775,7 +1068,7 @@ impl Queue {
                     let table = *(object as *const *const Signal);
                     (*table.add(10))(object, value)
                 }
-            }),
+            })),
         )
     }
 
@@ -851,9 +1144,10 @@ fn console_refusal(options: u64) -> Option<String> {
     })
 }
 
-/// The worker thread of a queue: runs the submitted operations in order, and on close cancels
-/// what is left.
+/// The worker thread of a queue: runs consecutive reads in batches up to `READ_BATCH_LIMIT`,
+/// runs barriers in order, and on close cancels what is left.
 fn run(core: &Arc<Core>, work: &Work) {
+    let mut batch = Vec::with_capacity(READ_BATCH_LIMIT);
     let mut state = lock(&work.state);
     loop {
         state = work.ready.wait_while(state, |s| !s.stopping && s.submitted.is_empty()).unwrap_or_else(PoisonError::into_inner);
@@ -867,12 +1161,27 @@ fn run(core: &Arc<Core>, work: &Work) {
             let rest = std::mem::take(&mut state.submitted);
             drop(state);
             for operation in rest {
-                operation(core, true);
+                if let QueueOp::Barrier(barrier) = operation {
+                    barrier(core, true);
+                }
             }
             state = lock(&work.state);
             continue;
         }
-        let Some(operation) = state.submitted.pop_front() else { continue };
+        batch.clear();
+        while batch.len() < READ_BATCH_LIMIT && matches!(state.submitted.front(), Some(QueueOp::Read(_))) {
+            if let Some(QueueOp::Read(op)) = state.submitted.pop_front() {
+                batch.push(op);
+            }
+        }
+        if !batch.is_empty() {
+            drop(state);
+            core.read_batch(&mut batch);
+            batch.clear();
+            state = lock(&work.state);
+            continue;
+        }
+        let Some(QueueOp::Barrier(operation)) = state.submitted.pop_front() else { continue };
         drop(state);
         let hr = operation(core, false);
         if hr < 0 {
@@ -887,7 +1196,9 @@ impl Drop for Queue {
         {
             let mut pending = lock(&self.pending);
             for operation in pending.drain(..) {
-                operation(&self.core, true);
+                if let QueueOp::Barrier(barrier) = operation {
+                    barrier(&self.core, true);
+                }
             }
         }
         if let Some(worker) = self.worker.take() {
@@ -986,7 +1297,7 @@ impl Factory {
         if path.is_null() {
             return Err(E_INVALIDARG);
         }
-        let mut file = File { vtbl: &FILE_VTBL, refs: AtomicU32::new(1), backend: self.backend.clone(), handle: Handle::null(), native: None };
+        let mut file = File { vtbl: &FILE_VTBL, refs: AtomicU32::new(1), backend: self.backend.clone(), handle: Handle::null(), native: None, byte_length: None };
         if let Some(factory) = self.backend.factory.as_ref() {
             let mut raw = std::ptr::null_mut();
             // SAFETY: the factory is an `IDStorageFactory` and `path` a zero terminated string, as the interface requires.
@@ -996,6 +1307,13 @@ impl Factory {
             }
             // SAFETY: on success `raw` is a file reference we now own.
             file.native = unsafe { Pc::from_raw(raw) };
+            if let Some(file_native) = file.native.as_ref() {
+                // SAFETY: `file_native` is a live `IDStorageFile` and `info` is writable.
+                let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+                if unsafe { (file_native.vtbl::<pc::FileVtbl>().get_file_information)(file_native.as_ptr(), &mut info) } >= 0 {
+                    file.byte_length = Some((u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow));
+                }
+            }
         } else {
             // SAFETY: `path` is a zero terminated string, as the interface requires.
             let handle = unsafe { CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_OVERLAPPED, std::ptr::null_mut()) };
