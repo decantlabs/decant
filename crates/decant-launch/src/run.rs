@@ -175,6 +175,22 @@ pub enum Verdict {
 
 /// [`redirect_game_path`] with the reason when the path is left alone.
 pub fn classify_game_path(requested: &str, letter: char, folder: &str, keep: &[String]) -> Verdict {
+    let base = folder.trim_end_matches(['\\', '/']).replace('/', "\\").to_ascii_lowercase();
+    classify_game_path_with_base(requested, letter, folder, &base, keep)
+}
+
+fn classify_game_path_with_base(requested: &str, letter: char, folder: &str, base: &str, keep: &[String]) -> Verdict {
+    // Fast-path reject before any allocation: a path on `letter:` must have `X:\` or `X:/` at
+    // offset 0 or right after a 4-char device prefix (`\\?\`, `\\.\`, `\??\`).
+    if letter.is_ascii() {
+        let b = requested.as_bytes();
+        let l = letter as u8;
+        let at0 = b.len() >= 3 && b[1] == b':' && b[0].eq_ignore_ascii_case(&l) && (b[2] == b'\\' || b[2] == b'/');
+        let at4 = b.len() >= 7 && b[5] == b':' && b[4].eq_ignore_ascii_case(&l) && (b[6] == b'\\' || b[6] == b'/');
+        if !at0 && !at4 {
+            return Verdict::NotGameDrive;
+        }
+    }
     // The same drive path in its Win32 extended (`\\?\G:\x`), device (`\\.\G:\x`) and NT (`\??\G:\x`) forms,
     // with either separator, is the plain `G:\x`.
     let normal = requested.replace('/', "\\");
@@ -186,16 +202,20 @@ pub fn classify_game_path(requested: &str, letter: char, folder: &str, keep: &[S
     }
     // A path already inside the title folder stays as it is: when that folder is itself on the game
     // drive letter (G: is a real drive), rewriting it again would nest the folder inside itself.
-    let base = folder.trim_end_matches(['\\', '/']).replace('/', "\\").to_ascii_lowercase();
     let whole = body.to_ascii_lowercase();
-    if !base.is_empty() && (whole == base || whole.starts_with(&format!("{base}\\"))) {
+    if !base.is_empty() && (whole == base || (whole.len() > base.len() && whole.starts_with(base) && whole.as_bytes()[base.len()] == b'\\')) {
         return Verdict::Inside;
     }
     let rest = chars.as_str();
     // The path below the drive, lowercased, one separator between names, for the keep list.
-    let tail: String = rest.split('\\').filter(|c| !c.is_empty()).map(str::to_lowercase).collect::<Vec<_>>().join("\\");
-    if keep.iter().any(|k| tail == k.trim_start_matches('\\') || tail.starts_with(&format!("{}\\", k.trim_start_matches('\\')))) {
-        return Verdict::Kept("on the keep list of the game drive");
+    if !keep.is_empty() {
+        let tail: String = rest.split('\\').filter(|c| !c.is_empty()).map(str::to_lowercase).collect::<Vec<_>>().join("\\");
+        if keep.iter().any(|k| {
+            let k = k.trim_start_matches('\\');
+            tail == k || (tail.len() > k.len() && tail.starts_with(k) && tail.as_bytes()[k.len()] == b'\\')
+        }) {
+            return Verdict::Kept("on the keep list of the game drive");
+        }
     }
     let mut out = format!("{}\\{}", folder.trim_end_matches(['\\', '/']), rest.trim_start_matches('\\'));
     if out.encode_utf16().count() >= 260 && !out.starts_with(r"\\") {
@@ -314,8 +334,16 @@ mod platform {
         pub struct Drive {
             pub letter: char,
             pub folder: String,
+            pub folder_base: String,
             /// The folders of the drive left alone (see `game_drive_keep`), read once at setup.
             pub keep: Vec<String>,
+        }
+
+        impl Drive {
+            pub fn new(letter: char, folder: String, keep: Vec<String>) -> Self {
+                let folder_base = folder.trim_end_matches(['\\', '/']).replace('/', "\\").to_ascii_lowercase();
+                Self { letter, folder, folder_base, keep }
+            }
         }
 
         pub struct Hook {
@@ -435,9 +463,12 @@ mod platform {
                     nt.add(0x50).cast::<u32>().read_unaligned() as usize
                 };
                 for name in names {
-                    let cname = format!("{name}\0");
-                    // SAFETY: `cname` is NUL-terminated and `mine` a loaded module.
-                    let entry = unsafe { GetProcAddress(mine, cname.as_ptr()) }.map(|f| f as usize).ok_or(format!("{name} not found in this process's kernelbase.dll"))?;
+                    let mut cbuf = [0u8; 64];
+                    let bytes = name.as_bytes();
+                    cbuf[..bytes.len()].copy_from_slice(bytes);
+                    cbuf[bytes.len()] = 0;
+                    // SAFETY: `cbuf` is NUL-terminated and `mine` a loaded module.
+                    let entry = unsafe { GetProcAddress(mine, cbuf.as_ptr()) }.map(|f| f as usize).ok_or(format!("{name} not found in this process's kernelbase.dll"))?;
                     // An export that forwards to another DLL answers with that DLL's address: not ours to break.
                     if entry < mine as usize || entry >= mine as usize + image_size {
                         return Err(format!("{name} is not in this process's kernelbase.dll (a forwarder)"));
@@ -510,17 +541,18 @@ mod platform {
             }
 
             fn redirect_runtime(&mut self, process: HANDLE, context: &mut CONTEXT, modules: &[(usize, String)], log: &mut dyn FnMut(&str)) {
-                let Some((ours, _)) = self.runtime.clone() else { return };
+                let Some(ours) = self.runtime.as_ref().map(|(p, _)| p) else { return };
                 let requested = read_wide(process, context.Rcx as usize);
                 let mut ret = [0u8; 8];
                 read(process, context.Rsp as usize, &mut ret);
                 let from = locate(modules, usize::from_le_bytes(ret));
                 // The interposer loads the real runtime by this very call: not redirected.
-                if is_runtime_request(&requested, &ours) && !from.to_ascii_lowercase().starts_with("xgameruntime.dll+") {
+                if is_runtime_request(&requested, ours) && !from.to_ascii_lowercase().starts_with("xgameruntime.dll+") {
                     let flags = context.R8 as u32;
+                    let ours_display = ours.display().to_string();
                     if let Some(remote) = self.remote_runtime(process) {
                         context.Rcx = remote as u64;
-                        log(&format!("redirect LoadLibraryExW(\"{requested}\", flags {flags:#x}) from {from} to {}", ours.display()));
+                        log(&format!("redirect LoadLibraryExW(\"{requested}\", flags {flags:#x}) from {from} to {ours_display}"));
                     } else {
                         log(&format!("LoadLibraryExW(\"{requested}\", flags {flags:#x}) from {from}: cannot write the redirect path"));
                     }
@@ -543,27 +575,33 @@ mod platform {
             /// The pointer to the rewritten copy of the path at `at` when it is on the game drive. `first`:
             /// the call is counted with this path (a function with two paths is one call).
             fn redirect_path(&mut self, process: HANDLE, at: usize, api: &'static FileApi, first: bool, log: &mut dyn FnMut(&str)) -> Option<usize> {
-                let drive = self.drive.as_ref()?;
-                let (letter, folder, keep) = (drive.letter, drive.folder.clone(), drive.keep.clone());
-                if at == 0 {
+                if self.drive.is_none() || at == 0 {
                     return None;
                 }
                 let requested = if api.ansi { read_narrow(process, at) } else { read_wide(process, at) };
                 let key = (requested.clone(), api.ansi);
                 // The verdict is worked out once per path: the pointer to the rewritten copy (if any), and
                 // whether the path is on the game drive at all.
+                let mut verdict_once: Option<Verdict> = None;
                 let (remote, on_drive) = match self.rewritten.get(&key) {
                     Some(&known) => known,
                     None => {
-                        let verdict = classify_game_path(&requested, letter, &folder, &keep);
+                        let drive = self.drive.as_ref().unwrap();
+                        let verdict = classify_game_path_with_base(&requested, drive.letter, &drive.folder, &drive.folder_base, &drive.keep);
                         let remote = match &verdict {
                             Verdict::Redirect(new) if api.ansi && !new.is_ascii() => None,
-                            Verdict::Redirect(new) if api.ansi => self.carve(process, &[new.as_bytes(), &[0]].concat()),
+                            Verdict::Redirect(new) if api.ansi => {
+                                let mut buf = Vec::with_capacity(new.len() + 1);
+                                buf.extend_from_slice(new.as_bytes());
+                                buf.push(0);
+                                self.carve(process, &buf)
+                            }
                             Verdict::Redirect(new) => self.carve(process, &new.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect::<Vec<u8>>()),
                             _ => None,
                         };
                         let known = (remote, verdict != Verdict::NotGameDrive);
                         self.rewritten.insert(key, known);
+                        verdict_once = Some(verdict);
                         known
                     }
                 };
@@ -572,9 +610,13 @@ mod platform {
                 calls[1] += u64::from(remote.is_some());
                 calls[2] += u64::from(on_drive && remote.is_none());
                 if self.seen.insert((api.name, requested.clone())) {
-                    // A line for each (function, path) once, from the verdict again (cheap, once per pair).
+                    // A line for each (function, path) once, reusing the verdict if just computed.
+                    let verdict = verdict_once.unwrap_or_else(|| {
+                        let drive = self.drive.as_ref().unwrap();
+                        classify_game_path_with_base(&requested, drive.letter, &drive.folder, &drive.folder_base, &drive.keep)
+                    });
                     let name = api.name;
-                    let (line, game) = match classify_game_path(&requested, letter, &folder, &keep) {
+                    let (line, game) = match verdict {
                         Verdict::Redirect(new) if remote.is_some() => (format!("redirect {name}(\"{requested}\") to {new}"), true),
                         Verdict::Redirect(_) => (format!("{name}(\"{requested}\"): cannot write the redirect path"), true),
                         Verdict::Inside => (format!("no redirect {name}(\"{requested}\"): already in the title folder"), true),
@@ -814,8 +856,8 @@ mod platform {
     /// every allocation of the layer's shader translator waited on the heap lock (a retail title, one
     /// run: a translation that takes a few ms alone took a hundred times longer in the title).
     /// It is set unless the environment names it already (`_NO_DEBUG_HEAP=0` keeps the debug heap).
-    fn environment(extra: &[(String, String)]) -> Vec<u16> {
-        let mut vars: Vec<(String, String)> = std::env::vars_os().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect();
+    fn environment_from(base_vars: &[(String, String)], extra: &[(String, String)]) -> Vec<u16> {
+        let mut vars: Vec<(String, String)> = base_vars.to_vec();
         for (k, v) in extra {
             vars.retain(|(key, _)| !key.eq_ignore_ascii_case(k));
             vars.push((k.clone(), v.clone()));
@@ -823,8 +865,15 @@ mod platform {
         if !vars.iter().any(|(k, _)| k.eq_ignore_ascii_case("_NO_DEBUG_HEAP")) {
             vars.push(("_NO_DEBUG_HEAP".to_string(), "1".to_string()));
         }
-        vars.sort_by_key(|(k, _)| k.to_uppercase());
-        let mut block: Vec<u16> = vars.iter().flat_map(|(k, v)| format!("{k}={v}").encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>()).collect();
+        vars.sort_by(|(a, _), (b, _)| a.chars().flat_map(char::to_uppercase).cmp(b.chars().flat_map(char::to_uppercase)));
+        let cap: usize = vars.iter().map(|(k, v)| k.len() + v.len() + 2).sum::<usize>() + 1;
+        let mut block = Vec::with_capacity(cap);
+        for (k, v) in &vars {
+            block.extend(k.encode_utf16());
+            block.push(b'=' as u16);
+            block.extend(v.encode_utf16());
+            block.push(0);
+        }
         block.push(0);
         block
     }
@@ -859,10 +908,16 @@ mod platform {
         let mut command = wide(std::ffi::OsStr::new(&command_line(exe, args)));
         let application = wide(exe.as_os_str());
         let directory = wide(folder.as_os_str());
-        let env = environment(&child_env);
+        let base_vars: Vec<(String, String)> = std::env::vars_os().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect();
+        let env = environment_from(&base_vars, &child_env);
         // The folders of the game drive the redirect leaves alone: fixed, from the environment the title inherits.
-        let env_vars: Vec<(String, String)> = std::env::vars().chain(child_env.iter().cloned()).collect();
-        let drive_keep = game_drive.map(|letter| game_drive_keep(letter, &env_vars)).unwrap_or_default();
+        let drive_keep = game_drive
+            .map(|letter| {
+                let mut all_vars = base_vars;
+                all_vars.extend(child_env.iter().cloned());
+                game_drive_keep(letter, &all_vars)
+            })
+            .unwrap_or_default();
         let creation_flags = if use_no_debugger { CREATE_UNICODE_ENVIRONMENT } else { DEBUG_ONLY_THIS_PROCESS | CREATE_UNICODE_ENVIRONMENT };
         // SAFETY: plain structures the call fills.
         let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
@@ -1062,7 +1117,7 @@ mod platform {
                                 tools.module(info.hProcess, dll.lpBaseOfDll as usize, &modules[modules.len() - 1].1, &mut |t: &str| log.line(&format!("{} {t}", stamp(start))));
                                 #[cfg(target_arch = "x86_64")]
                                 if want_hook && hook.is_none() && path.file_name().is_some_and(|n| n.eq_ignore_ascii_case("kernelbase.dll")) {
-                                    match hook::Hook::arm(info.hProcess, dll.lpBaseOfDll as usize, want_runtime.then(|| ours.clone()), game_drive.map(|letter| hook::Drive { letter, folder: folder.display().to_string(), keep: drive_keep.clone() })) {
+                                    match hook::Hook::arm(info.hProcess, dll.lpBaseOfDll as usize, want_runtime.then(|| ours.clone()), game_drive.map(|letter| hook::Drive::new(letter, folder.display().to_string(), drive_keep.clone()))) {
                                         Ok(h) => { log.line(&format!("{} redirect armed: {}", stamp(start), h.describe())); log.line(&format!("{} redirect keeps on the game drive: {}", stamp(start), if drive_keep.is_empty() { "nothing".to_owned() } else { drive_keep.join(" ; ") })); hook = Some(h) }
                                         Err(e) => log.line(&format!("{} redirect not armed: {e}", stamp(start))),
                                     }
@@ -1607,5 +1662,19 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.exit_code, Some(9), "{log:#?}");
         assert!(log.iter().any(|l| l.contains("no debugger")));
+    }
+
+    #[test]
+    fn fast_path_rejects_non_game_drive_paths_consistently() {
+        let folder = r"D:\title_overlay";
+        let base = folder.to_ascii_lowercase();
+        let keep = keep(&[r"G:\Tools\Scratch"]);
+        for p in [r"C:\Windows\System32\ntdll.dll", r"\\?\C:\foo", "G", "G:", r"D:\title_overlay\a", r"G:\Tools\Scratch\x", r"G:\pack\a.bin"] {
+            assert_eq!(
+                classify_game_path_with_base(p, 'G', folder, &base, &keep),
+                classify_game_path(p, 'G', folder, &keep),
+                "{p}"
+            );
+        }
     }
 }

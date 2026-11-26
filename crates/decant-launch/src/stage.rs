@@ -92,20 +92,25 @@ pub fn staged(overlay: &Path) -> Vec<Entry> {
         .collect()
 }
 
+fn remove_entry(overlay: &Path, entry: &Entry) -> io::Result<()> {
+    let path = overlay.join(&entry.name);
+    let Ok(meta) = fs::symlink_metadata(&path) else { return Ok(()) };
+    if ((entry.made == Made::Junction || entry.made == Made::RealDir) && meta.is_dir()) || (entry.made == Made::Junction && meta.file_type().is_symlink()) {
+        // On a junction, RemoveDirectory removes the reparse point only.
+        fs::remove_dir(&path)?;
+    } else {
+        fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
 /// Removes what a previous staging made: links are removed as links (a junction's folder and a
 /// linked file's data stay in the package), copies are deleted. Nothing else is touched.
 pub fn unstage(overlay: &Path) -> io::Result<()> {
     let mut entries = staged(overlay);
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.name.matches('/').count()));
     for entry in entries {
-        let path = overlay.join(&entry.name);
-        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
-        if ((entry.made == Made::Junction || entry.made == Made::RealDir) && meta.is_dir()) || (entry.made == Made::Junction && meta.file_type().is_symlink()) {
-            // On a junction, RemoveDirectory removes the reparse point only.
-            fs::remove_dir(&path)?;
-        } else {
-            fs::remove_file(&path)?;
-        }
+        remove_entry(overlay, &entry)?;
     }
     let manifest = overlay.join(MANIFEST);
     if manifest.exists() {
@@ -160,10 +165,11 @@ fn link_tree_file(link: &Path, target: &Path) -> io::Result<Made> {
 fn stage_tree(package: &Path, overlay: &Path, files: &mut Vec<Entry>, prefix: &Path) -> io::Result<()> {
     for entry in fs::read_dir(package)? {
         let entry = entry?;
+        let file_type = entry.file_type()?;
         let source = entry.path();
         let target = overlay.join(entry.file_name());
         let relative = prefix.join(entry.file_name());
-        if source.is_dir() {
+        if file_type.is_dir() {
             fs::create_dir_all(&target)?;
             stage_tree(&source, &target, files, &relative)?;
         } else {
@@ -191,9 +197,25 @@ pub const VKD3D_DLLS: [&str; 2] = ["d3d12.dll", "d3d12core.dll"];
 
 /// The lower case hex SHA-256 of a file.
 pub fn sha256_file(path: &Path) -> io::Result<String> {
+    use io::Read;
     use sha2::Digest;
-    let digest = sha2::Sha256::digest(fs::read(path)?);
-    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+    let mut file = fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    Ok(hex)
 }
 
 /// Checks that `vkd3d` holds both renderer DLLs and returns their paths, in [`VKD3D_DLLS`] order.
@@ -230,18 +252,41 @@ pub fn renderer_env(overlay: &Path, lookup: impl Fn(&str) -> Option<String>) -> 
     env
 }
 
+fn shim_matches(dst: &Path, src: &Path) -> bool {
+    let (Ok(d), Ok(s)) = (fs::symlink_metadata(dst), fs::metadata(src)) else { return false };
+    if !d.file_type().is_file() || d.len() != s.len() {
+        return false;
+    }
+    match (d.modified(), s.modified()) {
+        (Ok(dm), Ok(sm)) => dm == sm,
+        _ => false,
+    }
+}
+
+fn junction_matches(link: &Path, target: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(link) else { return false };
+    if !meta.is_dir() {
+        return false;
+    }
+    fs::canonicalize(link).is_ok_and(|resolved| resolved == target)
+}
+
 /// [`stage`], and with `vkd3d` also the renderer DLLs of that folder as shims (they replace a
 /// package or shim file of the same name). Both must exist, or nothing is staged.
 pub fn stage_with_renderer(package: &Path, overlay: &Path, shims: Option<&Path>, vkd3d: Option<&Path>) -> io::Result<Vec<Entry>> {
+    use std::collections::{HashMap, HashSet};
     let renderer = vkd3d.map(vkd3d_files).transpose()?.unwrap_or_default();
     let (package, overlay) = check_folders(package, overlay)?;
-    unstage(&overlay)?;
+    let prev_entries = staged(&overlay);
+    let prev_map: HashMap<String, Made> = prev_entries.iter().map(|e| (e.name.clone(), e.made)).collect();
+
     let shim_names: Vec<(String, PathBuf)> = match shims {
         Some(dir) => {
             let mut found: Vec<(String, PathBuf)> = fs::read_dir(dir)?
                 .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
                 .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dll")) && p.is_file())
+                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dll")))
                 .filter_map(|p| Some((p.file_name()?.to_string_lossy().into_owned(), p)))
                 .collect();
             found.sort();
@@ -257,20 +302,66 @@ pub fn stage_with_renderer(package: &Path, overlay: &Path, shims: Option<&Path>,
     }
     shim_names.sort();
     let is_shim = |name: &str| shim_names.iter().any(|(s, _)| s.eq_ignore_ascii_case(name));
-    let mut made = Vec::new();
     let hardlink_mode = std::env::var("DECANT_STAGE_MODE").is_ok_and(|mode| mode == "hardlink");
-    let mut names: Vec<PathBuf> = fs::read_dir(&package)?.filter_map(Result::ok).map(|e| e.path()).collect();
-    names.sort();
-    for source in names {
-        let Some(name) = source.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+
+    let mut pkg_items: Vec<(String, PathBuf, bool)> = fs::read_dir(&package)?
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let is_dir = e.file_type().ok()?.is_dir();
+            let path = e.path();
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            Some((name, path, is_dir))
+        })
+        .collect();
+    pkg_items.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let want_spec = (shims.is_some() || vkd3d.is_some()) && !pkg_items.iter().any(|(n, _, _)| n == SPEC_NAME);
+
+    // Determine which top-level/tree entries will be kept in place vs removed.
+    let mut keep_names: HashSet<String> = HashSet::new();
+    for (name, path, is_dir) in &pkg_items {
+        if is_shim(name) || name == MANIFEST {
+            continue;
+        }
+        if *is_dir && !(hardlink_mode && matches!(name.as_str(), "pack" | "data")) && prev_map.get(name) == Some(&Made::Junction) && junction_matches(&overlay.join(name), path) {
+            keep_names.insert(name.clone());
+        }
+    }
+    for (name, path) in &shim_names {
+        if prev_map.get(name) == Some(&Made::Shim) && shim_matches(&overlay.join(name), path) {
+            keep_names.insert(name.clone());
+        }
+    }
+    if want_spec && prev_map.get(SPEC_NAME) == Some(&Made::Shim) {
+        let spec_path = overlay.join(SPEC_NAME);
+        if fs::symlink_metadata(&spec_path).is_ok_and(|m| m.file_type().is_file() && m.len() == RETAIL_SPEC.len() as u64)
+            && fs::read(&spec_path).is_ok_and(|b| b == RETAIL_SPEC.as_bytes())
+        {
+            keep_names.insert(SPEC_NAME.to_owned());
+        }
+    }
+
+    // Remove previous entries that are not kept (deepest paths first).
+    let mut to_remove: Vec<Entry> = prev_entries.into_iter().filter(|e| !keep_names.contains(&e.name)).collect();
+    to_remove.sort_by_key(|entry| std::cmp::Reverse(entry.name.matches('/').count()));
+    for entry in &to_remove {
+        remove_entry(&overlay, entry)?;
+    }
+
+    let mut made = Vec::new();
+    for (name, source, is_dir) in pkg_items {
         if is_shim(&name) || name == MANIFEST {
             continue;
         }
         let link = overlay.join(&name);
+        if keep_names.contains(&name) {
+            made.push(Entry { name, made: Made::Junction });
+            continue;
+        }
         if fs::symlink_metadata(&link).is_ok() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists in the overlay and is not from a staging", link.display())));
         }
-        let how = if source.is_dir() {
+        let how = if is_dir {
             if hardlink_mode && matches!(name.as_str(), "pack" | "data") {
                 fs::create_dir_all(&link)?;
                 stage_tree(&source, &link, &mut made, Path::new(&name))?;
@@ -285,15 +376,29 @@ pub fn stage_with_renderer(package: &Path, overlay: &Path, shims: Option<&Path>,
         made.push(Entry { name, made: how });
     }
     for (name, path) in &shim_names {
-        fs::copy(path, overlay.join(name))?;
+        if !keep_names.contains(name) {
+            let dst = overlay.join(name);
+            if !prev_map.contains_key(name) && fs::symlink_metadata(&dst).is_ok() {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists in the overlay and is not from a staging", dst.display())));
+            }
+            fs::copy(path, dst)?;
+        }
         made.push(Entry { name: name.clone(), made: Made::Shim });
     }
     // With shims, a title folder that brings no spec of its own gets ours (one `Shim` entry, so it is unstaged too).
-    if (shims.is_some() || vkd3d.is_some()) && !package.join(SPEC_NAME).exists() {
-        fs::write(overlay.join(SPEC_NAME), RETAIL_SPEC)?;
+    if want_spec {
+        if !keep_names.contains(SPEC_NAME) {
+            fs::write(overlay.join(SPEC_NAME), RETAIL_SPEC)?;
+        }
         made.push(Entry { name: SPEC_NAME.to_owned(), made: Made::Shim });
     }
-    let manifest: String = made.iter().map(|e| format!("{}\t{}\n", e.made.word(), e.name)).collect();
+    let mut manifest = String::with_capacity(made.len() * 24);
+    for e in &made {
+        manifest.push_str(e.made.word());
+        manifest.push('\t');
+        manifest.push_str(&e.name);
+        manifest.push('\n');
+    }
     fs::write(overlay.join(MANIFEST), manifest)?;
     Ok(made)
 }
@@ -495,5 +600,21 @@ mod tests {
         let nested = package.path().join("overlay");
         assert_eq!(stage(package.path(), &nested, None).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert!(!nested.exists(), "nothing is created inside the package");
+    }
+
+    #[test]
+    fn re_staging_reuses_unchanged_shims_and_updates_changed_ones() {
+        let (package, shims, overlay) = package();
+        let first = stage(package.path(), overlay.path(), Some(shims.path())).unwrap();
+        let xmem_dst = overlay.path().join("xmem.dll");
+        let meta_before = fs::metadata(&xmem_dst).unwrap();
+        // Re-staging with identical shims and package keeps the same result.
+        let second = stage(package.path(), overlay.path(), Some(shims.path())).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fs::metadata(&xmem_dst).unwrap().len(), meta_before.len());
+        // Updating a shim DLL in `shims` replaces the staged copy.
+        fs::write(shims.path().join("xmem.dll"), b"our updated shim").unwrap();
+        stage(package.path(), overlay.path(), Some(shims.path())).unwrap();
+        assert_eq!(fs::read(&xmem_dst).unwrap(), b"our updated shim");
     }
 }

@@ -60,17 +60,23 @@ impl Runtime {
 
 /// Reads the runtime's state. Nothing is changed.
 pub fn state() -> Runtime {
+    let (runtime, _) = state_and_reachability();
+    runtime
+}
+
+fn state_and_reachability() -> (Runtime, bool) {
     let system = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join("System32");
     let dll = system.join("xgameruntime.dll");
-    Runtime { dll_present: dll.is_file(), dll, services: SERVICES.map(service_state) }
+    let (services, reachable) = query_services();
+    (Runtime { dll_present: dll.is_file(), dll, services }, reachable)
 }
 
 /// One line per fact: the runtime DLL, then each service and its state.
 pub fn report() -> Vec<String> {
-    let runtime = state();
+    let (runtime, reachable) = state_and_reachability();
     let mut out = vec![format!("runtime: {} {}", runtime.dll.display(), if runtime.dll_present { "present" } else { "MISSING (install Gaming Services)" })];
     for (name, state) in SERVICES.iter().zip(runtime.services) {
-        let word = if state == ServiceState::Unknown && !manager_reachable() { "unknown (no access to the service manager)" } else { state.word() };
+        let word = if state == ServiceState::Unknown && !reachable { "unknown (no access to the service manager)" } else { state.word() };
         out.push(format!("runtime: service {name} {word}"));
     }
     out
@@ -85,18 +91,6 @@ mod platform {
         CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
         SERVICE_STOPPED,
     };
-
-    pub fn manager_reachable() -> bool {
-        // SAFETY: a plain service manager query; the handle opened is closed.
-        unsafe {
-            let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
-            if manager.is_null() {
-                return false;
-            }
-            CloseServiceHandle(manager);
-            true
-        }
-    }
 
     /// The file version (major, minor, build, revision) from the version resource, if it has one.
     pub fn file_version(path: &std::path::Path) -> Option<[u16; 4]> {
@@ -124,16 +118,12 @@ mod platform {
         }
     }
 
-    pub fn service_state(name: &str) -> ServiceState {
+    fn query_with_manager(manager: windows_sys::Win32::System::Services::SC_HANDLE, name: &str) -> ServiceState {
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: plain service manager queries; every handle opened is closed.
+        // SAFETY: `manager` is a valid service manager handle and `wide` is NUL-terminated.
         unsafe {
-            let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
-            if manager.is_null() {
-                return ServiceState::Unknown;
-            }
             let service = OpenServiceW(manager, wide.as_ptr(), SERVICE_QUERY_STATUS);
-            let state = if service.is_null() {
+            if service.is_null() {
                 ServiceState::Missing
             } else {
                 let mut status: SERVICE_STATUS = std::mem::zeroed();
@@ -148,7 +138,34 @@ mod platform {
                 };
                 CloseServiceHandle(service);
                 state
-            };
+            }
+        }
+    }
+
+    pub fn query_services() -> ([ServiceState; 2], bool) {
+        // SAFETY: plain service manager queries; every handle opened is closed.
+        unsafe {
+            let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+            if manager.is_null() {
+                return ([ServiceState::Unknown, ServiceState::Unknown], false);
+            }
+            let states = [
+                query_with_manager(manager, super::SERVICES[0]),
+                query_with_manager(manager, super::SERVICES[1]),
+            ];
+            CloseServiceHandle(manager);
+            (states, true)
+        }
+    }
+
+    pub fn service_state(name: &str) -> ServiceState {
+        // SAFETY: plain service manager queries; every handle opened is closed.
+        unsafe {
+            let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+            if manager.is_null() {
+                return ServiceState::Unknown;
+            }
+            let state = query_with_manager(manager, name);
             CloseServiceHandle(manager);
             state
         }
@@ -156,7 +173,7 @@ mod platform {
 }
 
 #[cfg(windows)]
-use platform::manager_reachable;
+use platform::query_services;
 #[cfg(windows)]
 pub use platform::{file_version, service_state};
 
@@ -173,8 +190,8 @@ pub fn file_version(_: &std::path::Path) -> Option<[u16; 4]> {
 }
 
 #[cfg(not(windows))]
-fn manager_reachable() -> bool {
-    true
+fn query_services() -> ([ServiceState; 2], bool) {
+    ([ServiceState::NotWindows, ServiceState::NotWindows], true)
 }
 
 #[cfg(test)]
