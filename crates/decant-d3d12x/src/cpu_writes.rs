@@ -165,14 +165,15 @@ impl Job {
                 }
             }
         }
+        let mut cached_region: Option<(usize, usize)> = None;
         for (va, words) in &self.writes {
             if !words.is_empty() {
                 // SAFETY: the target is checked against the title's memory before the store.
-                unsafe { write_now(*va, words) };
+                unsafe { write_now_cached(*va, words, &mut cached_region) };
             } else if let Some(clock) = self.clock {
                 let tick = clock.gpu_at(counter_now());
                 // SAFETY: as above.
-                unsafe { write_now(*va, &[tick as u32, (tick >> 32) as u32]) };
+                unsafe { write_now_cached(*va, &[tick as u32, (tick >> 32) as u32], &mut cached_region) };
             }
         }
     }
@@ -232,14 +233,44 @@ fn all_regions(va: usize, bytes: usize, mut accept: impl FnMut(&MEMORY_BASIC_INF
     true
 }
 
+/// Whether the CPU can write all of `[va, va + bytes)` now, reusing a cached writable region
+/// `(base, end)` across consecutive writes in the same job.
+fn writable_cached(va: usize, bytes: usize, cache: &mut Option<(usize, usize)>) -> bool {
+    let Some(end) = va.checked_add(bytes.max(1)) else { return false };
+    if let Some((c_lo, c_hi)) = *cache
+        && va >= c_lo
+        && end <= c_hi
+    {
+        return true;
+    }
+    let tracked_by_title = std::cell::OnceCell::new();
+    let mut single_rw_region: Option<(usize, usize)> = None;
+    let ok = all_regions(va, bytes, |r| {
+        if r.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0 {
+            let r_lo = r.BaseAddress as usize;
+            let r_hi = r_lo.saturating_add(r.RegionSize);
+            single_rw_region = match single_rw_region {
+                None => Some((r_lo, r_hi)),
+                Some((_, prev_hi)) if prev_hi == r_lo => Some((r_lo, r_hi)),
+                Some(_) => None,
+            };
+            true
+        } else {
+            r.Protect & PAGE_READONLY != 0 && *tracked_by_title.get_or_init(|| crate::title_mem::writable(va, bytes))
+        }
+    });
+    if ok && let Some(region) = single_rw_region {
+        *cache = Some(region);
+    }
+    ok
+}
+
 /// Whether the CPU can write all of `[va, va + bytes)` now. A read only page counts as writable
 /// when `xmem.dll` protected it to see the next write, which is how a clean page of the GPU
 /// mirror looks.
 pub(crate) fn writable(va: usize, bytes: usize) -> bool {
-    let tracked_by_title = std::cell::OnceCell::new();
-    all_regions(va, bytes, |r| {
-        r.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0 || (r.Protect & PAGE_READONLY != 0 && *tracked_by_title.get_or_init(|| crate::title_mem::writable(va, bytes)))
-    })
+    let mut cache = None;
+    writable_cached(va, bytes, &mut cache)
 }
 
 /// Whether the CPU can read all of `[va, va + bytes)` now.
@@ -283,17 +314,28 @@ pub(crate) fn wait_until(wait: &PendingWait, timeout: Duration) -> bool {
 /// Stores `words` at `va` if that memory is still there and the CPU can write it.
 ///
 /// # Safety
-/// Nothing stops the title from unmapping `[va, va + 4 * words.len())` between the check and the
-/// stores. The title owns that memory for as long as its submissions last, and `va` is dword aligned
-/// (`list_sync` refuses other writes).
-unsafe fn write_now(va: usize, words: &[u32]) {
-    if !writable(va, words.len() * 4) {
+/// Same safety contract as [`write_now`].
+unsafe fn write_now_cached(va: usize, words: &[u32], cache: &mut Option<(usize, usize)>) {
+    if !writable_cached(va, words.len() * 4, cache) {
         return;
     }
     for (index, &word) in words.iter().enumerate() {
         // SAFETY: checked above, alignment by the caller.
         unsafe { (*((va + index * 4) as *const AtomicU32)).store(word, Ordering::Release) };
     }
+}
+
+/// Stores `words` at `va` if that memory is still there and the CPU can write it.
+///
+/// # Safety
+/// Nothing stops the title from unmapping `[va, va + 4 * words.len())` between the check and the
+/// stores. The title owns that memory for as long as its submissions last, and `va` is dword aligned
+/// (`list_sync` refuses other writes).
+#[cfg(test)]
+unsafe fn write_now(va: usize, words: &[u32]) {
+    let mut cache = None;
+    // SAFETY: forwarded from caller.
+    unsafe { write_now_cached(va, words, &mut cache) };
 }
 
 /// How many failures of the bottom of pipe machinery are logged.
@@ -456,5 +498,18 @@ mod tests {
         assert_eq!(clock.gpu_at(80_000), 5_000 + 25_000, "one millisecond on");
         assert_eq!(clock.gpu_at(0), 0, "no value below zero");
         assert_eq!(Clock { cpu_freq: 0, ..clock }.gpu_at(123), 5_000, "no counter frequency, no movement");
+    }
+
+    #[test]
+    fn writable_cached_reuses_region_bounds_across_writes() {
+        let target = Box::new([0u32; 4]);
+        let va = target.as_ptr() as usize;
+        let mut cache = None;
+        assert!(writable_cached(va, 8, &mut cache));
+        let (lo, hi) = cache.expect("readwrite region cached");
+        assert!(va >= lo && va + 16 <= hi);
+        // SAFETY: `va` points into the live, dword aligned box.
+        unsafe { write_now_cached(va + 8, &[0x12, 0x34], &mut cache) };
+        assert_eq!(*target, [0, 0, 0x12, 0x34]);
     }
 }

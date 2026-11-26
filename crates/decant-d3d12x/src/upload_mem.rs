@@ -15,8 +15,8 @@
 //! address.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The size of an owner's first chunk when the request is small. Every command allocator the title
 /// records with holds at least one chunk until it is reset. A retail title keeps many of them, most for
@@ -104,21 +104,28 @@ impl UploadMem {
 
     /// The GPU address of the CPU address `va`, when it lies in a chunk.
     pub fn to_gpu(&self, va: u64) -> Option<u64> {
-        let (start, off) = self.find(va as usize, 0)?;
-        let (_, gpu, _) = self.ranges[&start];
+        let (&(_, gpu, _), off) = self.find(va as usize, 0)?;
         Some(gpu + off as u64)
     }
 
     /// The resource and the offset inside it of `[va, va + len)`, when it lies in one chunk.
     pub fn locate(&self, va: u64, len: u64) -> Option<(usize, u64)> {
-        let (start, off) = self.find(va as usize, usize::try_from(len).ok()?)?;
-        Some((self.ranges[&start].2, off as u64))
+        let (&(_, _, res), off) = self.find(va as usize, usize::try_from(len).ok()?)?;
+        Some((res, off as u64))
     }
 
-    fn find(&self, va: usize, len: usize) -> Option<(usize, usize)> {
-        let (&start, &(size, _, _)) = self.ranges.range(..=va).next_back()?;
+    fn find(&self, va: usize, len: usize) -> Option<(&(usize, u64, usize), usize)> {
+        let (&start, entry) = self.ranges.range(..=va).next_back()?;
         let off = va - start;
-        (off.checked_add(len)? <= size && off < size).then_some((start, off))
+        (off.checked_add(len)? <= entry.0 && off < entry.0).then_some((entry, off))
+    }
+
+    /// Inclusive low and exclusive high CPU address bounds across all live chunks.
+    pub fn bounds(&self) -> (usize, usize) {
+        match (self.ranges.first_key_value(), self.ranges.last_key_value()) {
+            (Some((&lo, _)), Some((&last_start, &(last_size, _, _)))) => (lo, last_start.saturating_add(last_size)),
+            _ => (usize::MAX, 0),
+        }
     }
 
     /// The bytes of all live chunks.
@@ -136,14 +143,32 @@ impl UploadMem {
     }
 }
 
-static MEM: Mutex<Option<UploadMem>> = Mutex::new(None);
+static MEM: RwLock<Option<UploadMem>> = RwLock::new(None);
 /// Whether any chunk may exist, so that the common case takes no lock.
 static ANY: AtomicBool = AtomicBool::new(false);
+/// CPU address envelope of all live upload chunks, for lock free rejection.
+static BOUND_LO: AtomicUsize = AtomicUsize::new(usize::MAX);
+static BOUND_HI: AtomicUsize = AtomicUsize::new(0);
 
 /// Runs `f` on the global table.
 pub fn with<R>(f: impl FnOnce(&mut UploadMem) -> R) -> R {
-    let mut g = MEM.lock().unwrap_or_else(|e| e.into_inner());
-    f(g.get_or_insert_with(UploadMem::default))
+    let mut g = MEM.write().unwrap_or_else(|e| e.into_inner());
+    let mem = g.get_or_insert_with(UploadMem::default);
+    let out = f(mem);
+    let (lo, hi) = mem.bounds();
+    BOUND_LO.store(lo, Ordering::Release);
+    BOUND_HI.store(hi, Ordering::Release);
+    out
+}
+
+fn with_read<R>(f: impl FnOnce(&UploadMem) -> R) -> Option<R> {
+    let g = MEM.read().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().map(f)
+}
+
+fn in_bounds(va: u64) -> bool {
+    let Ok(addr) = usize::try_from(va) else { return false };
+    (BOUND_LO.load(Ordering::Acquire)..BOUND_HI.load(Ordering::Acquire)).contains(&addr)
 }
 
 /// Marks that chunks exist (called after a chunk is added).
@@ -154,18 +179,18 @@ pub fn note_used() {
 /// The GPU address for an address a title passes: the buffer's GPU address when `va` is upload memory
 /// of slot 148, else `va` itself.
 pub fn translate(va: u64) -> u64 {
-    if !ANY.load(Ordering::Acquire) {
+    if !ANY.load(Ordering::Acquire) || !in_bounds(va) {
         return va;
     }
-    with(|m| m.to_gpu(va)).unwrap_or(va)
+    with_read(|m| m.to_gpu(va)).flatten().unwrap_or(va)
 }
 
 /// The upload buffer and the byte offset that hold `[va, va + len)`, if it is upload memory.
 pub fn locate(va: u64, len: u64) -> Option<(usize, u64)> {
-    if !ANY.load(Ordering::Acquire) {
+    if !ANY.load(Ordering::Acquire) || !in_bounds(va) {
         return None;
     }
-    with(|m| m.locate(va, len))
+    with_read(|m| m.locate(va, len)).flatten()
 }
 
 #[cfg(test)]
@@ -319,5 +344,22 @@ mod tests {
         assert_eq!(m.owner_of(0x77), 0x99);
         m.set_allocator(0x77, 0);
         assert_eq!(m.owner_of(0x77), 0x77);
+    }
+
+    #[test]
+    fn bounds_and_rwlock_allow_concurrent_reads_and_fast_outside_miss() {
+        let mut m = UploadMem::default();
+        assert_eq!(m.bounds(), (usize::MAX, 0));
+        m.add_chunk(1, chunk(0xA, 0x10_0000, 0x9000_0000, 0x1000));
+        m.add_chunk(2, chunk(0xB, 0x20_0000, 0xA000_0000, 0x2000));
+        assert_eq!(m.bounds(), (0x10_0000, 0x20_2000));
+        m.free_owner(1);
+        assert_eq!(m.bounds(), (0x20_0000, 0x20_2000));
+        m.free_owner(2);
+        assert_eq!(m.bounds(), (usize::MAX, 0));
+
+        let r1 = MEM.read().unwrap_or_else(|e| e.into_inner());
+        let r2 = std::thread::spawn(|| MEM.read().unwrap_or_else(|e| e.into_inner()).is_some()).join().unwrap();
+        assert_eq!(r2, r1.is_some());
     }
 }
