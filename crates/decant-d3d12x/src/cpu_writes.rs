@@ -297,6 +297,7 @@ fn fence_wait_limit_ms(current: u64, stalled_at: Option<u64>) -> (u32, bool) {
 
 /// The writes of one submission, waiting for the GPU to reach `value` on `fence`.
 struct Job {
+    queue: usize,
     fence: usize,
     value: u64,
     writes: Vec<CpuWrite>,
@@ -363,10 +364,19 @@ impl Job {
                     static STALL_LOGS: AtomicU32 = AtomicU32::new(0);
                     let n = STALL_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
                     if n <= 8 || n.is_power_of_two() {
-                        xs_log!(
-                            "bottom-of-pipe writes: queue fence stalled at {after} waiting for {}, applying writes after {limit_ms} ms ({n} so far)",
-                            self.value
-                        );
+                        if let Some((map_done, map_pub, removed)) = crate::title_mem::map_fence_status() {
+                            xs_log!(
+                                "bottom-of-pipe writes: queue {:#x} fence stalled at {after} waiting for {} (map_fence {map_done}/{map_pub}, removed {removed:#x}), applying writes after {limit_ms} ms ({n} so far)",
+                                self.queue,
+                                self.value
+                            );
+                        } else {
+                            xs_log!(
+                                "bottom-of-pipe writes: queue {:#x} fence stalled at {after} waiting for {}, applying writes after {limit_ms} ms ({n} so far)",
+                                self.queue,
+                                self.value
+                            );
+                        }
                     }
                 }
             }
@@ -702,7 +712,7 @@ pub(crate) unsafe fn after(queue: Object, writes: Vec<CpuWrite>) {
             return;
         }
         let guard = slot.activity.enqueue();
-        let job = Job { fence: *fence, value: *signalled, writes, clock, guard };
+        let job = Job { queue: queue as usize, fence: *fence, value: *signalled, writes, clock, guard };
         (sender, job)
     };
     if ANNOUNCED.fetch_add(1, Ordering::Relaxed) < 3 {

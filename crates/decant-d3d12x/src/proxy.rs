@@ -917,6 +917,20 @@ extern "system" fn dev_create_queue(this: *mut Proxy, desc: *const c_void, riid:
             xs_log!("console device: queue IID {{{}}} unknown to the PC runtime, created as ID3D12CommandQueue", guid_at(riid));
             hr = method::<CreateQueue>(pc, 8)(pc, desc, &IID_COMMAND_QUEUE, &mut q);
         }
+        if hr >= 0 && !q.is_null() {
+            static QUEUES_LOGGED: AtomicI32 = AtomicI32::new(0);
+            if QUEUES_LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
+                let d = host.unwrap_or([0; 4]);
+                xs_log!(
+                    "console device: PC command queue {:#x} created (type {}, priority {}, host flags {:#x}, node mask {:#x})",
+                    q as usize,
+                    d[0],
+                    d[1] as i32,
+                    d[2],
+                    d[3]
+                );
+            }
+        }
         give(hr, q, Kind::Queue, out)
     }
 }
@@ -2457,7 +2471,7 @@ extern "system" fn dev_create_queue_x(this: *mut Proxy, desc: *const c_void, rii
             return E_INVALIDARG;
         }
         let pc_desc: [u32; 4] = std::ptr::read_unaligned(desc.cast());
-        if log_due(&N) {
+        if N.fetch_add(1, Ordering::Relaxed) < 16 {
             xs_log!(
                 "console device slot 48: queue type {}, priority {}, flags 0x{:X} (host 0x{:X}), node mask 0x{:X} (rest of the console desc ignored)",
                 pc_desc[0],

@@ -1378,19 +1378,204 @@ impl Drop for StagingRing {
     }
 }
 
-fn wait_fence(fence: &ID3D12Fence, event: usize, target: u64) {
-    if target == 0 || event == 0 {
-        return;
-    }
-    // SAFETY: `fence` and `event` are live; `GetCompletedValue` and `SetEventOnCompletion` are plain D3D12 calls.
-    unsafe {
-        if fence.GetCompletedValue() >= target {
-            return;
+const STAGING_FENCE_WAIT_MS: u64 = 5000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FenceWaitResult {
+    Reached(u64),
+    DeviceRemoved,
+    TimedOut { completed: u64, target: u64 },
+}
+
+/// Advances `fence_value` strictly after `signal` succeeds. Callers must hold `MAP_QUEUE_LOCK` so
+/// signals reach `map_queue` in strict monotonic order and no waiting queue observes a target
+/// before `Signal` succeeded.
+fn publish_map_signal<E>(fence_value: &AtomicU64, signal: impl FnOnce(u64) -> Result<(), E>) -> Result<u64, E> {
+    let next_val = fence_value.load(Ordering::Relaxed) + 1;
+    signal(next_val)?;
+    fence_value.store(next_val, Ordering::Release);
+    Ok(next_val)
+}
+
+/// Signals `map_fence` on `map_queue` while holding `MAP_QUEUE_LOCK` (proven by `_lock`),
+/// publishing the new value in `fence_value` only after `Signal` succeeds.
+fn signal_map_queue_locked(
+    map_queue: &ID3D12CommandQueue,
+    map_fence: &ID3D12Fence,
+    fence_value: &AtomicU64,
+    _lock: &mut TileScratch,
+    what: &str,
+) -> Option<u64> {
+    // SAFETY: both objects are live, and `_lock` proves `MAP_QUEUE_LOCK` is held so submissions
+    // and fence signals on `map_queue` execute in strict monotonic order.
+    match publish_map_signal(fence_value, |next_val| unsafe { map_queue.Signal(map_fence, next_val) }) {
+        Ok(next_val) => Some(next_val),
+        Err(e) => {
+            xs_log!("title memory: the map fence cannot be signalled after {what} ({e})");
+            None
         }
-        if fence.SetEventOnCompletion(target, HANDLE(event as *mut c_void)).is_ok() {
-            WaitForSingleObject(HANDLE(event as *mut c_void), 5000);
+    }
+}
+
+/// Returns whether a submitting queue can safely skip `queue.Wait(map_fence, target)` because the
+/// target is zero or `map_fence` has already reached `target` on a live device.
+fn should_skip_queue_wait(target: u64, completed: u64) -> bool {
+    target == 0 || (completed != u64::MAX && completed >= target)
+}
+
+/// Chooses an allocator slot for the next staging copy starting from `start_slot`. Prefers any
+/// non-retired slot whose prior submission has already completed on the GPU, then falls back to
+/// the non-retired slot with the lowest in-flight fence value. Returns `None` if all slots were
+/// retired (`u64::MAX`).
+fn select_allocator_slot(alloc_fences: &[u64], start_slot: usize, completed: u64) -> Option<(usize, u64)> {
+    let n = alloc_fences.len();
+    if n == 0 {
+        return None;
+    }
+    let start = start_slot % n;
+    for offset in 0..n {
+        let idx = (start + offset) % n;
+        let f = alloc_fences[idx];
+        if f != u64::MAX && (f == 0 || (completed != u64::MAX && completed >= f)) {
+            return Some((idx, 0));
         }
     }
+    let mut oldest: Option<(usize, u64)> = None;
+    for offset in 0..n {
+        let idx = (start + offset) % n;
+        let f = alloc_fences[idx];
+        if f != u64::MAX && oldest.is_none_or(|(_, best)| f < best) {
+            oldest = Some((idx, f));
+        }
+    }
+    oldest
+}
+
+/// Waits until `completed()` reaches `target` (or reports `u64::MAX` for a removed device) or
+/// `timeout_ms` elapses. Re-checks completion on every wake so a stale auto-reset event signal
+/// never releases an in-flight command allocator or staging span early.
+fn wait_fence_with(
+    target: u64,
+    timeout_ms: u64,
+    mut completed: impl FnMut() -> u64,
+    mut arm: impl FnMut(u64) -> bool,
+    mut wait_ms: impl FnMut(u32),
+    mut elapsed_ms: impl FnMut() -> u64,
+) -> FenceWaitResult {
+    if target == 0 {
+        return FenceWaitResult::Reached(0);
+    }
+    let cur = completed();
+    if cur == u64::MAX {
+        return FenceWaitResult::DeviceRemoved;
+    }
+    if cur >= target {
+        return FenceWaitResult::Reached(cur);
+    }
+    loop {
+        let elapsed = elapsed_ms();
+        if elapsed >= timeout_ms {
+            let final_val = completed();
+            return if final_val == u64::MAX {
+                FenceWaitResult::DeviceRemoved
+            } else if final_val >= target {
+                FenceWaitResult::Reached(final_val)
+            } else {
+                FenceWaitResult::TimedOut { completed: final_val, target }
+            };
+        }
+        if !arm(target) {
+            let final_val = completed();
+            return if final_val == u64::MAX {
+                FenceWaitResult::DeviceRemoved
+            } else if final_val >= target {
+                FenceWaitResult::Reached(final_val)
+            } else {
+                FenceWaitResult::TimedOut { completed: final_val, target }
+            };
+        }
+        let rem = (timeout_ms - elapsed).clamp(1, u64::from(u32::MAX)) as u32;
+        wait_ms(rem);
+        let cur = completed();
+        if cur == u64::MAX {
+            return FenceWaitResult::DeviceRemoved;
+        }
+        if cur >= target {
+            return FenceWaitResult::Reached(cur);
+        }
+    }
+}
+
+/// Non-blocking snapshot of the mirror's `map_fence` progress and device removal status for stall
+/// diagnostics: `(completed, published, removed_hr)`. Returns `None` if `STATE` is write-locked or
+/// uninitialized.
+pub(crate) fn map_fence_status() -> Option<(u64, u64, u32)> {
+    let guard = STATE.try_read().ok()?;
+    let st = guard.as_ref()?;
+    // SAFETY: `map_fence` and `device` are live COM objects held by `State`.
+    let (completed, removed) = unsafe {
+        let c = st.map_fence.GetCompletedValue();
+        let r = st.device.GetDeviceRemovedReason().err().map_or(0u32, |e| e.code().0 as u32);
+        (c, r)
+    };
+    let published = st.fence_value.load(Ordering::Acquire);
+    Some((completed, published, removed))
+}
+
+fn wait_fence(fence: &ID3D12Fence, event: usize, target: u64, fence_value: &AtomicU64, what: &str) -> FenceWaitResult {
+    if target == 0 {
+        return FenceWaitResult::Reached(0);
+    }
+    if event == 0 {
+        // SAFETY: `fence` is live.
+        let cur = unsafe { fence.GetCompletedValue() };
+        return if cur == u64::MAX {
+            FenceWaitResult::DeviceRemoved
+        } else if cur >= target {
+            FenceWaitResult::Reached(cur)
+        } else {
+            FenceWaitResult::TimedOut { completed: cur, target }
+        };
+    }
+    let started = Instant::now();
+    let handle = HANDLE(event as *mut c_void);
+    let result = wait_fence_with(
+        target,
+        STAGING_FENCE_WAIT_MS,
+        // SAFETY: `fence` is live.
+        || unsafe { fence.GetCompletedValue() },
+        // SAFETY: `fence` and `handle` are live.
+        |t| unsafe { fence.SetEventOnCompletion(t, handle).is_ok() },
+        // SAFETY: `handle` is a live auto-reset Win32 event owned by `StagingRing`.
+        |ms| unsafe {
+            WaitForSingleObject(handle, ms);
+        },
+        || started.elapsed().as_millis() as u64,
+    );
+    match result {
+        FenceWaitResult::Reached(_) => {}
+        FenceWaitResult::DeviceRemoved => {
+            static LOGGED: AtomicU64 = AtomicU64::new(0);
+            let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 4 || n.is_power_of_two() {
+                let published = fence_value.load(Ordering::Acquire);
+                let removed = map_fence_status().map_or(0, |(_, _, r)| r);
+                xs_log!("title memory: staging {what} wait saw device removed on map fence (target {target}, published {published}, removed {removed:#x}, {n} so far)");
+            }
+        }
+        FenceWaitResult::TimedOut { completed, target } => {
+            static LOGGED: AtomicU64 = AtomicU64::new(0);
+            let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                let published = fence_value.load(Ordering::Acquire);
+                let removed = map_fence_status().map_or(0, |(_, _, r)| r);
+                xs_log!(
+                    "title memory: staging {what} wait timed out after {STAGING_FENCE_WAIT_MS} ms on map fence (completed {completed}, target {target}, published {published}, removed {removed:#x}, {n} so far)"
+                );
+            }
+        }
+    }
+    result
 }
 
 impl StagingRing {
@@ -1441,27 +1626,39 @@ impl StagingRing {
         })
     }
 
-    fn reserve(&mut self, bytes: usize, fence: &ID3D12Fence) -> Option<usize> {
+    fn reserve(&mut self, bytes: usize, fence: &ID3D12Fence, fence_value: &AtomicU64) -> Option<usize> {
         if bytes == 0 {
             return Some(self.head);
         }
         if bytes > self.size {
             return None;
         }
-        if self.head + bytes > self.size {
-            self.head = 0;
+        // SAFETY: `fence` is live.
+        let completed_before = unsafe { fence.GetCompletedValue() };
+        if completed_before == u64::MAX {
+            return None;
         }
-        let start = self.head;
+        self.in_flight.retain(|&(_, _, f_val)| f_val > completed_before);
+        let start = if self.head + bytes > self.size { 0 } else { self.head };
         let end = start + bytes;
         let mut wait_val = 0u64;
         for &(f_start, f_len, f_val) in &self.in_flight {
             if f_start < end && start < f_start + f_len {
+                if f_val == u64::MAX {
+                    return None;
+                }
                 wait_val = wait_val.max(f_val);
             }
         }
         if wait_val > 0 {
-            wait_fence(fence, self.event, wait_val);
-            self.in_flight.retain(|&(f_start, f_len, f_val)| f_val > wait_val && !(f_start < end && start < f_start + f_len));
+            match wait_fence(fence, self.event, wait_val, fence_value, "reserve") {
+                FenceWaitResult::Reached(completed_now) => {
+                    self.in_flight.retain(|&(_, _, f_val)| f_val > completed_now);
+                }
+                FenceWaitResult::TimedOut { .. } | FenceWaitResult::DeviceRemoved => {
+                    return None;
+                }
+            }
         }
         self.head = end;
         Some(start)
@@ -1480,11 +1677,25 @@ impl StagingRing {
         if runs.is_empty() {
             return false;
         }
-        wait_fence(fence, self.event, self.alloc_fences[self.slot]);
-        let alloc = &self.allocators[self.slot];
-        let next_val;
-        // SAFETY: `alloc_fences[slot]` has completed above, and `list` is closed before reset.
-        unsafe {
+        // SAFETY: `fence` is live.
+        let completed = unsafe { fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            return false;
+        }
+        let Some((slot, wait_target)) = select_allocator_slot(&self.alloc_fences, self.slot, completed) else {
+            return false;
+        };
+        if wait_target > 0
+            && !matches!(
+                wait_fence(fence, self.event, wait_target, fence_value, "allocator"),
+                FenceWaitResult::Reached(_)
+            )
+        {
+            return false;
+        }
+        let alloc = &self.allocators[slot];
+        // SAFETY: `alloc` has completed on the GPU above, and `list` is closed before reset.
+        let cmd = unsafe {
             if alloc.Reset().is_err() || self.list.Reset(alloc, None).is_err() {
                 return false;
             }
@@ -1503,14 +1714,31 @@ impl StagingRing {
                 return false;
             }
             let Ok(cmd) = self.list.cast::<ID3D12CommandList>() else { return false };
-            queue.ExecuteCommandLists(&[Some(cmd)]);
-            next_val = fence_value.fetch_add(1, Ordering::AcqRel) + 1;
-            let _ = queue.Signal(fence, next_val);
+            cmd
+        };
+        let next_val = {
+            let mut map_guard = MAP_QUEUE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            // SAFETY: `cmd` is a closed command list targeting live heaps and staging buffer,
+            // and `MAP_QUEUE_LOCK` serializes all submissions and fence signals on `map_queue`.
+            unsafe { queue.ExecuteCommandLists(&[Some(cmd)]) };
+            signal_map_queue_locked(queue, fence, fence_value, &mut map_guard, "staging copy")
+        };
+        match next_val {
+            Some(val) => {
+                self.in_flight.push_back((base_offset, total_bytes, val));
+                self.alloc_fences[slot] = val;
+                self.slot = (slot + 1) % self.allocators.len();
+                true
+            }
+            None => {
+                // `ExecuteCommandLists` ran without a fence signal, so retire this allocator and
+                // span instead of resetting or overwriting potentially live GPU memory.
+                self.in_flight.push_back((base_offset, total_bytes, u64::MAX));
+                self.alloc_fences[slot] = u64::MAX;
+                self.slot = (slot + 1) % self.allocators.len();
+                false
+            }
         }
-        self.in_flight.push_back((base_offset, total_bytes, next_val));
-        self.alloc_fences[self.slot] = next_val;
-        self.slot = (self.slot + 1) % self.allocators.len();
-        true
     }
 }
 
@@ -2503,8 +2731,9 @@ fn update_call(queue: &ID3D12CommandQueue, window: &ID3D12Resource, call: &TileC
     let flag = if call.heap.is_some() && heap.is_some() { D3D12_TILE_RANGE_FLAG_NONE } else { D3D12_TILE_RANGE_FLAG_NULL };
     scratch.flags.clear();
     scratch.flags.resize(n as usize, flag);
+    let heap_offsets = (flag == D3D12_TILE_RANGE_FLAG_NONE).then_some(call.heap_tiles.as_ptr());
     // SAFETY: the arrays have `n` entries each, the resource and the heap are live.
-    unsafe { queue.UpdateTileMappings(window, n, Some(scratch.coords.as_ptr()), Some(scratch.sizes.as_ptr()), heap, n, Some(scratch.flags.as_ptr()), Some(call.heap_tiles.as_ptr()), Some(scratch.counts.as_ptr()), D3D12_TILE_MAPPING_FLAG_NONE) };
+    unsafe { queue.UpdateTileMappings(window, n, Some(scratch.coords.as_ptr()), Some(scratch.sizes.as_ptr()), heap, n, Some(scratch.flags.as_ptr()), heap_offsets, Some(scratch.counts.as_ptr()), D3D12_TILE_MAPPING_FLAG_NONE) };
     crate::diagnose::removed_after(|| format!("UpdateTileMappings of {n} ranges on window buffer {} (heap {:?}, first tile {:?})", call.buffer, call.heap, call.ranges.first()));
 }
 
@@ -3257,11 +3486,7 @@ fn map_buffer_to_pool_outside_state(
         };
         update_call(map_queue, buffer, &call, Some(&pool_heap), &mut scratch);
     }
-    let next_val = fence_value.fetch_add(1, Ordering::AcqRel) + 1;
-    // SAFETY: both objects are live.
-    if let Err(e) = unsafe { map_queue.Signal(map_fence, next_val) } {
-        xs_log!("title memory: the map fence cannot be signalled ({e})");
-    }
+    let _ = signal_map_queue_locked(map_queue, map_fence, fence_value, &mut scratch, "placed buffer mapping");
     Some(())
 }
 
@@ -3411,6 +3636,38 @@ fn maybe_stats_and_guard(
     }
 }
 
+/// Orders upcoming commands on `queue_ref` after the latest published `map_fence` signal. Skips
+/// the GPU `Wait` when this queue already waited for at least `cur_fence` or `map_fence` has
+/// already completed `cur_fence` on a live device.
+///
+/// # Safety
+/// `queue_ref` and `map_fence` are live COM objects of the same device.
+unsafe fn wait_queue_for_map_fence(
+    queue_ref: &ID3D12CommandQueue,
+    queue_key: usize,
+    map_fence: &ID3D12Fence,
+    fence_value: &AtomicU64,
+    waited: &mut HashMap<usize, u64>,
+) {
+    let cur_fence = fence_value.load(Ordering::Acquire);
+    if cur_fence == 0 || waited.get(&queue_key).is_some_and(|&v| v >= cur_fence) {
+        return;
+    }
+    // SAFETY: `map_fence` is live by the contract above.
+    let completed = unsafe { map_fence.GetCompletedValue() };
+    if should_skip_queue_wait(cur_fence, completed) {
+        waited.insert(queue_key, cur_fence);
+        return;
+    }
+    // SAFETY: both objects are live. The queue waits on the GPU, the CPU does not.
+    match unsafe { queue_ref.Wait(map_fence, cur_fence) } {
+        Ok(()) => {
+            waited.insert(queue_key, cur_fence);
+        }
+        Err(e) => xs_log!("title memory: a queue cannot wait for the tile mappings ({e})"),
+    }
+}
+
 pub unsafe fn sync(queue: *mut c_void) {
     if !enabled() {
         return;
@@ -3456,16 +3713,8 @@ pub unsafe fn sync(queue: *mut c_void) {
             }
         }
         if let Some(c) = cached.as_ref().filter(|c| c.state_id == cur_id) {
-            let cur_fence = c.fence_value.load(Ordering::Acquire);
-            if cur_fence > 0 && waited.get(&(queue as usize)).is_none_or(|&v| v < cur_fence) {
-                // SAFETY: both objects are live. The queue waits on the GPU, the CPU does not.
-                match unsafe { queue_ref.Wait(&c.map_fence, cur_fence) } {
-                    Ok(()) => {
-                        waited.insert(queue as usize, cur_fence);
-                    }
-                    Err(e) => xs_log!("title memory: a queue cannot wait for the tile mappings ({e})"),
-                }
-            }
+            // SAFETY: `queue_ref` and `c.map_fence` are live objects of the active device.
+            unsafe { wait_queue_for_map_fence(queue_ref, queue as usize, &c.map_fence, &c.fence_value, waited) };
             crate::diagnose::removed_after(|| "a sync of 0 pages and 0 tile ranges".to_string());
             let mut run_guard = false;
             maybe_stats_and_guard(stats, last_guard, SyncBatchMetrics::default(), started, &mut run_guard);
@@ -3570,22 +3819,26 @@ pub unsafe fn sync(queue: *mut c_void) {
         let diff_enabled = subpage_diff_enabled();
         let (staged_bytes, l1_skipped_bytes) = if !runs.is_empty() && staging.is_some() {
             // SAFETY: every staged `UploadRun` points to a live section view for this sync.
-            let res = unsafe { filter_staged_runs(runs, l1_prints, jobs, diff_enabled, cores) };
-            if diff_enabled {
-                collect_changed_l1_tiles(runs, &mut written);
-            }
-            res
+            unsafe { filter_staged_runs(runs, l1_prints, jobs, diff_enabled, cores) }
         } else {
             (0, 0)
         };
         let staging_span = if let (true, Some(ring)) = (staged_bytes > 0, staging.as_mut()) {
-            let Some(base) = ring.reserve(staged_bytes, &map_fence) else {
-                SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
-                return;
-            };
-            let dst_base = ring.ptr + base;
-            apply_staging_base(jobs, runs, dst_base);
-            Some((base, staged_bytes))
+            if let Some(base) = ring.reserve(staged_bytes, &map_fence, &fence_value) {
+                if diff_enabled {
+                    collect_changed_l1_tiles(runs, &mut written);
+                }
+                let dst_base = ring.ptr + base;
+                apply_staging_base(jobs, runs, dst_base);
+                Some((base, staged_bytes))
+            } else {
+                // Staging reservation failed or timed out: drop staged jobs so `execute_copies`
+                // never writes to relative offsets, while still allowing L0 copies and tile
+                // mappings for this batch to proceed.
+                jobs.retain(|j| !j.staged);
+                runs.clear();
+                None
+            }
         } else {
             None
         };
@@ -3663,11 +3916,7 @@ pub unsafe fn sync(queue: *mut c_void) {
                     ranges += call.ranges.len() as u64;
                     update_call(&map_queue, window, &call, heap, &mut scratch);
                 }
-                let next_val = fence_value.fetch_add(1, Ordering::AcqRel) + 1;
-                // SAFETY: both objects are live.
-                if let Err(e) = unsafe { map_queue.Signal(&map_fence, next_val) } {
-                    xs_log!("title memory: the map fence cannot be signalled ({e})");
-                }
+                let _ = signal_map_queue_locked(&map_queue, &map_fence, &fence_value, &mut scratch, "tile mappings");
             }
         }
         total_pages += pages;
@@ -3679,16 +3928,8 @@ pub unsafe fn sync(queue: *mut c_void) {
         last_fence = Some((map_fence, fence_value));
     }
     if let Some((map_fence, fence_value)) = last_fence {
-        let cur_fence = fence_value.load(Ordering::Acquire);
-        if cur_fence > 0 && waited.get(&(queue as usize)).is_none_or(|&v| v < cur_fence) {
-            // SAFETY: both objects are live. The queue waits on the GPU, the CPU does not.
-            match unsafe { queue_ref.Wait(&map_fence, cur_fence) } {
-                Ok(()) => {
-                    waited.insert(queue as usize, cur_fence);
-                }
-                Err(e) => xs_log!("title memory: a queue cannot wait for the tile mappings ({e})"),
-            }
-        }
+        // SAFETY: `queue_ref` and `map_fence` are live objects of the active device.
+        unsafe { wait_queue_for_map_fence(queue_ref, queue as usize, &map_fence, &fence_value, waited) };
     }
     crate::diagnose::removed_after(|| format!("a sync of {total_pages} pages and {total_ranges} tile ranges"));
     maybe_stats_and_guard(
@@ -4724,5 +4965,222 @@ mod tests {
 
         drop(_state_read);
         MIRROR_MAY_HAVE_PENDING.store(prev_mirror_pending, Ordering::Release);
+    }
+
+    #[test]
+    fn publish_map_signal_advances_only_after_signal_succeeds() {
+        let fv = AtomicU64::new(0);
+        // Inside the signal callback `fv` must still hold the previous value (no wait-before-signal).
+        let v1 = publish_map_signal(&fv, |next| -> Result<(), &'static str> {
+            assert_eq!(next, 1);
+            assert_eq!(fv.load(Ordering::Acquire), 0);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(v1, 1);
+        assert_eq!(fv.load(Ordering::Acquire), 1);
+
+        // A failing Signal must not advance `fv` so waiting queues never block on an unsignalled value.
+        let err = publish_map_signal(&fv, |next| -> Result<(), &'static str> {
+            assert_eq!(next, 2);
+            Err("boom")
+        });
+        assert_eq!(err, Err("boom"));
+        assert_eq!(fv.load(Ordering::Acquire), 1);
+
+        // Next successful Signal reuses value 2 cleanly.
+        let v2 = publish_map_signal(&fv, |next| -> Result<(), &'static str> {
+            assert_eq!(next, 2);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(v2, 2);
+        assert_eq!(fv.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn map_queue_lock_serializes_signal_order_across_threads() {
+        let fv = Arc::new(AtomicU64::new(0));
+        let observed = Arc::new(Mutex::new(Vec::<u64>::new()));
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let fv = Arc::clone(&fv);
+                let observed = Arc::clone(&observed);
+                s.spawn(move || {
+                    for _ in 0..200 {
+                        let _guard = MAP_QUEUE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+                        let v = publish_map_signal(&fv, |next| -> Result<(), ()> {
+                            observed.lock().unwrap_or_else(PoisonError::into_inner).push(next);
+                            Ok(())
+                        })
+                        .unwrap();
+                        assert_eq!(fv.load(Ordering::Acquire), v);
+                    }
+                });
+            }
+        });
+        let seq = observed.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(seq.len(), 800);
+        for (i, &v) in seq.iter().enumerate() {
+            assert_eq!(v, (i + 1) as u64, "signals must arrive strictly monotonically");
+        }
+    }
+
+    #[test]
+    fn wait_fence_with_handles_spurious_wakes_device_removal_and_timeout() {
+        // Already reached returns immediately without arming.
+        let mut armed = 0usize;
+        let res = wait_fence_with(5, 5000, || 5, |_| { armed += 1; true }, |_| {}, || 0);
+        assert_eq!(res, FenceWaitResult::Reached(5));
+        assert_eq!(armed, 0);
+
+        // Device removed (u64::MAX) returns immediately without waiting.
+        let mut waited = 0usize;
+        let res = wait_fence_with(5, 5000, || u64::MAX, |_| true, |_| { waited += 1; }, || 0);
+        assert_eq!(res, FenceWaitResult::DeviceRemoved);
+        assert_eq!(waited, 0);
+
+        // Spurious wakes before target is reached keep looping until completion.
+        let mut polls = 0u64;
+        let mut waits = 0usize;
+        let clock = std::cell::Cell::new(0u64);
+        let res = wait_fence_with(
+            10,
+            5000,
+            || {
+                polls += 1;
+                if polls >= 4 { 10 } else { 9 }
+            },
+            |_| true,
+            |_| {
+                waits += 1;
+                clock.set(clock.get() + 5);
+            },
+            || clock.get(),
+        );
+        assert_eq!(res, FenceWaitResult::Reached(10));
+        assert_eq!(waits, 3);
+
+        // Unreached target times out once elapsed >= timeout_ms and reports completed value.
+        let clock = std::cell::Cell::new(0u64);
+        let res = wait_fence_with(
+            10,
+            100,
+            || 7,
+            |_| true,
+            |rem| {
+                clock.set(clock.get() + u64::from(rem));
+            },
+            || clock.get(),
+        );
+        assert_eq!(res, FenceWaitResult::TimedOut { completed: 7, target: 10 });
+    }
+
+    #[test]
+    fn select_allocator_slot_prefers_idle_then_oldest_and_skips_retired() {
+        // Prefers an idle slot starting at start_slot.
+        assert_eq!(select_allocator_slot(&[10, 11, 5, 12], 1, 8), Some((2, 0)));
+        // When all non-retired slots are busy, picks the lowest fence value (oldest).
+        assert_eq!(select_allocator_slot(&[20, u64::MAX, 15, 18], 0, 10), Some((2, 15)));
+        // Skips retired slots even when start_slot points at one.
+        assert_eq!(select_allocator_slot(&[u64::MAX, 0, u64::MAX], 0, 0), Some((1, 0)));
+        // All retired returns None.
+        assert_eq!(select_allocator_slot(&[u64::MAX, u64::MAX], 0, 100), None);
+    }
+
+    #[test]
+    fn should_skip_queue_wait_checks_completion_and_device_removal() {
+        assert!(should_skip_queue_wait(0, 0));
+        assert!(should_skip_queue_wait(5, 5));
+        assert!(should_skip_queue_wait(5, 8));
+        assert!(!should_skip_queue_wait(5, 4));
+        assert!(!should_skip_queue_wait(5, u64::MAX));
+    }
+
+    #[test]
+    fn serialized_map_queue_prevents_fence_regression_on_real_device() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+
+        type CreateDeviceFn = unsafe extern "system" fn(*mut c_void, i32, *const windows::core::GUID, *mut *mut c_void) -> i32;
+
+        // SAFETY: load system `d3d12.dll` dynamically so unit tests do not collide with this
+        // crate's own exported `D3D12CreateDevice` symbol.
+        let dev: ID3D12Device = unsafe {
+            let module = LoadLibraryW(windows_sys::w!("d3d12.dll"));
+            if module.is_null() {
+                return;
+            }
+            let Some(proc) = GetProcAddress(module, c"D3D12CreateDevice".as_ptr().cast()) else {
+                return;
+            };
+            let create: CreateDeviceFn = std::mem::transmute(proc);
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            let hr = create(std::ptr::null_mut(), D3D_FEATURE_LEVEL_12_0.0, &ID3D12Device::IID, &mut raw);
+            if hr < 0 || raw.is_null() {
+                return;
+            }
+            ID3D12Device::from_raw(raw)
+        };
+
+        // SAFETY: plain D3D12 resource, queue, and fence setup on the test device above.
+        unsafe {
+            let Ok(map_q) = dev.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            }) else {
+                return;
+            };
+            let Ok(map_fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+            let Ok(comp_q) = dev.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                ..Default::default()
+            }) else {
+                return;
+            };
+            let Ok(comp_fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+            let Ok(mut ring) = StagingRing::new(&dev, (PAGE as usize) * 4) else { return };
+            let Ok(pool_heap) = make_heap(&dev, 0, MirrorPool::L1) else { return };
+            let Ok(window) = make_window(&dev, PAGE * 4, 0) else { return };
+
+            let fence_value = Arc::new(AtomicU64::new(0));
+            let map_q_bg = map_q.clone();
+            let map_f_bg = map_fence.clone();
+            let fv_bg = Arc::clone(&fence_value);
+            let win_bg = window.resource.clone();
+            let heap_bg = pool_heap._heap.clone();
+
+            let mapper = std::thread::spawn(move || {
+                let call = TileCall { buffer: 0, heap: Some(0), ranges: vec![(0, 4)], heap_tiles: vec![0] };
+                for _ in 0..200 {
+                    let mut scratch = MAP_QUEUE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+                    update_call(&map_q_bg, &win_bg, &call, Some(&heap_bg), &mut scratch);
+                    let _ = signal_map_queue_locked(&map_q_bg, &map_f_bg, &fv_bg, &mut scratch, "test tile mapping");
+                }
+            });
+
+            let heaps = [Some(pool_heap.buffer.clone())];
+            let runs = [UploadRun { source: 0, heap: 0, heap_offset: 0, staging_offset: 0, bytes: PAGE }];
+            let mut waited = HashMap::new();
+            let mut max_completed = 0u64;
+            for i in 0..200u64 {
+                let base = ring.reserve(PAGE as usize, &map_fence, &fence_value).expect("staging reserve");
+                assert!(ring.copy_to_heaps(&map_q, &map_fence, &heaps, (base, PAGE as usize), &runs, &fence_value));
+                let c = map_fence.GetCompletedValue();
+                assert_ne!(c, u64::MAX);
+                assert!(c >= max_completed, "map_fence regressed from {max_completed} to {c}");
+                max_completed = c;
+                wait_queue_for_map_fence(&comp_q, comp_q.as_raw() as usize, &map_fence, &fence_value, &mut waited);
+                comp_q.Signal(&comp_fence, i + 1).expect("comp signal");
+            }
+            mapper.join().unwrap();
+
+            let final_val = fence_value.load(Ordering::Acquire);
+            assert_eq!(final_val, 400);
+            let wait_res = wait_fence(&map_fence, ring.event, final_val, &fence_value, "test drain");
+            assert_eq!(wait_res, FenceWaitResult::Reached(final_val));
+            let comp_res = wait_fence(&comp_fence, ring.event, 200, &fence_value, "test compute drain");
+            assert_eq!(comp_res, FenceWaitResult::Reached(200));
+        }
     }
 }
