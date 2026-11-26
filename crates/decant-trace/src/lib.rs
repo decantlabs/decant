@@ -20,7 +20,7 @@ mod perfetto;
 mod tracy_bridge;
 
 use perfetto::{Event, Kind, ThreadView};
-pub use perfetto::{FRAME_CAT, LOCK_WAIT_CAT, LockStat, SpanStat, Summary, ThreadStat, summarize};
+pub use perfetto::{FRAME_CAT, LOCK_WAIT_CAT, LockStat, SpanStat, StutterFrame, Summary, ThreadStat, WindowStat, summarize, summarize_range};
 
 /// The environment variable that turns tracing on.
 pub const ENV_VAR: &str = "DECANT_TRACE";
@@ -258,7 +258,13 @@ pub fn flush() -> io::Result<()> {
 }
 
 fn write_to(path: &Path) -> io::Result<()> {
-    std::fs::write(path, render_json())
+    let data = render_json();
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &data).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(path, data)
 }
 
 #[cfg(test)]

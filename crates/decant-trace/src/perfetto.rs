@@ -191,6 +191,36 @@ impl ThreadStat {
     }
 }
 
+/// Frame statistics for one 10-second window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowStat {
+    /// Window start in seconds relative to trace start.
+    pub start_s: u64,
+    /// Window end in seconds relative to trace start.
+    pub end_s: u64,
+    /// Number of frame marks in this window.
+    pub frames: u64,
+    /// Frames per second in this window.
+    pub fps: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+}
+
+/// One worst stutter frame (`> 50 ms`) and its overlapping spans/locks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StutterFrame {
+    /// Timestamp in seconds relative to trace start.
+    pub at_s: f64,
+    /// Frame interval duration in milliseconds.
+    pub dur_ms: f64,
+    /// Top overlapping non-lock spans `(label, overlap_ms)`.
+    pub spans: Vec<(String, f64)>,
+    /// Top overlapping lock waits `(lock_name, overlap_ms)`.
+    pub locks: Vec<(String, f64)>,
+}
+
 /// The result of reading a trace.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Summary {
@@ -204,6 +234,10 @@ pub struct Summary {
     pub locks: Vec<LockStat>,
     /// Thread aggregates, busiest first.
     pub threads: Vec<ThreadStat>,
+    /// 10-second windowed frame statistics.
+    pub windows: Vec<WindowStat>,
+    /// Top 15 worst stutter frames (`> 50 ms`).
+    pub stutters: Vec<StutterFrame>,
     /// Number of frame marks.
     pub frames: u64,
     /// Mean time between frame marks in microseconds, 0 for fewer than two frames.
@@ -268,19 +302,118 @@ fn text<'a>(e: &'a Value, key: &str) -> &'a str {
     e.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
+fn percentile(sorted: &[f64], pct: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() - 1) as f64 * pct).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn compute_windows(frame_ts: &[f64], t0: f64) -> Vec<WindowStat> {
+    if frame_ts.is_empty() {
+        return Vec::new();
+    }
+    let mut counts: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut intervals: BTreeMap<u64, Vec<f64>> = BTreeMap::new();
+    for (i, &ts) in frame_ts.iter().enumerate() {
+        let rel_s = ((ts - t0).max(0.0)) / 1_000_000.0;
+        let bucket = (rel_s / 10.0).floor() as u64;
+        *counts.entry(bucket).or_insert(0) += 1;
+        if i > 0 {
+            let dt_ms = (ts - frame_ts[i - 1]).max(0.0) / 1_000.0;
+            intervals.entry(bucket).or_default().push(dt_ms);
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(bucket, frames)| {
+            let mut dts = intervals.remove(&bucket).unwrap_or_default();
+            dts.sort_by(f64::total_cmp);
+            WindowStat {
+                start_s: bucket * 10,
+                end_s: (bucket + 1) * 10,
+                frames,
+                fps: frames as f64 / 10.0,
+                p50_ms: percentile(&dts, 0.50),
+                p95_ms: percentile(&dts, 0.95),
+                p99_ms: percentile(&dts, 0.99),
+                max_ms: dts.last().copied().unwrap_or(0.0),
+            }
+        })
+        .collect()
+}
+
+fn compute_stutters(frame_ts: &[f64], t0: f64, span_intervals: &[(f64, f64, bool, String)]) -> Vec<StutterFrame> {
+    const STUTTER_MIN_MS: f64 = 50.0;
+    const TOP_STUTTERS: usize = 15;
+    let mut worst: Vec<(f64, f64, f64)> = Vec::new();
+    for i in 1..frame_ts.len() {
+        let (prev, cur) = (frame_ts[i - 1], frame_ts[i]);
+        let dt_ms = (cur - prev) / 1_000.0;
+        if dt_ms > STUTTER_MIN_MS {
+            worst.push((dt_ms, prev, cur));
+        }
+    }
+    worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+    worst.truncate(TOP_STUTTERS);
+    worst
+        .into_iter()
+        .map(|(dur_ms, prev, cur)| {
+            let mut span_agg: BTreeMap<&str, f64> = BTreeMap::new();
+            let mut lock_agg: BTreeMap<&str, f64> = BTreeMap::new();
+            for (s, e, is_lock, label) in span_intervals {
+                let ov = (e.min(cur) - s.max(prev)) / 1_000.0;
+                if ov > 0.0 {
+                    let target = if *is_lock { &mut lock_agg } else { &mut span_agg };
+                    *target.entry(label.as_str()).or_insert(0.0) += ov;
+                }
+            }
+            let mut spans: Vec<(String, f64)> = span_agg.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
+            spans.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            spans.truncate(3);
+            let mut locks: Vec<(String, f64)> = lock_agg.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
+            locks.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            locks.truncate(3);
+            StutterFrame { at_s: (cur - t0).max(0.0) / 1_000_000.0, dur_ms, spans, locks }
+        })
+        .collect()
+}
+
 /// Reads a Chrome or Perfetto JSON trace, either an object with `traceEvents` or a bare array.
 pub fn summarize(json: &str) -> Result<Summary, String> {
+    summarize_range(json, None, None)
+}
+
+/// Reads a Chrome or Perfetto JSON trace, optionally filtering events to `[from_s, to_s]` seconds
+/// relative to the first event timestamp.
+pub fn summarize_range(json: &str, from_s: Option<f64>, to_s: Option<f64>) -> Result<Summary, String> {
     let root: Value = serde_json::from_str(json).map_err(|e| format!("not valid JSON: {e}"))?;
     let events: &Vec<Value> = match &root {
         Value::Array(a) => a,
         Value::Object(o) => o.get("traceEvents").and_then(Value::as_array).ok_or("no traceEvents array")?,
         _ => return Err("expected an object or an array".to_owned()),
     };
+    let mut t0 = f64::INFINITY;
+    for e in events {
+        if text(e, "ph") != "M" {
+            t0 = t0.min(num(e, "ts"));
+        }
+    }
+    let from_us = from_s.map(|s| t0 + s * 1_000_000.0);
+    let to_us = to_s.map(|s| t0 + s * 1_000_000.0);
+    let in_range = |ts: f64, dur: f64| -> bool {
+        let lo_ok = from_us.is_none_or(|lo| ts + dur >= lo);
+        let hi_ok = to_us.is_none_or(|hi| ts <= hi);
+        lo_ok && hi_ok
+    };
+
     let mut spans: BTreeMap<(String, String), Agg> = BTreeMap::new();
     let mut locks: BTreeMap<String, Agg> = BTreeMap::new();
     let mut threads: BTreeMap<(u64, u64), ThreadAcc> = BTreeMap::new();
     let mut names: BTreeMap<(u64, u64), String> = BTreeMap::new();
     let mut frame_ts: Vec<f64> = Vec::new();
+    let mut span_intervals: Vec<(f64, f64, bool, String)> = Vec::new();
     let mut s = Summary::default();
     let (mut first, mut last) = (f64::INFINITY, 0.0_f64);
     for e in events {
@@ -302,6 +435,9 @@ pub fn summarize(json: &str) -> Result<Summary, String> {
             continue;
         }
         let (ts, dur) = (num(e, "ts"), num(e, "dur").max(0.0));
+        if !in_range(ts, dur) {
+            continue;
+        }
         match ph {
             "X" => {
                 let (cat, name) = (text(e, "cat"), text(e, "name"));
@@ -309,9 +445,11 @@ pub fn summarize(json: &str) -> Result<Summary, String> {
                 if cat == LOCK_WAIT_CAT {
                     locks.entry(name.to_owned()).or_default().add(dur);
                     acc.lock_wait += dur;
+                    span_intervals.push((ts, ts + dur, true, name.to_owned()));
                 } else {
                     spans.entry((cat.to_owned(), name.to_owned())).or_default().add(dur);
                     acc.intervals.push((ts, ts + dur));
+                    span_intervals.push((ts, ts + dur, false, format!("{cat}:{name}")));
                 }
             }
             "C" => s.counter_samples += 1,
@@ -338,12 +476,16 @@ pub fn summarize(json: &str) -> Result<Summary, String> {
         })
         .collect();
     s.threads.sort_by(|a, b| b.active_us.total_cmp(&a.active_us).then(a.tid.cmp(&b.tid)));
+    frame_ts.sort_by(f64::total_cmp);
     s.frames = u64::try_from(frame_ts.len()).unwrap_or(u64::MAX);
-    if let (Some(lo), Some(hi)) = (frame_ts.iter().copied().reduce(f64::min), frame_ts.iter().copied().reduce(f64::max))
+    if let (Some(&lo), Some(&hi)) = (frame_ts.first(), frame_ts.last())
         && frame_ts.len() > 1
     {
         s.frame_mean_us = (hi - lo) / (frame_ts.len() - 1) as f64;
     }
+    let origin = if t0.is_finite() { t0 } else { 0.0 };
+    s.windows = compute_windows(&frame_ts, origin);
+    s.stutters = compute_stutters(&frame_ts, origin, &span_intervals);
     Ok(s)
 }
 
@@ -408,6 +550,28 @@ impl Summary {
             let _ = writeln!(o, "{:>12} {:>8} {:>12}  lock", "total ms", "count", "max ms");
             for l in self.top_locks(top) {
                 let _ = writeln!(o, "{:>12.3} {:>8} {:>12.3}  {}", ms(l.total_us), l.count, ms(l.max_us), l.name);
+            }
+        }
+        if !self.windows.is_empty() {
+            let _ = writeln!(o, "\nframe windows (10s)");
+            let _ = writeln!(o, "{:>11} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8}", "window", "frames", "FPS", "p50 ms", "p95 ms", "p99 ms", "max ms");
+            for w in &self.windows {
+                let label = format!("{}..{}s", w.start_s, w.end_s);
+                let _ = writeln!(
+                    o,
+                    "{:>11} {:>7} {:>7.1} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
+                    label, w.frames, w.fps, w.p50_ms, w.p95_ms, w.p99_ms, w.max_ms
+                );
+            }
+        }
+        if !self.stutters.is_empty() {
+            let _ = writeln!(o, "\ntop {} stutter frames (> 50 ms)", self.stutters.len());
+            let _ = writeln!(o, "{:>9} {:>9}  overlapping spans & locks", "at_s", "dur ms");
+            for st in &self.stutters {
+                let mut parts: Vec<String> = st.spans.iter().map(|(n, d)| format!("{n}={d:.1}ms")).collect();
+                parts.extend(st.locks.iter().map(|(n, d)| format!("lock:{n}={d:.1}ms")));
+                let detail = if parts.is_empty() { "untraced".to_owned() } else { parts.join(", ") };
+                let _ = writeln!(o, "{:>9.3} {:>9.2}  {}", st.at_s, st.dur_ms, detail);
             }
         }
         o
@@ -538,5 +702,32 @@ mod tests {
         }
         let none = summarize("[]").unwrap().report(3);
         assert!(none.contains("none recorded"));
+    }
+
+    #[test]
+    fn windows_stutters_and_range_filter_attribute_spans_and_locks() {
+        let json = r#"{"traceEvents":[
+            {"name":"frame","cat":"frame","ph":"i","s":"g","ts":0,"pid":1,"tid":1},
+            {"name":"frame","cat":"frame","ph":"i","s":"g","ts":20000,"pid":1,"tid":1},
+            {"name":"frame","cat":"frame","ph":"i","s":"g","ts":120000,"pid":1,"tid":1},
+            {"name":"sync","cat":"title_mem","ph":"X","ts":30000,"dur":60000,"pid":1,"tid":1},
+            {"name":"STATE","cat":"lock_wait","ph":"X","ts":40000,"dur":30000,"pid":1,"tid":1},
+            {"name":"frame","cat":"frame","ph":"i","s":"g","ts":12000000,"pid":1,"tid":1},
+            {"name":"late","cat":"detile","ph":"X","ts":12000000,"dur":5000,"pid":1,"tid":1}
+        ]}"#;
+        let full = summarize(json).unwrap();
+        assert_eq!(full.windows.len(), 2);
+        assert_eq!((full.windows[0].start_s, full.windows[0].end_s, full.windows[0].frames), (0, 10, 3));
+        assert_eq!((full.windows[1].start_s, full.windows[1].end_s, full.windows[1].frames), (10, 20, 1));
+        assert_eq!(full.stutters.len(), 2);
+        // Worst stutter is 12.0s - 0.12s = 11880 ms, second is 100 ms (with title_mem:sync=60ms and lock STATE=30ms).
+        let s100 = full.stutters.iter().find(|s| (s.dur_ms - 100.0).abs() < 1e-6).unwrap();
+        assert_eq!(s100.spans, vec![("title_mem:sync".to_owned(), 60.0)]);
+        assert_eq!(s100.locks, vec![("STATE".to_owned(), 30.0)]);
+
+        let ranged = summarize_range(json, Some(10.0), Some(15.0)).unwrap();
+        assert_eq!(ranged.frames, 1);
+        assert_eq!(ranged.spans.len(), 1);
+        assert_eq!(ranged.spans[0].name, "late");
     }
 }

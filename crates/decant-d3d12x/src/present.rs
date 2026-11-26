@@ -774,7 +774,14 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
             }
             if decant_trace::enabled() {
                 decant_trace::frame_mark();
-                if frame_num.is_multiple_of(TRACE_FLUSH_INTERVAL) {
+                static TRACE_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                static LAST_FLUSH_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let elapsed_ms = TRACE_START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+                let prev_ms = LAST_FLUSH_MS.load(std::sync::atomic::Ordering::Relaxed);
+                let time_due = elapsed_ms.saturating_sub(prev_ms) >= 15_000;
+                if (frame_num.is_multiple_of(TRACE_FLUSH_INTERVAL) || time_due)
+                    && LAST_FLUSH_MS.compare_exchange(prev_ms, elapsed_ms, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok()
+                {
                     let _ = decant_trace::flush();
                 }
             }
