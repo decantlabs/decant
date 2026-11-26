@@ -254,6 +254,11 @@ impl Store {
         self.keys.write().unwrap_or_else(|e| e.into_inner()).remove(&key);
     }
 
+    fn rescan_keys(&self) {
+        let scanned = scan_store_keys(&self.dir);
+        *self.keys.write().unwrap_or_else(|e| e.into_inner()) = scanned;
+    }
+
     /// The blob stored for `key`. `None` on a miss or a file that fails any check.
     pub fn read(&self, key: u128) -> Option<Vec<u8>> {
         if !self.has_key(key) {
@@ -529,6 +534,7 @@ impl Library {
                 let prev = ACTIVE_WRITERS.lock().unwrap_or_else(|e| e.into_inner()).get(&dir).and_then(Weak::upgrade);
                 if let Some(prev) = prev {
                     prev.wait_idle();
+                    s.rescan_keys();
                 }
                 let writer = BackgroundWriter::spawn(s.clone());
                 ACTIVE_WRITERS.lock().unwrap_or_else(|e| e.into_inner()).insert(dir, Arc::downgrade(&writer));
@@ -1016,5 +1022,17 @@ mod tests {
         assert_eq!(reader.read(20).as_deref(), Some(&b"second blob"[..]));
         reader.forget(20);
         assert!(!reader.has_key(20));
+    }
+
+    #[test]
+    fn reopened_library_sees_keys_flushed_from_previous_active_writer() {
+        let dir = TempDir::new("pso-library-reopen-live");
+        let first = Library::new(dir.0.clone(), "t");
+        first.open(|| Some(adapter())).unwrap();
+        first.keep(77, b"live writer payload").unwrap();
+
+        let second = Library::new(dir.0.clone(), "t");
+        second.open(|| Some(adapter())).unwrap();
+        assert_eq!(second.lookup(77).as_deref(), Some(&b"live writer payload"[..]));
     }
 }

@@ -1615,7 +1615,7 @@ mod tests {
         let keeper = shared_copy(b"DXBCprune_keeper_000000000");
         let table = SEEN_SHADERS.lock().unwrap_or_else(|e| e.into_inner());
         let remaining = dropped_keys.iter().filter(|key| table.entries.contains_key(key)).count();
-        assert!(remaining < 50, "expected dead weak entries to be pruned, {remaining} remained");
+        assert!(remaining < dropped_keys.len() / 2, "expected dead weak entries to be pruned, {remaining} remained");
         drop(table);
         drop(keeper);
     }
