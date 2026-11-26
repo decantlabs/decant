@@ -221,6 +221,15 @@ pub(super) fn lift(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
         // The scalar analysis proved this instruction unreachable.
         return Ok(true);
     }
+    // A register that parks scalars holds no lane value of an array (`exec::Parking`). When the
+    // scalar analysis says the move reaches one, the program is not what that rests on.
+    if cx.relative.get(&insn.pc).and_then(Option::as_ref).is_some()
+        && registers
+            .iter()
+            .any(|(_, reg)| matches!(reg, Var::V(v) if cx.masks.parks_scalars(*v)))
+    {
+        return Err(operand::form(insn, "relative-parking"));
+    }
     if read {
         let dst = operand::var(insn, insn.dst)?;
         let valid = Expr::bin(

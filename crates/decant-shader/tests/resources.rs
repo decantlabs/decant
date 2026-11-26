@@ -805,3 +805,73 @@ fn merged_image_descriptor_after_many_diamonds_is_traced() {
     assert_eq!(needs.mirror_dwords, [4]);
     assert!(needs.resource_heap);
 }
+
+#[test]
+fn waterfall_comparison_of_identical_descriptor_words_is_accepted() {
+    let mut a = Asm::new();
+    let again = a.label();
+    a.push(sop1(Op::s_mov_b32, s(5), int(0)));
+    a.push(smem(Op::s_load_dwordx8, s(8), s(4), 0x40));
+    for i in 0..8u8 {
+        a.push(vop1(Op::v_mov_b32, v(57 + i), s(8 + i)));
+    }
+    a.push(sop1(Op::s_mov_b64, s(2), EXEC));
+    a.bind(again);
+    for i in 0..8u8 {
+        a.push(vop1(Op::v_readfirstlane_b32, s(12 + i), v(57 + i)));
+    }
+    a.push(vopc(Op::v_cmp_eq_u64, s(12), v(57)));
+    a.push(vop3(Op::v_cmp_eq_u64, s(0), s(14), v(59), Operand::None));
+    a.push(sop2(Op::s_and_b64, s(0), VCC, s(0)));
+    a.push(sop1(Op::s_and_saveexec_b64, s(0), s(0)));
+    a.push(image(Op::image_load, v(2), v(0), s(12), s(0), 1, 0xf));
+    a.push(sop2(Op::s_xor_b64, EXEC, EXEC, s(0)));
+    a.branch(Op::s_cbranch_execnz, again);
+    a.push(sop1(Op::s_mov_b64, EXEC, s(2)));
+    a.push(sopp(Op::s_endpgm, 0));
+
+    let mut p = program(Stage::Compute, a);
+    p.threads = [64, 1, 1];
+    p.user_data = vec![UserDataSlot {
+        sgpr: 4,
+        kind: UserDataKind::Table,
+    }];
+    let (func, _) = placed(&p).unwrap();
+    assert_eq!(func.resources.len(), 1);
+}
+
+#[test]
+fn image_and_buffer_loads_clear_stale_descriptor_words_in_vgprs() {
+    let build = |overwrite_with: Option<Insn>| {
+        let mut a = Asm::new();
+        a.push(sop1(Op::s_mov_b32, s(5), int(0)));
+        a.push(smem(Op::s_load_dwordx8, s(8), s(4), 0x40));
+        a.push(smem(Op::s_load_dwordx4, s(16), s(4), 0x80));
+        a.push(vop1(Op::v_mov_b32, v(57), s(8)));
+        if let Some(insn) = overwrite_with {
+            a.push(insn);
+        }
+        a.push(vop2(Op::v_add_f32, v(57), v(57), float(1.0)));
+        a.push(sopp(Op::s_endpgm, 0));
+        let mut p = program(Stage::Compute, a);
+        p.threads = [32, 1, 1];
+        p.user_data = vec![UserDataSlot {
+            sgpr: 4,
+            kind: UserDataKind::Table,
+        }];
+        p.binding_table = vec![record(RegisterClass::Srv, 0, 4, 32)];
+        p
+    };
+
+    // Without an overwrite, using the moved descriptor word in arithmetic is still refused.
+    let refusal = placed(&build(None)).unwrap_err();
+    assert_eq!(refusal.key(), "resource:descriptor-as-data");
+
+    // An image load writing v56..v57 (dmask=0x3) clears v57's stale descriptor provenance.
+    let img = image(Op::image_load, v(56), v(0), s(8), s(0), 1, 0x3);
+    placed(&build(Some(img))).unwrap();
+
+    // A buffer load writing v57 clears v57's stale descriptor provenance.
+    let buf = buffer_load(Op::buffer_load_dword, v(57), v(0), s(16), 0, true);
+    placed(&build(Some(buf))).unwrap();
+}

@@ -267,6 +267,7 @@ impl Parking {
 
     fn find(cfg: &Cfg) -> Parking {
         let mut places = BTreeSet::new();
+        let mut written = BTreeSet::new();
         // Vector registers any other instruction names, with the registers after them that the
         // instruction also touches (results and addresses of memory instructions, 64 bit pairs).
         // The parking register is often the very next one after the last data register.
@@ -278,15 +279,18 @@ impl Parking {
                 }
             }
         };
+        let mut relative = false;
         for insn in cfg.insns() {
             if let Some(place) = Parking::place(insn) {
                 places.insert(place);
+                if insn.op == Op::v_writelane_b32_e64 {
+                    written.insert(place);
+                }
                 continue;
             }
-            if insn.op.name().starts_with("v_movrel") {
-                // A register chosen at run time: it can be any.
-                mark(Operand::Reg(Reg::V(0)), 256);
-            }
+            // A relative move reaches a register chosen at run time, inside the per lane array
+            // it indexes. See `parks_beside_relative_moves` for why that is never a parking place.
+            relative |= insn.op.name().starts_with("v_movrel");
             let (dst, dst2, src) = vector_spans(insn);
             mark(insn.dst, dst);
             mark(insn.dst2, dst2);
@@ -299,6 +303,9 @@ impl Parking {
                 }
             }
         }
+        if relative {
+            Parking::drop_unwritten(&places, &written, &mut other);
+        }
         let mut out = Parking::default();
         for place in places {
             let loc = REGS + out.slots.len();
@@ -307,6 +314,26 @@ impl Parking {
             }
         }
         out
+    }
+
+    /// In a program with relative moves, keeps only the registers that look like a spill of
+    /// scalars: every lane that is read back was written with `v_writelane_b32` first.
+    ///
+    /// Why a relative move never reaches such a register (`parks_beside_relative_moves`): it
+    /// indexes an array that holds one value per lane, the private array of the source
+    /// program. HLSL has no instruction that writes one chosen lane of a vector register, so
+    /// a constant lane write only comes from the compiler parking a scalar. A register whose
+    /// lanes are each a different parked scalar holds no per lane value, so no array of the
+    /// source program can be in it. A register that is only read with constant lanes and never
+    /// written that way could be an array element read across lanes, so it stays out.
+    fn drop_unwritten(
+        places: &BTreeSet<(u8, u8)>,
+        written: &BTreeSet<(u8, u8)>,
+        other: &mut [bool; 256],
+    ) {
+        for place in places.difference(written) {
+            other[usize::from(place.0)] = true;
+        }
     }
 
     fn slot(&self, insn: &Insn) -> Option<u16> {
@@ -912,6 +939,8 @@ pub struct Masks {
     /// Whole mask words can only be collected where all invocations stay together.
     converged: bool,
     sites: BTreeMap<u32, Site>,
+    /// The vector registers that only park scalars, one bit per register.
+    parking: [u64; 4],
     /// The instruction the lifter is at.
     at: Cell<Site>,
 }
@@ -919,6 +948,12 @@ pub struct Masks {
 impl Masks {
     pub fn converged(&self) -> bool {
         self.converged
+    }
+
+    /// Whether vector register `v` only parks scalars (`v_writelane_b32` and `v_readlane_b32`
+    /// with constant lanes). Its lanes are scalars of their own, not the register's value.
+    pub fn parks_scalars(&self, v: u8) -> bool {
+        (self.parking[usize::from(v / 64)] >> (v % 64)) & 1 != 0
     }
 
     pub fn reads_high_mask(&self, first: u8) -> bool {
@@ -2035,27 +2070,17 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
             }
         }
     }
-    // A group nothing sure reaches, whose result is never read, or where mixed mask and numeric
-    // provenance reaches with no reader requiring a mask is a number from here on.
-    let mut resolved_dead = false;
+    // An ambiguous group nothing sure reaches, whose result is never read, or where mixed mask and
+    // numeric provenance reaches with no reader requiring a mask is a number from here on. Groups
+    // already narrowed to a single kind stay as they are: turning an unambiguous dead mask copy or
+    // restore into a number would contradict its live mask producer without helping any reader.
     for g in &mut typing.groups {
         if !g.clash
-            && (!g.def_live
-                || ((!g.sure || (g.kinds & NUMBER) != 0) && g.kinds.count_ones() != 1))
+            && g.kinds.count_ones() != 1
+            && (!g.def_live || !g.sure || (g.kinds & NUMBER) != 0)
         {
-            if !g.def_live && g.kinds != NUMBER {
-                resolved_dead = true;
-            }
             g.kinds = NUMBER;
             g.sure = false;
-        }
-    }
-    if resolved_dead {
-        for _ in 0..ROUNDS {
-            let outs = typing.backward();
-            if !typing.narrow_by_readers(&outs) {
-                break;
-            }
         }
     }
     let ins = typing.forward();
@@ -2065,6 +2090,9 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
         converged: cfg.blocks.len() == 1,
         ..Masks::default()
     };
+    for &(reg, _) in parking.slots.keys() {
+        masks.parking[usize::from(reg / 64)] |= 1 << (reg % 64);
+    }
     let mut refused = 0;
     for (b, list) in typing.spans.iter().enumerate() {
         let mut cur = ins[b];
@@ -2252,6 +2280,128 @@ mod tests {
         for insn in graph.insns() {
             masks.enter(insn.pc);
             assert_eq!(masks.refusal(), None, "{insn}");
+        }
+    }
+
+    #[test]
+    fn a_dead_restore_of_a_parked_mask_does_not_refuse_mixed_pair() {
+        // 32 lanes: EXEC is saved and parked around a branch, taken back after it and then
+        // overwritten with a number before anything reads it.
+        let mut a = Asm::new();
+        let skip = a.label();
+        a.push(vopc(Op::v_cmp_lg_u32, int(0), v(1)));
+        a.push(sop1(Op::s_and_saveexec_b32, s(2), crate::asm::VCC));
+        a.push(vop3(Op::v_writelane_b32_e64, v(128), s(2), int(0), Operand::None));
+        a.branch(Op::s_cbranch_execz, skip);
+        a.push(vop1(Op::v_mov_b32, v(3), int(1)));
+        a.bind(skip);
+        a.push(vop3(Op::v_readlane_b32_e64, s(2), v(128), int(0), Operand::None));
+        a.push(sop1(Op::s_mov_b32, s(2), int(7)));
+        a.push(vop1(Op::v_mov_b32, v(4), s(2)));
+        let (graph, masks) = analyse_asm(a);
+        assert_eq!(masks.lanes(), 32);
+        for insn in graph.insns() {
+            masks.enter(insn.pc);
+            assert_eq!(masks.refusal(), None, "{insn}");
+            if insn.op == Op::v_writelane_b32_e64 {
+                assert_eq!(masks.parked(), Some(Parked::Mask), "{insn}");
+            }
+            if insn.op == Op::v_readlane_b32_e64 {
+                assert_eq!(masks.parked(), Some(Parked::Mask), "{insn}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dead_scalar_mask_restore_chain_does_not_refuse_mixed_pair() {
+        let mut a = Asm::new();
+        a.push(sop1(Op::s_mov_b32, s(71), EXEC));
+        a.push(sop1(Op::s_mov_b32, s(24), s(71)));
+        a.push(sop1(Op::s_mov_b32, s(71), s(24)));
+        let (graph, masks) = analyse_asm(a);
+        assert_eq!(masks.lanes(), 32);
+        for insn in graph.insns() {
+            masks.enter(insn.pc);
+            assert_eq!(masks.refusal(), None, "{insn}");
+        }
+        let save = graph.insns().nth(1).unwrap();
+        masks.enter(save.pc);
+        assert!(masks.reads_mask(71));
+        assert!(masks.writes_mask(24));
+        let restore = graph.insns().nth(2).unwrap();
+        masks.enter(restore.pc);
+        assert!(masks.reads_mask(24));
+        assert!(masks.writes_mask(71));
+    }
+
+    #[test]
+    fn a_dead_destination_mask_and_with_live_scc_stays_a_mask() {
+        let mut a = Asm::new();
+        let done = a.label();
+        a.push(sop1(Op::s_mov_b32, s(71), EXEC));
+        a.push(sop2(Op::s_and_b32, s(24), s(71), EXEC));
+        a.branch(Op::s_cbranch_scc0, done);
+        a.push(vop1(Op::v_mov_b32, v(1), int(1)));
+        a.bind(done);
+        let (graph, masks) = analyse_asm(a);
+        let and = graph.insns().find(|i| i.op == Op::s_and_b32).unwrap();
+        masks.enter(and.pc);
+        assert_eq!(masks.refusal(), None);
+        assert!(masks.reads_mask(71));
+        assert!(masks.writes_mask(24));
+    }
+
+    #[test]
+    fn scratch_vcc_64_bit_move_lifts_and_preserves_mask_rejection() {
+        let mut a = Asm::new();
+        a.push(sop1(Op::s_mov_b64, s(0), int(7)));
+        a.push(sop1(Op::s_mov_b64, crate::asm::VCC, s(0)));
+        a.push(sop1(Op::s_mov_b64, s(0), EXEC));
+        a.push(sop1(Op::s_mov_b64, EXEC, s(0)));
+        a.push(sop1(Op::s_mov_b64, s(0), crate::asm::VCC));
+        a.push(vop1(Op::v_mov_b32, v(2), s(0)));
+        a.push(vop1(Op::v_mov_b32, v(3), s(1)));
+        a.push(sopp(Op::s_endpgm, 0));
+        let prog = crate::api::StageProgram {
+            threads: [64, 1, 1],
+            ..crate::api::StageProgram::new(crate::api::Stage::Compute, a.finish())
+        };
+        let text = crate::lift_program(&prog).unwrap().to_string();
+        assert!(text.contains("s106"), "{text}");
+        assert!(text.contains("s107"), "{text}");
+
+        // VCC holding a real mask in a numeric 64 bit shift is still refused.
+        let mut b = Asm::new();
+        b.push(vopc(Op::v_cmp_lt_u32, v(0), int(4)));
+        b.push(sop2(Op::s_lshl_b64, s(4), crate::asm::VCC, int(1)));
+        b.push(sopp(Op::s_endpgm, 0));
+        let bad = crate::api::StageProgram {
+            threads: [64, 1, 1],
+            ..crate::api::StageProgram::new(crate::api::Stage::Compute, b.finish())
+        };
+        let refusal = crate::lift_program(&bad).unwrap_err();
+        assert_eq!(refusal.key(), "exec:mask-as-data");
+    }
+
+    #[test]
+    fn a_used_restore_of_a_parked_mask_stays_a_mask() {
+        let mut a = Asm::new();
+        let skip = a.label();
+        a.push(vopc(Op::v_cmp_lg_u32, int(0), v(1)));
+        a.push(sop1(Op::s_and_saveexec_b32, s(2), crate::asm::VCC));
+        a.push(vop3(Op::v_writelane_b32_e64, v(128), s(2), int(0), Operand::None));
+        a.branch(Op::s_cbranch_execz, skip);
+        a.push(vop1(Op::v_mov_b32, v(3), int(1)));
+        a.bind(skip);
+        a.push(vop3(Op::v_readlane_b32_e64, s(2), v(128), int(0), Operand::None));
+        a.push(sop1(Op::s_mov_b32, EXEC, s(2)));
+        let (graph, masks) = analyse_asm(a);
+        for insn in graph.insns() {
+            masks.enter(insn.pc);
+            assert_eq!(masks.refusal(), None, "{insn}");
+            if matches!(insn.op, Op::v_writelane_b32_e64 | Op::v_readlane_b32_e64) {
+                assert_eq!(masks.parked(), Some(Parked::Mask), "{insn}");
+            }
         }
     }
 

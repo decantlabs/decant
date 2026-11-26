@@ -749,6 +749,15 @@ impl Tracer<'_> {
             }
             Expr::Var(_) => upper(e, 0, out).unwrap_or(true),
             Expr::Un(_, a) => self.data_reads(state, a, out),
+            Expr::Bin(Bin::Eq | Bin::Ne, a, b) => {
+                if let (Some(wa), Some(wb)) = (word(a), word(b))
+                    && wa == wb
+                {
+                    true
+                } else {
+                    self.data_reads(state, a, out) & self.data_reads(state, b, out)
+                }
+            }
             Expr::Bin(Bin::And, a, b) => {
                 let const_val = |e: &Expr| match e {
                     Expr::U32(v) => Some(*v),
@@ -997,6 +1006,16 @@ impl Tracer<'_> {
             }
             Stmt::Effect { dst: Some(dst), .. } => {
                 state.remove(dst);
+            }
+            Stmt::Image(op, _) => {
+                for r in op.data_writes() {
+                    state.remove(&Var::V(r));
+                }
+            }
+            Stmt::Buffer(op, _) if !op.store || (op.glc && op.op.name().contains("atomic")) => {
+                for r in op.data..op.data.saturating_add(op.count) {
+                    state.remove(&Var::V(r));
+                }
             }
             _ => {}
         }
@@ -1592,11 +1611,19 @@ impl Tracer<'_> {
                 if let Some(sampler) = &mut op.sampler {
                     self.desc(state, sampler, 4, ResourceUse::Sampler { compare }, pc)?;
                 }
+                for r in op.data_writes() {
+                    state.remove(&Var::V(r));
+                }
             }
             Stmt::Buffer(op, _) => {
                 let pc = op.pc;
                 let usage = ResourceUse::Words { written: op.store };
                 self.desc(state, &mut op.buffer, 4, usage, pc)?;
+                if !op.store || (op.glc && op.op.name().contains("atomic")) {
+                    for r in op.data..op.data.saturating_add(op.count) {
+                        state.remove(&Var::V(r));
+                    }
+                }
             }
             Stmt::Effect { dst, .. } => {
                 // What the call gives back is a number the pass knows nothing about.

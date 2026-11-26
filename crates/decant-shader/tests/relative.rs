@@ -7,6 +7,7 @@ use std::path::Path;
 use decant_shader::api::{CountingHost, Options, RootSignature, Stage, StageProgram};
 use decant_shader::asm::*;
 use decant_shader::corpus::{self, Entry, Selection};
+use decant_shader::decode::Operand;
 use decant_shader::tables::Op;
 use decant_shader::{lift_program, translate_to_dxil};
 
@@ -112,4 +113,70 @@ fn dynamic_m0_covers_signed_offsets_and_saves_an_aliased_source() {
         "{text}"
     );
     assert!(text.contains("((5 + m0) <u 0x100)"), "{text}");
+}
+
+/// A compute program that saves EXEC into two lanes of `v128` around a branch and indexes a
+/// private array with a relative move inside the branch. `m0` is the relative index.
+fn parked_exec_around_relative_move(m0: Operand) -> Asm {
+    let mut asm = Asm::new();
+    let skip = asm.label();
+    asm.push(vopc(Op::v_cmp_gt_u32, v(0), int(3)))
+        .push(sop1(Op::s_and_saveexec_b64, s(6), VCC))
+        .push(vop3(Op::v_writelane_b32_e64, v(128), s(6), int(4), Operand::None))
+        .push(vop3(Op::v_writelane_b32_e64, v(128), s(7), int(5), Operand::None))
+        .branch(Op::s_cbranch_execz, skip)
+        .push(sop1(Op::s_mov_b32, M0, m0))
+        .push(vop1(Op::v_movrels_b32, v(2), v(5)))
+        .bind(skip)
+        .push(vop3(Op::v_readlane_b32_e64, s(6), v(128), int(4), Operand::None))
+        .push(vop3(Op::v_readlane_b32_e64, s(7), v(128), int(5), Operand::None))
+        .push(sop2(Op::s_or_b64, EXEC, EXEC, s(6)));
+    asm
+}
+
+#[test]
+fn parks_beside_relative_moves() {
+    for m0 in [s(0), int(1)] {
+        let program = compute(parked_exec_around_relative_move(m0));
+        let text = lift_program(&program)
+            .unwrap_or_else(|r| panic!("{m0:?}: {r}"))
+            .to_string();
+        assert!(text.contains("spill128_4"), "{text}");
+        assert!(!text.contains("decant_write_lane"), "{text}");
+        let Some(dxc) = common::find_dxc() else {
+            eprintln!("no DXC, compile check skipped");
+            continue;
+        };
+        translate_to_dxil(
+            &[program],
+            &RootSignature::default(),
+            &Options::default(),
+            &CountingHost::default(),
+            &dxc,
+        )
+        .unwrap_or_else(|r| panic!("{m0:?}: {r}"));
+    }
+}
+
+#[test]
+fn a_lane_read_without_a_lane_write_is_no_parking_place_beside_a_relative_move() {
+    let mut asm = Asm::new();
+    asm.push(sop1(Op::s_mov_b32, M0, s(0)))
+        .push(vop1(Op::v_movreld_b32, v(5), v(1)))
+        .push(vop3(Op::v_readlane_b32_e64, s(6), v(9), int(3), Operand::None))
+        .push(vop1(Op::v_mov_b32, v(2), s(6)));
+    let text = lift_program(&compute(asm)).unwrap().to_string();
+    assert!(text.contains("decant_read_lane(v9, "), "{text}");
+    assert!(!text.contains("spill9_3"), "{text}");
+}
+
+#[test]
+fn a_relative_move_proven_to_reach_a_parking_register_is_refused() {
+    let mut asm = Asm::new();
+    asm.push(sop1(Op::s_mov_b32, M0, int(3)))
+        .push(vop3(Op::v_writelane_b32_e64, v(8), s(6), int(0), Operand::None))
+        .push(vop1(Op::v_movrels_b32, v(2), v(5)))
+        .push(vop3(Op::v_readlane_b32_e64, s(7), v(8), int(0), Operand::None));
+    let refusal = lift_program(&compute(asm)).unwrap_err();
+    assert_eq!(refusal.key(), "form:v_movrels_b32:relative-parking");
 }

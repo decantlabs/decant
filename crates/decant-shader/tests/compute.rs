@@ -1094,3 +1094,65 @@ fn merged_image_descriptor_after_many_diamonds_compiles_cs_6_6() {
     assert!(text.contains("ResourceDescriptorHeap"), "{text}");
     compiles(&p);
 }
+
+#[test]
+fn scratch_vcc_pair_and_dead_mask_restore_compile_to_dxil() {
+    let p = compute([64, 1, 1], vec![table(4)], |a| {
+        a.push(sop1(Op::s_mov_b32, s(5), int(0)));
+        a.push(smem(Op::s_load_dwordx4, s(8), s(4), 0x40));
+        a.push(sop1(Op::s_mov_b64, s(0), int(7)));
+        a.push(sop1(Op::s_mov_b64, VCC, s(0)));
+        a.push(sop1(Op::s_mov_b64, s(0), EXEC));
+        a.push(sop1(Op::s_mov_b64, s(2), s(0)));
+        a.push(sop1(Op::s_mov_b64, s(0), s(2)));
+        a.push(sop1(Op::s_mov_b64, s(0), VCC));
+        a.push(vop1(Op::v_mov_b32, v(2), s(0)));
+        a.push(vop1(Op::v_mov_b32, v(3), s(1)));
+        a.push(buffer_store(
+            Op::buffer_store_dwordx2,
+            v(2),
+            v(0),
+            s(8),
+            0,
+            true,
+        ));
+    });
+    let text = hlsl(&p);
+    assert!(text.contains("s106"), "{text}");
+    compiles(&p);
+}
+
+#[test]
+fn descriptor_waterfall_and_vgpr_overwrite_compile_to_dxil() {
+    let p = compute([64, 1, 1], vec![table(4)], |a| {
+        let again = a.label();
+        a.push(sop1(Op::s_mov_b32, s(5), int(0)));
+        a.push(smem(Op::s_load_dwordx8, s(8), s(4), 0x40));
+        a.push(smem(Op::s_load_dwordx4, s(16), s(4), 0x80));
+        for i in 0..8u8 {
+            a.push(vop1(Op::v_mov_b32, v(57 + i), s(8 + i)));
+        }
+        a.push(sop1(Op::s_mov_b64, s(2), EXEC));
+        a.bind(again);
+        for i in 0..8u8 {
+            a.push(vop1(Op::v_readfirstlane_b32, s(24 + i), v(57 + i)));
+        }
+        a.push(vopc(Op::v_cmp_eq_u64, s(24), v(57)));
+        a.push(sop1(Op::s_and_saveexec_b64, s(0), VCC));
+        a.push(image(Op::image_load, v(2), v(0), s(24), s(0), 1, 0xf));
+        a.push(sop2(Op::s_xor_b64, EXEC, EXEC, s(0)));
+        a.branch(Op::s_cbranch_execnz, again);
+        a.push(sop1(Op::s_mov_b64, EXEC, s(2)));
+        a.push(image(Op::image_load, v(56), v(0), s(8), s(0), 1, 0x3));
+        a.push(vop2(Op::v_add_f32, v(57), v(57), v(2)));
+        a.push(buffer_store(
+            Op::buffer_store_dword,
+            v(57),
+            v(0),
+            s(16),
+            0,
+            true,
+        ));
+    });
+    compiles(&p);
+}

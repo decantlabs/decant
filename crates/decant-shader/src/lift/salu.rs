@@ -286,6 +286,14 @@ fn pair(cx: &Lifter, insn: &Insn, op: Operand) -> Result<(Expr, Expr), Refusal> 
         Operand::Reg(Reg::Null) => Ok((Expr::U32(0), Expr::U32(0))),
         Operand::Reg(Reg::S(n)) if cx.masks.is_mask(n) => Err(mask_as_data(insn)),
         Operand::Reg(Reg::S(n)) => Ok((Expr::Var(Var::S(n)), Expr::Var(Var::S(n + 1)))),
+        Operand::Reg(Reg::VccLo)
+            if !cx.masks.is_mask(crate::exec::VCC) && !cx.masks.is_mask(crate::exec::VCC + 1) =>
+        {
+            Ok((
+                Expr::Var(Var::S(crate::exec::VCC)),
+                Expr::Var(Var::S(crate::exec::VCC + 1)),
+            ))
+        }
         Operand::Reg(Reg::ExecLo | Reg::VccLo) => Err(mask_as_data(insn)),
         _ => Err(form(insn, "operand")),
     }
@@ -317,6 +325,12 @@ fn set_pair(cx: &mut Lifter, insn: &Insn, lo: Expr, hi: Expr, scc: bool) -> Resu
         Operand::Reg(Reg::S(d)) if !cx.masks.is_mask(d) => {
             cx.set(Var::S(d), Expr::Var(t0));
             cx.set(Var::S(d + 1), Expr::Var(t1));
+        }
+        Operand::Reg(Reg::VccLo)
+            if !cx.masks.is_mask(crate::exec::VCC) && !cx.masks.is_mask(crate::exec::VCC + 1) =>
+        {
+            cx.set(Var::S(crate::exec::VCC), Expr::Var(t0));
+            cx.set(Var::S(crate::exec::VCC + 1), Expr::Var(t1));
         }
         Operand::Reg(Reg::S(_) | Reg::ExecLo | Reg::VccLo) => return Err(mask_as_data(insn)),
         _ => return Err(form(insn, "operand")),
