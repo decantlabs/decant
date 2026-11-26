@@ -32,6 +32,8 @@
 #![allow(unsafe_code)]
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use decant_log::trace;
@@ -158,6 +160,8 @@ struct Voice {
     decoder: Option<Decoder>,
     /// Decoded interleaved samples that have not reached the ring yet.
     pending: VecDeque<i16>,
+    /// Reusable per-frame decode scratch buffer.
+    scratch: Vec<i16>,
     /// Samples per channel still to be dropped, from the start skip or a loop skip.
     to_skip: usize,
     /// Both inputs ran out and the error status is set.
@@ -168,10 +172,26 @@ struct Voice {
     blocks_taken: u64,
 }
 
+impl Voice {
+    fn reset_for_enable(&mut self, to_skip: usize) {
+        self.decoder = None;
+        self.pending.clear();
+        self.scratch.clear();
+        self.to_skip = to_skip;
+        self.starved = false;
+        self.frames = 0;
+        self.bad_frames = 0;
+        self.blocks_written = 0;
+        self.blocks_taken = 0;
+    }
+}
+
 struct Engine {
     /// Host address of the context array.
     array: usize,
     voices: Vec<Option<Voice>>,
+    /// Bitset of currently enabled context indices (64 contexts per word).
+    enabled_bits: Vec<u64>,
 }
 
 // SAFETY: `array` is an address in the APU heap, only used while the engine lock is held.
@@ -182,23 +202,48 @@ impl Engine {
         let slot = index as usize;
         (slot < self.voices.len()).then(|| Context((self.array + slot * WORDS_PER_CONTEXT * 4) as *mut u32))
     }
+
+    fn set_enabled_bit(&mut self, index: u32, enabled: bool) {
+        let idx = index as usize;
+        let word = idx / 64;
+        let bit = 1u64 << (idx % 64);
+        if let Some(slot) = self.enabled_bits.get_mut(word) {
+            if enabled {
+                *slot |= bit;
+            } else {
+                *slot &= !bit;
+            }
+        }
+    }
 }
 
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
+static ENABLED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn lock() -> MutexGuard<'static, Option<Engine>> {
     ENGINE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn xma_traced(counter: &AtomicU32, first: u32, every: u32) -> Option<u32> {
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    (n <= first || n.is_multiple_of(every)).then_some(n)
+}
+
 /// The context array exists: `count` contexts at host address `array`.
 pub fn attach(array: usize, count: u32) {
-    let engine = (array != 0 && count != 0).then(|| Engine { array, voices: (0..count).map(|_| None).collect() });
+    let engine = (array != 0 && count != 0).then(|| Engine {
+        array,
+        voices: (0..count).map(|_| None).collect(),
+        enabled_bits: vec![0; (count as usize).div_ceil(64)],
+    });
     *lock() = engine;
+    ENABLED_COUNT.store(0, Ordering::Release);
 }
 
 /// The context array is gone.
 pub fn detach() {
     let Some(engine) = lock().take() else { return };
+    ENABLED_COUNT.store(0, Ordering::Release);
     for index in 0..engine.voices.len() as u32 {
         monitor::end(index);
     }
@@ -206,29 +251,45 @@ pub fn detach() {
 
 /// Command 5 (and 6 per bit): the context starts from its words, the error field is cleared.
 pub fn enable(index: u32) {
+    static LOGS: AtomicU32 = AtomicU32::new(0);
     let mut guard = lock();
     let Some(engine) = guard.as_mut() else { return };
     let Some(context) = engine.context(index) else { return };
     context.write(ERROR_AND_STATUS, 0);
-    let voice = Voice { to_skip: context.read(START_SKIP) as usize * SUBFRAME_SAMPLES, ..Voice::default() };
+    let to_skip = context.read(START_SKIP) as usize * SUBFRAME_SAMPLES;
     let slot = &mut engine.voices[index as usize];
-    if slot.is_none() {
-        let words: Vec<String> = (0..10).map(|w| format!("{:08x}", context.word(w))).collect();
-        trace(&format!("AcpHal: XMA context {index} enabled: words {}", words.join(" ")));
+    let was_disabled = slot.is_none();
+    if was_disabled {
+        if xma_traced(&LOGS, 16, 1000).is_some() {
+            let mut msg = format!("AcpHal: XMA context {index} enabled: words");
+            for w in 0..10 {
+                let _ = write!(msg, " {:08x}", context.word(w));
+            }
+            trace(&msg);
+        }
+        *slot = Some(Voice { to_skip, ..Voice::default() });
+        engine.set_enabled_bit(index, true);
+        ENABLED_COUNT.fetch_add(1, Ordering::Release);
+    } else if let Some(voice) = slot.as_mut() {
+        voice.reset_for_enable(to_skip);
     }
-    *slot = Some(voice);
 }
 
 /// Command 7 (and 8 per bit): the context stops.
 pub fn disable(index: u32) {
+    static LOGS: AtomicU32 = AtomicU32::new(0);
     let mut guard = lock();
     let Some(engine) = guard.as_mut() else { return };
     let Some(voice) = engine.voices.get_mut(index as usize).and_then(Option::take) else { return };
+    engine.set_enabled_bit(index, false);
+    ENABLED_COUNT.fetch_sub(1, Ordering::Release);
     monitor::end(index);
-    trace(&format!(
-        "AcpHal: XMA context {index} disabled: {} frames ({} bad), {} blocks written, {} taken",
-        voice.frames, voice.bad_frames, voice.blocks_written, voice.blocks_taken
-    ));
+    if xma_traced(&LOGS, 16, 1000).is_some() {
+        trace(&format!(
+            "AcpHal: XMA context {index} disabled: {} frames ({} bad), {} blocks written, {} taken",
+            voice.frames, voice.bad_frames, voice.blocks_written, voice.blocks_taken
+        ));
+    }
 }
 
 /// Command 0x12: the title took `blocks` output blocks, the read block moves on and the ring is writable again.
@@ -265,16 +326,29 @@ pub fn is_enabled(index: u32) -> bool {
 /// The lock is taken again for every context instead of once for all of them. The title sends its commands from a
 /// time-critical mixer thread under the same lock, and it must not wait for the decoding of every enabled context.
 pub fn pump() {
-    let count = match lock().as_ref() {
-        Some(engine) => engine.voices.len() as u32,
-        None => return,
+    if ENABLED_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut stack_bits = [0u64; 16];
+    let word_count = {
+        let guard = lock();
+        let Some(engine) = guard.as_ref() else { return };
+        let n = engine.enabled_bits.len().min(stack_bits.len());
+        stack_bits[..n].copy_from_slice(&engine.enabled_bits[..n]);
+        n
     };
-    for index in 0..count {
-        let mut guard = lock();
-        let Some(engine) = guard.as_mut() else { return };
-        let Some(context) = engine.context(index) else { continue };
-        if let Some(voice) = engine.voices.get_mut(index as usize).and_then(Option::as_mut) {
-            fill_ring(index, context, voice);
+    for (word_idx, &word) in stack_bits[..word_count].iter().enumerate() {
+        let mut bits = word;
+        while bits != 0 {
+            let bit = bits.trailing_zeros();
+            bits &= bits - 1;
+            let index = (word_idx as u32) * 64 + bit;
+            let mut guard = lock();
+            let Some(engine) = guard.as_mut() else { return };
+            let Some(context) = engine.context(index) else { continue };
+            if let Some(voice) = engine.voices.get_mut(index as usize).and_then(Option::as_mut) {
+                fill_ring(index, context, voice);
+            }
         }
     }
 }
@@ -366,9 +440,10 @@ fn decode_next_frame(index: u32, context: Context, voice: &mut Voice) -> bool {
         return true;
     };
     let decoder = voice.decoder.get_or_insert_with(|| Decoder::new(channels, context.rate()));
-    let mut samples = Vec::with_capacity(FRAME_SAMPLES * channels);
+    voice.scratch.clear();
+    voice.scratch.reserve(FRAME_SAMPLES * channels);
     voice.frames += 1;
-    if let Err(e) = decoder.decode(&frame, &mut samples) {
+    if let Err(e) = decoder.decode(&frame, &mut voice.scratch) {
         voice.bad_frames += 1;
         if voice.bad_frames <= 2 {
             trace(&format!("AcpHal: XMA context {index}: the frame at bit {at} does not decode ({e})"));
@@ -379,16 +454,16 @@ fn decode_next_frame(index: u32, context: Context, voice: &mut Voice) -> bool {
     let loop_end = context.read(LOOP_END_BITS) as usize;
     let closes_loop = loops > 0 && loop_end != 0 && frame.start <= loop_end && next.is_none_or(|n| loop_end < n);
     if closes_loop {
-        samples.truncate((context.read(LOOP_END_SUBFRAME) as usize + 1) * SUBFRAME_SAMPLES * channels);
+        voice.scratch.truncate((context.read(LOOP_END_SUBFRAME) as usize + 1) * SUBFRAME_SAMPLES * channels);
         next = Some(context.read(LOOP_START_BITS) as usize);
         voice.to_skip = context.read(LOOP_SKIP) as usize * SUBFRAME_SAMPLES;
         if loops != LOOP_FOREVER {
             context.write(LOOP_COUNT, loops - 1);
         }
     }
-    let dropped = (voice.to_skip * channels).min(samples.len());
+    let dropped = (voice.to_skip * channels).min(voice.scratch.len());
     voice.to_skip -= dropped / channels;
-    voice.pending.extend(&samples[dropped..]);
+    voice.pending.extend(&voice.scratch[dropped..]);
     match next {
         Some(bit) => context.write(READ_BITS, bit as u32),
         None => {
@@ -397,4 +472,40 @@ fn decode_next_frame(index: u32, context: Context, voice: &mut Voice) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xma_traced_logs_first_16_and_every_1000th() {
+        let counter = AtomicU32::new(0);
+        let mut logged = Vec::new();
+        for _ in 0..2050 {
+            if let Some(n) = xma_traced(&counter, 16, 1000) {
+                logged.push(n);
+            }
+        }
+        let mut expected: Vec<u32> = (1..=16).collect();
+        expected.push(1000);
+        expected.push(2000);
+        assert_eq!(logged, expected);
+    }
+
+    #[test]
+    fn engine_enabled_bits_track_enable_and_disable() {
+        let mut words = [0u32; 128 * WORDS_PER_CONTEXT];
+        let mut engine = Engine {
+            array: words.as_mut_ptr() as usize,
+            voices: (0..128).map(|_| None).collect(),
+            enabled_bits: vec![0; 2],
+        };
+        assert_eq!(engine.enabled_bits, [0, 0]);
+        engine.set_enabled_bit(3, true);
+        engine.set_enabled_bit(70, true);
+        assert_eq!(engine.enabled_bits, [1 << 3, 1 << 6]);
+        engine.set_enabled_bit(3, false);
+        assert_eq!(engine.enabled_bits, [0, 1 << 6]);
+    }
 }

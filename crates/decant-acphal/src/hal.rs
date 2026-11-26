@@ -264,18 +264,18 @@ fn payload_words(kind: u32) -> Option<usize> {
     }
 }
 
-/// Trace budget: the first lines of each call are logged with their result, then every 1000th.
-fn traced(counter: &AtomicU32, first: u32) -> Option<u32> {
+/// Trace budget: the first `first` calls are logged, then every `every`th.
+fn traced(counter: &AtomicU32, first: u32, every: u32) -> Option<u32> {
     let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    (n <= first || n.is_multiple_of(1000)).then_some(n)
+    (n <= first || n.is_multiple_of(every)).then_some(n)
 }
 
-/// `SubmitCommand` with a trace line per command (type, id, frame, fence, result): the audio chain trace of the audio chain.
+/// `SubmitCommand` with a rate-limited trace line per command (type, id, frame, fence, result).
 unsafe extern "system" fn submit_command(this: *mut IAcpHal, kind: u32, id: u64, frame: u32, payload: *const c_void, fence: u32) -> Hresult {
     static CALLS: AtomicU32 = AtomicU32::new(0);
     // SAFETY: the arguments are the caller's, passed on unchanged.
     let hr = unsafe { submit_command_inner(this, kind, id, frame, payload, fence) };
-    if let Some(n) = traced(&CALLS, 200) {
+    if let Some(n) = traced(&CALLS, 16, 10_000) {
         trace(&format!(
             "AcpHal: SubmitCommand #{n} type {kind:#x} id {id:#x} frame {frame:#x} data {} fence {fence:#x} -> {:#010x}",
             if payload.is_null() { "none" } else { "yes" },
@@ -302,7 +302,10 @@ unsafe extern "system" fn submit_command_inner(this: *mut IAcpHal, kind: u32, id
     }
     let Some(count) = payload_words(kind) else {
         decant_log::calls::record_with(decant_log::calls::Kind::NotImplemented, || format!("AcpHal SubmitCommand type {kind:#x}"));
-        trace(&format!("AcpHal: SubmitCommand type {kind:#x} is not implemented (E_NOTIMPL)"));
+        static SEEN_UNIMPL: AtomicU32 = AtomicU32::new(0);
+        if kind >= 32 || (SEEN_UNIMPL.fetch_or(1u32 << kind, Ordering::Relaxed) & (1u32 << kind)) == 0 {
+            trace(&format!("AcpHal: SubmitCommand type {kind:#x} is not implemented (E_NOTIMPL)"));
+        }
         return E_NOTIMPL;
     };
     if s.pending >= s.command_slots {
@@ -371,23 +374,35 @@ fn execute(s: &mut HalState, kind: u32, id: u64, words: Option<&[u32; 16]>) -> H
     match kind {
         CMD_RUN_FLOWGRAPH => {
             let (count, address) = (w[0], w[1]);
-            let commands = (count != 0)
-                .then(|| {
-                    with_heaps(|heaps| {
-                        let p = heaps.map_apu_range(address, count.checked_mul(8)?)?;
+            let mut stack_buf = [0u64; 64];
+            let mut heap_buf: Option<Vec<u64>> = None;
+            let ok = if count != 0 {
+                with_heaps(|heaps| {
+                    let Some(p) = heaps.map_apu_range(address, count.checked_mul(8)?) else { return Some(false) };
+                    let n = count as usize;
+                    if n <= stack_buf.len() {
+                        for (i, dst) in stack_buf[..n].iter_mut().enumerate() {
+                            // SAFETY: `count * 8` bytes inside one live allocation.
+                            *dst = unsafe { std::ptr::read_unaligned((p as *const u64).add(i)) };
+                        }
+                    } else {
                         // SAFETY: `count * 8` bytes inside one live allocation.
-                        Some((0..count as usize).map(|i| unsafe { std::ptr::read_unaligned((p as *const u64).add(i)) }).collect::<Vec<u64>>())
-                    })
-                    .ok()
-                    .flatten()
+                        heap_buf = Some((0..n).map(|i| unsafe { std::ptr::read_unaligned((p as *const u64).add(i)) }).collect());
+                    }
+                    Some(true)
                 })
-                .flatten();
-            match commands {
-                Some(list) => {
-                    shape::run_flowgraph(&list);
-                    s.push(MSG_FLOWGRAPH_COMPLETED, address, id);
-                }
-                None => s.push(MSG_FLOWGRAPH_TERMINATED, address, id),
+                .ok()
+                .flatten()
+                .unwrap_or(false)
+            } else {
+                false
+            };
+            if ok {
+                let list = heap_buf.as_deref().unwrap_or(&stack_buf[..count as usize]);
+                shape::run_flowgraph(list);
+                s.push(MSG_FLOWGRAPH_COMPLETED, address, id);
+            } else {
+                s.push(MSG_FLOWGRAPH_TERMINATED, address, id);
             }
             return S_OK;
         }
@@ -478,7 +493,7 @@ unsafe extern "system" fn pop_message(this: *mut IAcpHal, out: *mut u8) -> i32 {
     static CALLS: AtomicU32 = AtomicU32::new(0);
     // SAFETY: the arguments are the caller's, passed on unchanged.
     let got = unsafe { pop_message_inner(this, out) };
-    if let Some(n) = traced(&CALLS, 40) {
+    if let Some(n) = traced(&CALLS, 16, 10_000) {
         // SAFETY: when a message was copied, `out` holds its 28 bytes, the first word is the kind.
         let kind = if got != 0 { format!("{:#x}", unsafe { std::ptr::read_unaligned(out.cast::<u32>()) }) } else { "-".to_string() };
         trace(&format!("AcpHal: PopMessage #{n} -> {got}, kind {kind}"));
@@ -509,7 +524,7 @@ unsafe extern "system" fn get_num_messages(this: *mut IAcpHal) -> u32 {
     static CALLS: AtomicU32 = AtomicU32::new(0);
     // SAFETY: the argument is the caller's, passed on unchanged.
     let n_msgs = unsafe { get_num_messages_inner(this) };
-    if let Some(n) = traced(&CALLS, 40) {
+    if let Some(n) = traced(&CALLS, 16, 10_000) {
         trace(&format!("AcpHal: GetNumMessages #{n} -> {n_msgs}"));
     }
     n_msgs
@@ -554,4 +569,24 @@ unsafe extern "system" fn destructor(this: *mut IAcpHal, flags: u32) -> *mut IAc
     s.free_rings();
     s.messages.clear();
     this
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn traced_rate_limits_first_calls_and_periodic_samples() {
+        let counter = AtomicU32::new(0);
+        let mut logged = Vec::new();
+        for _ in 0..2050 {
+            if let Some(n) = traced(&counter, 16, 1000) {
+                logged.push(n);
+            }
+        }
+        let mut expected: Vec<u32> = (1..=16).collect();
+        expected.push(1000);
+        expected.push(2000);
+        assert_eq!(logged, expected);
+    }
 }
