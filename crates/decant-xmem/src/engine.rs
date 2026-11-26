@@ -1800,13 +1800,7 @@ impl Engine {
         self.finish_io_write(address, len);
     }
 
-    fn collect_rw_view_indices(st: &State, address: usize, len: usize, commit: bool) -> Vec<u32> {
-        let mut indices = Vec::new();
-        Self::collect_rw_view_indices_into(st, address, len, commit, &mut indices);
-        indices
-    }
-
-    fn collect_rw_view_indices_into(st: &State, address: usize, len: usize, commit: bool, indices: &mut Vec<u32>) {
+    fn collect_rw_view_indices_into(st: &State, address: usize, len: usize, indices: &mut Vec<u32>) {
         if len == 0 {
             return;
         }
@@ -1824,15 +1818,74 @@ impl Engine {
             {
                 while page < end && page < region_end {
                     let index = first + (page - base) / PAGE_BYTES;
-                    if commit {
-                        let _ = Self::commit_page(st, index);
-                    }
                     indices.push(index as u32);
                     page += PAGE_BYTES;
                 }
             } else {
                 page = region_end.max(page + PAGE_BYTES);
             }
+        }
+    }
+
+    fn collect_rw_view_indices(st: &State, address: usize, len: usize) -> Vec<u32> {
+        let mut indices = Vec::new();
+        Self::collect_rw_view_indices_into(st, address, len, &mut indices);
+        indices
+    }
+
+    /// Commits any uncommitted pool pages in `indices` in maximal contiguous section runs.
+    /// Returns the indices that were not yet marked committed in `track`.
+    fn commit_uncommitted_runs(st: &State, indices: &[u32]) -> Vec<u32> {
+        let uncommitted = {
+            let dirty_state = Arc::clone(&st.dirty);
+            let dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+            match dirty_guard.track.as_ref() {
+                Some(track) => indices.iter().copied().filter(|&i| !track.is_committed(i)).collect::<Vec<u32>>(),
+                None => indices.to_vec(),
+            }
+        };
+        if uncommitted.is_empty() {
+            return Vec::new();
+        }
+        Self::commit_index_runs(st, &uncommitted);
+        uncommitted
+    }
+
+    /// Commits contiguous pool page indices within the same section with one `VirtualAlloc` per run,
+    /// falling back to per-page `commit_page` on failure.
+    fn commit_index_runs(st: &State, indices: &[u32]) {
+        if indices.is_empty() {
+            return;
+        }
+        let mut sorted = indices.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut i = 0;
+        while i < sorted.len() {
+            let start_idx = sorted[i] as usize;
+            let Some(sec) = st.sections.iter().find(|s| start_idx >= s.start && start_idx < s.start + s.pages) else {
+                i += 1;
+                continue;
+            };
+            let sec_end = sec.start + sec.pages;
+            let mut run_len = 1usize;
+            while i + run_len < sorted.len() {
+                let next_idx = sorted[i + run_len] as usize;
+                if next_idx == start_idx + run_len && next_idx < sec_end {
+                    run_len += 1;
+                } else {
+                    break;
+                }
+            }
+            let base_addr = sec.rw_view + (start_idx - sec.start) * PAGE_BYTES;
+            let run_bytes = run_len * PAGE_BYTES;
+            // SAFETY: `base_addr..base_addr + run_bytes` lies inside one section's private read-write view.
+            if unsafe { VirtualAlloc(base_addr as *const c_void, run_bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+                for offset in 0..run_len {
+                    let _ = Self::commit_page(st, start_idx + offset);
+                }
+            }
+            i += run_len;
         }
     }
 
@@ -1847,18 +1900,21 @@ impl Engine {
         let mut total_bytes = 0usize;
         for &(address, len) in runs {
             total_bytes = total_bytes.saturating_add(len);
-            Self::collect_rw_view_indices_into(&st, address, len, true, &mut indices);
+            Self::collect_rw_view_indices_into(&st, address, len, &mut indices);
         }
         if indices.is_empty() {
             return;
         }
+        let committed = Self::commit_uncommitted_runs(&st, &indices);
         let until = Instant::now() + track::io_hold_for(total_bytes);
         let dirty_state = Arc::clone(&st.dirty);
         let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut open = Vec::new();
         if let Some(track) = dirty_guard.track.as_mut() {
-            for index in indices {
+            for index in committed {
                 track.mark_committed(index);
+            }
+            for index in indices {
                 open.extend(track.prepare_until(index, until));
             }
         }
@@ -1869,16 +1925,19 @@ impl Engine {
     /// asynchronous write until [`Engine::finish_io_write`] balances every overlapping pin.
     pub fn begin_io_write(&self, address: usize, len: usize) {
         let st = self.lock();
-        let indices = Self::collect_rw_view_indices(&st, address, len, true);
+        let indices = Self::collect_rw_view_indices(&st, address, len);
         if indices.is_empty() {
             return;
         }
+        let committed = Self::commit_uncommitted_runs(&st, &indices);
         let dirty_state = Arc::clone(&st.dirty);
         let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut open = Vec::new();
         if let Some(track) = dirty_guard.track.as_mut() {
-            for index in indices {
+            for index in committed {
                 track.mark_committed(index);
+            }
+            for index in indices {
                 open.extend(track.begin_write_pin(index));
             }
         }
@@ -1889,7 +1948,7 @@ impl Engine {
     /// Once the last pin drops, the next `take_dirty` copies the page once and protects it again.
     pub fn finish_io_write(&self, address: usize, len: usize) {
         let st = self.lock();
-        let indices = Self::collect_rw_view_indices(&st, address, len, false);
+        let indices = Self::collect_rw_view_indices(&st, address, len);
         if indices.is_empty() {
             return;
         }
@@ -1904,16 +1963,19 @@ impl Engine {
 
     fn prepare_write_until(&self, address: usize, len: usize, until: Instant) {
         let st = self.lock();
-        let indices = Self::collect_rw_view_indices(&st, address, len, true);
+        let indices = Self::collect_rw_view_indices(&st, address, len);
         if indices.is_empty() {
             return;
         }
+        let committed = Self::commit_uncommitted_runs(&st, &indices);
         let dirty_state = Arc::clone(&st.dirty);
         let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut open = Vec::new();
         if let Some(track) = dirty_guard.track.as_mut() {
-            for index in indices {
+            for index in committed {
                 track.mark_committed(index);
+            }
+            for index in indices {
                 open.extend(track.prepare_until(index, until));
             }
         }
@@ -3185,5 +3247,41 @@ mod tests {
 
         e.free_pages(&frames).unwrap();
         assert_eq!(e.journal_seq(), s4, "free_pages does not emit a journal event");
+    }
+
+    #[test]
+    fn commit_index_runs_commits_contiguous_runs_and_skips_committed_pages() {
+        let Some(e) = held(|| Engine::load_limited(8, 8)) else { return };
+        e.set_tracking(true);
+        let area = e.reserve(0, 8 * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(6).unwrap();
+        e.map_frames(area, &frames).unwrap();
+        let p0 = page_of(frames[0]);
+        let p1 = page_of(frames[1]);
+        let p2 = page_of(frames[2]);
+        let p4 = page_of(frames[4]);
+        let p5 = page_of(frames[5]);
+
+        // Commit p0 via fault path and mark it committed in track.
+        assert!(Engine::commit_on_access_in(&e.state, area));
+        assert!(e.dirty.lock().unwrap().track.as_ref().unwrap().is_committed(p0));
+        assert!(!accessible(area + P, false));
+        assert!(!accessible(area + 2 * P, false));
+        assert!(!accessible(area + 4 * P, false));
+        assert!(!accessible(area + 5 * P, false));
+
+        {
+            let st = e.lock();
+            let uncom = Engine::commit_uncommitted_runs(&st, &[p0, p1, p2, p4, p5, p2]);
+            assert_eq!(uncom, vec![p1, p2, p4, p5, p2]);
+        }
+        assert!(accessible(area + P, true));
+        assert!(accessible(area + 2 * P, true));
+        assert!(!accessible(area + 3 * P, false));
+        assert!(accessible(area + 4 * P, true));
+        assert!(accessible(area + 5 * P, true));
+
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
     }
 }
