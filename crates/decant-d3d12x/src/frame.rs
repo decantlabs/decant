@@ -40,6 +40,8 @@ const TOKEN_MEMORY: usize = 64;
 const BURST_THRESHOLD: u64 = 16;
 /// Frames to stay uncapped after streaming work drops below `BURST_THRESHOLD`.
 const UNCAPPED_HOLD_FRAMES: u32 = 20;
+/// Minimum milliseconds to stay uncapped after a streaming burst so tight loops do not expire early.
+const UNCAPPED_HOLD_MS: i64 = 250;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UncapMode {
@@ -135,6 +137,8 @@ struct Clock {
     next: [u64; EVENT_TYPES],
     /// Remaining frames to stay uncapped after a streaming burst.
     uncap_hold: u32,
+    /// Counter deadline until which uncap stays active after a streaming burst.
+    uncap_until: i64,
     /// Whether the clock was uncapped on the previous frame check.
     uncapped: bool,
 }
@@ -148,6 +152,7 @@ static CLOCK: Mutex<Clock> = Mutex::new(Clock {
     offset: [0; EVENT_TYPES],
     next: [0; EVENT_TYPES],
     uncap_hold: 0,
+    uncap_until: 0,
     uncapped: false,
 });
 
@@ -194,26 +199,30 @@ impl Clock {
     }
 
     /// Updates streaming burst uncap state and resets the clock origin when leaving uncap so
-    /// steady-state pacing resumes smoothly without catch-up stutter.
+    /// steady state pacing resumes smoothly without catch up stutter.
     fn update_uncap(&mut self, mode: UncapMode, burst_units: u64, decay: bool, at: i64) -> bool {
         let active = match mode {
             UncapMode::Off => {
                 self.uncap_hold = 0;
+                self.uncap_until = 0;
                 false
             }
             UncapMode::Always => true,
             UncapMode::Auto => {
                 if burst_units >= BURST_THRESHOLD {
                     self.uncap_hold = UNCAPPED_HOLD_FRAMES;
+                    self.uncap_until = at.saturating_add(self.freq * UNCAPPED_HOLD_MS / 1000);
                 } else if decay && self.uncap_hold > 0 {
                     self.uncap_hold -= 1;
                 }
-                self.uncap_hold > 0
+                self.uncap_hold > 0 || at < self.uncap_until
             }
         };
         if self.uncapped && !active {
             self.origin = at;
             self.next = [1; EVENT_TYPES];
+            self.uncap_hold = 0;
+            self.uncap_until = 0;
         }
         self.uncapped = active;
         active
@@ -228,15 +237,36 @@ pub(crate) fn bounded_deadline(deadline: i64, now: i64, freq: i64) -> i64 {
     deadline.min(now + freq * 66 / 1000)
 }
 
-fn wait_until(deadline: i64, freq: i64) {
-    // SAFETY: plain creation calls with null optional arguments.
-    let timer: HANDLE = unsafe {
-        let mut timer = CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if timer.is_null() {
-            timer = CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), 0, TIMER_ALL_ACCESS);
+struct ThreadTimer(HANDLE);
+
+impl ThreadTimer {
+    fn new() -> Self {
+        // SAFETY: plain creation calls with null optional arguments.
+        let timer = unsafe {
+            let mut timer = CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if timer.is_null() {
+                timer = CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), 0, TIMER_ALL_ACCESS);
+            }
+            timer
+        };
+        Self(timer)
+    }
+}
+
+impl Drop for ThreadTimer {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the handle was created by this wrapper and is closed once.
+            unsafe { CloseHandle(self.0) };
         }
-        timer
-    };
+    }
+}
+
+fn wait_until(deadline: i64, freq: i64) {
+    thread_local! {
+        static TIMER: ThreadTimer = ThreadTimer::new();
+    }
+    let timer = TIMER.with(|t| t.0);
     loop {
         let left = deadline - now();
         if left <= 0 {
@@ -257,10 +287,6 @@ fn wait_until(deadline: i64, freq: i64) {
                 Sleep(0);
             }
         }
-    }
-    if !timer.is_null() {
-        // SAFETY: the handle was created above and is closed once.
-        unsafe { CloseHandle(timer) };
     }
 }
 
@@ -333,16 +359,28 @@ pub(crate) fn wait_event(kind: u32, timeout_ms: u32, aux: usize, flags: u32, tok
     }
     let burst_units = if t == 0 { crate::title_mem::take_streaming_work() } else { crate::title_mem::peek_streaming_work() };
     let mode = uncap_mode();
-    let (frame, deadline, arrival, freq, uncapped) = {
+    let (frame, deadline, arrival, freq, uncapped, consumed) = {
         let mut clock = lock();
         clock.start();
         let arrival = now();
         let uncapped = clock.update_uncap(mode, burst_units, t == 0, arrival);
-        let (frame, deadline) = clock.next_event(t, arrival);
         if uncapped {
-            clock.consume(t, frame);
+            let frame = if t == 0 {
+                0
+            } else {
+                let f = clock.next[t];
+                clock.next[t] = f + 1;
+                f
+            };
+            (frame, arrival, arrival, clock.freq, true, true)
+        } else {
+            let (frame, deadline) = clock.next_event(t, arrival);
+            let consumed = deadline <= arrival;
+            if consumed {
+                clock.consume(t, frame);
+            }
+            (frame, deadline, arrival, clock.freq, false, consumed)
         }
-        (frame, deadline, arrival, clock.freq, uncapped)
     };
     if uncapped {
         return (S_OK, Some(if t == 0 { issue_token() } else { frame + 1 }));
@@ -367,7 +405,9 @@ pub(crate) fn wait_event(kind: u32, timeout_ms: u32, aux: usize, flags: u32, tok
     if deadline > arrival {
         wait_until(deadline, freq);
     }
-    lock().consume(t, frame);
+    if !consumed {
+        lock().consume(t, frame);
+    }
     if log_due(&CALLS) {
         xs_log!("WaitFrameEventX(type {kind}, {timeout_ms} ms, aux {:016X}, flags 0x{flags:X}): frame {} reached (emulated clock)", aux, frame + 1);
     }
@@ -380,7 +420,7 @@ mod tests {
 
     /// A started clock at 1 MHz so tick values read as microseconds.
     fn micro_clock(period: f64) -> Clock {
-        Clock { started: true, active: true, freq: 1_000_000, origin: 0, period, offset: [0; EVENT_TYPES], next: [1; EVENT_TYPES], uncap_hold: 0, uncapped: false }
+        Clock { started: true, active: true, freq: 1_000_000, origin: 0, period, offset: [0; EVENT_TYPES], next: [1; EVENT_TYPES], uncap_hold: 0, uncap_until: 0, uncapped: false }
     }
 
     #[test]
@@ -514,6 +554,26 @@ mod tests {
         // Off and Always modes behave as configured.
         assert!(!clock.update_uncap(UncapMode::Off, BURST_THRESHOLD * 4, true, 600_000));
         assert!(clock.update_uncap(UncapMode::Always, 0, true, 610_000));
+    }
+
+    #[test]
+    fn tight_uncapped_loop_stays_uncapped_until_hold_window_elapses() {
+        let mut clock = micro_clock(33_333.0);
+        let start = 100_000;
+        assert!(clock.update_uncap(UncapMode::Auto, BURST_THRESHOLD, true, start));
+
+        // Rapid spinner frames within the 250 ms hold window stay uncapped even after frame count decays.
+        for i in 1..=(UNCAPPED_HOLD_FRAMES + 10) {
+            let at = start + i64::from(i) * 100;
+            assert!(clock.update_uncap(UncapMode::Auto, 0, true, at), "frame {i} at {at} should stay uncapped");
+        }
+        assert_eq!(clock.uncap_hold, 0);
+
+        // Once the time window elapses, steady state pacing resumes cleanly.
+        let after = start + UNCAPPED_HOLD_MS * 1000;
+        assert!(!clock.update_uncap(UncapMode::Auto, 0, true, after));
+        assert_eq!(clock.origin, after);
+        assert_eq!(clock.next, [1; EVENT_TYPES]);
     }
 }
 
