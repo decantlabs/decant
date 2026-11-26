@@ -607,8 +607,12 @@ mod pc {
         // SAFETY: the blob owns `GetBufferSize` bytes while it lives.
         unsafe {
             let blob = pso.GetCachedBlob().ok()?;
-            let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-            (!bytes.is_empty()).then(|| bytes.to_vec())
+            let ptr = blob.GetBufferPointer().cast::<u8>();
+            let len = blob.GetBufferSize();
+            if ptr.is_null() || len == 0 {
+                return None;
+            }
+            Some(std::slice::from_raw_parts(ptr, len).to_vec())
         }
     }
 }

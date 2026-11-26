@@ -289,10 +289,31 @@ fn log_due(n: u64) -> bool {
     n < 16 || n.is_power_of_two()
 }
 
+/// Caps concurrent DXC compile workers and stage helpers so at least half the CPU cores stay
+/// free for render and streaming threads.
+pub fn default_worker_cap(cores: usize) -> usize {
+    (cores / 2).clamp(2, 8)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn set_below_normal_priority() {
+    // SAFETY: GetCurrentThread returns the pseudo handle of the calling thread.
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_below_normal_priority() {}
+
 impl Service {
     /// Starts the workers.
     pub fn new(source: Arc<dyn ShaderSource>, compiler: Arc<dyn Compiler>, settings: Settings) -> Service {
         let (tx, rx) = std::sync::mpsc::channel::<Work>();
+        let worker_cap = default_worker_cap(std::thread::available_parallelism().map_or(4, |cores| cores.get()));
+        let worker_count = settings.threads.clamp(1, worker_cap);
         let shared = Arc::new(Shared {
             translator_version: source.version(),
             compiler_version: compiler.version(),
@@ -314,12 +335,15 @@ impl Service {
             live: AtomicBool::new(false),
             live_limit: AtomicUsize::new(usize::MAX),
             last_summary: Mutex::new(String::new()),
-            stage_slots: AtomicUsize::new(std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 2).max(1))),
+            stage_slots: AtomicUsize::new(worker_cap),
         });
         let rx = Arc::new(Mutex::new(rx));
-        for i in 0..settings.threads.max(1) {
+        for i in 0..worker_count {
             let (worker_shared, rx) = (shared.clone(), rx.clone());
-            let spawned = std::thread::Builder::new().name(format!("decant-direct-{i}")).stack_size(32 << 20).spawn(move || worker(&worker_shared, &rx));
+            let spawned = std::thread::Builder::new().name(format!("decant-direct-{i}")).stack_size(32 << 20).spawn(move || {
+                set_below_normal_priority();
+                worker(&worker_shared, &rx);
+            });
             if let Err(e) = spawned {
                 (settings.log)(&format!("direct shaders: worker {i} not started ({e})"));
             }
@@ -874,6 +898,7 @@ impl Shared {
                 }
                 let work = &work;
                 let spawned = std::thread::Builder::new().name("decant-direct-stage".into()).stack_size(32 << 20).spawn_scoped(scope, move || {
+                    set_below_normal_priority();
                     let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(item)));
                     self.stage_slots.fetch_add(1, Ordering::AcqRel);
                     answer
@@ -1566,5 +1591,14 @@ pub(crate) mod tests {
         assert!(matches!(poll_until_final(&service, 2, &second), Poll::Ready(_)));
         assert_eq!(service.shared.stage_slots.load(Ordering::SeqCst), 1);
         assert_eq!(service.counters().compiled.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn default_worker_cap_leaves_half_the_cores_free_and_caps_at_eight() {
+        assert_eq!(default_worker_cap(1), 2);
+        assert_eq!(default_worker_cap(4), 2);
+        assert_eq!(default_worker_cap(8), 4);
+        assert_eq!(default_worker_cap(16), 8);
+        assert_eq!(default_worker_cap(32), 8);
     }
 }

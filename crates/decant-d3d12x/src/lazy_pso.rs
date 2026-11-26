@@ -1443,4 +1443,9 @@ mod tests {
         assert_eq!(made_after, made_before + 2);
         assert_eq!(refused_after, refused_before + 1);
     }
+
+    #[test]
+    fn async_make_enabled_is_true_by_default() {
+        assert!(async_make_enabled());
+    }
 }
