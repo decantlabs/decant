@@ -146,16 +146,16 @@ pub struct AdapterIdentity {
     pub driver_version: u64,
 }
 
-/// The key of the folder that holds the blobs of one kind of adapter, driver and translator. It
-/// stays the same across reboots: only the PCI identity and the driver version of the adapter
-/// count, never its LUID.
-pub fn context_key(adapter: &AdapterIdentity, translator: &str) -> u128 {
+/// The key of the folder that holds the blobs of one kind of adapter and driver. It stays the
+/// same across reboots and across binary rebuilds when the adapter and driver are unchanged,
+/// because [`pipeline_key`] already hashes the compiled DXIL stage bytes.
+pub fn context_key(adapter: &AdapterIdentity, _translator: &str) -> u128 {
     let mut h = Fnv128::default();
     h.field(b"decant pso library context").field(&FORMAT.to_le_bytes());
     for word in [adapter.vendor_id, adapter.device_id, adapter.subsys_id, adapter.revision] {
         h.field(&word.to_le_bytes());
     }
-    h.field(&adapter.driver_version.to_le_bytes()).field(translator.as_bytes());
+    h.field(&adapter.driver_version.to_le_bytes());
     h.finish()
 }
 
@@ -443,9 +443,10 @@ mod tests {
     }
 
     #[test]
-    fn the_context_key_changes_with_each_part_of_the_adapter_driver_and_translator() {
+    fn the_context_key_changes_with_adapter_and_driver_but_stays_stable_across_rebuilds() {
         let base = context_key(&adapter(), "translator a");
         assert_eq!(base, context_key(&adapter(), "translator a"), "stable for the same inputs");
+        assert_eq!(context_key(&adapter(), "translator b"), base, "stable across rebuilds on the same GPU and driver");
         let changed = [
             AdapterIdentity { vendor_id: 0x1002, ..adapter() },
             AdapterIdentity { device_id: 1, ..adapter() },
@@ -456,7 +457,6 @@ mod tests {
         for other in changed {
             assert_ne!(context_key(&other, "translator a"), base, "{other:?}");
         }
-        assert_ne!(context_key(&adapter(), "translator b"), base);
     }
 
     #[test]
