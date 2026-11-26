@@ -2880,9 +2880,9 @@ unsafe fn view_texture(this: *mut Proxy, va: u64, rdesc: *const c_void) -> Optio
         crate::detile::forget(old);
         crate::views_at::forget_resource(old);
     }
-    let (count, held_bytes) = crate::views_at::with_view_textures(|t| {
+    let count = crate::views_at::with_view_textures(|t| {
         t.note(va, crate::views_at::ViewEntry::new(raw, res, heap_index, bytes, crate::title_heap::presents(), view_clock_ms()));
-        (t.len(), t.held_bytes(crate::view_heap::HEAP_BYTES))
+        t.len()
     });
     mem_owners::add(
         mem_owners::Kind::ViewTexture,
@@ -2890,7 +2890,7 @@ unsafe fn view_texture(this: *mut Proxy, va: u64, rdesc: *const c_void) -> Optio
         1,
         bytes,
     );
-    trim_view_textures_with(device.as_ref(), Some(held_bytes));
+    trim_view_textures_with(device.as_ref());
     let width = u64::from_le_bytes(raw[0x10..0x18].try_into().unwrap_or([0; 8]));
     crate::views_at::record_resource(va, width, res, false);
     crate::detile::register(res, va, &raw, state, bytes);
@@ -2979,10 +2979,7 @@ fn cached_resource_alloc_size(
 /// its memory cap (`views_at::view_texture_cap_bytes`, `DECANT_D3D12X_VIEW_TEX_MIB`). Each goes through
 /// `retire`, so the GPU finishes the submissions that may read it first; its heap is used again once
 /// every texture placed in it is gone (`view_heap`). A line says how much went.
-fn trim_view_textures_with(
-    known_device: Option<&windows::Win32::Graphics::Direct3D12::ID3D12Device>,
-    known_held_bytes: Option<u64>,
-) {
+fn trim_view_textures_with(known_device: Option<&windows::Win32::Graphics::Direct3D12::ID3D12Device>) {
     static NEXT_TRIM_PRESENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let present = crate::title_heap::presents();
     if present < NEXT_TRIM_PRESENT.load(Ordering::Relaxed) {
@@ -3014,7 +3011,7 @@ fn trim_view_textures_with(
             lru_budget >> 20
         );
     });
-    let held_bytes = known_held_bytes.unwrap_or_else(|| crate::views_at::with_view_textures(|t| t.held_bytes(crate::view_heap::HEAP_BYTES)));
+    let held_bytes = crate::views_at::with_view_textures(|t| t.held_bytes(crate::view_heap::HEAP_BYTES));
     if effective_cap == 0 || held_bytes <= effective_cap {
         NEXT_TRIM_PRESENT.store(next_trim_present(present, false), Ordering::Relaxed);
         return;
