@@ -147,6 +147,8 @@ pub struct ViewTextures {
     count: usize,
     /// Bytes of the textures made and not released.
     live_bytes: u64,
+    /// Monotonic counter bumped on every texture creation or reuse.
+    use_seq: u64,
 }
 
 /// A texture made for a view at an address, with what the cache needs to give it back.
@@ -160,6 +162,8 @@ pub struct ViewEntry {
     /// The present and the time (milliseconds) of its last view or reuse.
     pub last_present: u64,
     pub last_ms: u64,
+    /// Monotonic sequence number of its last view or reuse.
+    pub last_use: u64,
 }
 
 /// Memory the textures of views at an address may take when the card says nothing (MiB). A run
@@ -208,10 +212,26 @@ pub fn view_texture_cap(device: &windows::Win32::Graphics::Direct3D12::ID3D12Dev
     })
 }
 
+/// Default LRU eviction budget for placed and committed view textures (MiB).
+pub const DEFAULT_VIEW_TEX_BUDGET_MIB: u64 = 2048;
+
+/// The LRU eviction budget in bytes from `DECANT_D3D12X_VIEW_TEX_BUDGET_MIB` (0 disables eviction).
+pub fn budget_from(over_ride: Option<&str>) -> u64 {
+    over_ride.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(DEFAULT_VIEW_TEX_BUDGET_MIB) << 20
+}
+
+/// The LRU eviction budget of view textures in bytes (`DECANT_D3D12X_VIEW_TEX_BUDGET_MIB`, default
+/// 2048 MiB, 0 disables eviction). Read once.
+#[cfg(windows)]
+pub fn view_texture_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| budget_from(std::env::var("DECANT_D3D12X_VIEW_TEX_BUDGET_MIB").ok().as_deref()))
+}
+
 impl ViewEntry {
     /// A texture `res` of `bytes` made at `present` and `ms` for the description `desc`.
     pub fn new(desc: [u8; 0x38], res: usize, heap: Option<usize>, bytes: u64, present: u64, ms: u64) -> ViewEntry {
-        ViewEntry { desc, res, heap, bytes, last_present: present, last_ms: ms }
+        ViewEntry { desc, res, heap, bytes, last_present: present, last_ms: ms, last_use: 0 }
     }
 }
 
@@ -227,8 +247,10 @@ impl ViewTextures {
     /// A new view of the texture made for `va`: it was used now.
     pub fn touch(&mut self, va: u64, present: u64, ms: u64) {
         if let Some(e) = self.made.get_mut(&va) {
+            self.use_seq += 1;
             e.last_present = present;
             e.last_ms = ms;
+            e.last_use = self.use_seq;
         }
     }
 
@@ -239,10 +261,12 @@ impl ViewTextures {
 
     /// Notes the texture `res` made for `va` and `desc`, in place of the one made there before
     /// (which then waits in `stale`, a slot may still read it).
-    pub fn note(&mut self, va: u64, e: ViewEntry) {
-        let (present, ms, bytes) = (e.last_present, e.last_ms, e.bytes);
+    pub fn note(&mut self, va: u64, mut e: ViewEntry) {
+        let bytes = e.bytes;
+        self.use_seq += 1;
+        e.last_use = self.use_seq;
         if let Some(old) = self.made.insert(va, e) {
-            self.stale.push(ViewEntry { last_present: present, last_ms: ms, ..old });
+            self.stale.push(old);
         }
         self.count += 1;
         self.live_bytes += bytes;
@@ -354,6 +378,56 @@ impl ViewTextures {
         }
         pass.heaps_in_use = self.held_bytes(heap_bytes).div_ceil(heap_bytes.max(1)) as usize;
         pass.stuck = pass.freed.is_empty() && pass.held_before > cap + cap / 2;
+        pass
+    }
+
+    /// Evicts the least recently used unreferenced textures when [`live_bytes`] exceeds `budget`
+    /// (`budget` 0 disables eviction), up to [`MAX_PER_PASS`] textures per pass.
+    pub fn collect_budget(&mut self, budget: u64, heap_bytes: u64, referenced: &std::collections::HashSet<usize>) -> Pass {
+        let held_before = self.held_bytes(heap_bytes);
+        let mut pass = Pass { held_before, held_after: held_before, ..Pass::default() };
+        if budget == 0 || self.live_bytes <= budget {
+            return pass;
+        }
+        // `(last_use, kind, key)` where kind 0 is `stale` (res) and kind 1 is `made` (va).
+        let mut order: Vec<(u64, u8, u64)> = Vec::new();
+        for e in &self.stale {
+            if !referenced.contains(&e.res) {
+                order.push((e.last_use, 0, e.res as u64));
+            }
+        }
+        for (&va, e) in &self.made {
+            if !referenced.contains(&e.res) {
+                order.push((e.last_use, 1, va));
+            }
+        }
+        order.sort_unstable();
+
+        let mut touched_heaps = std::collections::HashSet::new();
+        for (_, kind, id) in order {
+            if self.live_bytes <= budget || pass.freed.len() >= MAX_PER_PASS {
+                break;
+            }
+            let removed = if kind == 0 {
+                let res = id as usize;
+                self.stale.iter().position(|e| e.res == res).map(|i| self.stale.swap_remove(i))
+            } else {
+                self.made.remove(&id)
+            };
+            if let Some(e) = removed {
+                self.live_bytes = self.live_bytes.saturating_sub(e.bytes);
+                if let Some(h) = e.heap {
+                    touched_heaps.insert(h);
+                }
+                pass.freed.push(e);
+            }
+        }
+
+        let live_heaps: std::collections::HashSet<usize> = self.made.values().chain(self.stale.iter()).filter_map(|e| e.heap).collect();
+        pass.heaps_freed = touched_heaps.iter().filter(|h| !live_heaps.contains(h)).count();
+        pass.held_after = self.held_bytes(heap_bytes);
+        pass.heaps_in_use = pass.held_after.div_ceil(heap_bytes.max(1)) as usize;
+        pass.stuck = pass.freed.is_empty() && self.live_bytes > budget;
         pass
     }
 }
@@ -676,5 +750,34 @@ mod tests {
         assert_eq!(p.register(0xEE00_00000, 128), 1);
         assert!(p.unregister(0xDD47_70000, 100000));
         assert_eq!(p.register(0xFF00_00000, 64), 0);
+    }
+
+    #[test]
+    fn lru_budget_evicts_oldest_unused_textures_and_reclaims_empty_heaps() {
+        use super::{DEFAULT_VIEW_TEX_BUDGET_MIB, budget_from};
+        assert_eq!(budget_from(None), DEFAULT_VIEW_TEX_BUDGET_MIB << 20);
+        assert_eq!(budget_from(Some("0")), 0);
+        assert_eq!(budget_from(Some(" 512 ")), 512 << 20);
+
+        let mut t = ViewTextures::default();
+        t.note(0x1000, ViewEntry::new(desc3(), 1, Some(0), 500, 0, 0));
+        t.note(0x2000, ViewEntry::new(desc3(), 2, Some(0), 500, 0, 0));
+        t.note(0x3000, ViewEntry::new(desc3(), 3, Some(1), 500, 0, 0));
+        // Touch 0x1000 so 0x2000 and 0x3000 are older.
+        t.touch(0x1000, 1, 10);
+
+        let held: std::collections::HashSet<usize> = [2].into_iter().collect();
+        // Budget 600: live_bytes is 1500. Res 2 is referenced, so 3 (oldest unreferenced) goes first,
+        // freeing heap 1 completely, then 1 (newer) goes so live_bytes drops to 500 <= 600.
+        let pass = t.collect_budget(600, 1000, &held);
+        let freed: Vec<usize> = pass.freed.iter().map(|e| e.res).collect();
+        assert_eq!(freed, vec![3, 1]);
+        assert_eq!(pass.heaps_freed, 1, "heap 1 became empty and was reclaimed");
+        assert_eq!(t.live_bytes(), 500);
+        assert_eq!(t.held_bytes(1000), 1000);
+        assert!(!pass.stuck);
+
+        // Budget 0 disables eviction.
+        assert!(t.collect_budget(0, 1000, &held).freed.is_empty());
     }
 }

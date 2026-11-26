@@ -2875,23 +2875,45 @@ fn trim_view_textures() {
     static WAVES: AtomicI32 = AtomicI32::new(0);
     static STUCK: std::sync::Once = std::sync::Once::new();
     static LAST_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_BUDGET_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let Some(device) = crate::title_mem::device() else { return };
     let (cap, dedicated, budget) = crate::views_at::view_texture_cap(&device);
+    let lru_budget = crate::views_at::view_texture_budget();
     static CAP_LOGGED: std::sync::Once = std::sync::Once::new();
     CAP_LOGGED.call_once(|| {
-        xs_log!("console device slot 70: the view textures may take {} MiB of heaps ({} MiB dedicated video memory, budget {} MiB, DECANT_D3D12X_VIEW_TEX_MIB {}); past it the least recently used heap whose textures are all idle and held by no slot goes whole", cap >> 20, dedicated >> 20, budget >> 20, std::env::var("DECANT_D3D12X_VIEW_TEX_MIB").unwrap_or_else(|_| "not set".into()));
+        xs_log!(
+            "console device slot 70: the view textures may take {} MiB of heaps ({} MiB dedicated video memory, budget {} MiB, DECANT_D3D12X_VIEW_TEX_MIB {}, DECANT_D3D12X_VIEW_TEX_BUDGET_MIB {} MiB)",
+            cap >> 20,
+            dedicated >> 20,
+            budget >> 20,
+            std::env::var("DECANT_D3D12X_VIEW_TEX_MIB").unwrap_or_else(|_| "not set".into()),
+            lru_budget >> 20
+        );
     });
     let (present, ms) = (crate::title_heap::presents(), view_clock_ms());
-    if cap == 0 || crate::views_at::with_view_textures(|t| t.held_bytes(crate::view_heap::HEAP_BYTES)) <= cap {
+    let (held_bytes, live_bytes) = crate::views_at::with_view_textures(|t| (t.held_bytes(crate::view_heap::HEAP_BYTES), t.live_bytes()));
+    let over_budget = lru_budget > 0 && live_bytes > lru_budget;
+    let over_cap = cap > 0 && held_bytes > cap;
+    if !over_budget && !over_cap {
         return;
     }
-    // the scan of every slot of every view heap is not made at every texture
-    if present < LAST_SCAN.load(Ordering::Relaxed) + 30 {
+    // Rate limit scans of view_shadow::referenced() to every 30 presents or 64 MiB of new growth.
+    let last_present = LAST_SCAN.load(Ordering::Relaxed);
+    let last_bytes = LAST_BUDGET_BYTES.load(Ordering::Relaxed);
+    let grew_enough = over_budget && live_bytes >= last_bytes.saturating_add(64 << 20);
+    if present < last_present + 30 && !grew_enough {
         return;
     }
     LAST_SCAN.store(present, Ordering::Relaxed);
+    LAST_BUDGET_BYTES.store(live_bytes, Ordering::Relaxed);
     let referenced = crate::view_shadow::referenced();
-    let pass = crate::views_at::with_view_textures(|t| t.collect(cap, crate::view_heap::HEAP_BYTES, present, ms, &referenced));
+    let pass = crate::views_at::with_view_textures(|t| {
+        if over_budget {
+            t.collect_budget(lru_budget, crate::view_heap::HEAP_BYTES, &referenced)
+        } else {
+            t.collect(cap, crate::view_heap::HEAP_BYTES, present, ms, &referenced)
+        }
+    });
     if pass.stuck {
         STUCK.call_once(|| {
             xs_log!("view texture cache over its cap, nothing idle: {} MiB held for a cap of {} MiB, {} textures are held by a slot", pass.held_before >> 20, cap >> 20, referenced.len());

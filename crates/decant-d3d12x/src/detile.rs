@@ -65,6 +65,17 @@ const LIST_STAGING_LIMIT: u64 = 256 << 20;
 /// more. Every list keeps its staging buffer for later batches, and a limit of 256 MiB left 2.8 GiB
 /// held by the lists.
 const BATCH_STAGING_TARGET: u64 = 32 << 20;
+/// Default cap on retained staging bytes across all detiler frames (MiB, 0 disables trimming).
+const DEFAULT_STAGING_CAP_MIB: u64 = 256;
+
+fn staging_cap_from(over_ride: Option<&str>) -> u64 {
+    over_ride.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(DEFAULT_STAGING_CAP_MIB) << 20
+}
+
+fn staging_cap_bytes() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| staging_cap_from(std::env::var("DECANT_D3D12X_DETILE_STAGING_CAP_MIB").ok().as_deref()))
+}
 /// Dispatches (parameter blocks) that fit in one list.
 const DISPATCH_SLOTS: usize = 1024;
 /// Size of one parameter block. A multiple of 256 because a root constant buffer address needs it.
@@ -703,6 +714,25 @@ impl Detiler {
         if wait {
             self.wait_idle();
         }
+        self.trim_staging(staging_cap_bytes());
+    }
+
+    /// Drops staging buffers from idle frames when total retained staging exceeds `cap` (`0`
+    /// disables trimming).
+    fn trim_staging(&mut self, cap: u64) {
+        let queues = &self.queues;
+        // SAFETY: the fences are live.
+        let completed = |queue: usize| queues.get(&queue).map_or(0, |q| unsafe { q.fence.GetCompletedValue() });
+        let indices = select_staging_to_trim(
+            self.frames.iter().map(|f| (f.queue, f.done_at, f.staging.as_ref().map_or(0, |(_, s)| *s))),
+            completed,
+            cap,
+        );
+        for index in indices {
+            if let Some((_, size)) = self.frames[index].staging.take() {
+                crate::mem_owners::remove(crate::mem_owners::Kind::DetileStaging, crate::mem_owners::Segment::Local, 1, size);
+            }
+        }
     }
 
     /// Frames made so far, queues they ran on and the staging bytes they hold.
@@ -829,6 +859,37 @@ fn best_finished(frames: impl Iterator<Item = (usize, u64, u64)>, needed: u64, c
         }
     }
     best_fit.or(best_any).map(|(index, _)| index)
+}
+
+/// Chooses idle frame indices whose staging buffers should be dropped so retained staging drops to
+/// `cap` or below (largest idle buffers first, `cap` 0 disables trimming).
+fn select_staging_to_trim(frames: impl Iterator<Item = (usize, u64, u64)>, completed: impl Fn(usize) -> u64, cap: u64) -> Vec<usize> {
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut total = 0u64;
+    let mut idle: Vec<(u64, usize)> = Vec::new();
+    for (index, (queue, done_at, size)) in frames.enumerate() {
+        total += size;
+        let is_idle = done_at == 0 || (done_at != u64::MAX && completed(queue) >= done_at);
+        if size > 0 && is_idle {
+            idle.push((size, index));
+        }
+    }
+    if total <= cap {
+        return Vec::new();
+    }
+    // Largest staging buffers first so retained memory drops with minimal churn.
+    idle.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut drop_indices = Vec::new();
+    for (size, index) in idle {
+        if total <= cap {
+            break;
+        }
+        total = total.saturating_sub(size);
+        drop_indices.push(index);
+    }
+    drop_indices
 }
 
 // ==== the registry of placed textures ====
@@ -1815,5 +1876,23 @@ mod tests {
         assert_eq!(r.layout_gen, 8);
         assert_eq!(r.mark_tiles_from_index(&[10], false), 0);
         assert_eq!(r.mark_tiles_from_index(&[20, 21], false), 2);
+    }
+
+    #[test]
+    fn staging_cap_trims_largest_idle_frames_down_to_budget() {
+        assert_eq!(staging_cap_from(None), DEFAULT_STAGING_CAP_MIB << 20);
+        assert_eq!(staging_cap_from(Some("0")), 0);
+        assert_eq!(staging_cap_from(Some(" 128 ")), 128 << 20);
+
+        // Frame 0: busy (done_at 10 > completed 5), 256 MiB
+        // Frame 1: idle, 128 MiB
+        // Frame 2: idle, 512 MiB
+        // Frame 3: idle, 128 MiB
+        // Total = 1024 MiB, cap = 256 MiB -> drop Frame 2 (512 MiB) and Frame 1 (128 MiB) -> 384 -> drop Frame 3 (128 MiB) -> 256 MiB.
+        let frames = [(1, 10, 256 << 20), (1, 4, 128 << 20), (1, 3, 512 << 20), (1, 5, 128 << 20)];
+        let trimmed = select_staging_to_trim(frames.into_iter(), |_| 5, 256 << 20);
+        assert_eq!(trimmed, vec![2, 1, 3], "busy frame 0 stays untouched, largest idle frames go first");
+
+        assert!(select_staging_to_trim(frames.into_iter(), |_| 5, 0).is_empty(), "cap 0 disables trimming");
     }
 }
