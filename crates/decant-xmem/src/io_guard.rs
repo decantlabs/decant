@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_NOACCESS, GetLastError, HMODULE, SetLastError};
@@ -51,11 +51,14 @@ struct OverlappedEntry {
 
 const MAX_PENDING_OVERLAPPED: usize = 4096;
 
+type PendingEntry = (u64, usize, Vec<(usize, usize)>);
+
 #[derive(Default)]
 struct PendingOverlapped {
-    map: HashMap<usize, (usize, Vec<(usize, usize)>)>,
+    map: HashMap<usize, PendingEntry>,
     events: HashMap<usize, Vec<usize>>,
-    order: VecDeque<usize>,
+    order: VecDeque<(usize, u64)>,
+    next_seq: u64,
 }
 
 /// The functions that were in the tables before the patch, 0 until a table was patched.
@@ -77,6 +80,7 @@ static ORIGINAL: [AtomicUsize; 12] = [
 static DONE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 static XGR_PATH: OnceLock<Option<Vec<u16>>> = OnceLock::new();
 static PENDING_OVERLAPPED: Mutex<Option<PendingOverlapped>> = Mutex::new(None);
+static HAS_PENDING_OVERLAPPED: AtomicBool = AtomicBool::new(false);
 
 fn xgr_path() -> Option<&'static [u16]> {
     XGR_PATH
@@ -153,11 +157,12 @@ fn record_pending_overlapped_with_event(ov: usize, event: usize, runs: Vec<(usiz
     }
     let mut guard = PENDING_OVERLAPPED.lock().unwrap_or_else(PoisonError::into_inner);
     let pending = guard.get_or_insert_with(PendingOverlapped::default);
-    if let Some((old_ev, _)) = pending.map.insert(ov, (event, runs)) {
+    pending.next_seq = pending.next_seq.wrapping_add(1);
+    let seq = pending.next_seq;
+    if let Some((_, old_ev, _)) = pending.map.insert(ov, (seq, event, runs)) {
         remove_event_entry(&mut pending.events, old_ev, ov);
-    } else {
-        pending.order.push_back(ov);
     }
+    pending.order.push_back((ov, seq));
     if event != 0 {
         let list = pending.events.entry(event).or_default();
         if !list.contains(&ov) {
@@ -165,27 +170,33 @@ fn record_pending_overlapped_with_event(ov: usize, event: usize, runs: Vec<(usiz
         }
     }
     while pending.map.len() > MAX_PENDING_OVERLAPPED {
-        let Some(oldest) = pending.order.pop_front() else { break };
-        if let Some((old_ev, _)) = pending.map.remove(&oldest) {
+        let Some((oldest, oldest_seq)) = pending.order.pop_front() else { break };
+        if pending.map.get(&oldest).is_some_and(|&(s, _, _)| s == oldest_seq)
+            && let Some((_, old_ev, _)) = pending.map.remove(&oldest)
+        {
             remove_event_entry(&mut pending.events, old_ev, oldest);
         }
     }
+    HAS_PENDING_OVERLAPPED.store(!pending.map.is_empty(), Ordering::Release);
 }
 
 fn take_pending_overlapped(ov: usize) -> Option<Vec<(usize, usize)>> {
-    if ov == 0 {
+    if ov == 0 || !HAS_PENDING_OVERLAPPED.load(Ordering::Acquire) {
         return None;
     }
     let mut guard = PENDING_OVERLAPPED.lock().unwrap_or_else(PoisonError::into_inner);
     let pending = guard.as_mut()?;
-    let (ev, runs) = pending.map.remove(&ov)?;
+    let (_, ev, runs) = pending.map.remove(&ov)?;
     remove_event_entry(&mut pending.events, ev, ov);
-    pending.order.retain(|&x| x != ov);
+    if pending.map.is_empty() {
+        pending.order.clear();
+        HAS_PENDING_OVERLAPPED.store(false, Ordering::Release);
+    }
     Some(runs)
 }
 
 fn take_pending_by_event(event: usize) -> Vec<Vec<(usize, usize)>> {
-    if event == 0 {
+    if event == 0 || !HAS_PENDING_OVERLAPPED.load(Ordering::Acquire) {
         return Vec::new();
     }
     let mut guard = PENDING_OVERLAPPED.lock().unwrap_or_else(PoisonError::into_inner);
@@ -193,10 +204,13 @@ fn take_pending_by_event(event: usize) -> Vec<Vec<(usize, usize)>> {
     let Some(ovs) = pending.events.remove(&event) else { return Vec::new() };
     let mut out = Vec::with_capacity(ovs.len());
     for ov in ovs {
-        if let Some((_, runs)) = pending.map.remove(&ov) {
-            pending.order.retain(|&x| x != ov);
+        if let Some((_, _, runs)) = pending.map.remove(&ov) {
             out.push(runs);
         }
+    }
+    if pending.map.is_empty() {
+        pending.order.clear();
+        HAS_PENDING_OVERLAPPED.store(false, Ordering::Release);
     }
     out
 }
@@ -283,34 +297,42 @@ fn check(result: BOOL, buffer: *const c_void, len: usize) {
 
 unsafe extern "system" fn read_file(file: *mut c_void, buffer: *mut c_void, len: u32, read: *mut u32, overlapped: *mut c_void) -> BOOL {
     let engine = Engine::started();
-    let runs = if len != 0 { vec![(buffer as usize, len as usize)] } else { Vec::new() };
-    if let Some(e) = engine {
-        e.begin_io_write_runs(&runs);
-    }
+    let touched = engine.is_some_and(|e| e.begin_io_write_checked(buffer as usize, len as usize));
     // SAFETY: the wrapper is only installed after `ORIGINAL[0]` holds the function it replaces, and the arguments are the caller's.
     let result = unsafe { std::mem::transmute::<usize, ReadFileFn>(ORIGINAL[0].load(Ordering::Acquire))(file, buffer, len, read, overlapped) };
     check(result, buffer, len as usize);
-    finish_or_pend_read(engine, overlapped, result, runs);
+    if touched && let Some(e) = engine {
+        // SAFETY: GetLastError and SetLastError only touch the thread's error code, kept for the caller.
+        unsafe {
+            let err = GetLastError();
+            if overlapped.is_null() || result != 0 || err != ERROR_IO_PENDING {
+                e.finish_io_write(buffer as usize, len as usize);
+            } else {
+                let runs = vec![(buffer as usize, len as usize)];
+                let ev = overlapped_event(overlapped);
+                e.convert_pin_to_hold_runs(&runs);
+                record_pending_overlapped_with_event(overlapped as usize, ev, runs);
+            }
+            SetLastError(err);
+        }
+    }
     result
 }
 
 unsafe extern "system" fn read_file_ex(file: *mut c_void, buffer: *mut c_void, len: u32, overlapped: *mut c_void, routine: *mut c_void) -> BOOL {
     let engine = Engine::started();
-    let runs = if len != 0 { vec![(buffer as usize, len as usize)] } else { Vec::new() };
-    if let Some(e) = engine {
-        e.begin_io_write_runs(&runs);
-    }
+    let touched = engine.is_some_and(|e| e.begin_io_write_checked(buffer as usize, len as usize));
     // SAFETY: as in `read_file`, with `ORIGINAL[1]`.
     let result = unsafe { std::mem::transmute::<usize, ReadFileExFn>(ORIGINAL[1].load(Ordering::Acquire))(file, buffer, len, overlapped, routine) };
     check(result, buffer, len as usize);
-    if let Some(e) = engine {
+    if touched && let Some(e) = engine {
         // SAFETY: preserves last error across pin cleanup.
         unsafe {
             let err = GetLastError();
             if result == 0 {
-                e.finish_io_write_runs(&runs);
+                e.finish_io_write(buffer as usize, len as usize);
             } else {
-                e.convert_pin_to_hold_runs(&runs);
+                e.convert_pin_to_hold_runs(&[(buffer as usize, len as usize)]);
             }
             SetLastError(err);
         }
@@ -325,17 +347,20 @@ unsafe extern "system" fn read_file_scatter(file: *mut c_void, segments: *const 
         // SAFETY: the caller's array has one element for each segment of `len` bytes.
         let slice = unsafe { std::slice::from_raw_parts(segments, count) };
         let runs = coalesce_scatter_segments(slice, len as usize);
-        if let Some(e) = engine {
-            e.begin_io_write_runs(&runs);
+        if engine.is_some_and(|e| e.begin_io_write_runs_checked(&runs)) {
+            runs
+        } else {
+            Vec::new()
         }
-        runs
     } else {
         Vec::new()
     };
     // SAFETY: as in `read_file`, with `ORIGINAL[2]`.
     let result = unsafe { std::mem::transmute::<usize, ReadFileScatterFn>(ORIGINAL[2].load(Ordering::Acquire))(file, segments, len, reserved, overlapped) };
     check(result, segments.cast(), len as usize);
-    finish_or_pend_read(engine, overlapped, result, runs);
+    if !runs.is_empty() {
+        finish_or_pend_read(engine, overlapped, result, runs);
+    }
     result
 }
 
@@ -674,7 +699,14 @@ mod tests {
         assert!(take_pending_overlapped(MAX_PENDING_OVERLAPPED + 5).is_none());
 
         record_pending_overlapped_with_event(100, 0xBEEF, vec![(0x10_0000, 0x1000)]);
+        assert!(HAS_PENDING_OVERLAPPED.load(Ordering::Acquire));
         assert_eq!(take_pending_by_event(0xBEEF), vec![vec![(0x10_0000, 0x1000)]]);
         assert!(take_pending_overlapped(100).is_none());
+
+        // Drain all remaining entries to verify HAS_PENDING_OVERLAPPED clears to false.
+        for i in 6..=(MAX_PENDING_OVERLAPPED + 5) {
+            let _ = take_pending_overlapped(i);
+        }
+        assert!(!HAS_PENDING_OVERLAPPED.load(Ordering::Acquire));
     }
 }

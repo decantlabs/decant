@@ -2164,6 +2164,7 @@ impl Engine {
 
     /// Commits any uncommitted pool pages in `indices` in maximal contiguous section runs.
     /// Returns the indices that were not yet marked committed in `track`.
+    #[cfg(test)]
     fn commit_uncommitted_runs(st: &State, indices: &[u32]) -> Vec<u32> {
         let uncommitted = {
             let dirty_state = Arc::clone(&st.dirty);
@@ -2235,47 +2236,74 @@ impl Engine {
         if indices.is_empty() {
             return;
         }
-        let committed = Self::commit_uncommitted_runs(&st, &indices);
         let until = Instant::now() + track::io_hold_for(total_bytes);
+        Self::commit_and_prepare_until(&st, indices, until);
+    }
+
+    fn commit_and_prepare_until(st: &State, indices: Vec<u32>, until: Instant) {
         let dirty_state = Arc::clone(&st.dirty);
         let protect_sync = Arc::clone(&st.protect_sync);
-        drop(st);
-        let chunks = {
-            let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut open = Vec::new();
-            if let Some(track) = dirty_guard.track.as_mut() {
-                for index in committed {
-                    track.mark_committed(index);
-                }
-                for index in indices {
-                    track.prepare_until_into(index, until, &mut open);
-                }
-                protect_sync.bump_addrs(&open);
-                if track.pending_len() > 0 {
-                    protect_sync.set_pending(true);
-                }
-            }
-            protect_sync.snapshot_chunks(open)
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let uncommitted = match dirty_guard.track.as_ref() {
+            Some(track) => indices.iter().copied().filter(|&i| !track.is_committed(i)).collect::<Vec<u32>>(),
+            None => indices.clone(),
         };
+        if !uncommitted.is_empty() {
+            drop(dirty_guard);
+            Self::commit_index_runs(st, &uncommitted);
+            dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        }
+        let mut open = Vec::new();
+        if let Some(track) = dirty_guard.track.as_mut() {
+            for index in uncommitted {
+                track.mark_committed(index);
+            }
+            for index in indices {
+                track.prepare_until_into(index, until, &mut open);
+            }
+            protect_sync.bump_addrs(&open);
+            if track.pending_len() > 0 {
+                protect_sync.set_pending(true);
+            }
+        }
+        let chunks = protect_sync.snapshot_chunks(open);
+        drop(dirty_guard);
         protect_sync.protect_rw_chunks(chunks, &dirty_state);
     }
 
     /// Commits and pins the writable view pages in `[address, address + len)` open for an active
     /// asynchronous write until [`Engine::finish_io_write`] balances every overlapping pin.
     pub fn begin_io_write(&self, address: usize, len: usize) {
-        self.begin_io_write_runs(&[(address, len)]);
+        let _ = self.begin_io_write_checked(address, len);
+    }
+
+    /// As [`Engine::begin_io_write`], returning whether any writable view page was touched.
+    pub(crate) fn begin_io_write_checked(&self, address: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        self.begin_io_write_runs_checked(&[(address, len)])
     }
 
     /// Releases one active write pin on each writable view page in `[address, address + len)`.
     /// Once the last pin drops, the next `take_dirty` copies the page once and protects it again.
     pub fn finish_io_write(&self, address: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
         self.finish_io_write_runs(&[(address, len)]);
     }
 
     /// Commits and pins the writable view pages across all `(address, len)` runs open for an active write.
+    #[cfg(test)]
     pub fn begin_io_write_runs(&self, runs: &[(usize, usize)]) {
+        let _ = self.begin_io_write_runs_checked(runs);
+    }
+
+    /// As [`Engine::begin_io_write_runs`], returning whether any writable view page was touched.
+    pub(crate) fn begin_io_write_runs_checked(&self, runs: &[(usize, usize)]) -> bool {
         if runs.is_empty() {
-            return;
+            return false;
         }
         let st = self.lock();
         let mut indices = Vec::new();
@@ -2283,35 +2311,43 @@ impl Engine {
             Self::collect_rw_view_indices_into(&st, address, len, &mut indices);
         }
         if indices.is_empty() {
-            return;
+            return false;
         }
-        let committed = Self::commit_uncommitted_runs(&st, &indices);
         let dirty_state = Arc::clone(&st.dirty);
         let protect_sync = Arc::clone(&st.protect_sync);
-        drop(st);
-        let chunks = {
-            let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut open = Vec::new();
-            if let Some(track) = dirty_guard.track.as_mut() {
-                for index in committed {
-                    track.mark_committed(index);
-                }
-                for index in indices {
-                    track.begin_write_pin_into(index, &mut open);
-                }
-                protect_sync.bump_addrs(&open);
-                if track.pending_len() > 0 {
-                    protect_sync.set_pending(true);
-                }
-            }
-            protect_sync.snapshot_chunks(open)
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let uncommitted = match dirty_guard.track.as_ref() {
+            Some(track) => indices.iter().copied().filter(|&i| !track.is_committed(i)).collect::<Vec<u32>>(),
+            None => indices.clone(),
         };
+        if !uncommitted.is_empty() {
+            drop(dirty_guard);
+            Self::commit_index_runs(&st, &uncommitted);
+            dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        }
+        let mut open = Vec::new();
+        if let Some(track) = dirty_guard.track.as_mut() {
+            for index in uncommitted {
+                track.mark_committed(index);
+            }
+            for index in indices {
+                track.begin_write_pin_into(index, &mut open);
+            }
+            protect_sync.bump_addrs(&open);
+            if track.pending_len() > 0 {
+                protect_sync.set_pending(true);
+            }
+        }
+        let chunks = protect_sync.snapshot_chunks(open);
+        drop(dirty_guard);
+        drop(st);
         protect_sync.protect_rw_chunks(chunks, &dirty_state);
+        true
     }
 
     /// Releases one active write pin on each writable view page across all `(address, len)` runs.
     pub fn finish_io_write_runs(&self, runs: &[(usize, usize)]) {
-        if runs.is_empty() {
+        if runs.is_empty() || !self.tracking.load(Ordering::Acquire) {
             return;
         }
         let st = self.lock();
@@ -2338,7 +2374,7 @@ impl Engine {
 
     /// Transitions active write pins across `runs` into a timed fallback hold for pending overlapped I/O.
     pub fn convert_pin_to_hold_runs(&self, runs: &[(usize, usize)]) {
-        if runs.is_empty() {
+        if runs.is_empty() || !self.tracking.load(Ordering::Acquire) {
             return;
         }
         let st = self.lock();
@@ -2368,7 +2404,7 @@ impl Engine {
 
     /// Clears I/O fallback holds across `runs` when an overlapped read completes.
     pub fn clear_io_hold_runs(&self, runs: &[(usize, usize)]) {
-        if runs.is_empty() {
+        if runs.is_empty() || !self.tracking.load(Ordering::Acquire) {
             return;
         }
         let st = self.lock();
@@ -2399,28 +2435,7 @@ impl Engine {
         if indices.is_empty() {
             return;
         }
-        let committed = Self::commit_uncommitted_runs(&st, &indices);
-        let dirty_state = Arc::clone(&st.dirty);
-        let protect_sync = Arc::clone(&st.protect_sync);
-        drop(st);
-        let chunks = {
-            let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut open = Vec::new();
-            if let Some(track) = dirty_guard.track.as_mut() {
-                for index in committed {
-                    track.mark_committed(index);
-                }
-                for index in indices {
-                    track.prepare_until_into(index, until, &mut open);
-                }
-                protect_sync.bump_addrs(&open);
-                if track.pending_len() > 0 {
-                    protect_sync.set_pending(true);
-                }
-            }
-            protect_sync.snapshot_chunks(open)
-        };
-        protect_sync.protect_rw_chunks(chunks, &dirty_state);
+        Self::commit_and_prepare_until(&st, indices, until);
     }
 
     /// The first page of `[address, address + len)` the kernel cannot write now, with what the engine
@@ -3844,6 +3859,25 @@ mod tests {
             fault_thread.join().unwrap();
             take_thread.join().unwrap();
         });
+
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
+    }
+
+    #[test]
+    fn begin_io_write_checked_skips_non_view_addresses_and_pins_views() {
+        let Some(e) = held(|| Engine::load_limited(4, 4)) else { return };
+        e.set_tracking(true);
+        assert!(!e.begin_io_write_checked(0x1000, P));
+        assert!(!e.begin_io_write_checked(0, 0));
+
+        let area = e.reserve(0, 2 * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(2).unwrap();
+        e.map_frames(area, &frames).unwrap();
+        assert!(e.begin_io_write_checked(area, P));
+        assert!(accessible(area, true));
+        e.finish_io_write(area, P);
+        assert_eq!(e.take_dirty(10), vec![page_of(frames[0])]);
 
         e.release(area).unwrap();
         e.free_pages(&frames).unwrap();
