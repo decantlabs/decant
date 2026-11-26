@@ -2035,10 +2035,14 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
             }
         }
     }
-    // A group nothing sure reaches, or whose result is never read, is a number from here on.
+    // A group nothing sure reaches, whose result is never read, or where mixed mask and numeric
+    // provenance reaches with no reader requiring a mask is a number from here on.
     let mut resolved_dead = false;
     for g in &mut typing.groups {
-        if !g.clash && (!g.def_live || (!g.sure && g.kinds.count_ones() != 1)) {
+        if !g.clash
+            && (!g.def_live
+                || ((!g.sure || (g.kinds & NUMBER) != 0) && g.kinds.count_ones() != 1))
+        {
             if !g.def_live && g.kinds != NUMBER {
                 resolved_dead = true;
             }
@@ -2047,8 +2051,12 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
         }
     }
     if resolved_dead {
-        let outs = typing.backward();
-        typing.narrow_by_readers(&outs);
+        for _ in 0..ROUNDS {
+            let outs = typing.backward();
+            if !typing.narrow_by_readers(&outs) {
+                break;
+            }
+        }
     }
     let ins = typing.forward();
     let later = typing.later_readers(&typing.backward());
@@ -2218,6 +2226,49 @@ mod tests {
         a.push(sop1(Op::s_mov_b64, s(32), EXEC));
         a.push(sop1(Op::s_mov_b64, s(62), s(32)));
         a.push(sop1(Op::s_mov_b32, s(40), s(62)));
+        let (graph, masks) = analyse_asm(a);
+        for insn in graph.insns() {
+            masks.enter(insn.pc);
+            assert_eq!(masks.refusal(), None, "{insn}");
+        }
+    }
+
+    #[test]
+    fn writelane_readlane_chain_with_mixed_provenance_and_dead_result_does_not_refuse_mixed_pair() {
+        let mut a = Asm::new();
+        let numeric = a.label();
+        let join = a.label();
+        a.push(sopc(Op::s_cmp_eq_u32, s(0), int(0)));
+        a.branch(Op::s_cbranch_scc1, numeric);
+        a.push(sop1(Op::s_mov_b64, s(2), EXEC));
+        a.branch(Op::s_branch, join);
+        a.bind(numeric);
+        a.push(sop1(Op::s_mov_b32, s(2), int(7)));
+        a.bind(join);
+        a.push(vop3(Op::v_writelane_b32_e64, v(128), s(2), int(0), int(0)));
+        a.push(vop3(Op::v_readlane_b32_e64, s(3), v(128), int(0), int(0)));
+        a.push(sop1(Op::s_mov_b32, s(4), s(3)));
+        let (graph, masks) = analyse_asm(a);
+        for insn in graph.insns() {
+            masks.enter(insn.pc);
+            assert_eq!(masks.refusal(), None, "{insn}");
+        }
+    }
+
+    #[test]
+    fn move_b64_chain_with_mixed_provenance_and_dead_result_does_not_refuse_mixed_pair() {
+        let mut a = Asm::new();
+        let numeric = a.label();
+        let join = a.label();
+        a.push(sopc(Op::s_cmp_eq_u32, s(0), int(0)));
+        a.branch(Op::s_cbranch_scc1, numeric);
+        a.push(sop1(Op::s_mov_b64, s(32), EXEC));
+        a.branch(Op::s_branch, join);
+        a.bind(numeric);
+        a.push(sop1(Op::s_mov_b64, s(32), int(7)));
+        a.bind(join);
+        a.push(sop1(Op::s_mov_b64, s(62), s(32)));
+        a.push(sop1(Op::s_mov_b64, s(64), s(62)));
         let (graph, masks) = analyse_asm(a);
         for insn in graph.insns() {
             masks.enter(insn.pc);
