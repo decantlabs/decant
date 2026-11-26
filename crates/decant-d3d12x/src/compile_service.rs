@@ -133,7 +133,7 @@ pub enum PipelineKind {
 const SUMMARY_INTERVAL: u64 = 64;
 
 /// A live cache miss of a stage with at least this much HLSL is compiled with `-O0` by default.
-pub const O0_HLSL_BYTES: usize = 128 * 1024;
+pub const O0_HLSL_BYTES: usize = 32 * 1024;
 
 /// Parses `DECANT_D3D12X_DIRECT_O0_BYTES`: `0`, `off`, or `false` disables `-O0` (`usize::MAX`),
 /// a positive integer sets the byte threshold, and missing or invalid values return [`O0_HLSL_BYTES`].
@@ -154,7 +154,7 @@ pub fn o0_hlsl_bytes() -> usize {
 }
 
 /// The default HLSL limit of a live compile (`DECANT_D3D12X_MAX_LIVE_HLSL_BYTES` sets another).
-pub const MAX_LIVE_HLSL_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_LIVE_HLSL_BYTES: usize = 16 * 1024 * 1024;
 
 /// The counters of one run.
 #[derive(Default)]
@@ -182,6 +182,7 @@ pub struct Counters {
     completed: AtomicU64,
     translation_us: AtomicU64,
     dxc_wait_us: AtomicU64,
+    dxc_compile_us: AtomicU64,
     pc_creation_us: AtomicU64,
 }
 
@@ -592,7 +593,7 @@ impl Service {
         let [vs_ps, cs, ms_ps] = counters.pipelines.each_ref().map(|n| n.load(Ordering::Relaxed));
         let [vs_ps_made, cs_made, ms_ps_made] = counters.made.each_ref().map(|n| n.load(Ordering::Relaxed));
         format!(
-            "direct shaders summary: pipelines vs+ps={vs_ps} cs={cs} ms+ps={ms_ps}, PC made vs+ps={vs_ps_made} cs={cs_made} ms+ps={ms_ps_made}, ready={} pipe_hits={} stage_hits={} translated={} cache_hits={} compiled={} compiled_o0={} dxc_errors={}, translation_us={} dxc_wait_us={} pc_creation_us={}",
+            "direct shaders summary: pipelines vs+ps={vs_ps} cs={cs} ms+ps={ms_ps}, PC made vs+ps={vs_ps_made} cs={cs_made} ms+ps={ms_ps_made}, ready={} pipe_hits={} stage_hits={} translated={} cache_hits={} compiled={} compiled_o0={} dxc_errors={}, translation_us={} dxc_wait_us={} dxc_compile_us={} pc_creation_us={}",
             counters.ready.load(Ordering::Relaxed),
             counters.pipe_hits.load(Ordering::Relaxed),
             counters.stage_hits.load(Ordering::Relaxed),
@@ -603,6 +604,7 @@ impl Service {
             counters.dxc_errors.load(Ordering::Relaxed),
             counters.translation_us.load(Ordering::Relaxed),
             counters.dxc_wait_us.load(Ordering::Relaxed),
+            counters.dxc_compile_us.load(Ordering::Relaxed),
             counters.pc_creation_us.load(Ordering::Relaxed),
         )
     }
@@ -849,7 +851,10 @@ impl Shared {
         } else {
             std::borrow::Cow::Borrowed(&stage.args)
         };
-        match self.compiler.compile(&stage.hlsl, &stage.entry, &stage.profile, &args) {
+        let compile_started = std::time::Instant::now();
+        let compile_result = self.compiler.compile(&stage.hlsl, &stage.entry, &stage.profile, &args);
+        self.counters.dxc_compile_us.fetch_add(compile_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        match compile_result {
             Ok(dxil) => {
                 self.counters.compiled.fetch_add(1, Ordering::Relaxed);
                 if o0 {
@@ -1006,7 +1011,7 @@ pub(crate) mod tests {
         assert!(lines[2].contains("pipelines vs+ps=62 cs=1 ms+ps=2, PC made vs+ps=0 cs=0 ms+ps=1"));
         assert_eq!(lines[3], lines[2]);
         assert!(lines[3].contains("ready=0 pipe_hits=0 stage_hits=0 translated=0 cache_hits=0 compiled=0 compiled_o0=0 dxc_errors=0"));
-        assert!(lines[3].ends_with("translation_us=0 dxc_wait_us=0 pc_creation_us=40"));
+        assert!(lines[3].ends_with("translation_us=0 dxc_wait_us=0 dxc_compile_us=0 pc_creation_us=40"));
     }
 
     /// A compiler that keeps the HLSL size and the extra arguments of each call.
@@ -1082,7 +1087,8 @@ pub(crate) mod tests {
             assert!(over.small_or_cached(&make(MAX_LIVE_HLSL_BYTES + 1)), "over limit refuses without DXC so the fast lane handles it");
         }
         let refused = poll_until_final(&over, 1, &compute);
-        assert!(matches!(&refused, Poll::Refused(r) if r.starts_with("live hlsl limit (cs ") && r.contains("8388609 bytes")), "{refused:?}");
+        let over_bytes = format!("{} bytes", MAX_LIVE_HLSL_BYTES + 1);
+        assert!(matches!(&refused, Poll::Refused(r) if r.starts_with("live hlsl limit (cs ") && r.contains(&over_bytes)), "{refused:?}");
         assert!(compiler.calls.lock().unwrap().is_empty(), "DXC never runs");
         assert_eq!(over.counters().dxc_errors.load(Ordering::Relaxed), 0);
         assert_eq!(over.counters().refused().get("live hlsl limit"), Some(&1));
@@ -1415,7 +1421,8 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_o0_hlsl_bytes_handles_defaults_overrides_and_off() {
-        assert_eq!(O0_HLSL_BYTES, 128 * 1024);
+        assert_eq!(O0_HLSL_BYTES, 32 * 1024);
+        assert_eq!(MAX_LIVE_HLSL_BYTES, 16 * 1024 * 1024);
         assert_eq!(parse_o0_hlsl_bytes(None), O0_HLSL_BYTES);
         assert_eq!(parse_o0_hlsl_bytes(Some("")), O0_HLSL_BYTES);
         assert_eq!(parse_o0_hlsl_bytes(Some("not-a-number")), O0_HLSL_BYTES);

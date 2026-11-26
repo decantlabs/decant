@@ -848,8 +848,8 @@ mod tests {
 
     #[test]
     fn the_live_hlsl_limit_is_8_mib_unless_set() {
-        assert_eq!(parse_live_limit(None), 8 * 1024 * 1024);
-        assert_eq!(parse_live_limit(Some("soon")), 8 * 1024 * 1024);
+        assert_eq!(parse_live_limit(None), 16 * 1024 * 1024);
+        assert_eq!(parse_live_limit(Some("soon")), 16 * 1024 * 1024);
         assert_eq!(parse_live_limit(Some(" 1048576 ")), 1 << 20);
         assert_eq!(parse_live_limit(Some("0")), usize::MAX, "0 lifts the limit");
         assert_eq!(TRANSLATOR_HASH.len(), 32, "the startup line names the full translator hash");
