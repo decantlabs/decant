@@ -45,15 +45,18 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-use windows::core::Interface;
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter3, IDXGIFactory4};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::core::{Interface, PCWSTR};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
 
@@ -531,11 +534,211 @@ struct Api {
     journal_seq: Option<JournalSeqFn>,
 }
 
-/// One pool heap: the buffer over it and where its memory is mapped.
+/// One pool heap: the buffer over it and where its memory is mapped (0 when in L1 VRAM).
 struct Heap {
     _heap: ID3D12Heap,
-    _buffer: ID3D12Resource,
+    buffer: ID3D12Resource,
     ptr: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MirrorPool {
+    L0,
+    L1,
+}
+
+const L1_MIN_VRAM_BYTES: u64 = 16 << 30;
+const STAGING_BYTES: usize = 64 << 20;
+const STAGING_MAX_PAGES: usize = STAGING_BYTES / PAGE as usize;
+const STAGING_ALLOCATORS: usize = 8;
+
+fn parse_mirror_pool(env: Option<&str>, dedicated_vram: u64) -> MirrorPool {
+    if let Some(val) = env {
+        if val.eq_ignore_ascii_case("l0") {
+            return MirrorPool::L0;
+        }
+        if val.eq_ignore_ascii_case("l1") {
+            return MirrorPool::L1;
+        }
+    }
+    if dedicated_vram >= L1_MIN_VRAM_BYTES { MirrorPool::L1 } else { MirrorPool::L0 }
+}
+
+fn dedicated_vram(device: &ID3D12Device) -> u64 {
+    // SAFETY: plain DXGI factory and adapter queries on a live D3D12 device.
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory4>() }) else { return 0 };
+    // SAFETY: `device` is live and `GetAdapterLuid` returns its LUID by value.
+    let Ok(adapter) = (unsafe { factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()) }) else { return 0 };
+    // SAFETY: `adapter` is live.
+    unsafe { adapter.GetDesc() }.map_or(0, |d| d.DedicatedVideoMemory as u64)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UploadRun {
+    heap: u32,
+    heap_offset: u64,
+    staging_offset: u64,
+    bytes: u64,
+}
+
+struct StagingRing {
+    buffer: ID3D12Resource,
+    ptr: usize,
+    size: usize,
+    head: usize,
+    in_flight: VecDeque<(usize, usize, u64)>,
+    allocators: Vec<ID3D12CommandAllocator>,
+    alloc_fences: Vec<u64>,
+    list: ID3D12GraphicsCommandList,
+    slot: usize,
+    /// `HANDLE` stored as `usize` so `StagingRing` is `Send + Sync` inside `STATE`.
+    event: usize,
+}
+
+impl Drop for StagingRing {
+    fn drop(&mut self) {
+        if self.event != 0 {
+            // SAFETY: `event` was created by `CreateEventW` and is owned by `StagingRing`.
+            unsafe {
+                let _ = CloseHandle(HANDLE(self.event as *mut c_void));
+            }
+        }
+    }
+}
+
+fn wait_fence(fence: &ID3D12Fence, event: usize, target: u64) {
+    if target == 0 || event == 0 {
+        return;
+    }
+    // SAFETY: `fence` and `event` are live; `GetCompletedValue` and `SetEventOnCompletion` are plain D3D12 calls.
+    unsafe {
+        if fence.GetCompletedValue() >= target {
+            return;
+        }
+        if fence.SetEventOnCompletion(target, HANDLE(event as *mut c_void)).is_ok() {
+            WaitForSingleObject(HANDLE(event as *mut c_void), 5000);
+        }
+    }
+}
+
+impl StagingRing {
+    fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
+        let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain D3D12 upload buffer creation on a live device.
+        unsafe {
+            device.CreateCommittedResource(
+                &props,
+                D3D12_HEAP_FLAG_NONE,
+                &buffer_desc(STAGING_BYTES as u64, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut buffer,
+            )
+        }?;
+        let fail = || windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32));
+        let buffer = buffer.ok_or_else(fail)?;
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: upload buffer mapped for the life of the ring.
+        unsafe { buffer.Map(0, None, Some(&mut ptr)) }?;
+        // SAFETY: live resource.
+        let _ = unsafe { buffer.SetName(&windows::core::HSTRING::from("decant title mirror staging")) };
+        let mut allocators = Vec::with_capacity(STAGING_ALLOCATORS);
+        for _ in 0..STAGING_ALLOCATORS {
+            // SAFETY: plain D3D12 command allocator creation.
+            let alloc: ID3D12CommandAllocator = unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }?;
+            allocators.push(alloc);
+        }
+        // SAFETY: plain D3D12 command list creation and immediate close.
+        let list: ID3D12GraphicsCommandList = unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocators[0], None) }?;
+        // SAFETY: list was just opened above.
+        unsafe { list.Close() }?;
+        // SAFETY: plain Win32 auto-reset event.
+        let event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }?;
+        Ok(Self {
+            buffer,
+            ptr: ptr as usize,
+            size: STAGING_BYTES,
+            head: 0,
+            in_flight: VecDeque::new(),
+            allocators,
+            alloc_fences: vec![0; STAGING_ALLOCATORS],
+            list,
+            slot: 0,
+            event: event.0 as usize,
+        })
+    }
+
+    fn reserve(&mut self, bytes: usize, fence: &ID3D12Fence) -> Option<usize> {
+        if bytes == 0 {
+            return Some(self.head);
+        }
+        if bytes > self.size {
+            return None;
+        }
+        if self.head + bytes > self.size {
+            self.head = 0;
+        }
+        let start = self.head;
+        let end = start + bytes;
+        let mut wait_val = 0u64;
+        for &(f_start, f_len, f_val) in &self.in_flight {
+            if f_start < end && start < f_start + f_len {
+                wait_val = wait_val.max(f_val);
+            }
+        }
+        if wait_val > 0 {
+            wait_fence(fence, self.event, wait_val);
+            self.in_flight.retain(|&(f_start, f_len, f_val)| f_val > wait_val && !(f_start < end && start < f_start + f_len));
+        }
+        self.head = end;
+        Some(start)
+    }
+
+    fn copy_to_heaps(
+        &mut self,
+        queue: &ID3D12CommandQueue,
+        fence: &ID3D12Fence,
+        heaps: &[Option<Heap>],
+        span: (usize, usize),
+        runs: &[UploadRun],
+        fence_value: &mut u64,
+    ) -> bool {
+        let (base_offset, total_bytes) = span;
+        if runs.is_empty() {
+            return false;
+        }
+        wait_fence(fence, self.event, self.alloc_fences[self.slot]);
+        let alloc = &self.allocators[self.slot];
+        // SAFETY: `alloc_fences[slot]` has completed above, and `list` is closed before reset.
+        unsafe {
+            if alloc.Reset().is_err() || self.list.Reset(alloc, None).is_err() {
+                return false;
+            }
+            for run in runs {
+                if let Some(dst) = heaps.get(run.heap as usize).and_then(|h| h.as_ref()) {
+                    self.list.CopyBufferRegion(
+                        &dst.buffer,
+                        run.heap_offset,
+                        &self.buffer,
+                        base_offset as u64 + run.staging_offset,
+                        run.bytes,
+                    );
+                }
+            }
+            if self.list.Close().is_err() {
+                return false;
+            }
+            let Ok(cmd) = self.list.cast::<ID3D12CommandList>() else { return false };
+            queue.ExecuteCommandLists(&[Some(cmd)]);
+            *fence_value += 1;
+            let _ = queue.Signal(fence, *fence_value);
+        }
+        self.in_flight.push_back((base_offset, total_bytes, *fence_value));
+        self.alloc_fences[self.slot] = *fence_value;
+        self.slot = (self.slot + 1) % self.allocators.len();
+        true
+    }
 }
 
 /// One window buffer: a reserved buffer, its GPU address.
@@ -581,6 +784,8 @@ struct State {
     last_journal_seq: Option<u64>,
     /// Pool heaps by index. A heap that cannot be made is `None` and is not tried again.
     heaps: Vec<Option<Heap>>,
+    pool: MirrorPool,
+    staging: Option<StagingRing>,
     /// The heaps that could not be made.
     failed: HashSet<u32>,
     windows: Vec<Option<Window>>,
@@ -605,9 +810,10 @@ struct State {
 impl Drop for State {
     fn drop(&mut self) {
         let heaps = self.heaps.iter().flatten().count() as u64;
+        let seg = if self.pool == MirrorPool::L1 { crate::mem_owners::Segment::Local } else { crate::mem_owners::Segment::System };
         crate::mem_owners::remove(
             crate::mem_owners::Kind::TitleMirrorHeap,
-            crate::mem_owners::Segment::System,
+            seg,
             heaps,
             heaps * POOL_HEAP_BYTES,
         );
@@ -737,11 +943,12 @@ fn journal_unchanged(api: &Api) -> bool {
 struct SyncScratch {
     jobs: Vec<CopyJob>,
     dirty: Vec<u32>,
+    runs: Vec<UploadRun>,
 }
 
 /// Serializes `sync` and `device_created` across queues so `execute_copies` runs without holding `STATE`,
-/// and reuses the `CopyJob` and dirty page buffers across syncs.
-static SYNC_LOCK: Mutex<SyncScratch> = Mutex::new(SyncScratch { jobs: Vec::new(), dirty: Vec::new() });
+/// and reuses the `CopyJob`, dirty page, and upload run buffers across syncs.
+static SYNC_LOCK: Mutex<SyncScratch> = Mutex::new(SyncScratch { jobs: Vec::new(), dirty: Vec::new(), runs: Vec::new() });
 
 fn should_skip_drain(last_seq: Option<u64>, current_seq: Option<u64>) -> bool {
     matches!((last_seq, current_seq), (Some(a), Some(b)) if a == b)
@@ -844,11 +1051,20 @@ fn buffer_desc(width: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
     }
 }
 
-/// A pool heap, the buffer over it and its mapped memory.
-fn make_heap(device: &ID3D12Device, index: u32) -> windows::core::Result<Heap> {
+/// A pool heap, the buffer over it and its mapped memory (or 0 when in L1 VRAM).
+fn make_heap(device: &ID3D12Device, index: u32, pool: MirrorPool) -> windows::core::Result<Heap> {
+    let props = match pool {
+        MirrorPool::L0 => D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        },
+        MirrorPool::L1 => D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+    };
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: POOL_HEAP_BYTES,
-        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, MemoryPoolPreference: D3D12_MEMORY_POOL_L0, ..Default::default() },
+        Properties: props,
         Alignment: 0,
         Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
     };
@@ -867,16 +1083,22 @@ fn make_heap(device: &ID3D12Device, index: u32) -> windows::core::Result<Heap> {
         let _ = heap.SetName(&windows::core::HSTRING::from(format!("decant title pool heap {index}")));
         let _ = buffer.SetName(&windows::core::HSTRING::from(format!("decant title pool buffer {index}")));
     }
-    let mut ptr = std::ptr::null_mut();
-    // SAFETY: a buffer in a CPU visible heap, mapped for the life of the process (never unmapped).
-    unsafe { buffer.Map(0, None, Some(&mut ptr)) }?;
+    let ptr = if pool == MirrorPool::L0 {
+        let mut p = std::ptr::null_mut();
+        // SAFETY: a buffer in a CPU visible heap, mapped for the life of the process (never unmapped).
+        unsafe { buffer.Map(0, None, Some(&mut p)) }?;
+        p as usize
+    } else {
+        0
+    };
+    let seg = if pool == MirrorPool::L1 { crate::mem_owners::Segment::Local } else { crate::mem_owners::Segment::System };
     crate::mem_owners::add(
         crate::mem_owners::Kind::TitleMirrorHeap,
-        crate::mem_owners::Segment::System,
+        seg,
         1,
         POOL_HEAP_BYTES,
     );
-    Ok(Heap { _heap: heap, _buffer: buffer, ptr: ptr as usize })
+    Ok(Heap { _heap: heap, buffer, ptr })
 }
 
 /// A window buffer: a reserved buffer of `bytes` bytes.
@@ -906,7 +1128,7 @@ impl State {
             self.heaps.resize_with(i + 1, || None);
         }
         if self.heaps[i].is_none() && !self.failed.contains(&index) {
-            match make_heap(&self.device, index) {
+            match make_heap(&self.device, index, self.pool) {
                 Ok(heap) => self.heaps[i] = Some(heap),
                 Err(e) => {
                     self.failed.insert(index);
@@ -1100,7 +1322,7 @@ impl State {
     }
 
     /// Collects copy jobs for sorted unique pool pages written since the last sync, ensuring heaps and sections exist.
-    fn plan_upload(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>) -> u64 {
+    fn plan_upload(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, runs: &mut Vec<UploadRun>) -> u64 {
         if pages.is_empty() {
             return 0;
         }
@@ -1115,15 +1337,16 @@ impl State {
                 new_tile = true;
             }
         }
-        self.plan_runs(api, pages, jobs, &mut total);
+        self.plan_runs(api, pages, jobs, runs, &mut total);
         if new_tile {
             bump_tile_gen();
         }
         total
     }
 
-    fn plan_runs(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, copied: &mut u64) {
+    fn plan_runs(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, runs: &mut Vec<UploadRun>, copied: &mut u64) {
         let mut i = 0;
+        let use_staging = self.pool == MirrorPool::L1;
         while i < pages.len() {
             let first = pages[i];
             let Some(first_tile) = self.mirror.tile_of(first) else {
@@ -1146,7 +1369,18 @@ impl State {
             // One run never leaves its section: the tail of a section is cut off and copied by page.
             let head = n.min(in_section);
             i += head;
-            plan_copy(jobs, src, dst + tile as usize * PAGE as usize, head);
+            if use_staging {
+                let staging_offset = *copied as usize * PAGE as usize;
+                plan_copy(jobs, src, staging_offset, head);
+                runs.push(UploadRun {
+                    heap,
+                    heap_offset: tile as u64 * PAGE,
+                    staging_offset: staging_offset as u64,
+                    bytes: head as u64 * PAGE,
+                });
+            } else {
+                plan_copy(jobs, src, dst + tile as usize * PAGE as usize, head);
+            }
             *copied += head as u64;
             self.written.extend(first_tile..first_tile + head as u32);
         }
@@ -1187,6 +1421,26 @@ pub unsafe fn device_created(device: *mut c_void) {
         xs_log!("title memory: the queue or the fence of the tile mappings cannot be made, title memory stays off");
         return;
     };
+    let env_pool = std::env::var("DECANT_D3D12X_MIRROR_POOL").ok();
+    let vram = dedicated_vram(&device);
+    let mut pool = parse_mirror_pool(env_pool.as_deref(), vram);
+    let staging = if pool == MirrorPool::L1 {
+        match StagingRing::new(&device) {
+            Ok(ring) => Some(ring),
+            Err(e) => {
+                xs_log!("title memory: L1 staging ring cannot be made ({e}), falling back to L0 mirror heaps");
+                pool = MirrorPool::L0;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    xs_log!(
+        "title memory: mirror heaps use {} (dedicated VRAM {} MiB)",
+        if pool == MirrorPool::L1 { "L1 VRAM with upload staging" } else { "L0 system memory" },
+        vram >> 20
+    );
     let _sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut st = STATE.write().unwrap_or_else(PoisonError::into_inner);
     if st.is_some() {
@@ -1206,6 +1460,8 @@ pub unsafe fn device_created(device: *mut c_void) {
         seq: 0,
         last_journal_seq: None,
         heaps: Vec::new(),
+        pool,
+        staging,
         failed: HashSet::new(),
         windows: Vec::new(),
         sections: Vec::new(),
@@ -1616,47 +1872,80 @@ pub unsafe fn sync(queue: *mut c_void) {
     let Some(queue_ref) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
     let Some(api_ref) = api() else { return };
     let mut sync_scratch = decant_trace::timed_lock("title_mem::SYNC_LOCK", || SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-    let SyncScratch { jobs, dirty } = &mut *sync_scratch;
-    jobs.clear();
+    let SyncScratch { jobs, dirty, runs } = &mut *sync_scratch;
     thread_local! {
         static SYNC_WRITTEN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     }
     let mut written = SYNC_WRITTEN.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     written.clear();
-    let started = Instant::now();
     let take_micros = take_dirty_outside_state(api_ref, dirty);
-    let Some((phase1_id, pages)) = with_state(|st, api| {
-        st.stats.take_micros += take_micros;
-        let pages = st.plan_upload(api, dirty, jobs);
-        std::mem::swap(&mut st.written, &mut written);
-        (st.id, pages)
-    }) else {
-        SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
-        return;
-    };
-
     static CORES: OnceLock<usize> = OnceLock::new();
     let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from));
-    let copy_micros = if !jobs.is_empty() {
-        let copying = Instant::now();
-        let _copy = decant_trace::span("title_mem", "copy_runs");
-        // SAFETY: sorted unique pool pages have unique mirror tiles. Planning keeps each job
-        // inside a live section and heap, and SYNC_LOCK keeps `device_created` from replacing heaps.
-        unsafe { execute_copies(jobs, cores) };
-        copying.elapsed().as_micros() as u64
-    } else {
-        0
-    };
 
-    let mut ranges_updated = 0u64;
+    let mut total_pages = 0u64;
+    let mut total_ranges = 0u64;
     let mut run_guard = false;
-    {
+    let mut first_batch = true;
+    let mut chunk_start = 0usize;
+    while first_batch || chunk_start < dirty.len() {
+        first_batch = false;
+        let chunk_end = (chunk_start + STAGING_MAX_PAGES).min(dirty.len());
+        let batch_pages = &dirty[chunk_start..chunk_end];
+        chunk_start = chunk_end;
+        jobs.clear();
+        runs.clear();
+        let started = Instant::now();
+        let batch_take = if total_pages == 0 && total_ranges == 0 { take_micros } else { 0 };
+        let Some((phase1_id, pages, staging_base)) = with_state(|st, api| {
+            st.stats.take_micros += batch_take;
+            let pages = st.plan_upload(api, batch_pages, jobs, runs);
+            let mut batch_written = std::mem::take(&mut st.written);
+            written.append(&mut batch_written);
+            st.written = batch_written;
+            let staging_base = if let (true, Some(ring)) = (pages > 0, st.staging.as_mut()) {
+                let bytes = pages as usize * PAGE as usize;
+                let base = ring.reserve(bytes, &st.map_fence)?;
+                let dst_base = ring.ptr + base;
+                for job in jobs.iter_mut() {
+                    job.destination += dst_base;
+                }
+                Some(base)
+            } else {
+                None
+            };
+            Some((st.id, pages, staging_base))
+        }).flatten() else {
+            SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
+            return;
+        };
+
+        let copy_micros = if !jobs.is_empty() {
+            let copying = Instant::now();
+            let _copy = decant_trace::span("title_mem", "copy_runs");
+            // SAFETY: sorted unique pool pages have unique mirror tiles. Planning keeps each job
+            // inside a live section and heap (or reserved staging span), and SYNC_LOCK keeps `device_created` from replacing heaps.
+            unsafe { execute_copies(jobs, cores) };
+            copying.elapsed().as_micros() as u64
+        } else {
+            0
+        };
+
         let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
         if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
             st.stats.copy_micros += copy_micros;
+            if let (Some(base), Some(ring)) = (staging_base, st.staging.as_mut()) {
+                ring.copy_to_heaps(
+                    &st.map_queue,
+                    &st.map_fence,
+                    &st.heaps,
+                    (base, pages as usize * PAGE as usize),
+                    runs,
+                    &mut st.fence_value,
+                );
+            }
             let tiles = Instant::now();
             let ranges = st.update_tiles();
-            ranges_updated = ranges;
+            total_ranges += ranges;
             st.stats.tile_micros += tiles.elapsed().as_micros() as u64;
             if st.fence_value > 0 && st.waited.get(&(queue as usize)).is_none_or(|&v| v < st.fence_value) {
                 // SAFETY: both objects are live. The queue waits on the GPU, the CPU does not.
@@ -1696,14 +1985,15 @@ pub unsafe fn sync(queue: *mut c_void) {
                 st.stats = Stats { syncs: st.stats.syncs, ..Stats::default() };
             }
         }
+        total_pages += pages;
     }
     drop(sync_scratch);
     if run_guard {
         // SAFETY: the export takes no argument.
         unsafe { (api_ref.guard_modules)() };
     }
-    let page_units = pages / 16;
-    let range_units = ranges_updated / 4;
+    let page_units = total_pages / 16;
+    let range_units = total_ranges / 4;
     note_streaming_work(page_units.max(range_units));
     // A placed texture whose memory the title wrote is filled again (after this lock is given back:
     // the detile table asks for tiles under its own lock).
@@ -2006,5 +2296,16 @@ mod tests {
         let mut dirty = Vec::new();
         let _ = take_dirty_outside_state(&api, &mut dirty);
         assert_eq!(dirty, [1, 3, 9]);
+    }
+
+    #[test]
+    fn mirror_pool_selects_l1_on_16_gib_vram_and_honors_env_override() {
+        assert_eq!(parse_mirror_pool(None, 8 << 30), MirrorPool::L0);
+        assert_eq!(parse_mirror_pool(None, 16 << 30), MirrorPool::L1);
+        assert_eq!(parse_mirror_pool(None, 24 << 30), MirrorPool::L1);
+        assert_eq!(parse_mirror_pool(Some("l0"), 24 << 30), MirrorPool::L0);
+        assert_eq!(parse_mirror_pool(Some("L0"), 24 << 30), MirrorPool::L0);
+        assert_eq!(parse_mirror_pool(Some("l1"), 4 << 30), MirrorPool::L1);
+        assert_eq!(parse_mirror_pool(Some("L1"), 4 << 30), MirrorPool::L1);
     }
 }
