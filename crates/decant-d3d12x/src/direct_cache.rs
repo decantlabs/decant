@@ -107,8 +107,7 @@ const STAGE_KEY_PREFIX: Fnv128 = Fnv128(FNV128_OFFSET)
 
 const SOURCE_STAGE_KEY_PREFIX: Fnv128 = Fnv128(FNV128_OFFSET)
     .with_field(b"decant direct stage by source key")
-    .with_field(&FORMAT.to_le_bytes())
-    .with_field(TRANSLATOR_HASH.as_bytes());
+    .with_field(&FORMAT.to_le_bytes());
 
 const PIPELINE_KEY_PREFIX: Fnv128 = Fnv128(FNV128_OFFSET)
     .with_field(b"decant direct pipeline")
@@ -190,13 +189,12 @@ pub fn stage_key(kind: StageKind, bytes: &[u8], root: &RootLayout, linkage: &Lin
 }
 
 /// The cache key of one stage from the key its translator gives for it
-/// (`ShaderSource::stage_keys`), which stands for the console bytes, the root signature and the
-/// linkage of [`stage_key`].
-pub fn source_stage_key(kind: StageKind, source_key: u128, translator: &str, dxc: &str) -> u128 {
+/// (`ShaderSource::stage_keys`), which stands for the compiled HLSL text and DXC version.
+/// Independent of translator build hashes so identical HLSL reuses cached DXIL across rebuilds.
+pub fn source_stage_key(kind: StageKind, source_key: u128, _translator: &str, dxc: &str) -> u128 {
     let mut h = SOURCE_STAGE_KEY_PREFIX;
     h.field(kind.short().as_bytes())
         .field(&source_key.to_le_bytes())
-        .field(translator.as_bytes())
         .field(dxc.as_bytes());
     h.finish()
 }
@@ -709,10 +707,10 @@ pub(crate) mod tests {
 
         let by_source = source_stage_key(StageKind::Vertex, 7, "t1", "d1");
         assert_eq!(by_source, source_stage_key(StageKind::Vertex, 7, "t1", "d1"));
+        assert_eq!(by_source, source_stage_key(StageKind::Vertex, 7, "t2", "d1"), "translator version does not invalidate identical HLSL DXIL");
         for other in [
             source_stage_key(StageKind::Pixel, 7, "t1", "d1"),
             source_stage_key(StageKind::Vertex, 8, "t1", "d1"),
-            source_stage_key(StageKind::Vertex, 7, "t2", "d1"),
             source_stage_key(StageKind::Vertex, 7, "t1", "d2"),
         ] {
             assert_ne!(other, by_source);
@@ -877,8 +875,7 @@ pub(crate) mod tests {
         let mut source = Fnv128::default();
         source
             .field(b"decant direct stage by source key")
-            .field(&FORMAT.to_le_bytes())
-            .field(TRANSLATOR_HASH.as_bytes());
+            .field(&FORMAT.to_le_bytes());
         assert_eq!(SOURCE_STAGE_KEY_PREFIX.finish(), source.finish());
 
         let mut pipe = Fnv128::default();

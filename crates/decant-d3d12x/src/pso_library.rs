@@ -125,20 +125,23 @@ fn masked_ranges(desc_len: usize) -> &'static [(usize, usize)] {
 }
 
 /// The key of one pipeline: `desc` is the PC description the direct path makes it with,
-/// `stages` the compiled bytes of its stages in order, `identity` the direct pipeline key (console
-/// stages, root signature layout and linkage). `None` for a pipeline the library does not keep.
-pub fn pipeline_key(desc: &[u8], stages: &[&[u8]], identity: u128) -> Option<u128> {
+/// `stages` the compiled bytes of its stages in order. `_identity` is ignored so identical
+/// compiled DXIL and pipeline state reuse driver blobs across translator rebuilds.
+/// `None` for a pipeline the library does not keep.
+pub fn pipeline_key(desc: &[u8], stages: &[&[u8]], _identity: u128) -> Option<u128> {
     cached_field(desc.len())?;
     // Stream output declarations live behind pointers: not keyed, not kept.
     if (desc.len() == GRAPHICS_DESC_SIZE || desc.len() == MESH_DESC_SIZE) && u32::from_le_bytes(desc[0x60..0x64].try_into().ok()?) != 0 {
         return None;
     }
-    let mut state = desc.to_vec();
+    let mut stack = [0u8; MESH_DESC_SIZE];
+    let state = &mut stack[..desc.len()];
+    state.copy_from_slice(desc);
     for &(from, to) in masked_ranges(desc.len()) {
         state[from..to].fill(0);
     }
     let mut h = Fnv128::default();
-    h.field(b"decant pso library pipeline").field(&FORMAT.to_le_bytes()).field(&identity.to_le_bytes()).field(&state);
+    h.field(b"decant pso library pipeline").field(&FORMAT.to_le_bytes()).field(state);
     h.field(&(stages.len() as u64).to_le_bytes());
     for stage in stages {
         h.field(stage);
@@ -709,7 +712,7 @@ mod tests {
         let base = pipeline_key(&graphics(0x11, 1), &stages, 7).unwrap();
         assert_eq!(pipeline_key(&graphics(0x99, 1), &stages, 7), Some(base), "pointers and padding do not count");
         assert_ne!(pipeline_key(&graphics(0x11, 2), &stages, 7), Some(base), "state counts");
-        assert_ne!(pipeline_key(&graphics(0x11, 1), &stages, 8), Some(base), "the direct key counts");
+        assert_eq!(pipeline_key(&graphics(0x11, 1), &stages, 8), Some(base), "identical DXIL and state stay cached across translator rebuilds");
         assert_ne!(pipeline_key(&graphics(0x11, 1), &[b"DXBC vertex", b"DXBC pixel 2"], 7), Some(base), "stage bytes count");
         assert_ne!(pipeline_key(&graphics(0x11, 1), &stages[..1], 7), Some(base), "the stage count counts");
 
