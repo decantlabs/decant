@@ -48,6 +48,26 @@ fn wanted_function(name: &str) -> Option<usize> {
     ["ReadFile", "ReadFileEx", "ReadFileScatter"].iter().position(|&n| n == name)
 }
 
+/// Coalesces contiguous `SEGMENT_BYTES` scatter segments into maximal `(base, run_len)` runs.
+pub(crate) fn coalesce_scatter_segments(segments: &[u64], len: usize) -> Vec<(usize, usize)> {
+    if len == 0 || segments.is_empty() {
+        return Vec::new();
+    }
+    let count = len.div_ceil(SEGMENT_BYTES).min(segments.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut remaining = len;
+    for &seg in &segments[..count] {
+        let seg_len = remaining.min(SEGMENT_BYTES);
+        let addr = seg as usize;
+        match runs.last_mut() {
+            Some((base, run_len)) if base.checked_add(*run_len) == Some(addr) => *run_len += seg_len,
+            _ => runs.push((addr, seg_len)),
+        }
+        remaining -= seg_len;
+    }
+    runs
+}
+
 /// Makes the pages of `[buffer, buffer + len)` writable for a kernel write.
 fn prepare(buffer: *const c_void, len: usize) {
     if let Some(engine) = Engine::started() {
@@ -102,10 +122,13 @@ unsafe extern "system" fn read_file_ex(file: *mut c_void, buffer: *mut c_void, l
 }
 
 unsafe extern "system" fn read_file_scatter(file: *mut c_void, segments: *const u64, len: u32, reserved: *mut u32, overlapped: *mut c_void) -> BOOL {
-    if !segments.is_null() {
-        for i in 0..(len as usize).div_ceil(SEGMENT_BYTES) {
-            // SAFETY: the caller's array has one element for each segment of `len` bytes, and one that ends it.
-            prepare(unsafe { segments.add(i).read_unaligned() } as usize as *const c_void, SEGMENT_BYTES);
+    if !segments.is_null() && len != 0 {
+        let count = (len as usize).div_ceil(SEGMENT_BYTES);
+        // SAFETY: the caller's array has one element for each segment of `len` bytes.
+        let slice = unsafe { std::slice::from_raw_parts(segments, count) };
+        let runs = coalesce_scatter_segments(slice, len as usize);
+        if let Some(engine) = Engine::started() {
+            engine.prepare_write_runs(&runs);
         }
     }
     // SAFETY: as in `read_file`, with `ORIGINAL[2]`.
@@ -262,5 +285,15 @@ mod tests {
         assert_eq!(wanted_function("WriteFile"), None);
         assert_eq!(folder("c:\\game\\title.exe"), "c:\\game\\");
         assert_eq!(folder("title.exe"), "");
+    }
+
+    #[test]
+    fn coalesce_scatter_segments_merges_contiguous_runs_and_handles_gaps() {
+        assert_eq!(coalesce_scatter_segments(&[], 4096), Vec::<(usize, usize)>::new());
+        assert_eq!(coalesce_scatter_segments(&[0x10_0000], 0), Vec::<(usize, usize)>::new());
+
+        let segs = [0x10_0000u64, 0x10_1000, 0x10_2000, 0x20_0000, 0x20_1000];
+        assert_eq!(coalesce_scatter_segments(&segs, 5 * SEGMENT_BYTES), vec![(0x10_0000, 3 * SEGMENT_BYTES), (0x20_0000, 2 * SEGMENT_BYTES)]);
+        assert_eq!(coalesce_scatter_segments(&segs, 4 * SEGMENT_BYTES + 123), vec![(0x10_0000, 3 * SEGMENT_BYTES), (0x20_0000, SEGMENT_BYTES + 123)]);
     }
 }

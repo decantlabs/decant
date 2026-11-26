@@ -1801,11 +1801,16 @@ impl Engine {
     }
 
     fn collect_rw_view_indices(st: &State, address: usize, len: usize, commit: bool) -> Vec<u32> {
-        if len == 0 {
-            return Vec::new();
-        }
-        let Some(end) = address.checked_add(len) else { return Vec::new() };
         let mut indices = Vec::new();
+        Self::collect_rw_view_indices_into(st, address, len, commit, &mut indices);
+        indices
+    }
+
+    fn collect_rw_view_indices_into(st: &State, address: usize, len: usize, commit: bool, indices: &mut Vec<u32>) {
+        if len == 0 {
+            return;
+        }
+        let Some(end) = address.checked_add(len) else { return };
         let mut page = address & !(PAGE_BYTES - 1);
         while page < end {
             let Some((base, region)) = st.regions.containing(page) else {
@@ -1829,7 +1834,33 @@ impl Engine {
                 page = region_end.max(page + PAGE_BYTES);
             }
         }
-        indices
+    }
+
+    /// Commits and opens the writable view pages across all `(address, len)` runs for a kernel
+    /// write, acquiring the state and dirty locks once across the whole batch.
+    pub fn prepare_write_runs(&self, runs: &[(usize, usize)]) {
+        if runs.is_empty() {
+            return;
+        }
+        let st = self.lock();
+        let mut indices = Vec::new();
+        for &(address, len) in runs {
+            Self::collect_rw_view_indices_into(&st, address, len, true, &mut indices);
+        }
+        if indices.is_empty() {
+            return;
+        }
+        let until = Instant::now() + track::io_hold();
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut open = Vec::new();
+        if let Some(track) = dirty_guard.track.as_mut() {
+            for index in indices {
+                track.mark_committed(index);
+                open.extend(track.prepare_until(index, until));
+            }
+        }
+        Self::protect_runs(open, PAGE_READWRITE);
     }
 
     /// Commits and pins the writable view pages in `[address, address + len)` open for an active
@@ -3093,6 +3124,35 @@ mod tests {
         assert!(e.take_dirty(usize::MAX).contains(&page));
         assert!(!accessible(area, true));
         assert!(e.take_dirty(usize::MAX).is_empty());
+
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
+    }
+
+    #[test]
+    fn prepare_write_runs_commits_and_opens_multiple_disjoint_runs_in_one_call() {
+        let Some(e) = held(|| Engine::load_limited(8, 8)) else { return };
+        e.set_tracking(true);
+        let area = e.reserve(0, 8 * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(6).unwrap();
+        e.map_frames(area, &frames).unwrap();
+
+        // Commit and protect page 0 so the batch mixes a protected committed page and uncommitted pages.
+        assert!(Engine::commit_on_access_in(&e.state, area));
+        assert!(e.take_dirty(usize::MAX).contains(&page_of(frames[0])));
+        assert!(!accessible(area, true));
+        assert!(!accessible(area + 3 * P, false));
+        assert!(!accessible(area + 4 * P, false));
+
+        e.prepare_write_runs(&[(area, P), (area + 3 * P, 2 * P)]);
+        assert!(accessible(area, true));
+        assert!(accessible(area + 3 * P, true));
+        assert!(accessible(area + 4 * P, true));
+
+        let taken = e.take_dirty(usize::MAX);
+        assert!(taken.contains(&page_of(frames[0])));
+        assert!(taken.contains(&page_of(frames[3])));
+        assert!(taken.contains(&page_of(frames[4])));
 
         e.release(area).unwrap();
         e.free_pages(&frames).unwrap();
