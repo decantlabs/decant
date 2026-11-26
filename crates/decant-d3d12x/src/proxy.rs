@@ -2904,6 +2904,7 @@ unsafe fn view_texture(this: *mut Proxy, va: u64, rdesc: *const c_void) -> Optio
             if n.is_power_of_two() {
                 xs_log!("console device slot 70: {n} views at an address reused the texture made for it, {} such textures made", crate::views_at::with_view_textures(|t| t.len()));
             }
+            trim_view_textures_with(None);
             return Some(res);
         }
         crate::views_at::ViewTexture::Changed(res) => Some(res),
@@ -3027,8 +3028,14 @@ fn view_clock_ms() -> u64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
+const TRIM_INTERVAL_MS: u64 = 1_000;
+
 fn next_trim_present(present: u64, freed_empty: bool) -> u64 {
     present.saturating_add(if freed_empty { 300 } else { 60 })
+}
+
+fn should_run_trim(present: u64, next_present: u64, now_ms: u64, last_ms: u64) -> bool {
+    present >= next_present || now_ms.saturating_sub(last_ms) >= TRIM_INTERVAL_MS
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -3090,10 +3097,15 @@ fn cached_resource_alloc_size(
 /// every texture placed in it is gone (`view_heap`). A line says how much went.
 fn trim_view_textures_with(known_device: Option<&windows::Win32::Graphics::Direct3D12::ID3D12Device>) {
     static NEXT_TRIM_PRESENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_TRIM_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let present = crate::title_heap::presents();
-    if present < NEXT_TRIM_PRESENT.load(Ordering::Relaxed) {
+    let ms = view_clock_ms();
+    let next_present = NEXT_TRIM_PRESENT.load(Ordering::Relaxed);
+    let last_ms = LAST_TRIM_MS.load(Ordering::Relaxed);
+    if !should_run_trim(present, next_present, ms, last_ms) {
         return;
     }
+    LAST_TRIM_MS.store(ms, Ordering::Relaxed);
     let _trace = decant_trace::span("views_at", "trim");
     static WAVES: AtomicI32 = AtomicI32::new(0);
     static STUCK: std::sync::Once = std::sync::Once::new();
@@ -3120,14 +3132,17 @@ fn trim_view_textures_with(known_device: Option<&windows::Win32::Graphics::Direc
             lru_budget >> 20
         );
     });
-    let held_bytes = crate::views_at::with_view_textures(|t| t.held_bytes(crate::view_heap::HEAP_BYTES));
+    let heap_sizes = crate::view_heap::heap_sizes();
+    let held_bytes = crate::views_at::with_view_textures(|t| t.held_bytes_with(&heap_sizes, crate::view_heap::HEAP_BYTES));
     if effective_cap == 0 || held_bytes <= effective_cap {
+        let _ = crate::view_heap::reclaim_idle();
         NEXT_TRIM_PRESENT.store(next_trim_present(present, false), Ordering::Relaxed);
         return;
     }
-    let ms = view_clock_ms();
     let referenced = crate::view_shadow::referenced();
-    let pass = crate::views_at::with_view_textures(|t| t.collect(effective_cap, crate::view_heap::HEAP_BYTES, present, ms, &referenced));
+    let pass = crate::views_at::with_view_textures(|t| {
+        t.collect_with_sizes(effective_cap, &heap_sizes, crate::view_heap::HEAP_BYTES, present, ms, &referenced)
+    });
     NEXT_TRIM_PRESENT.store(next_trim_present(present, pass.freed.is_empty()), Ordering::Relaxed);
     if pass.stuck {
         STUCK.call_once(|| {
@@ -3135,6 +3150,7 @@ fn trim_view_textures_with(known_device: Option<&windows::Win32::Graphics::Direc
         });
     }
     if pass.freed.is_empty() {
+        let _ = crate::view_heap::reclaim_idle();
         return;
     }
     mem_owners::note_view_heaps_evicted(pass.heaps_freed as u64);
@@ -6272,6 +6288,9 @@ mod tests {
         assert_eq!(super::next_trim_present(100, false), 160);
         assert_eq!(super::next_trim_present(100, true), 400);
         assert_eq!(super::next_trim_present(u64::MAX - 10, true), u64::MAX);
+        assert!(super::should_run_trim(100, 100, 500, 500));
+        assert!(!super::should_run_trim(100, 400, 1499, 500));
+        assert!(super::should_run_trim(100, 400, 1500, 500), "wall-clock interval triggers trim during low-FPS stalls");
     }
 
     #[test]

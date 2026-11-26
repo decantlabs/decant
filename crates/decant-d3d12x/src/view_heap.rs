@@ -20,9 +20,9 @@ use windows::core::Interface;
 /// Bytes of one large streaming heap.
 pub const HEAP_BYTES: u64 = 64 << 20;
 /// Bytes of one small persistent texture heap.
-const SMALL_HEAP_BYTES: u64 = 16 << 20;
-/// Textures up to this byte size use small heaps so tiny persistent views do not pin 64 MiB heaps.
-const SMALL_TEXTURE_LIMIT: u64 = 64 << 10;
+const SMALL_HEAP_BYTES: u64 = 8 << 20;
+/// Textures up to this byte size use small heaps so smaller persistent views do not pin 64 MiB heaps.
+const SMALL_TEXTURE_LIMIT: u64 = 256 << 10;
 /// Maximum warm empty heaps kept per size class for instant reuse.
 const WARM_FREE_HEAPS_PER_CLASS: usize = 1;
 /// The small resource placement alignment of the PC runtime.
@@ -276,13 +276,15 @@ fn reclaim_empty_in_pool(pool: &mut HeapPool, now: u64) -> Vec<(ID3D12Heap, u64)
     let mut to_release = Vec::new();
     for slot in &mut pool.heaps {
         let Some(h) = slot.as_mut() else { continue };
-        if !reusable(h.meta.live, h.meta.free_at, now) {
+        if h.meta.live != 0 || h.meta.free_at.is_none() {
             continue;
         }
         let class_idx = h.class as usize;
         if warm[class_idx] < WARM_FREE_HEAPS_PER_CLASS {
             warm[class_idx] += 1;
-            h.meta.reset_empty();
+            if reusable(h.meta.live, h.meta.free_at, now) {
+                h.meta.reset_empty();
+            }
         } else if let Some(gone) = slot.take() {
             to_release.push((gone.heap, class_heap_bytes(gone.class)));
         }
@@ -290,22 +292,47 @@ fn reclaim_empty_in_pool(pool: &mut HeapPool, now: u64) -> Vec<(ID3D12Heap, u64)
     to_release
 }
 
+/// Orders matching-class heap indices for dense packing: fullest live heaps first (so sparse heaps
+/// drain empty instead of getting new allocations), followed by empty reusable heaps.
+fn dense_candidate_order(entries: &[(usize, u32, u64, bool)]) -> Vec<usize> {
+    let mut ranked: Vec<(bool, u64, usize)> = entries
+        .iter()
+        .filter_map(|&(index, live, live_bytes, can_reuse)| {
+            if live > 0 {
+                Some((false, live_bytes, index))
+            } else if can_reuse {
+                Some((true, 0, index))
+            } else {
+                None
+            }
+        })
+        .collect();
+    ranked.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
+    ranked.into_iter().map(|(_, _, idx)| idx).collect()
+}
+
 fn reserve_in_pool(pool: &mut HeapPool, class: SizeClass, size: u64, align: u64, now: u64) -> Option<(ID3D12Heap, usize, u64)> {
-    let len = pool.heaps.len();
-    if len == 0 {
+    if pool.heaps.is_empty() {
         return None;
     }
     let capacity = class_heap_bytes(class);
-    let hint = &mut pool.active_hint[class as usize];
-    let start = (*hint).min(len - 1);
-    for step in 0..len {
-        let index = (start + step) % len;
-        let Some(h) = pool.heaps[index].as_mut() else { continue };
+    let mut entries = Vec::new();
+    for (index, slot) in pool.heaps.iter_mut().enumerate() {
+        let Some(h) = slot.as_mut() else { continue };
         if h.class != class {
             continue;
         }
+        h.meta.drain_ready(now);
+        let can_reuse = h.meta.free_at.is_none() || reusable(h.meta.live, h.meta.free_at, now);
+        entries.push((index, h.meta.live, h.meta.live_bytes(), can_reuse));
+    }
+    for index in dense_candidate_order(&entries) {
+        let Some(h) = pool.heaps[index].as_mut() else { continue };
+        if h.meta.live == 0 && h.meta.free_at.is_some() {
+            h.meta.reset_empty();
+        }
         if let Some(at) = h.meta.alloc(size, align, capacity, now) {
-            *hint = index;
+            pool.active_hint[class as usize] = index;
             return Some((h.heap.clone(), index, at));
         }
     }
@@ -466,6 +493,24 @@ pub fn adapter_memory(device: &windows::Win32::Graphics::Direct3D12::ID3D12Devic
         let budget = if adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).is_ok() { info.Budget } else { 0 };
         (dedicated, budget)
     }
+}
+
+/// Reclaims any excess empty heaps beyond the per-class warm reserve immediately via `retire`.
+pub fn reclaim_idle() -> usize {
+    let now = crate::title_heap::presents();
+    let excess = {
+        let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        reclaim_empty_in_pool(&mut pool, now)
+    };
+    let count = excess.len();
+    release_excess_heaps(excess);
+    count
+}
+
+/// Allocated capacity in bytes for each heap index (`0` for freed slots).
+pub fn heap_sizes() -> Vec<u64> {
+    let pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    pool.heaps.iter().map(|slot| slot.as_ref().map_or(0, |h| class_heap_bytes(h.class))).collect()
 }
 
 /// Live heaps and the live placed bytes inside them.
@@ -639,5 +684,19 @@ mod tests {
         meta.free_now(d, 4096);
         assert_eq!(meta.used, 16384);
         assert_eq!(meta.live_bytes(), 12288);
+    }
+
+    #[test]
+    fn dense_candidate_order_prefers_fullest_live_heaps_before_sparse_and_reusable_empty() {
+        use super::{SizeClass, dense_candidate_order};
+        let entries = vec![
+            (0, 0, 0, false),        // freshly emptied, not reusable yet -> skipped
+            (1, 1, 4096, true),      // sparse draining heap (live=1, 4 KiB)
+            (2, 0, 0, true),         // reusable empty warm heap
+            (3, 12, 8_000_000, true),// fullest live heap
+            (4, 3, 2_000_000, true), // medium live heap
+        ];
+        assert_eq!(dense_candidate_order(&entries), vec![3, 4, 1, 2]);
+        let _ = SizeClass::Small;
     }
 }

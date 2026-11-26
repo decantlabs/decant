@@ -184,6 +184,9 @@ pub const MIN_IDLE_MS: u64 = 15_000;
 pub const OVER_BUDGET_IDLE_PRESENTS: u64 = 8;
 /// When `budget < held <= 2 * budget`, also require this many idle milliseconds.
 pub const OVER_BUDGET_IDLE_MS: u64 = 1_000;
+/// When `held > 2 * cap` during low-FPS stalls, entries older than this wall-clock age with at least
+/// 1 elapsed present are also eligible for eviction.
+pub const SEVERE_OVER_IDLE_MS: u64 = 5_000;
 /// The most textures given back in one pass.
 pub const MAX_PER_PASS: usize = 4096;
 
@@ -312,9 +315,13 @@ impl ViewTextures {
         self.live_bytes
     }
 
-    /// Bytes the cache holds in memory: each heap with a live texture at `heap_bytes`, and the committed
-    /// textures at their size. A heap with no live texture is free to be filled again and is not counted.
+    /// Bytes the cache holds in memory: each heap with a live texture using `heap_size_fn`, and the
+    /// committed textures at their size. A heap with no live texture is free to be filled again and is not counted.
     pub fn held_bytes(&self, heap_bytes: u64) -> u64 {
+        self.held_bytes_with(&[], heap_bytes)
+    }
+
+    pub fn held_bytes_with(&self, heap_sizes: &[u64], default_heap_bytes: u64) -> u64 {
         let mut heaps = std::collections::HashSet::new();
         let mut committed = 0u64;
         for e in self.made.values().chain(self.stale.iter()) {
@@ -325,18 +332,31 @@ impl ViewTextures {
                 None => committed += e.bytes,
             }
         }
-        heaps.len() as u64 * heap_bytes + committed
+        let heap_sum: u64 = heaps
+            .into_iter()
+            .map(|h| heap_sizes.get(h).copied().filter(|&s| s > 0).unwrap_or(default_heap_bytes))
+            .sum();
+        heap_sum + committed
     }
 
     /// Takes out the textures to give back when the cache holds more than `cap` bytes ([`held_bytes`],
-    /// `cap` 0: never). The unit is the heap: the least recently used heap **all** of whose textures are
-    /// idle (no view of their address asked for during [`MIN_IDLE_PRESENTS`] presents and
-    /// [`MIN_IDLE_MS`] ms at `present` and `ms`) and which no slot of a view heap holds a view of
-    /// (`referenced`) goes whole, so that it can be filled again. Committed textures go one by one under
-    /// the same two conditions. It stops once the cache is back at `cap`, at most [`MAX_PER_PASS`] textures. The
-    /// caller releases them through `retire` (after the submissions in flight).
+    /// `cap` 0: never). Whole idle unpinned heaps go first; remaining overage evicts unpinned heaps
+    /// one heap at a time (smallest/oldest first) before falling back to individual oldest textures.
     pub fn collect(&mut self, cap: u64, heap_bytes: u64, present: u64, ms: u64, referenced: &std::collections::HashSet<usize>) -> Pass {
-        let mut pass = Pass { held_before: self.held_bytes(heap_bytes), ..Pass::default() };
+        self.collect_with_sizes(cap, &[], heap_bytes, present, ms, referenced)
+    }
+
+    pub fn collect_with_sizes(
+        &mut self,
+        cap: u64,
+        heap_sizes: &[u64],
+        default_heap_bytes: u64,
+        present: u64,
+        ms: u64,
+        referenced: &std::collections::HashSet<usize>,
+    ) -> Pass {
+        let size_of_heap = |h: usize| heap_sizes.get(h).copied().filter(|&s| s > 0).unwrap_or(default_heap_bytes);
+        let mut pass = Pass { held_before: self.held_bytes_with(heap_sizes, default_heap_bytes), ..Pass::default() };
         pass.held_after = pass.held_before;
         if cap == 0 || pass.held_before <= cap {
             return pass;
@@ -344,35 +364,44 @@ impl ViewTextures {
         let severely_over = pass.held_before > cap.saturating_mul(2);
         let pass_limit = if severely_over { MAX_PER_PASS * 4 } else { MAX_PER_PASS };
         let free = |e: &ViewEntry| {
-            let idle_presents = present.saturating_sub(e.last_present) >= OVER_BUDGET_IDLE_PRESENTS;
-            let idle_ms = severely_over || ms.saturating_sub(e.last_ms) >= OVER_BUDGET_IDLE_MS;
-            idle_presents && idle_ms && !referenced.contains(&e.res)
+            let dp = present.saturating_sub(e.last_present);
+            let dt = ms.saturating_sub(e.last_ms);
+            let idle = (dp >= OVER_BUDGET_IDLE_PRESENTS && (severely_over || dt >= OVER_BUDGET_IDLE_MS))
+                || (severely_over && dp >= 1 && dt >= SEVERE_OVER_IDLE_MS);
+            idle && !referenced.contains(&e.res)
         };
-        // per heap: whether every texture of it may go, and when one of them was last used
-        let mut heaps: std::collections::BTreeMap<usize, (bool, u64)> = std::collections::BTreeMap::new();
+        // per heap: (all_free, has_pinned, live_count, max_ms)
+        let mut heaps: std::collections::BTreeMap<usize, (bool, bool, usize, u64)> = std::collections::BTreeMap::new();
         for e in self.made.values().chain(self.stale.iter()) {
             if let Some(h) = e.heap {
-                let v = heaps.entry(h).or_insert((true, 0));
-                v.0 &= free(e);
-                v.1 = v.1.max(e.last_ms);
+                let is_free = free(e);
+                let is_pinned = referenced.contains(&e.res);
+                let v = heaps.entry(h).or_insert((true, false, 0, 0));
+                v.0 &= is_free;
+                v.1 |= is_pinned;
+                v.2 += 1;
+                v.3 = v.3.max(e.last_ms);
             }
         }
-        let mut order: Vec<(u64, usize)> = heaps.iter().filter(|(_, v)| v.0).map(|(&h, v)| (v.1, h)).collect();
+        let mut order: Vec<(u64, usize)> = heaps.iter().filter(|(_, v)| v.0).map(|(&h, v)| (v.3, h)).collect();
         order.sort_unstable();
         let target = cap;
-        let mut gone_heaps = Vec::new();
+        let mut gone_heaps = std::collections::HashSet::new();
         let mut taken = 0usize;
         for (_, h) in order {
             if pass.held_after <= target || taken >= pass_limit {
                 break;
             }
-            let n = self.made.values().chain(self.stale.iter()).filter(|e| e.heap == Some(h)).count();
-            taken += n;
-            pass.held_after = pass.held_after.saturating_sub(heap_bytes);
-            gone_heaps.push(h);
+            taken += heaps.get(&h).map_or(0, |v| v.2);
+            pass.held_after = pass.held_after.saturating_sub(size_of_heap(h));
+            gone_heaps.insert(h);
         }
-        for h in &gone_heaps {
-            let vas: Vec<u64> = self.made.iter().filter(|(_, e)| e.heap == Some(*h)).map(|(&va, _)| va).collect();
+        if !gone_heaps.is_empty() {
+            let vas: Vec<u64> = self
+                .made
+                .iter()
+                .filter_map(|(&va, e)| e.heap.is_some_and(|h| gone_heaps.contains(&h)).then_some(va))
+                .collect();
             for va in vas {
                 if let Some(e) = self.made.remove(&va) {
                     self.live_bytes = self.live_bytes.saturating_sub(e.bytes);
@@ -381,7 +410,7 @@ impl ViewTextures {
             }
             let mut i = 0;
             while i < self.stale.len() {
-                if self.stale[i].heap == Some(*h) {
+                if self.stale[i].heap.is_some_and(|h| gone_heaps.contains(&h)) {
                     let e = self.stale.remove(i);
                     self.live_bytes = self.live_bytes.saturating_sub(e.bytes);
                     pass.freed.push(e);
@@ -391,22 +420,47 @@ impl ViewTextures {
             }
         }
         pass.heaps_freed = gone_heaps.len();
-        // Evict individual idle unreferenced textures (placed or committed) while still over target.
+        // Evict remaining idle unreferenced textures: drain unpinned heaps (emptiest/oldest heap
+        // first) so whole ID3D12Heaps are freed, before evicting individual oldest textures.
         if pass.held_after > target && pass.freed.len() < pass_limit {
-            let mut touched_heaps = std::collections::HashSet::new();
-            let mut indiv: Vec<(u64, u8, u64)> = Vec::new();
+            let mut heap_live: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            let mut heap_pinned: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
+            let mut heap_max_ms: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+            for e in self.made.values().chain(self.stale.iter()) {
+                if let Some(h) = e.heap {
+                    *heap_live.entry(h).or_default() += 1;
+                    if referenced.contains(&e.res) {
+                        heap_pinned.insert(h, true);
+                    }
+                    let m = heap_max_ms.entry(h).or_default();
+                    *m = (*m).max(e.last_ms);
+                }
+            }
+            // Sort key: (has_pinned_or_committed, group_live_count, group_max_ms, entry.last_ms, kind, id)
+            let sort_key = |e: &ViewEntry, kind: u8, id: u64| -> (u8, usize, u64, u64, u8, u64) {
+                match e.heap {
+                    Some(h) if !heap_pinned.get(&h).copied().unwrap_or(false) => {
+                        let live = heap_live.get(&h).copied().unwrap_or(usize::MAX);
+                        let h_ms = heap_max_ms.get(&h).copied().unwrap_or(e.last_ms);
+                        (0, live, h_ms, e.last_ms, kind, id)
+                    }
+                    _ => (1, usize::MAX, e.last_ms, e.last_ms, kind, id),
+                }
+            };
+            let mut indiv: Vec<(u8, usize, u64, u64, u8, u64)> = Vec::new();
             for e in &self.stale {
                 if free(e) {
-                    indiv.push((e.last_ms, 0, e.res as u64));
+                    indiv.push(sort_key(e, 0, e.res as u64));
                 }
             }
             for (&va, e) in &self.made {
                 if free(e) {
-                    indiv.push((e.last_ms, 1, va));
+                    indiv.push(sort_key(e, 1, va));
                 }
             }
             indiv.sort_unstable();
-            for (_, kind, id) in indiv {
+            let mut touched_heaps = std::collections::HashSet::new();
+            for (_, _, _, _, kind, id) in indiv {
                 if pass.held_after <= target || pass.freed.len() >= pass_limit {
                     break;
                 }
@@ -418,9 +472,17 @@ impl ViewTextures {
                 };
                 if let Some(e) = removed {
                     self.live_bytes = self.live_bytes.saturating_sub(e.bytes);
-                    pass.held_after = pass.held_after.saturating_sub(e.bytes);
                     if let Some(h) = e.heap {
                         touched_heaps.insert(h);
+                        let left = heap_live.get_mut(&h).map(|c| {
+                            *c = c.saturating_sub(1);
+                            *c
+                        });
+                        if left == Some(0) {
+                            pass.held_after = pass.held_after.saturating_sub(size_of_heap(h));
+                        }
+                    } else {
+                        pass.held_after = pass.held_after.saturating_sub(e.bytes);
                     }
                     pass.freed.push(e);
                 }
@@ -437,8 +499,8 @@ impl ViewTextures {
                 crate::view_heap::retire_resources(&heap_res, present);
             }
         }
-        pass.held_after = self.held_bytes(heap_bytes);
-        pass.heaps_in_use = pass.held_after.div_ceil(heap_bytes.max(1)) as usize;
+        pass.held_after = self.held_bytes_with(heap_sizes, default_heap_bytes);
+        pass.heaps_in_use = self.made.values().chain(self.stale.iter()).filter_map(|e| e.heap).collect::<std::collections::HashSet<_>>().len();
         pass.stuck = pass.freed.is_empty() && pass.held_before > cap + cap / 2;
         pass
     }
@@ -914,6 +976,44 @@ mod tests {
         assert_eq!(pass.heaps_freed, 0);
         assert_eq!(pass.freed.len(), 3);
         assert_eq!(t.live_bytes(), 100);
+    }
+
+    #[test]
+    fn unpinned_heaps_drain_whole_before_chewing_into_pinned_or_larger_heaps() {
+        // 1) Under severe over-budget + low-FPS wall-clock idle (`dt >= SEVERE_OVER_IDLE_MS`,
+        // `dp >= 1`), an unpinned heap empties whole even before `OVER_BUDGET_IDLE_PRESENTS`.
+        let mut t1 = ViewTextures::default();
+        t1.note(0x1000, ViewEntry::new(desc3(), 10, Some(0), 100, 0, 0));
+        t1.note(0x3000, ViewEntry::new(desc3(), 12, Some(1), 100, 0, 500));
+        t1.note(0x4000, ViewEntry::new(desc3(), 13, Some(1), 100, 1, 500));
+        let pinned1: std::collections::HashSet<usize> = [10].into_iter().collect();
+        let pass1 = t1.collect(900, 1000, 2, 6000, &pinned1);
+        assert_eq!(pass1.heaps_freed, 1, "unpinned heap 1 must empty completely under low-FPS severe over-budget");
+        assert_eq!(
+            pass1.freed.iter().map(|e| e.res).collect::<std::collections::HashSet<_>>(),
+            [12, 13].into_iter().collect()
+        );
+
+        // 2) In individual eviction fallback (`indiv`), unpinned heaps with fewest live entries
+        // drain before larger unpinned heaps and before pinned heaps regardless of oldest ms.
+        let mut t2 = ViewTextures::default();
+        // Heap 0: pinned (10) + oldest idle (11, ms=50).
+        t2.note(0x1000, ViewEntry::new(desc3(), 10, Some(0), 100, 0, 100));
+        t2.note(0x2000, ViewEntry::new(desc3(), 11, Some(0), 100, 0, 50));
+        // Heap 1: unpinned, 3 live (14 active at present 15, 15/16 idle at ms=400).
+        t2.note(0x3000, ViewEntry::new(desc3(), 14, Some(1), 100, 15, 500));
+        t2.note(0x4000, ViewEntry::new(desc3(), 15, Some(1), 100, 0, 400));
+        t2.note(0x5000, ViewEntry::new(desc3(), 16, Some(1), 100, 0, 400));
+        // Heap 2: unpinned, 2 live (12 idle at ms=450, 13 active at present 15).
+        t2.note(0x6000, ViewEntry::new(desc3(), 12, Some(2), 100, 0, 450));
+        t2.note(0x7000, ViewEntry::new(desc3(), 13, Some(2), 100, 15, 600));
+        let pinned2: std::collections::HashSet<usize> = [10].into_iter().collect();
+        let pass2 = t2.collect(1500, 1000, 20, 3000, &pinned2);
+        let order: Vec<usize> = pass2.freed.iter().map(|e| e.res).collect();
+        assert_eq!(order.len(), 4);
+        assert_eq!(order[0], 12, "2-live unpinned heap drains before 3-live and pinned heaps");
+        assert!(order[1..3].contains(&15) && order[1..3].contains(&16));
+        assert_eq!(order[3], 11, "pinned heap's idle texture goes last");
     }
 
     #[test]
