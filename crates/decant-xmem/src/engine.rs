@@ -1690,7 +1690,7 @@ impl Engine {
         if !was_held && track.is_held(index, now) {
             let hot = HOT.fetch_add(1, Ordering::Relaxed) + 1;
             if hot <= 8 || hot.is_multiple_of(1000) {
-                decant_log::trace(&format!("[xmem] suivi des pages : page {index} (0x{page:x}) ecrite a chaque copie, ouverte et copiee a chaque synchronisation pour {} s ({hot} fois)\r\n", track::HOT_HOLD.as_secs()));
+                decant_log::trace(&format!("[xmem] suivi des pages : page {index} (0x{page:x}) ecrite a chaque copie, ouverte et copiee a chaque synchronisation pour {} s ({hot} fois)\r\n", track::hot_hold().as_secs()));
             }
         }
         let n = FAULTS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1827,12 +1827,11 @@ impl Engine {
         }
     }
 
-    fn prepare_write_until(&self, address: usize, len: usize, until: Instant) {
+    fn collect_rw_view_indices(st: &State, address: usize, len: usize, commit: bool) -> Vec<u32> {
         if len == 0 {
-            return;
+            return Vec::new();
         }
-        let Some(end) = address.checked_add(len) else { return };
-        let st = self.lock();
+        let Some(end) = address.checked_add(len) else { return Vec::new() };
         let mut indices = Vec::new();
         let mut page = address & !(PAGE_BYTES - 1);
         while page < end {
@@ -1847,7 +1846,9 @@ impl Engine {
             {
                 while page < end && page < region_end {
                     let index = first + (page - base) / PAGE_BYTES;
-                    let _ = Self::commit_page(&st, index);
+                    if commit {
+                        let _ = Self::commit_page(st, index);
+                    }
                     indices.push(index as u32);
                     page += PAGE_BYTES;
                 }
@@ -1855,6 +1856,49 @@ impl Engine {
                 page = region_end.max(page + PAGE_BYTES);
             }
         }
+        indices
+    }
+
+    /// Commits and pins the writable view pages in `[address, address + len)` open for an active
+    /// asynchronous write until [`Engine::finish_io_write`] balances every overlapping pin.
+    pub fn begin_io_write(&self, address: usize, len: usize) {
+        let st = self.lock();
+        let indices = Self::collect_rw_view_indices(&st, address, len, true);
+        if indices.is_empty() {
+            return;
+        }
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut open = Vec::new();
+        if let Some(track) = dirty_guard.track.as_mut() {
+            for index in indices {
+                track.mark_committed(index);
+                open.extend(track.begin_write_pin(index));
+            }
+        }
+        Self::protect_runs(open, PAGE_READWRITE);
+    }
+
+    /// Releases one active write pin on each writable view page in `[address, address + len)`.
+    /// Once the last pin drops, the next `take_dirty` copies the page once and protects it again.
+    pub fn finish_io_write(&self, address: usize, len: usize) {
+        let st = self.lock();
+        let indices = Self::collect_rw_view_indices(&st, address, len, false);
+        if indices.is_empty() {
+            return;
+        }
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(track) = dirty_guard.track.as_mut() {
+            for index in indices {
+                track.finish_write_pin(index);
+            }
+        }
+    }
+
+    fn prepare_write_until(&self, address: usize, len: usize, until: Instant) {
+        let st = self.lock();
+        let indices = Self::collect_rw_view_indices(&st, address, len, true);
         if indices.is_empty() {
             return;
         }
@@ -3040,5 +3084,44 @@ mod tests {
         e.free_pages(&prep_frames).unwrap();
         e.release(fault_area).unwrap();
         e.free_pages(&fault_frames).unwrap();
+    }
+
+    #[test]
+    fn overlapping_begin_and_finish_io_write_protect_immediately_after_last_writer() {
+        let Some(e) = held(|| Engine::load_limited(4, 4)) else { return };
+        e.set_tracking(true);
+        let area = e.reserve(0, 2 * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(1).unwrap();
+        e.map_frames(area, &frames).unwrap();
+        let page = page_of(frames[0]);
+
+        assert!(Engine::commit_on_access_in(&e.state, area));
+        assert!(e.take_dirty(usize::MAX).contains(&page));
+        assert!(!accessible(area, true));
+
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                e.begin_io_write(area, P);
+            });
+            barrier.wait();
+            e.begin_io_write(area, P);
+        });
+        assert!(accessible(area, true));
+        assert!(e.take_dirty(usize::MAX).contains(&page));
+        assert!(accessible(area, true));
+
+        e.finish_io_write(area, P);
+        assert!(e.take_dirty(usize::MAX).contains(&page));
+        assert!(accessible(area, true));
+
+        e.finish_io_write(area, P);
+        assert!(e.take_dirty(usize::MAX).contains(&page));
+        assert!(!accessible(area, true));
+        assert!(e.take_dirty(usize::MAX).is_empty());
+
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
     }
 }

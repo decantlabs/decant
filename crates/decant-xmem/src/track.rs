@@ -24,8 +24,22 @@ pub const CALL_HOLD: Duration = Duration::from_secs(600);
 pub const HOT_WINDOW: Duration = Duration::from_millis(250);
 /// Quick faults in a row that make a page hot.
 pub const HOT_FAULTS: u8 = 3;
+/// How long a hot page stays unprotected and is copied at every sync by default.
+pub const HOT_HOLD: Duration = Duration::from_secs(2);
+
+/// Parses `DECANT_XMEM_HOT_HOLD_MS` from an optional string, falling back to [`HOT_HOLD`].
+pub fn parse_hot_hold_ms(raw: Option<&str>) -> Duration {
+    match raw.and_then(|s| s.trim().parse::<u64>().ok()) {
+        Some(ms) => Duration::from_millis(ms),
+        None => HOT_HOLD,
+    }
+}
+
 /// How long a hot page stays unprotected and is copied at every sync.
-pub const HOT_HOLD: Duration = Duration::from_secs(8);
+pub fn hot_hold() -> Duration {
+    static HOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| parse_hot_hold_ms(std::env::var("DECANT_XMEM_HOT_HOLD_MS").ok().as_deref()))
+}
 
 /// One title view page of a pool page: its address and whether the title protection is read write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +57,7 @@ pub struct Track {
     aliases: HashMap<u32, Vec<Alias>>,
     addresses: HashMap<usize, (u32, bool)>,
     held: HashMap<u32, Instant>,
+    active_writes: HashMap<u32, u32>,
     /// When `take` last made the page clean, and the quick faults in a row since (`HOT_WINDOW`).
     cleaned: HashMap<u32, (Instant, u8)>,
     /// The dirty pages that have a view, waiting for `take`.
@@ -135,6 +150,7 @@ impl Track {
             if v.is_empty() {
                 self.aliases.remove(&page);
                 self.held.remove(&page);
+                self.active_writes.remove(&page);
                 self.cleaned.remove(&page);
             }
         }
@@ -143,7 +159,7 @@ impl Track {
     /// A write faulted on a read write view of the page at `now`. `Some(views)` when the page was clean:
     /// those views become read write again and the page is dirty. `None` when it was dirty already (another
     /// thread won the race, the faulting write may simply run again). The `HOT_FAULTS`th quick fault in a
-    /// row makes the page hot: held for `HOT_HOLD`.
+    /// row makes the page hot: held for `hot_hold()`.
     pub fn on_fault(&mut self, page: u32, now: Instant) -> Option<Vec<usize>> {
         if !self.clean[page as usize] {
             return None;
@@ -152,7 +168,7 @@ impl Track {
             *quick = if now.saturating_duration_since(*at) < HOT_WINDOW { *quick + 1 } else { 0 };
             if *quick >= HOT_FAULTS {
                 *quick = 0;
-                self.held.insert(page, now + HOT_HOLD);
+                self.held.insert(page, now + hot_hold());
             }
         }
         Some(self.dirty(page))
@@ -161,6 +177,28 @@ impl Track {
     /// Whether the page is held now (a kernel write may reach it, or it is hot).
     pub fn is_held(&self, page: u32, now: Instant) -> bool {
         self.held.get(&page).is_some_and(|&until| now < until)
+    }
+
+    /// Pins `page` open for an active asynchronous write. Marks the page dirty, increments the
+    /// active write pin count, and returns the read write views to make writable.
+    pub fn begin_write_pin(&mut self, page: u32) -> Vec<usize> {
+        if self.aliases.contains_key(&page) {
+            *self.active_writes.entry(page).or_insert(0) += 1;
+        }
+        self.dirty(page)
+    }
+
+    /// Unpins `page` after an active asynchronous write finishes. Decrements the pin count and
+    /// marks the page dirty once with no hold so the next `take` copies it and protects it again.
+    pub fn finish_write_pin(&mut self, page: u32) {
+        if let Some(count) = self.active_writes.get_mut(&page) {
+            if *count <= 1 {
+                self.active_writes.remove(&page);
+            } else {
+                *count -= 1;
+            }
+        }
+        let _ = self.dirty(page);
     }
 
     /// A kernel write may land in the page: it is dirty, unprotected and held for `IO_HOLD`. Returns the
@@ -179,12 +217,12 @@ impl Track {
     }
 
     /// The write a long hold was for ended at `now`: the page is held for `IO_HOLD` from now. That
-    /// shortens a `CALL_HOLD` (any hold that ends later than the longest other one, `HOT_HOLD`) and
+    /// shortens a `CALL_HOLD` (any hold that ends later than the longest other one, `hot_hold()`) and
     /// keeps a hot or kernel write hold that ends later.
     pub fn hold_from(&mut self, page: u32, now: Instant) {
         if let Some(until) = self.held.get_mut(&page) {
             let end = now + IO_HOLD;
-            if *until > now + HOT_HOLD.max(IO_HOLD) || *until < end {
+            if *until > now + hot_hold().max(IO_HOLD) || *until < end {
                 *until = end;
             }
         }
@@ -220,7 +258,9 @@ impl Track {
             } else if !self.committed[i] && !committed(page) {
                 self.clean[i] = true;
                 self.queued[i] = false;
-            } else if self.held.get(&page).is_some_and(|&until| now < until) {
+            } else if self.active_writes.get(&page).is_some_and(|&n| n > 0)
+                || self.held.get(&page).is_some_and(|&until| now < until)
+            {
                 self.committed[i] = true;
                 taken.push(page);
                 keep.push(page);
@@ -437,5 +477,33 @@ mod tests {
     fn runs_merge_adjacent_pages() {
         assert_eq!(runs(vec![0x30_0000, 0x10_0000, 0x10_0000 + P, 0x10_0000]), [(0x10_0000, 2 * P), (0x30_0000, P)]);
         assert!(runs(vec![]).is_empty());
+    }
+
+    #[test]
+    fn write_pins_keep_page_open_until_last_writer_finishes_then_protect_immediately() {
+        let mut t = track();
+        let now = Instant::now();
+        t.on_map(5, 0x10_0000, true);
+        assert_eq!(t.take(now, 10, all), (vec![5], vec![0x10_0000]));
+
+        assert_eq!(t.begin_write_pin(5), [0x10_0000]);
+        assert!(t.begin_write_pin(5).is_empty());
+        assert_eq!(t.take(now, 10, all), (vec![5], vec![]));
+
+        t.finish_write_pin(5);
+        assert_eq!(t.take(now, 10, all), (vec![5], vec![]));
+
+        t.finish_write_pin(5);
+        assert_eq!(t.take(now, 10, all), (vec![5], vec![0x10_0000]));
+        assert_eq!(t.take(now, 10, all), (vec![], vec![]));
+    }
+
+    #[test]
+    fn parse_hot_hold_ms_parses_override_and_defaults_to_two_seconds() {
+        assert_eq!(HOT_HOLD, Duration::from_secs(2));
+        assert_eq!(parse_hot_hold_ms(None), Duration::from_millis(2000));
+        assert_eq!(parse_hot_hold_ms(Some("")), Duration::from_millis(2000));
+        assert_eq!(parse_hot_hold_ms(Some("invalid")), Duration::from_millis(2000));
+        assert_eq!(parse_hot_hold_ms(Some(" 750 ")), Duration::from_millis(750));
     }
 }
