@@ -1664,6 +1664,13 @@ impl State {
         Some((Span { resource: w.resource.as_raw() as usize, gpu: w.gpu + placed.offset, offset: placed.offset, left: placed.left }, is_fresh))
     }
 
+    fn translate_span_give_read(&self, va: u64, len: u64) -> Option<(Span, bool)> {
+        if self.mirror.wants_use(va, len.max(ADDRESS_REACH)) || !self.mirror.has_tiles_for_span(va, len.clamp(1, ADDRESS_REACH)) {
+            return None;
+        }
+        self.translate_span_read(va, len)
+    }
+
     fn translate_span(&mut self, api: &Api, va: u64, len: u64, give: bool) -> Option<(Span, bool)> {
         if give {
             self.give(api, va, len.max(ADDRESS_REACH));
@@ -1689,6 +1696,20 @@ pub fn translate_fresh_batch(spans: &[(u64, u64)], out: &mut Vec<Option<(Span, b
     if spans.is_empty() {
         return;
     }
+    let read_ok = with_state_read(|st| {
+        let mut tmp = Vec::with_capacity(spans.len());
+        for &(va, len) in spans {
+            if st.mirror.wants_use(va, len.max(ADDRESS_REACH)) || !st.mirror.has_tiles_for_span(va, len.clamp(1, ADDRESS_REACH)) {
+                return None;
+            }
+            tmp.push(st.translate_span_read(va, len));
+        }
+        Some(tmp)
+    });
+    if let Some(tmp) = read_ok {
+        *out = tmp;
+        return;
+    }
     let filled = with_state(|st, api| {
         out.extend(spans.iter().map(|&(va, len)| st.translate_span(api, va, len, true)));
     });
@@ -1704,7 +1725,8 @@ fn span_of_with(va: u64, len: u64, give: bool, fresh: &mut bool) -> Option<Span>
         with_state_read(|st| st.translate_span_read(va, len))
             .or_else(|| with_state(|st, api| st.translate_span(api, va, len, false)).flatten())?
     } else {
-        with_state(|st, api| st.translate_span(api, va, len, true)).flatten()?
+        with_state_read(|st| st.translate_span_give_read(va, len))
+            .or_else(|| with_state(|st, api| st.translate_span(api, va, len, true)).flatten())?
     };
     *fresh = is_fresh;
     if SEEN.fetch_add(1, Ordering::Relaxed) < 3 {
@@ -2039,13 +2061,26 @@ pub fn spans_touch(spans: &[(u64, u64)], written: &HashSet<u32>) -> Vec<Option<b
 /// mapped pages of one reservation. `None` for anything else (including the module being off).
 pub fn tiles_of(va: u64, len: u64) -> Option<Vec<u32>> {
     let (first, pages) = crate::title_mirror::page_span(va, len);
-    with_state(|st, _| st.mirror.mirror_tiles(first, pages))?
+    with_state_read(|st| st.mirror.mirror_tiles_read(first, pages))
+        .or_else(|| with_state(|st, _| st.mirror.mirror_tiles(first, pages)).flatten())
 }
 
 /// Mirror tiles for each `(va, len)` span under one state lock and one journal drain.
 pub fn tiles_of_batch(spans: &[(u64, u64)], out: &mut Vec<Option<Vec<u32>>>) {
     out.clear();
     if spans.is_empty() {
+        return;
+    }
+    let read_ok = with_state_read(|st| {
+        let mut tmp = Vec::with_capacity(spans.len());
+        for &(va, len) in spans {
+            let (first, pages) = crate::title_mirror::page_span(va, len);
+            tmp.push(Some(st.mirror.mirror_tiles_read(first, pages)?));
+        }
+        Some(tmp)
+    });
+    if let Some(tmp) = read_ok {
+        *out = tmp;
         return;
     }
     let filled = with_state(|st, _| {
@@ -2307,5 +2342,21 @@ mod tests {
         assert_eq!(parse_mirror_pool(Some("L0"), 24 << 30), MirrorPool::L0);
         assert_eq!(parse_mirror_pool(Some("l1"), 4 << 30), MirrorPool::L1);
         assert_eq!(parse_mirror_pool(Some("L1"), 4 << 30), MirrorPool::L1);
+    }
+
+    #[test]
+    fn read_fastpath_falls_back_on_on_demand_or_missing_tile_and_hits_when_ready() {
+        let mut m = Mirror::new(1 << 30);
+        m.apply(Change::Reserve { va: 0x1000_0000, pages: 2, on_demand: true });
+        m.apply(Change::Map { va: 0x1000_0000, pages: 1, first_page: 5 });
+        // Page 1 is unmapped in an on-demand reservation: wants_use is true, must fall back.
+        assert!(m.wants_use(0x1000_0000, PAGE * 2));
+        assert!(!m.wants_use(0x1000_0000, PAGE));
+        // Page 0 has no tile yet: must fall back until given.
+        assert!(!m.has_tiles_for_span(0x1000_0000, PAGE));
+        m.give_span(0x1000_0000, PAGE);
+        assert!(m.has_tiles_for_span(0x1000_0000, PAGE));
+        assert!(should_skip_drain(Some(7), Some(7)));
+        assert!(!should_skip_drain(Some(7), Some(8)));
     }
 }

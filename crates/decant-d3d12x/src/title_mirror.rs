@@ -191,6 +191,25 @@ impl Mirror {
         self.tiles[i]
     }
 
+    /// Whether every mapped page of `[va, va + len)` (clipped to its reservation) already has a mirror tile.
+    pub fn has_tiles_for_span(&self, va: u64, len: u64) -> bool {
+        let Some((base, r)) = self.holding(va) else { return false };
+        let end = va.saturating_add(len.max(1)).min(base + r.bytes);
+        let mut page = va & !(PAGE - 1);
+        while page < end {
+            if let Some((&v, view)) = r.views.range(..=page).next_back()
+                && page < v + u64::from(view.pages) * PAGE
+            {
+                let pool_page = view.first_page + ((page - v) / PAGE) as u32;
+                if self.tile_of(pool_page).is_none() {
+                    return false;
+                }
+            }
+            page += PAGE;
+        }
+        true
+    }
+
     /// Gives a mirror tile to every mapped page of `[va, va + len)` (clipped to its reservation) that has none.
     pub fn give_span(&mut self, va: u64, len: u64) {
         let Some((base, r)) = self.holding(va) else { return };
@@ -423,6 +442,29 @@ impl Mirror {
             }
         }
         false
+    }
+
+    /// Read-only version of [`mirror_tiles`](Self::mirror_tiles): returns `Some` only when every page
+    /// in the span is mapped in one reservation and already has a mirror tile.
+    pub fn mirror_tiles_read(&self, va: u64, pages: u32) -> Option<Vec<u32>> {
+        if !va.is_multiple_of(PAGE) || pages == 0 {
+            return None;
+        }
+        let (base, r) = self.holding(va)?;
+        if va - base + u64::from(pages) * PAGE > r.bytes {
+            return None;
+        }
+        let mut out = Vec::with_capacity(pages as usize);
+        for k in 0..u64::from(pages) {
+            let page = va + k * PAGE;
+            let (&v, view) = r.views.range(..=page).next_back()?;
+            let index = (page - v) / PAGE;
+            if index >= u64::from(view.pages) {
+                return None;
+            }
+            out.push(self.tile_of(view.first_page + index as u32)?);
+        }
+        Some(out)
     }
 
     /// The mirror tile of each of the `pages` title pages from `va` (on a page), when all of them lie in
@@ -818,5 +860,23 @@ mod tests {
         reserve(&mut m, 0x1000_0000, 4);
         map(&mut m, 0x1000_0000, 2, 3);
         assert!(m.translate(0x1000_0000, 4).is_some());
+    }
+
+    #[test]
+    fn read_fast_path_checks_tiles_without_allocating_and_misses_until_given() {
+        let mut m = Mirror::new(GIB);
+        reserve(&mut m, 0x1000_0000, 4);
+        assert_eq!(m.apply(Change::Map { va: 0x1000_0000, pages: 2, first_page: 10 }), None);
+        assert!(!m.has_tiles_for_span(0x1000_0000, PAGE * 2));
+        assert_eq!(m.mirror_tiles_read(0x1000_0000, 2), None);
+        m.give_span(0x1000_0000, PAGE);
+        assert!(m.has_tiles_for_span(0x1000_0000, PAGE));
+        assert!(!m.has_tiles_for_span(0x1000_0000, PAGE * 2));
+        assert_eq!(m.mirror_tiles_read(0x1000_0000, 1), Some(vec![0]));
+        assert_eq!(m.mirror_tiles_read(0x1000_0000, 2), None);
+        assert_eq!(m.mirror_tiles(0x1000_0000, 2), Some(vec![0, 1]));
+        assert!(m.has_tiles_for_span(0x1000_0000, PAGE * 2));
+        assert_eq!(m.mirror_tiles_read(0x1000_0000, 2), Some(vec![0, 1]));
+        assert!(!m.has_tiles_for_span(0x2000_0000, PAGE));
     }
 }
