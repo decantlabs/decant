@@ -1156,3 +1156,176 @@ fn descriptor_waterfall_and_vgpr_overwrite_compile_to_dxil() {
     });
     compiles(&p);
 }
+
+fn barrier_depths(nodes: &[decant_shader::ir::Node], depth: usize, out: &mut Vec<usize>) {
+    use decant_shader::ir::Node;
+    for n in nodes {
+        match n {
+            Node::Block(stmts) => out.extend(
+                stmts
+                    .iter()
+                    .filter(|s| matches!(s, Stmt::Barrier { .. }))
+                    .map(|_| depth),
+            ),
+            Node::If { then, els, .. } => {
+                barrier_depths(then, depth + 1, out);
+                barrier_depths(els, depth + 1, out);
+            }
+            Node::Loop(body) | Node::Once(body) => barrier_depths(body, depth + 1, out),
+            _ => {}
+        }
+    }
+}
+
+fn lifted_barrier_depths(p: &StageProgram) -> Vec<usize> {
+    let func = decant_shader::lift_program(p).unwrap_or_else(|e| panic!("{e}"));
+    let mut out = Vec::new();
+    barrier_depths(&func.body, 0, &mut out);
+    out
+}
+
+#[test]
+fn early_exec_exit_before_barrier_is_dropped_and_compiles() {
+    // 1. `v_cmpx` + `s_cbranch_execz` jumping to `s_endpgm` skips an LDS barrier.
+    let mut p = compute([256, 2, 1], Vec::new(), |a| {
+        let end = a.label();
+        a.push(vopc(Op::v_cmpx_gt_u32, s(4), v(0)));
+        a.branch(Op::s_cbranch_execz, end);
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+        a.bind(end);
+    });
+    p.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&p), [0]);
+    let text = hlsl(&p);
+    assert!(text.contains("GroupMemoryBarrierWithGroupSync()"), "{text}");
+    assert_eq!(text.matches("return;").count(), 1, "{text}");
+    compiles(&p);
+
+    // 2. `s_and_saveexec_b64` + `s_cbranch_scc0` jumping to a separate `s_endpgm` block.
+    let mut a = Asm::new();
+    let end = a.label();
+    a.push(vopc(Op::v_cmp_gt_u32, s(4), v(0)));
+    a.push(sop1(Op::s_and_saveexec_b64, s(10), VCC));
+    a.branch(Op::s_cbranch_scc0, end);
+    a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+    a.push(sopp(Op::s_barrier, 0));
+    a.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+    a.push(sopp(Op::s_endpgm, 0));
+    a.bind(end);
+    a.push(sopp(Op::s_endpgm, 0));
+    let p2 = StageProgram {
+        threads: [256, 1, 1],
+        lds_bytes: 2048,
+        name: "scc0 barrier skip".to_owned(),
+        ..StageProgram::new(Stage::Compute, a.finish())
+    };
+    assert_eq!(lifted_barrier_depths(&p2), [0]);
+    let text2 = hlsl(&p2);
+    assert!(text2.contains("GroupMemoryBarrierWithGroupSync()"), "{text2}");
+    assert_eq!(text2.matches("return;").count(), 1, "{text2}");
+    compiles(&p2);
+}
+
+#[test]
+fn early_exec_exit_before_barriers_with_scalar_counted_loop_is_dropped() {
+    let mut p = compute([1024, 1, 1], Vec::new(), |a| {
+        let loop_hdr = a.label();
+        let inner_skip = a.label();
+        let end = a.label();
+        a.push(vopc(Op::v_cmpx_gt_u32, s(4), v(0)));
+        a.branch(Op::s_cbranch_execz, end);
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(sop1(Op::s_mov_b32, s(12), int(0)));
+        a.bind(loop_hdr);
+        // Inner EXEC narrowing overwrites SCC, and the loop exit below overwrites SCC cleanly.
+        a.push(vopc(Op::v_cmp_gt_u32, int(8), v(1)));
+        a.push(sop1(Op::s_and_saveexec_b64, s(14), VCC));
+        a.branch(Op::s_cbranch_execz, inner_skip);
+        a.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+        a.bind(inner_skip);
+        a.push(sop1(Op::s_mov_b64, EXEC, s(14)));
+        a.push(sop2(Op::s_add_u32, s(12), s(12), int(1)));
+        a.push(sopc(Op::s_cmp_eq_u32, s(12), int(25)));
+        a.branch(Op::s_cbranch_scc0, loop_hdr);
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+        a.bind(end);
+    });
+    p.lds_bytes = 4096;
+    assert_eq!(lifted_barrier_depths(&p), [0, 0]);
+    let text = hlsl(&p);
+    assert_eq!(text.matches("return;").count(), 1, "{text}");
+    compiles(&p);
+}
+
+#[test]
+fn barrier_skip_respects_mid_shader_joins_and_rejects_unsafe_regions() {
+    // 1. Mid-shader skip around a barrier with dead scalar writes is dropped.
+    let mut safe_mid = compute([256, 1, 1], Vec::new(), |a| {
+        let join = a.label();
+        a.push(vopc(Op::v_cmp_gt_u32, s(4), v(0)));
+        a.push(sop1(Op::s_and_saveexec_b64, s(10), VCC));
+        a.branch(Op::s_cbranch_execz, join);
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+        a.bind(join);
+        a.push(sop1(Op::s_mov_b64, EXEC, s(10)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+    });
+    safe_mid.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&safe_mid), [0]);
+    compiles(&safe_mid);
+
+    // 2. Restoring EXEC from an outer mask inside the skipped region keeps the skip.
+    let mut unsafe_exec = compute([256, 1, 1], Vec::new(), |a| {
+        let end = a.label();
+        a.push(sop1(Op::s_mov_b64, s(20), EXEC));
+        a.push(vopc(Op::v_cmpx_gt_u32, s(4), v(0)));
+        a.branch(Op::s_cbranch_execz, end);
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(sop1(Op::s_mov_b64, EXEC, s(20)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+        a.bind(end);
+    });
+    unsafe_exec.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&unsafe_exec), [1]);
+
+    // 3. A CAS-style `s_cbranch_vccz` retry loop inside the skipped region keeps the skip
+    //    because `vcc` stays false for an inactive lane and would loop forever.
+    let mut unsafe_cas = compute([256, 1, 1], Vec::new(), |a| {
+        let retry = a.label();
+        let end = a.label();
+        a.push(vopc(Op::v_cmpx_gt_u32, s(4), v(0)));
+        a.branch(Op::s_cbranch_execz, end);
+        a.bind(retry);
+        a.push(vop2(Op::v_add_u32, v(3), int(1), v(3)));
+        a.push(vopc(Op::v_cmp_eq_u32, int(4), v(3)));
+        a.branch(Op::s_cbranch_vccz, retry);
+        a.push(sopp(Op::s_barrier, 0));
+        a.bind(end);
+    });
+    unsafe_cas.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&unsafe_cas), [1]);
+
+    // 4. A loop exiting on a vector-derived scalar (`v_readfirstlane_b32`) keeps the skip.
+    let mut unsafe_vloop = compute([256, 1, 1], Vec::new(), |a| {
+        let retry = a.label();
+        let end = a.label();
+        a.push(vopc(Op::v_cmpx_gt_u32, s(4), v(0)));
+        a.branch(Op::s_cbranch_execz, end);
+        a.bind(retry);
+        a.push(vop2(Op::v_add_u32, v(3), int(1), v(3)));
+        a.push(vop1(Op::v_readfirstlane_b32, s(12), v(3)));
+        a.push(sopc(Op::s_cmp_lt_u32, s(12), int(4)));
+        a.branch(Op::s_cbranch_scc1, retry);
+        a.push(sopp(Op::s_barrier, 0));
+        a.bind(end);
+    });
+    unsafe_vloop.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&unsafe_vloop), [1]);
+}

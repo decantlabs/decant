@@ -862,7 +862,8 @@ impl Printer<'_> {
         let a = addr.at.clone();
         if let Some(kind) = sh.atomic {
             let lines = self.buf_atomic(op, kind, &name, &a);
-            return self.buf_finish_write(guard, &addr, lines);
+            let oob = op.glc.then(|| format!("v{} = 0u;", op.data));
+            return self.buf_finish_write(guard, &addr, lines, oob.as_deref());
         }
         if sh.store {
             if sh.conversion == Conversion::Instruction {
@@ -886,7 +887,7 @@ impl Printer<'_> {
                     ),
                 ]
             };
-            return self.buf_finish_write(guard, &addr, lines);
+            return self.buf_finish_write(guard, &addr, lines, None);
         }
         // Loads: all dwords are read before the first register is written, the address may be
         // in one of them.
@@ -953,16 +954,23 @@ impl Printer<'_> {
     }
 
     /// A store or atomic: only in an active lane, and only inside a structured view.
+    /// A returning atomic (`glc`) outside the view writes zero to its data register,
+    /// matching hardware and out of bounds loads.
     fn buf_finish_write(
         &mut self,
         guard: Guard,
         addr: &Address,
         lines: Vec<String>,
+        oob: Option<&str>,
     ) -> Result<(), Refusal> {
         let lines = match &addr.inside {
             Some(c) => {
                 let mut l = vec![format!("if {c} {{")];
                 l.extend(lines.into_iter().map(|x| format!("    {x}")));
+                if let Some(fallback) = oob {
+                    l.push("} else {".to_owned());
+                    l.push(format!("    {fallback}"));
+                }
                 l.push("}".to_owned());
                 l
             }
@@ -1141,7 +1149,7 @@ impl Printer<'_> {
             }
             lines.push("    }".to_owned());
             lines.push("}".to_owned());
-            return self.buf_finish_write(guard, &addr, lines);
+            return self.buf_finish_write(guard, &addr, lines, None);
         }
         let inside = addr.inside.as_deref().expect("set above");
         if self.typed_decode_x && is_single_typed_load(op) {
@@ -1616,6 +1624,91 @@ mod tests {
             text.contains("decant_typed_d16_kind(decant_row_heap_t_s4_50.z)"),
             "{text}"
         );
+        compile_cs(&text);
+    }
+
+    #[test]
+    fn structured_returning_atomic_zeros_destination_when_out_of_bounds() {
+        let iface = Interface {
+            threads: Some([32, 1, 1]),
+            ..Interface::default()
+        };
+        let structured_uav = Resource {
+            origin: Origin::Table { sgpr: 5, offset: 0 },
+            usage: ResourceUse::Words { written: true },
+            declared: Some(DeclaredResource {
+                class: RegisterClass::Uav,
+                lower: 0,
+                upper: 0,
+                space: 0,
+                psv_type: 8,
+                psv_kind: 0,
+            }),
+            placement: Some(Placement::HeapAtMirror {
+                class: RegisterClass::Uav,
+                dword: 5,
+                slot: 0,
+            }),
+            name: "heap_u_s5_0".to_owned(),
+        };
+        let func = Function {
+            body: vec![
+                Node::Block(vec![
+                    Stmt::Buffer(
+                        BufferOp {
+                            op: Op::buffer_atomic_cmpswap,
+                            glc: true,
+                            store: true,
+                            bytes: 4,
+                            count: 2,
+                            data: 5,
+                            index: Some(Expr::Var(Var::V(0))),
+                            offset: Expr::U32(0),
+                            format: 0,
+                            buffer: Desc::Res(ResId(0)),
+                            pc: 0,
+                        },
+                        Guard::Exec,
+                    ),
+                    Stmt::Buffer(
+                        BufferOp {
+                            op: Op::buffer_atomic_add,
+                            glc: false,
+                            store: true,
+                            bytes: 4,
+                            count: 1,
+                            data: 8,
+                            index: Some(Expr::Var(Var::V(0))),
+                            offset: Expr::U32(0),
+                            format: 0,
+                            buffer: Desc::Res(ResId(0)),
+                            pc: 4,
+                        },
+                        Guard::Exec,
+                    ),
+                ]),
+                Node::Return,
+            ],
+            resources: vec![structured_uav],
+            groupshared_dwords: 0,
+            lanes: 32,
+        };
+        let text = hlsl::print(
+            &func,
+            &Context {
+                iface: &iface,
+                mirror: Some(MirrorAbi::default()),
+                header: &[],
+                code: &[],
+            },
+        )
+        .unwrap();
+        // Returning atomic writes zero when out of bounds, non-returning atomic has no else branch.
+        assert!(
+            text.contains("} else {\n            v5 = 0u;\n        }"),
+            "{text}"
+        );
+        assert_eq!(text.matches("} else {").count(), 1, "{text}");
         compile_cs(&text);
     }
 }
