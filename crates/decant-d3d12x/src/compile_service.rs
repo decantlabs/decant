@@ -257,6 +257,8 @@ struct Shared {
     pipelines: Mutex<HashMap<u128, Vec<u128>>>,
     /// Stage results by stage key: in flight, or kept when there is no disk cache.
     stages: Mutex<HashMap<u128, StageCell>>,
+    /// Number of entries currently in `stages` so `cached` can skip locking when empty.
+    active_stages: AtomicUsize,
     counters: Counters,
     /// Jobs queued or running.
     busy: AtomicUsize,
@@ -413,6 +415,7 @@ impl Service {
             active_objects: AtomicUsize::new(0),
             pipelines: Mutex::new(HashMap::new()),
             stages: Mutex::new(HashMap::new()),
+            active_stages: AtomicUsize::new(0),
             counters: Counters::default(),
             busy: AtomicUsize::new(0),
             idle: (Mutex::new(()), Condvar::new()),
@@ -746,9 +749,11 @@ impl Drop for Service {
 impl Shared {
     /// The DXIL of stage `key` from memory or disk.
     fn cached(&self, key: u128) -> Option<Arc<[u8]>> {
-        let cell = self.stages.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
-        if let Some(Ok(dxil)) = cell.as_ref().and_then(|c| c.get()) {
-            return Some(dxil.clone());
+        if self.active_stages.load(Ordering::Acquire) > 0 {
+            let cell = self.stages.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+            if let Some(Ok(dxil)) = cell.as_ref().and_then(|c| c.get()) {
+                return Some(dxil.clone());
+            }
         }
         self.cache.as_ref()?.read(key).map(Arc::from)
     }
@@ -776,7 +781,9 @@ impl Shared {
             }
             let mut map = self.stages.lock().unwrap_or_else(|e| e.into_inner());
             for k in keys {
-                map.remove(k);
+                if map.remove(k).is_some() {
+                    self.active_stages.fetch_sub(1, Ordering::AcqRel);
+                }
             }
         } else {
             self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).insert(key, keys.to_vec());
@@ -910,7 +917,18 @@ impl Shared {
             Ok(resolved.into_iter().flatten().collect())
         } else {
             let compiled = self.map_stages(&misses, |&(idx, stage, key, input)| {
-                let cell = self.stages.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_default().clone();
+                let cell = {
+                    let mut map = self.stages.lock().unwrap_or_else(|e| e.into_inner());
+                    match map.get(&key) {
+                        Some(existing) => existing.clone(),
+                        None => {
+                            let created = StageCell::default();
+                            map.insert(key, created.clone());
+                            self.active_stages.fetch_add(1, Ordering::AcqRel);
+                            created
+                        }
+                    }
+                };
                 let mut fresh = false;
                 let result = cell.get_or_init(|| {
                     fresh = true;
@@ -940,8 +958,8 @@ impl Shared {
         if self.cache.is_some() && !misses.is_empty() {
             let mut map = self.stages.lock().unwrap_or_else(|e| e.into_inner());
             for &(_, _, k, _) in &misses {
-                if map.get(&k).is_some_and(|cell| Arc::strong_count(cell) == 1) {
-                    map.remove(&k);
+                if map.get(&k).is_some_and(|cell| Arc::strong_count(cell) == 1) && map.remove(&k).is_some() {
+                    self.active_stages.fetch_sub(1, Ordering::AcqRel);
                 }
             }
         }
@@ -1795,5 +1813,17 @@ pub(crate) mod tests {
             compiler.release.1.notify_all();
         });
         assert_eq!(compiler.large_peak.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn active_stages_returns_to_zero_after_disk_cached_compile() {
+        let cache_dir = crate::direct_cache::tests::TempDir::new("active-stages-zero");
+        let mut settings = Settings::quiet(1);
+        settings.cache = Some(DiskCache::new(cache_dir.0.clone()));
+        let service = Service::new(Arc::new(FixedSource::simple()), Arc::new(FakeCompiler::default()), settings);
+        let compute = pipeline(&[(StageKind::Compute, b"cs active stages")]);
+        assert_eq!(service.shared.active_stages.load(Ordering::Acquire), 0);
+        assert!(matches!(poll_until_final(&service, 1, &compute), Poll::Ready(_)));
+        assert_eq!(service.shared.active_stages.load(Ordering::Acquire), 0);
     }
 }

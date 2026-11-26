@@ -795,7 +795,7 @@ fn patch(desc: &[u8], dxil: &[Arc<[u8]>]) -> Patched {
 /// notes its key for [`library_made`] and [`library_refused`].
 fn attach_blob(library: &Library, owned: &Owned, patched: &mut Patched) {
     let Some(at) = crate::pso_library::cached_field(patched.desc.len()) else { return };
-    let Some(key) = library_key(owned, patched) else { return };
+    let Some(key) = library_key(patched) else { return };
     let blob = library.lookup(key);
     if let Some(blob) = &blob {
         patched.desc[at..at + 8].copy_from_slice(&(blob.as_ptr() as u64).to_le_bytes());
@@ -805,19 +805,17 @@ fn attach_blob(library: &Library, owned: &Owned, patched: &mut Patched) {
     patched._blob = blob;
 }
 
-/// The library key of a patched description: its state, its compiled stages and the direct key of
-/// the console pipeline.
-fn library_key(owned: &Owned, patched: &Patched) -> Option<u128> {
-    let identity = crate::direct_cache::pipeline_key(&pipeline_of(owned).ok()?, TRANSLATOR_HASH, "");
+/// The library key of a patched description: its state and its compiled stages.
+fn library_key(patched: &Patched) -> Option<u128> {
     let mut stack = [&[][..]; MAX_PIPELINE_STAGES];
     if patched.dxil.len() <= MAX_PIPELINE_STAGES {
         for (slot, d) in stack.iter_mut().zip(&patched.dxil) {
             *slot = &d[..];
         }
-        return crate::pso_library::pipeline_key(&patched.desc, &stack[..patched.dxil.len()], identity);
+        return crate::pso_library::pipeline_key(&patched.desc, &stack[..patched.dxil.len()], 0);
     }
     let stages: Vec<&[u8]> = patched.dxil.iter().map(|d| &d[..]).collect();
-    crate::pso_library::pipeline_key(&patched.desc, &stages, identity)
+    crate::pso_library::pipeline_key(&patched.desc, &stages, 0)
 }
 
 #[cfg(test)]
@@ -1224,5 +1222,16 @@ mod tests {
         }
         assert_eq!(json.matches("\"pso_ready_total\"").count(), 1);
         assert_eq!(json.matches("\"pso_pending_binds\"").count(), 2);
+    }
+
+    #[test]
+    fn library_key_does_not_require_pipeline_of_or_root_layout() {
+        let mut desc = [0u8; COMPUTE_DESC_SIZE];
+        desc[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+        desc[16..24].copy_from_slice(&4u64.to_le_bytes());
+        let dxil = vec![Arc::<[u8]>::from(&b"DXBCcs"[..])];
+        let patched = patch(&desc, &dxil);
+        let expected = crate::pso_library::pipeline_key(patched.desc(), &[&b"DXBCcs"[..]], 999);
+        assert_eq!(library_key(&patched), expected);
     }
 }
