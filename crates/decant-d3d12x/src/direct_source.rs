@@ -68,7 +68,7 @@ const SAMPLER_HEAP_FLAG: u32 = 0x800;
 /// a title thread may have a small stack.
 const TRANSLATE_STACK: usize = 32 << 20;
 /// How many translations are kept for the compile worker.
-const KEPT: usize = 64;
+const KEPT: usize = 256;
 /// A translation slower than this is logged, as it holds a title thread.
 const SLOW_MS: u128 = 50;
 
@@ -251,13 +251,15 @@ fn translate_wait() -> std::time::Duration {
     std::time::Duration::from_millis(*MS.get_or_init(|| std::env::var("DECANT_D3D12X_DIRECT_TRANSLATE_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2000)))
 }
 
+type KeptEntry = (u128, [u8; 20], Arc<Answer>);
+
 /// The translator behind the layer's direct shader path.
 pub struct DirectSource {
     host: Arc<dyn sd::Host + Send + Sync>,
     log: fn(&str),
     dump: Option<PathBuf>,
-    /// The last translations, by the translator's cache key of their input.
-    kept: Mutex<VecDeque<([u8; 20], Arc<Answer>)>>,
+    /// The last translations, by fast pipeline input key and translator cache key.
+    kept: Mutex<VecDeque<KeptEntry>>,
     /// Translations still running, by the same key.
     running: Mutex<HashMap<[u8; 20], Arc<Running>>>,
     /// The wait of a binding thread for a translation.
@@ -274,8 +276,68 @@ fn log_due(n: u64) -> bool {
 }
 
 /// The container hash the layer names override files by, as 16 hex digits.
+#[cfg(test)]
 fn hash_of(bytes: &[u8]) -> String {
     format!("{:016x}", decant_shader::container::fnv1a64(bytes))
+}
+
+/// Formats a 64 bit hash as 16 lowercase hex ASCII bytes on the stack without allocating.
+fn hex64_buf(hash: u64) -> [u8; 16] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 16];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let nibble = ((hash >> ((15 - i) * 4)) & 0xF) as usize;
+        *slot = HEX[nibble];
+    }
+    out
+}
+
+/// Zero allocation content key for `DirectSource::kept` covering stage bytes and root layout.
+fn pipeline_input_key(pipeline: &Pipeline) -> u128 {
+    let mut h = Fnv128::default();
+    h.bytes(&(pipeline.stages.len() as u64).to_le_bytes());
+    for stage in &pipeline.stages {
+        h.bytes(&stage.kind.visibility().to_le_bytes());
+        h.field(&stage.bytes);
+    }
+    h.bytes(&pipeline.root.flags.to_le_bytes());
+    h.bytes(&(pipeline.root.params.len() as u64).to_le_bytes());
+    for param in &pipeline.root.params {
+        h.bytes(&param.visibility.to_le_bytes());
+        match &param.kind {
+            rts0::RootParamKind::Table(ranges) => {
+                h.bytes(&1u32.to_le_bytes());
+                h.bytes(&(ranges.len() as u64).to_le_bytes());
+                for r in ranges {
+                    h.bytes(&(class(r.class) as u32).to_le_bytes());
+                    h.bytes(&r.count.to_le_bytes());
+                    h.bytes(&r.base.to_le_bytes());
+                    h.bytes(&r.space.to_le_bytes());
+                    h.bytes(&r.flags.to_le_bytes());
+                    h.bytes(&r.offset.to_le_bytes());
+                }
+            }
+            rts0::RootParamKind::Constants { register, space, count } => {
+                h.bytes(&2u32.to_le_bytes());
+                h.bytes(&register.to_le_bytes());
+                h.bytes(&space.to_le_bytes());
+                h.bytes(&count.to_le_bytes());
+            }
+            rts0::RootParamKind::Descriptor { class: c, register, space } => {
+                h.bytes(&3u32.to_le_bytes());
+                h.bytes(&(class(*c) as u32).to_le_bytes());
+                h.bytes(&register.to_le_bytes());
+                h.bytes(&space.to_le_bytes());
+            }
+        }
+    }
+    h.bytes(&(pipeline.root.static_samplers.len() as u64).to_le_bytes());
+    for sampler in &pipeline.root.static_samplers {
+        h.bytes(&sampler.register.to_le_bytes());
+        h.bytes(&sampler.space.to_le_bytes());
+        h.bytes(&sampler.visibility.to_le_bytes());
+    }
+    h.finish()
 }
 
 /// Starts `work` on a thread of its own with the translator's stack; `running` gets its outcome
@@ -332,9 +394,31 @@ impl DirectSource {
 
     /// The answer for `pipeline`: kept from an earlier call, or translated now.
     fn answer(&self, pipeline: &Pipeline, inline: bool) -> Arc<Answer> {
+        let input_key = pipeline_input_key(pipeline);
+        if let Some(found) = self.kept.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(ik, _, _)| *ik == input_key).map(|(_, _, a)| a.clone()) {
+            return found;
+        }
         let all = |r: Refusal| Arc::new(pipeline.stages.iter().map(|_| Err(r.clone())).collect::<Answer>());
-        let names: Vec<String> = pipeline.stages.iter().map(|s| hash_of(&s.bytes)).collect();
-        let described = || pipeline.stages.iter().zip(&names).map(|(s, n)| format!("{} {n}", s.kind.short())).collect::<Vec<_>>().join(", ");
+        let mut stack_hashes = [0u64; 8];
+        let mut heap_hashes = Vec::new();
+        let hashes: &mut [u64] = if pipeline.stages.len() <= stack_hashes.len() {
+            &mut stack_hashes[..pipeline.stages.len()]
+        } else {
+            heap_hashes.resize(pipeline.stages.len(), 0);
+            &mut heap_hashes
+        };
+        for (slot, stage) in hashes.iter_mut().zip(&pipeline.stages) {
+            *slot = decant_shader::container::fnv1a64(&stage.bytes);
+        }
+        let described = || {
+            pipeline
+                .stages
+                .iter()
+                .zip(hashes.iter().copied())
+                .map(|(s, h)| format!("{} {h:016x}", s.kind.short()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         // Served pipelines read their tables through the heap at the index the mirror holds.
         let layout = &pipeline.root;
         if layout.mirror_index().is_none() {
@@ -345,8 +429,10 @@ impl DirectSource {
         }
         // The containers are read here: bounds checked parsing without recursion.
         let mut programs = Vec::with_capacity(pipeline.stages.len());
-        for (stage, name) in pipeline.stages.iter().zip(&names) {
+        for (stage, &h) in pipeline.stages.iter().zip(hashes.iter()) {
             let kind = stage_of(stage.kind);
+            let hex = hex64_buf(h);
+            let name = std::str::from_utf8(&hex).unwrap_or("");
             let parsed = std::panic::catch_unwind(|| decant_shader::container::program(&stage.bytes, name));
             match parsed {
                 Ok(Ok(p)) if p.stage == kind => programs.push(p),
@@ -363,11 +449,11 @@ impl DirectSource {
             let listed = self.dump.is_some().then(|| decant_shader::translate(
                 &programs, &root, &sd::Options { listing: true, ..options.clone() }, &*self.host,
             ));
-            return self.finish_translation(pipeline, &names, &root, Ok((translated, listed)), started.elapsed().as_millis());
+            return self.finish_translation(pipeline, hashes, &root, Ok((translated, listed)), started.elapsed().as_millis());
         }
         // Registry indices are the same in every run (the registry file), so no host tag.
         let key = decant_shader::cache::key(&programs, &root, &options, 0);
-        if let Some(found) = self.kept.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key).map(|(_, a)| a.clone()) {
+        if let Some(found) = self.kept.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(_, k, _)| *k == key).map(|(_, _, a)| a.clone()) {
             return found;
         }
         // A translation runs on a thread of its own. The binding thread waits for it a while; past
@@ -409,7 +495,7 @@ impl DirectSource {
         // the same translation finds it kept, or asks again at its next bind.
         let taken = self.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&key).and_then(|r| r.outcome.lock().unwrap_or_else(|e| e.into_inner()).take());
         let Some((translated, ms)) = taken else {
-            return self.kept.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key).map(|(_, a)| a.clone()).unwrap_or_else(pending);
+            return self.kept.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(_, k, _)| *k == key).map(|(_, _, a)| a.clone()).unwrap_or_else(pending);
         };
         (self.log)(&format!("direct shaders: the translation of {} ended in {ms} ms", described()));
         if running.left_out.load(Ordering::Relaxed) {
@@ -418,7 +504,7 @@ impl DirectSource {
                 (self.log)(&format!("direct shaders: {} is taken later, translated in {ms} ms ({n} so far)", described()));
             }
         }
-        let answer = self.finish_translation(pipeline, &names, &root, translated, ms);
+        let answer = self.finish_translation(pipeline, hashes, &root, translated, ms);
         if ms >= SLOW_MS && log_due(self.slow.fetch_add(1, Ordering::Relaxed)) {
             (self.log)(&format!("direct shaders: the translation of {} took {ms} ms on the binding thread", described()));
         }
@@ -426,24 +512,24 @@ impl DirectSource {
         if kept.len() >= KEPT {
             kept.pop_front();
         }
-        kept.push_back((key, answer.clone()));
+        kept.push_back((input_key, key, answer.clone()));
         answer
     }
 
-    fn finish_translation(&self, pipeline: &Pipeline, names: &[String], root: &sd::RootSignature, translated: Result<(Translated, Option<Translated>), Refusal>, ms: u128) -> Arc<Answer> {
+    fn finish_translation(&self, pipeline: &Pipeline, hashes: &[u64], root: &sd::RootSignature, translated: Result<(Translated, Option<Translated>), Refusal>, ms: u128) -> Arc<Answer> {
         let all = |r: Refusal| Arc::new(pipeline.stages.iter().map(|_| Err(r.clone())).collect::<Answer>());
-        let described = || pipeline.stages.iter().zip(names).map(|(s, n)| format!("{} {n}", s.kind.short())).collect::<Vec<_>>().join(", ");
+        let described = || pipeline.stages.iter().zip(hashes).map(|(s, h)| format!("{} {h:016x}", s.kind.short())).collect::<Vec<_>>().join(", ");
         match translated {
             Err(r) => all(Refusal::new(r.reason, described())),
             Ok((Err(r), _)) => {
                 let at = r.stage.and_then(|s| pipeline.stages.iter().position(|p| stage_of(p.kind) == s));
-                let who = at.map_or_else(described, |i| format!("{} {}", pipeline.stages[i].kind.short(), names[i]));
+                let who = at.map_or_else(described, |i| format!("{} {:016x}", pipeline.stages[i].kind.short(), hashes[i]));
                 let place = r.pc.map_or_else(String::new, |pc| format!(" at word {pc}"));
                 let detail = if r.detail.is_empty() { format!("{who}{place}") } else { format!("{who}{place}: {}", r.detail) };
-                self.dump_refusal(at.map_or(&names[0], |i| &names[i]), &r.key(), &detail);
+                self.dump_refusal(hashes[at.unwrap_or(0)], &r.key(), &detail);
                 all(Refusal::new(r.key(), detail))
             }
-            Ok((Ok(translation), listed)) => self.checked(pipeline, names, translation, listed.and_then(Result::ok), root, ms),
+            Ok((Ok(translation), listed)) => self.checked(pipeline, hashes, translation, listed.and_then(Result::ok), root, ms),
         }
     }
 
@@ -454,22 +540,24 @@ impl DirectSource {
     }
 
     /// The HLSL of a translation whose stages all pass [`check_stage`], else the refusal.
-    fn checked(&self, pipeline: &Pipeline, names: &[String], translation: sd::Translation, listed: Option<sd::Translation>, root: &sd::RootSignature, ms: u128) -> Arc<Answer> {
+    fn checked(&self, pipeline: &Pipeline, hashes: &[u64], translation: sd::Translation, listed: Option<sd::Translation>, root: &sd::RootSignature, ms: u128) -> Arc<Answer> {
         let all = |r: Refusal| Arc::new(pipeline.stages.iter().map(|_| Err(r.clone())).collect::<Answer>());
         if translation.stages.len() != pipeline.stages.len() {
             return all(Refusal::new("adapter:stage-count", format!("{} answers for {} stages", translation.stages.len(), pipeline.stages.len())));
         }
-        for ((stage, input), name) in translation.stages.iter().zip(&pipeline.stages).zip(names) {
+        for ((stage, input), &h) in translation.stages.iter().zip(&pipeline.stages).zip(hashes) {
             if let Err(mut r) = check_stage(stage, input.kind, &pipeline.root, root) {
+                let hex = hex64_buf(h);
+                let name = std::str::from_utf8(&hex).unwrap_or("");
                 r.detail = if r.detail.is_empty() { format!("{} {name}", input.kind.short()) } else { format!("{} {name}: {}", input.kind.short(), r.detail) };
-                self.dump_refusal(name, &r.reason, &r.detail);
+                self.dump_refusal(h, &r.reason, &r.detail);
                 return all(r);
             }
         }
         if let Some(dir) = &self.dump {
             let _ = std::fs::create_dir_all(dir);
-            for (stage, name) in listed.as_ref().unwrap_or(&translation).stages.iter().zip(names) {
-                let _ = std::fs::write(dir.join(format!("{name}.{}.hlsl", stage.profile)), &stage.hlsl);
+            for (stage, &h) in listed.as_ref().unwrap_or(&translation).stages.iter().zip(hashes) {
+                let _ = std::fs::write(dir.join(format!("{h:016x}.{}.hlsl", stage.profile)), &stage.hlsl);
             }
         }
         let n = self.translated.fetch_add(1, Ordering::Relaxed);
@@ -478,10 +566,10 @@ impl DirectSource {
                 .stages
                 .iter()
                 .zip(&pipeline.stages)
-                .zip(names)
-                .map(|((t, input), name)| {
+                .zip(hashes)
+                .map(|((t, input), &h)| {
                     let heap = t.resources.iter().filter(|r| !matches!(r.placement, sd::Placement::Register { .. })).count();
-                    format!("{} {name} (mirror dwords {:?}, {} of {} resources through the heap)", input.kind.short(), t.needs.mirror_dwords, heap, t.resources.len())
+                    format!("{} {h:016x} (mirror dwords {:?}, {} of {} resources through the heap)", input.kind.short(), t.needs.mirror_dwords, heap, t.resources.len())
                 })
                 .collect();
             (self.log)(&format!("direct shaders: translated {} in {ms} ms ({} pipelines so far)", stages.join(", "), n + 1));
@@ -489,10 +577,10 @@ impl DirectSource {
         Arc::new(translation.stages.into_iter().map(|s| Ok(StageHlsl { hlsl: s.hlsl, entry: s.entry, profile: s.profile, args: s.dxc_args })).collect())
     }
 
-    fn dump_refusal(&self, name: &str, reason: &str, detail: &str) {
+    fn dump_refusal(&self, hash: u64, reason: &str, detail: &str) {
         if let Some(dir) = &self.dump {
             let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(dir.join(format!("{name}.refused.txt")), format!("{reason}\n{detail}\n"));
+            let _ = std::fs::write(dir.join(format!("{hash:016x}.refused.txt")), format!("{reason}\n{detail}\n"));
         }
     }
 }
@@ -821,5 +909,20 @@ mod tests {
         assert!(s.accepts(&bad).is_err());
         let text = std::fs::read_to_string(tmp.0.join(format!("{}.refused.txt", hash_of(&bad.stages[1].bytes)))).expect("refusal dump");
         assert!(text.starts_with("stage:link-missing\n"), "{text}");
+    }
+
+    #[test]
+    fn fast_input_key_hits_kept_without_reparsing_and_formats_hex_without_alloc() {
+        let s = source();
+        let root = layout(title_table());
+        let p = pipeline(&[ui_vertex(), ui_pixel()], root.clone());
+        assert_eq!(hex64_buf(0x0123_4567_89ab_cdef), *b"0123456789abcdef");
+        assert_eq!(s.accepts(&p), Ok(()));
+        assert_eq!(s.kept.lock().unwrap().len(), 1);
+        assert_eq!(s.kept.lock().unwrap()[0].0, pipeline_input_key(&p));
+        let keys = s.stage_keys(&p).expect("stage keys");
+        assert_eq!(keys.len(), 2);
+        let other_root = layout(vec![range(rts0::RegisterClass::Srv, 3, 0)]);
+        assert_ne!(pipeline_input_key(&p), pipeline_input_key(&pipeline(&[ui_vertex(), ui_pixel()], other_root)));
     }
 }
