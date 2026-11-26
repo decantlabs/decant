@@ -148,6 +148,30 @@ pub fn o0_hlsl_bytes() -> usize {
     *THRESHOLD.get_or_init(|| parse_o0_hlsl_bytes(std::env::var("DECANT_D3D12X_DIRECT_O0_BYTES").ok().as_deref()))
 }
 
+/// A live cache miss of a stage with at least this much HLSL is throttled by [`large_dxc_limit`].
+pub const LARGE_STAGE_HLSL_BYTES: usize = 256 * 1024;
+/// Default maximum concurrent live DXC compiles of stages `>= LARGE_STAGE_HLSL_BYTES`.
+pub const DEFAULT_LARGE_DXC_LIMIT: usize = 2;
+
+/// Parses `DECANT_D3D12X_LARGE_DXC_LIMIT`: `0`, `off`, or `false` disables the cap (`usize::MAX`),
+/// a positive integer sets the concurrent limit, and missing or invalid values return
+/// [`DEFAULT_LARGE_DXC_LIMIT`].
+pub fn parse_large_dxc_limit(setting: Option<&str>) -> usize {
+    let Some(text) = setting.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_LARGE_DXC_LIMIT;
+    };
+    if matches!(text.to_ascii_lowercase().as_str(), "0" | "off" | "false") {
+        return usize::MAX;
+    }
+    text.parse::<usize>().unwrap_or(DEFAULT_LARGE_DXC_LIMIT)
+}
+
+/// Returns the live large-stage DXC concurrency limit from `DECANT_D3D12X_LARGE_DXC_LIMIT`, read once.
+pub fn large_dxc_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| parse_large_dxc_limit(std::env::var("DECANT_D3D12X_LARGE_DXC_LIMIT").ok().as_deref()))
+}
+
 /// The default HLSL limit of a live compile (`DECANT_D3D12X_MAX_LIVE_HLSL_BYTES` sets another).
 pub const MAX_LIVE_HLSL_BYTES: usize = 16 * 1024 * 1024;
 
@@ -247,6 +271,57 @@ struct Shared {
     last_summary: Mutex<String>,
     /// Helper threads that may compile stages beside the workers, free now.
     stage_slots: AtomicUsize,
+    /// Concurrency gate for giant (`>= LARGE_STAGE_HLSL_BYTES`) live DXC compiles.
+    large_gate: LargeCompileGate,
+}
+
+struct LargeCompileGate {
+    active: Mutex<usize>,
+    ready: Condvar,
+    limit: AtomicUsize,
+}
+
+impl LargeCompileGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            active: Mutex::new(0),
+            ready: Condvar::new(),
+            limit: AtomicUsize::new(limit),
+        }
+    }
+
+    fn acquire(&self) -> LargeCompileGuard<'_> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= self.limit.load(Ordering::Relaxed) {
+            active = self.ready.wait(active).unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+        #[cfg(windows)]
+        let restore_below_normal = set_lowest_priority();
+        LargeCompileGuard {
+            gate: self,
+            #[cfg(windows)]
+            restore_below_normal,
+        }
+    }
+}
+
+struct LargeCompileGuard<'a> {
+    gate: &'a LargeCompileGate,
+    #[cfg(windows)]
+    restore_below_normal: bool,
+}
+
+impl Drop for LargeCompileGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.restore_below_normal {
+            set_below_normal_priority();
+        }
+        let mut active = self.gate.active.lock().unwrap_or_else(|e| e.into_inner());
+        *active = active.saturating_sub(1);
+        self.gate.ready.notify_one();
+    }
 }
 
 /// The HLSL of every stage of a queued pipeline and its stage keys, made on a precompile worker.
@@ -305,6 +380,16 @@ fn set_below_normal_priority() {
     }
 }
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn set_lowest_priority() -> bool {
+    // SAFETY: GetCurrentThread returns the pseudo handle of the calling thread.
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) != 0
+    }
+}
+
 #[cfg(not(windows))]
 fn set_below_normal_priority() {}
 
@@ -336,6 +421,7 @@ impl Service {
             live_limit: AtomicUsize::new(usize::MAX),
             last_summary: Mutex::new(String::new()),
             stage_slots: AtomicUsize::new(worker_cap),
+            large_gate: LargeCompileGate::new(large_dxc_limit()),
         });
         let rx = Arc::new(Mutex::new(rx));
         for i in 0..worker_count {
@@ -952,6 +1038,8 @@ impl Shared {
         } else {
             std::borrow::Cow::Borrowed(&stage.args)
         };
+        let _large_guard = (self.live.load(Ordering::Relaxed) && stage.hlsl.len() >= LARGE_STAGE_HLSL_BYTES)
+            .then(|| self.large_gate.acquire());
         let compile_started = std::time::Instant::now();
         let compile_result = self.compiler.compile(&stage.hlsl, &stage.entry, &stage.profile, &args);
         self.counters.dxc_compile_us.fetch_add(compile_started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1600,5 +1688,112 @@ pub(crate) mod tests {
         assert_eq!(default_worker_cap(8), 4);
         assert_eq!(default_worker_cap(16), 8);
         assert_eq!(default_worker_cap(32), 8);
+    }
+
+    #[test]
+    fn parse_large_dxc_limit_handles_defaults_overrides_and_unlimited() {
+        assert_eq!(LARGE_STAGE_HLSL_BYTES, 256 * 1024);
+        assert_eq!(DEFAULT_LARGE_DXC_LIMIT, 2);
+        assert_eq!(parse_large_dxc_limit(None), DEFAULT_LARGE_DXC_LIMIT);
+        assert_eq!(parse_large_dxc_limit(Some("")), DEFAULT_LARGE_DXC_LIMIT);
+        assert_eq!(parse_large_dxc_limit(Some("not-a-number")), DEFAULT_LARGE_DXC_LIMIT);
+        assert_eq!(parse_large_dxc_limit(Some(" 4 ")), 4);
+        for unlimited in ["0", "off", "OFF", "false"] {
+            assert_eq!(parse_large_dxc_limit(Some(unlimited)), usize::MAX, "{unlimited}");
+        }
+    }
+
+    #[test]
+    fn live_large_stage_gate_caps_giant_compiles_without_blocking_small_or_offline() {
+        #[derive(Default)]
+        struct TrackingCompiler {
+            large_active: AtomicUsize,
+            large_peak: AtomicUsize,
+            small_active: AtomicUsize,
+            small_peak: AtomicUsize,
+            release: (Mutex<bool>, Condvar),
+        }
+
+        impl Compiler for TrackingCompiler {
+            fn version(&self) -> String {
+                "tracking 1".to_string()
+            }
+
+            fn compile(&self, hlsl: &str, _entry: &str, profile: &str, _args: &[String]) -> Result<Vec<u8>, String> {
+                let is_large = hlsl.len() >= LARGE_STAGE_HLSL_BYTES;
+                if is_large {
+                    let cur = self.large_active.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.large_peak.fetch_max(cur, Ordering::SeqCst);
+                    let mut guard = self.release.0.lock().unwrap();
+                    while !*guard {
+                        guard = self.release.1.wait(guard).unwrap();
+                    }
+                    self.large_active.fetch_sub(1, Ordering::SeqCst);
+                } else {
+                    let cur = self.small_active.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.small_peak.fetch_max(cur, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(10));
+                    self.small_active.fetch_sub(1, Ordering::SeqCst);
+                }
+                Ok([b"DXBC".as_slice(), profile.as_bytes()].concat())
+            }
+        }
+
+        let compiler = Arc::new(TrackingCompiler::default());
+        let service = Service::new(Arc::new(FixedSource::simple()), compiler.clone(), Settings::quiet(4));
+        service.set_live(MAX_LIVE_HLSL_BYTES);
+        service.shared.large_gate.limit.store(2, Ordering::Relaxed);
+
+        let large_stage = StageHlsl { hlsl: "x".repeat(LARGE_STAGE_HLSL_BYTES), entry: "main".into(), profile: "cs_6_0".into(), args: Vec::new() };
+        let small_stage = StageHlsl { hlsl: "x".repeat(1024), entry: "main".into(), profile: "cs_6_0".into(), args: Vec::new() };
+
+        std::thread::scope(|scope| {
+            for i in 0..4u128 {
+                let svc = &service;
+                let st = &large_stage;
+                scope.spawn(move || {
+                    assert!(svc.shared.compile_stage(100 + i, st).is_ok());
+                });
+            }
+            // Wait until 2 large compiles are inside `compile`, then verify no more than 2 enter.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while compiler.large_active.load(Ordering::SeqCst) < 2 {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(compiler.large_active.load(Ordering::SeqCst), 2);
+            assert_eq!(compiler.large_peak.load(Ordering::SeqCst), 2);
+
+            // Small stages are not blocked by the large-stage gate.
+            assert!(service.shared.compile_stage(200, &small_stage).is_ok());
+            assert_eq!(compiler.small_peak.load(Ordering::SeqCst), 1);
+
+            *compiler.release.0.lock().unwrap() = true;
+            compiler.release.1.notify_all();
+        });
+        assert_eq!(compiler.large_peak.load(Ordering::SeqCst), 2);
+
+        // Offline mode (`!live`) bypasses the large-stage gate.
+        service.shared.live.store(false, Ordering::Relaxed);
+        compiler.large_peak.store(0, Ordering::SeqCst);
+        *compiler.release.0.lock().unwrap() = false;
+        std::thread::scope(|scope| {
+            for i in 0..3u128 {
+                let svc = &service;
+                let st = &large_stage;
+                scope.spawn(move || {
+                    assert!(svc.shared.compile_stage(300 + i, st).is_ok());
+                });
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while compiler.large_active.load(Ordering::SeqCst) < 3 {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            *compiler.release.0.lock().unwrap() = true;
+            compiler.release.1.notify_all();
+        });
+        assert_eq!(compiler.large_peak.load(Ordering::SeqCst), 3);
     }
 }
