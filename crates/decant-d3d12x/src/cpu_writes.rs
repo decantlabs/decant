@@ -28,7 +28,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use windows_sys::core::{GUID, HRESULT};
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::Memory::{
     MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_MAPPED, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
 };
@@ -37,6 +37,15 @@ use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::list_sync::{CpuWrite, PendingWait, WaitLimits};
 use crate::log::xs_log;
+
+/// Return value of `WaitForSingleObject` when the event was signalled.
+const WAIT_OBJECT_0: u32 = 0;
+
+/// How long a pending GPU fence wait counts as an active producer for memory waits before letting
+/// other queues fall back to their idle timeout. A healthy GPU submission finishes far faster than
+/// this, while a queue blocked on a cross-queue GPU fence stops pinning every wait to its hard
+/// limit for the full `SUBMISSION_WAIT_MS`.
+const ACTIVE_WAIT_MS: u32 = 500;
 
 type Object = *mut c_void;
 
@@ -108,6 +117,9 @@ struct QueueSlot {
     fence: Option<(usize, u64)>,
     /// The calibration, taken the first time a timestamp write needs it.
     clock: Option<Clock>,
+    /// The sender for this queue's dedicated worker thread, so a slow or blocked fence on one
+    /// queue never stalls CPU writes for another queue.
+    sender: Option<mpsc::Sender<Job>>,
 }
 
 static QUEUES: Mutex<Option<HashMap<usize, QueueSlot>>> = Mutex::new(None);
@@ -143,6 +155,31 @@ fn counter_now() -> u64 {
     u64::try_from(ticks).unwrap_or(0)
 }
 
+/// One job's claim on [`PENDING_JOBS`]. Dropping or releasing it lowers the count once and wakes
+/// memory waits so idle waits can observe that no producer remains.
+struct ActiveJob(bool);
+
+impl ActiveJob {
+    fn acquire() -> Self {
+        PENDING_JOBS.fetch_add(1, Ordering::AcqRel);
+        Self(true)
+    }
+
+    fn release(&mut self) {
+        if self.0 {
+            self.0 = false;
+            PENDING_JOBS.fetch_sub(1, Ordering::AcqRel);
+            wake_waits();
+        }
+    }
+}
+
+impl Drop for ActiveJob {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// The writes of one submission, waiting for the GPU to reach `value` on `fence`.
 struct Job {
     fence: usize,
@@ -150,6 +187,7 @@ struct Job {
     writes: Vec<CpuWrite>,
     /// The clock of the queue, present when some write is a timestamp.
     clock: Option<Clock>,
+    active: ActiveJob,
 }
 
 impl Job {
@@ -157,7 +195,7 @@ impl Job {
     ///
     /// # Safety
     /// The fence is live and `event` is an event handle that no other thread uses.
-    unsafe fn run(&self, event: HANDLE) {
+    unsafe fn run(mut self, event: HANDLE) {
         let fence = self.fence as Object;
         // SAFETY: by the contract above.
         unsafe {
@@ -165,11 +203,33 @@ impl Job {
             if completed(fence) < self.value {
                 let arm: SetEventOnCompletion = vslot(fence, SLOT_SET_EVENT_ON_COMPLETION);
                 if arm(fence, self.value, event) >= 0 {
-                    WaitForSingleObject(event, SUBMISSION_WAIT_MS);
+                    let started = Instant::now();
+                    let active_limit = Duration::from_millis(u64::from(ACTIVE_WAIT_MS));
+                    let total_limit = Duration::from_millis(u64::from(SUBMISSION_WAIT_MS));
+                    while completed(fence) < self.value {
+                        let elapsed = started.elapsed();
+                        if elapsed >= total_limit {
+                            break;
+                        }
+                        if self.active.0 && elapsed >= active_limit {
+                            self.active.release();
+                        }
+                        let remaining = if self.active.0 {
+                            active_limit.saturating_sub(elapsed)
+                        } else {
+                            total_limit.saturating_sub(elapsed)
+                        };
+                        let ms = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX).max(1);
+                        let waited = WaitForSingleObject(event, ms);
+                        if waited == WAIT_OBJECT_0 && completed(fence) < self.value && arm(fence, self.value, event) < 0 {
+                            break;
+                        }
+                    }
                 }
             }
         }
         apply_writes(&self.writes, self.clock);
+        self.active.release();
     }
 }
 
@@ -204,7 +264,7 @@ fn writes_count() -> u64 {
 }
 
 /// Wakes every memory wait, so it reads its value again at once.
-fn wake_waits() {
+pub(crate) fn wake_waits() {
     let (count, changed) = writes_made();
     *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     changed.notify_all();
@@ -224,27 +284,27 @@ fn sleep_until_written(seen: u64, timeout: Duration) {
     }
 }
 
-/// The sender of the worker thread. The thread starts on the first use.
-fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
-    static WORKER: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
-    WORKER.get_or_init(|| {
-        let (sender, jobs) = mpsc::channel::<Job>();
-        let started = std::thread::Builder::new().name("decant-cpu-writes".into()).spawn(move || {
-            // SAFETY: the event is made here and only this thread uses it.
-            let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
-            decant_log::handles::created(event as usize, "CPU write fence event");
-            for job in jobs {
-                // SAFETY: `QUEUES` keeps the fences alive for the process.
-                unsafe { job.run(event) };
-                PENDING_JOBS.fetch_sub(1, Ordering::AcqRel);
-                wake_waits();
-            }
-        });
-        if let Err(e) = started {
-            xs_log!("console proxies: no thread for the writes after the GPU: {e}");
+/// Spawns one dedicated worker thread for a single queue, running `run` on each queued item in
+/// order with its own fence event handle.
+fn spawn_queue_worker<T: Send + 'static>(run: impl Fn(T, HANDLE) + Send + 'static) -> Option<mpsc::Sender<T>> {
+    let (sender, jobs) = mpsc::channel::<T>();
+    let started = std::thread::Builder::new().name("decant-cpu-writes".into()).spawn(move || {
+        // SAFETY: the event is made here and only this thread uses it.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        decant_log::handles::created(event as usize, "CPU write fence event");
+        for job in jobs {
+            run(job, event);
         }
-        Mutex::new(sender)
-    })
+        // SAFETY: `event` was created by this thread and is closed once on exit.
+        unsafe { CloseHandle(event) };
+    });
+    match started {
+        Ok(_) => Some(sender),
+        Err(e) => {
+            xs_log!("console proxies: no thread for the writes after the GPU: {e}");
+            None
+        }
+    }
 }
 
 /// Applies a lazily committed pool page to `info`. A page of `xmem.dll` that the title has not
@@ -346,26 +406,43 @@ pub(crate) fn satisfied(wait: &PendingWait) -> bool {
 /// module was made: the title's own threads may write the value too, and they wake nobody.
 const RECHECK: Duration = Duration::from_millis(2);
 
-/// Waits until the memory meets `wait`. Returns whether it was met. Each write this module makes
-/// wakes the wait at once. It gives up after `limits.hard`, or after `limits.idle` when no write of
-/// this module is on its way and `elsewhere()` (other work that might still write it) says no.
-/// Called by the worker of a queue (`queue_fifo`), never on the title's thread.
-pub(crate) fn wait_until(wait: &PendingWait, limits: WaitLimits, elsewhere: impl Fn() -> bool) -> bool {
+/// Waits until every memory wait in `waits` is met, sharing one `limits` budget across the whole
+/// slice. Returns the waits that were still unmet when the wait gave up (either because
+/// `interrupted()` asked the queue to advance, `limits.idle` passed with no active producer, or
+/// `limits.hard` elapsed). Each write this module makes wakes the wait at once. Called by the
+/// worker of a queue (`queue_fifo`), never on the title's thread.
+pub(crate) fn wait_all_until(
+    waits: &[PendingWait],
+    limits: WaitLimits,
+    elsewhere: impl Fn() -> bool,
+    interrupted: impl Fn() -> bool,
+) -> Vec<PendingWait> {
     let started = Instant::now();
     loop {
         let seen = writes_count();
-        if satisfied(wait) {
-            return true;
+        if waits.iter().all(satisfied) {
+            return Vec::new();
+        }
+        if interrupted() {
+            return waits.iter().copied().filter(|w| !satisfied(w)).collect();
         }
         let waited = started.elapsed();
         if waited >= limits.hard {
-            return false;
+            return waits.iter().copied().filter(|w| !satisfied(w)).collect();
         }
         if waited >= limits.idle && PENDING_JOBS.load(Ordering::Acquire) == 0 && !elsewhere() {
-            return false;
+            return waits.iter().copied().filter(|w| !satisfied(w)).collect();
         }
-        sleep_until_written(seen, (limits.hard - waited).min(RECHECK));
+        let until_idle = if waited < limits.idle { limits.idle - waited } else { RECHECK };
+        sleep_until_written(seen, (limits.hard - waited).min(until_idle).min(RECHECK));
     }
+}
+
+/// Waits until the memory meets `wait`. Returns whether it was met. Convenience wrapper over
+/// [`wait_all_until`] for a single wait without interruption.
+#[cfg(test)]
+pub(crate) fn wait_until(wait: &PendingWait, limits: WaitLimits, elsewhere: impl Fn() -> bool) -> bool {
+    wait_all_until(&[*wait], limits, elsewhere, || false).is_empty()
 }
 
 /// Stores `words` at `va` if that memory is still there and the CPU can write it.
@@ -443,7 +520,7 @@ pub(crate) unsafe fn after(queue: Object, writes: Vec<CpuWrite>) {
         return;
     }
     let wants_clock = writes.iter().any(|(_, words)| words.is_empty());
-    let job = {
+    let (sender, job) = {
         let mut guard = queues();
         let slot = guard.get_or_insert_with(HashMap::new).entry(queue as usize).or_default();
         let clock = if !wants_clock {
@@ -460,6 +537,18 @@ pub(crate) unsafe fn after(queue: Object, writes: Vec<CpuWrite>) {
             let Some(fence) = (unsafe { new_fence(queue) }) else { return };
             slot.fence = Some((fence as usize, 0));
         }
+        if slot.sender.is_none() {
+            slot.sender = spawn_queue_worker(|job: Job, event| {
+                // SAFETY: `QUEUES` keeps the fences alive for the process.
+                unsafe { job.run(event) };
+            });
+        }
+        let Some(sender) = slot.sender.clone() else {
+            // Without a worker thread the title would never see these writes; apply them now so
+            // memory waits do not starve.
+            apply_writes(&writes, clock);
+            return;
+        };
         let (fence, signalled) = slot.fence.as_mut().expect("the fence was made above");
         *signalled += 1;
         // SAFETY: the queue and the fence are live COM objects of one device.
@@ -468,15 +557,13 @@ pub(crate) unsafe fn after(queue: Object, writes: Vec<CpuWrite>) {
             log_failure("Signal of the queue", hr);
             return;
         }
-        Job { fence: *fence, value: *signalled, writes, clock }
+        let job = Job { fence: *fence, value: *signalled, writes, clock, active: ActiveJob::acquire() };
+        (sender, job)
     };
     if ANNOUNCED.fetch_add(1, Ordering::Relaxed) < 3 {
         xs_log!("bottom-of-pipe writes outside the GPU's memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len());
     }
-    PENDING_JOBS.fetch_add(1, Ordering::AcqRel);
-    if worker().lock().unwrap_or_else(|e| e.into_inner()).send(job).is_err() {
-        PENDING_JOBS.fetch_sub(1, Ordering::AcqRel);
-    }
+    let _ = sender.send(job);
 }
 
 #[cfg(test)]
@@ -607,5 +694,87 @@ mod tests {
         // SAFETY: `va` points into the live, dword aligned box.
         unsafe { write_now_cached(va + 8, &[0x12, 0x34], &mut cache) };
         assert_eq!(*target, [0, 0, 0x12, 0x34]);
+    }
+
+    #[test]
+    fn per_queue_workers_do_not_head_of_line_block_each_other() {
+        let (block_tx, block_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let slow_queue = spawn_queue_worker(move |(): (), _| {
+            let _ = started_tx.send(());
+            let _ = block_rx.recv();
+        })
+        .expect("slow worker spawns");
+        let fast_queue = spawn_queue_worker(|(va, val): (usize, u32), _| {
+            apply_writes(&[(va, vec![val, 0])], None);
+        })
+        .expect("fast worker spawns");
+
+        slow_queue.send(()).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).expect("slow worker entered blocked job");
+
+        let cell = Box::new(AtomicU64::new(0));
+        let va = std::ptr::from_ref(&*cell) as usize;
+        let wait = PendingWait { va: va as u64, width: 8, comparison: 7, value: 42, mask: u64::MAX };
+        let begun = Instant::now();
+        fast_queue.send((va, 42)).unwrap();
+        assert!(wait_until(&wait, WaitLimits { idle: Duration::from_secs(2), hard: Duration::from_secs(5) }, || true));
+        assert!(begun.elapsed() < Duration::from_millis(200), "fast queue completed while slow queue stayed blocked ({:?})", begun.elapsed());
+
+        let _ = block_tx.send(());
+        drop(slow_queue);
+        drop(fast_queue);
+    }
+
+    #[test]
+    fn wait_all_until_shares_budget_and_honours_interrupt() {
+        let a = Box::new(AtomicU64::new(0));
+        let b = Box::new(AtomicU64::new(0));
+        let c = Box::new(AtomicU64::new(0));
+        let waits = [
+            PendingWait { va: std::ptr::from_ref(&*a) as u64, width: 8, comparison: 7, value: 1, mask: u64::MAX },
+            PendingWait { va: std::ptr::from_ref(&*b) as u64, width: 8, comparison: 7, value: 1, mask: u64::MAX },
+            PendingWait { va: std::ptr::from_ref(&*c) as u64, width: 8, comparison: 7, value: 1, mask: u64::MAX },
+        ];
+        // Three unmet waits share one idle budget instead of waiting 3x.
+        let begun = Instant::now();
+        let unmet = wait_all_until(&waits, WaitLimits { idle: Duration::from_millis(30), hard: Duration::from_secs(2) }, || false, || false);
+        assert_eq!(unmet.len(), 3);
+        assert!(begun.elapsed() < Duration::from_millis(250), "shared budget ended in {:?}", begun.elapsed());
+
+        // An interrupt + wake_waits exits immediately without waiting for idle or hard limits.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = std::sync::Arc::clone(&stop);
+        let kicker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            stop_flag.store(true, Ordering::Release);
+            wake_waits();
+        });
+        let begun = Instant::now();
+        let unmet = wait_all_until(
+            &waits,
+            WaitLimits { idle: Duration::from_secs(5), hard: Duration::from_secs(10) },
+            || true,
+            || stop.load(Ordering::Acquire),
+        );
+        kicker.join().unwrap();
+        assert_eq!(unmet.len(), 3);
+        assert!(begun.elapsed() < Duration::from_millis(250), "interrupt ended in {:?}", begun.elapsed());
+    }
+
+    #[test]
+    fn active_job_release_drops_pending_count_so_idle_waits_finish() {
+        let cell = Box::new(AtomicU64::new(0));
+        let wait = PendingWait { va: std::ptr::from_ref(&*cell) as u64, width: 8, comparison: 7, value: 1, mask: u64::MAX };
+        let mut active = ActiveJob::acquire();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            active.release();
+        });
+        let begun = Instant::now();
+        let unmet = wait_all_until(&[wait], WaitLimits { idle: Duration::from_millis(20), hard: Duration::from_secs(2) }, || false, || false);
+        releaser.join().unwrap();
+        assert_eq!(unmet.len(), 1);
+        assert!(begun.elapsed() < Duration::from_millis(400), "wait exited once stalled active job released ({:?})", begun.elapsed());
     }
 }

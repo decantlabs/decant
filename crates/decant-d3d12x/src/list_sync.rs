@@ -205,6 +205,32 @@ pub fn all_waits(list: usize, met: impl Fn(&PendingWait) -> bool) -> bool {
     peek(list, |r| r.waits.iter().all(&met)).unwrap_or(true)
 }
 
+/// Walks `keys` in order and splits the batch before each list whose memory waits are not yet met.
+/// Before waiting on list `i`, any earlier lists `start..i` run through `execute_slice(start, i)`
+/// so both the PC GPU work and its CPU bottom-of-pipe writes are dispatched before the wait begins.
+/// The trailing slice `start..keys.len()` runs once the loop finishes.
+pub fn for_each_ready_slice(
+    keys: &[usize],
+    mut ready: impl FnMut(usize) -> bool,
+    mut execute_slice: impl FnMut(usize, usize),
+    mut wait_list: impl FnMut(usize),
+) {
+    let mut start = 0usize;
+    for (i, &key) in keys.iter().enumerate() {
+        if ready(key) {
+            continue;
+        }
+        if i > start {
+            execute_slice(start, i);
+        }
+        wait_list(key);
+        start = i;
+    }
+    if start < keys.len() {
+        execute_slice(start, keys.len());
+    }
+}
+
 /// Whether `list` holds a CPU write that overlaps `[va, va + bytes)`. Such a write only happens
 /// after the list ran, so a wait on that memory in the same list can never be met beforehand and the
 /// caller must not record it.
@@ -364,6 +390,43 @@ mod tests {
         assert_eq!(state_after, Some((0, caps_before.0, 0, caps_before.1, None)));
         if let Some(table) = lock().as_mut() {
             table.remove(&list);
+        }
+    }
+
+    #[test]
+    fn for_each_ready_slice_dispatches_prefix_writes_before_same_batch_waits() {
+        let (l0, l1, l2) = (0x8_0000usize, 0x8_0001usize, 0x8_0002usize);
+        let cell = Box::new(std::sync::atomic::AtomicU64::new(0));
+        let va = std::ptr::from_ref(&*cell) as usize;
+        record_cpu_write(l0, va, vec![1, 0]);
+        record_wait(l1, PendingWait { va: va as u64, width: 8, comparison: 7, value: 1, mask: u64::MAX });
+        record_cpu_write(l2, va, vec![2, 0]);
+
+        let keys = [l0, l1, l2];
+        let mut slices = Vec::new();
+        let mut waited_keys = Vec::new();
+        let mut wait_was_satisfied = false;
+        for_each_ready_slice(
+            &keys,
+            |k| all_waits(k, |w| w.satisfied_by(cell.load(std::sync::atomic::Ordering::Acquire))),
+            |start, end| {
+                slices.push((start, end));
+                for (addr, words) in cpu_writes_of(&keys[start..end]) {
+                    assert_eq!(addr, va);
+                    cell.store(u64::from(words[0]), std::sync::atomic::Ordering::Release);
+                }
+            },
+            |k| {
+                waited_keys.push(k);
+                wait_was_satisfied = all_waits(k, |w| w.satisfied_by(cell.load(std::sync::atomic::Ordering::Acquire)));
+            },
+        );
+        assert_eq!(slices, [(0, 1), (1, 3)]);
+        assert_eq!(waited_keys, [l1]);
+        assert!(wait_was_satisfied, "L0's write ran before L1 waited");
+        assert_eq!(cell.load(std::sync::atomic::Ordering::Acquire), 2);
+        for k in keys {
+            forget(k);
         }
     }
 }

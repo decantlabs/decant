@@ -3821,12 +3821,7 @@ unsafe fn bound_at_reset(this: *mut Proxy, pso: Object) -> Object {
 /// of the list (`queue_fifo`) runs first, because the PC list is only read when it does.
 fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
     let key = this as usize;
-    if !crate::queue_fifo::wait_lists_idle(key, crate::list_sync::wait_limits().hard * 2) {
-        static N: AtomicI32 = AtomicI32::new(0);
-        if log_due(&N) {
-            xs_log!("console list {key:#x}: Reset while a queued submission of it has not run yet, reset anyway");
-        }
-    }
+    crate::queue_fifo::wait_list_idle(key, crate::list_sync::wait_limits().idle);
     crate::list_sync::forget(key);
     crate::user_mirror::forget(key);
     crate::title_heap::list_reset(key);
@@ -3976,7 +3971,7 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
             let tracked = crate::retire::begin(pc);
             submit_lists(pc, mapped, keys, tracked);
         } else {
-            QueuedLists::hold(pc, mapped, keys).queue();
+            QueuedLists::enqueue(pc, mapped, keys);
         }
     }
 }
@@ -4009,28 +4004,40 @@ unsafe fn submit_lists(pc: Object, mapped: &[Object], keys: &[usize], tracked: b
         }
         let watched = crate::flicker_probe::submitting(pc, keys, suspects);
         // a list whose memory waits are not met runs after the lists before it, once they are
-        // (the GPU has to run those first); the wait holds it back within `list_sync::wait_limits`
-        let mut start = 0usize;
-        for (i, &key) in keys.iter().enumerate() {
-            if crate::list_sync::all_waits(key, crate::cpu_writes::satisfied) {
-                continue;
-            }
-            if i > start {
-                execute_closed(pc, &mapped[start..i]);
-            }
-            let _trace = decant_trace::span("queue", "memory_wait");
-            for w in &crate::list_sync::waits_of(key) {
-                if !crate::cpu_writes::wait_until(w, crate::list_sync::wait_limits(), || crate::queue_fifo::busy_elsewhere(pc as usize)) {
-                    static N: AtomicI32 = AtomicI32::new(0);
-                    if log_due(&N) {
-                        xs_log!("console list: a memory wait at {:#x} ({} bytes, comparison {}, value {:#x}, mask {:#x}) timed out, the list runs anyway", w.va, w.width, w.comparison, w.value, w.mask);
+        // (both the GPU work and the CPU bottom-of-pipe writes of those earlier lists must be
+        // dispatched before waiting, because later lists in the same batch or on another queue may
+        // wait on them); the wait holds it back within `list_sync::wait_limits`
+        let mut total_writes = 0usize;
+        if keys.is_empty() {
+            execute_closed(pc, mapped);
+        } else {
+            crate::list_sync::for_each_ready_slice(
+                keys,
+                |key| crate::list_sync::all_waits(key, crate::cpu_writes::satisfied),
+                |start, end| {
+                    execute_closed(pc, &mapped[start..end]);
+                    let writes = crate::list_sync::cpu_writes_of(&keys[start..end]);
+                    total_writes += writes.len();
+                    crate::cpu_writes::after(pc, writes);
+                },
+                |key| {
+                    let _trace = decant_trace::span("queue", "memory_wait");
+                    let wait_scope = crate::queue_fifo::enter_wait();
+                    let waits = crate::list_sync::waits_of(key);
+                    let unmet = crate::cpu_writes::wait_all_until(
+                        &waits,
+                        crate::list_sync::wait_limits(),
+                        || crate::queue_fifo::busy_elsewhere(pc as usize),
+                        || wait_scope.interrupted(),
+                    );
+                    for w in unmet {
+                        static N: AtomicI32 = AtomicI32::new(0);
+                        if log_due(&N) {
+                            xs_log!("console list: a memory wait at {:#x} ({} bytes, comparison {}, value {:#x}, mask {:#x}) timed out, the list runs anyway", w.va, w.width, w.comparison, w.value, w.mask);
+                        }
                     }
-                }
-            }
-            start = i;
-        }
-        if start < mapped.len() || mapped.is_empty() {
-            execute_closed(pc, &mapped[start..]);
+                },
+            );
         }
         crate::flicker_probe::submitted(pc, watched);
         let mut mapped_keys_stack = [0usize; STACK_LISTS];
@@ -4047,15 +4054,12 @@ unsafe fn submit_lists(pc: Object, mapped: &[Object], keys: &[usize], tracked: b
         crate::detile::submitted(mapped_keys);
         crate::present::list_submitted(mapped_keys);
         crate::rt_diag::executed(keys);
-        // the lists' bottom-of-pipe writes into title memory: done once the GPU has finished this
         if !keys.is_empty() {
-            let writes = crate::list_sync::cpu_writes_of(keys);
             static N: AtomicI32 = AtomicI32::new(0);
             if log_due(&N) {
                 let waits: usize = keys.iter().map(|&k| crate::list_sync::waits_of(k).len()).sum();
-                xs_log!("console queue: {} lists, {} CPU writes, {waits} waits recorded on them", keys.len(), writes.len());
+                xs_log!("console queue: {} lists, {total_writes} CPU writes, {waits} waits recorded on them", keys.len());
             }
-            crate::cpu_writes::after(pc, writes);
         }
         if tracked {
             crate::retire::submitted(pc);
@@ -4088,49 +4092,82 @@ unsafe fn com_release(object: Object) {
 }
 
 /// A submission queued behind the work of its queue (`queue_fifo`). Until it ran it holds a
-/// reference on the PC queue and on each console list, and the lists against a `Reset`.
+/// reference on the PC queue and on each console list, and holds the lists and their command
+/// allocators against a `Reset`.
 struct QueuedLists {
     queue: usize,
     lists: Vec<usize>,
     keys: Vec<usize>,
     /// The submission is open in `retire` and not yet closed.
     tracked: bool,
+    hold: Option<crate::queue_fifo::Hold>,
 }
 
 // SAFETY: the queue and the lists are free threaded COM objects that this value keeps alive.
 unsafe impl Send for QueuedLists {}
 
+/// Collects the deduplicated list and command allocator hold keys for a queued submission.
+fn collect_hold_keys(keys: &[usize]) -> Vec<crate::queue_fifo::HoldKey> {
+    use crate::queue_fifo::HoldKey;
+    let mut out = Vec::with_capacity(keys.len() * 2);
+    for &key in keys {
+        let hold = HoldKey::List(key);
+        if !out.contains(&hold) {
+            out.push(hold);
+        }
+    }
+    crate::upload_mem::with(|m| {
+        for &key in keys {
+            let owner = m.owner_of(key);
+            if owner != key {
+                let hold = HoldKey::Allocator(owner);
+                if !out.contains(&hold) {
+                    out.push(hold);
+                }
+            }
+        }
+    });
+    out
+}
+
 impl QueuedLists {
-    /// Takes the references and opens the submission in `retire` now, on the title's thread, so
-    /// that an object the title releases from now on waits until the submission ran.
+    /// Takes the references, opens the submission in `retire` on the title's thread so objects
+    /// released afterwards wait for it, and queues it on its queue while holding every list and
+    /// command allocator against `Reset`.
     ///
     /// # Safety
     /// As for [`submit_lists`].
-    unsafe fn hold(pc: Object, mapped: &[Object], keys: &[usize]) -> Self {
+    unsafe fn enqueue(pc: Object, mapped: &[Object], keys: &[usize]) {
+        static N: AtomicI32 = AtomicI32::new(0);
         // SAFETY: by the contract above.
-        unsafe {
+        let mut queued = unsafe {
             com_add_ref(pc);
             for &key in keys {
                 com_add_ref(key as Object);
             }
-            crate::queue_fifo::hold_lists(keys);
             let tracked = crate::retire::begin(pc);
-            Self { queue: pc as usize, lists: mapped.iter().map(|&l| l as usize).collect(), keys: keys.to_vec(), tracked }
-        }
-    }
-
-    fn queue(self) {
-        static N: AtomicI32 = AtomicI32::new(0);
-        let (queue, lists) = (self.queue, self.lists.len());
-        let queued = crate::queue_fifo::defer(queue, Box::new(move || self.run()));
+            Self {
+                queue: pc as usize,
+                lists: mapped.iter().map(|&l| l as usize).collect(),
+                keys: keys.to_vec(),
+                tracked,
+                hold: None,
+            }
+        };
+        let hold_keys = collect_hold_keys(keys);
+        let (queue, lists) = (queued.queue, queued.lists.len());
+        let count = crate::queue_fifo::defer_holding(queue, hold_keys, move |hold| {
+            queued.hold = Some(hold);
+            Box::new(move || queued.run())
+        });
         if log_due(&N) {
-            xs_log!("console queue {queue:#x}: a submission of {lists} lists waits on title memory or on earlier work of its queue, queued so the title's thread goes on ({queued} queued so far)");
+            xs_log!("console queue {queue:#x}: a submission of {lists} lists waits on title memory or on earlier work of its queue, queued so the title's thread goes on ({count} queued so far)");
         }
     }
 
     fn run(mut self) {
         let mapped: Vec<Object> = self.lists.iter().map(|&l| l as Object).collect();
-        // SAFETY: the references taken in `hold` keep the queue and the lists alive.
+        // SAFETY: the references taken in `enqueue` keep the queue and the lists alive.
         unsafe { submit_lists(self.queue as Object, &mapped, &self.keys, self.tracked) };
         self.tracked = false;
     }
@@ -4138,13 +4175,14 @@ impl QueuedLists {
 
 impl Drop for QueuedLists {
     fn drop(&mut self) {
-        crate::queue_fifo::release_lists(&self.keys);
-        // SAFETY: the references were taken in `hold`. A submission that never ran is closed in
+        // SAFETY: the references were taken in `enqueue`. A submission that never ran is closed in
         // `retire` all the same, so its targets are reached.
         unsafe {
             if self.tracked {
                 crate::retire::submitted(self.queue as Object);
             }
+            // Drop list and allocator holds only after `submit_lists` and `retire` are done.
+            self.hold = None;
             for &key in &self.keys {
                 com_release(key as Object);
             }
@@ -4604,6 +4642,15 @@ impl Drop for QueuedPresent {
 }
 
 // ---- command allocator ----
+
+/// Console allocator slot 8: `Reset` (PC 8). Waits for any queued submission holding a list
+/// recorded with this allocator before forwarding to `list_gaps::allocator_reset`.
+extern "system" fn queue_safe_allocator_reset(this: *mut Proxy) -> HRESULT {
+    // SAFETY: `this` is a live allocator proxy.
+    let pc = unsafe { (*this).pc as usize };
+    crate::queue_fifo::wait_allocator_idle(pc, crate::list_sync::wait_limits().idle);
+    list_gaps::allocator_reset(this)
+}
 
 /// Console allocator slot 9: `(function, context)`, a "set memory callbacks" method. The function
 /// (size and alignment, calls the title's allocator) and the context are kept in the proxy and not
@@ -5422,7 +5469,7 @@ fn custom(kind: Kind, slot: u32) -> Option<usize> {
         (Kind::List, 47) => list_gaps::list_ia_set_index_buffer as *const () as usize,
         (Kind::List, 48) => list_gaps::list_ia_set_vertex_buffers as *const () as usize,
         (Kind::List, 148) => list_gaps::list_allocate_upload_memory as *const () as usize,
-        (Kind::Allocator, 8) => list_gaps::allocator_reset as *const () as usize,
+        (Kind::Allocator, 8) => queue_safe_allocator_reset as *const () as usize,
         (Kind::Resource, 8) => res_map as *const () as usize,
         (Kind::Resource, 9) => res_unmap as *const () as usize,
         (Kind::Resource, 11) => res_gpu_virtual_address as *const () as usize,
