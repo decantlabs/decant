@@ -326,7 +326,7 @@ struct Tracer<'a> {
     sources: Vec<Source>,
     choices: Vec<Vec<u32>>,
     finite_samplers: bool,
-    guarded_slots: guarded::Slots,
+    guarded: guarded::Guarded,
     ids: HashMap<Source, u32>,
     /// Dwords the scalar load at each word index reads.
     widths: HashMap<u32, u8>,
@@ -538,6 +538,11 @@ impl Tracer<'_> {
                     _ => None,
                 }
             }
+            Expr::Call(h, args)
+                if h.name == crate::lift::wave::READ_FIRST_LANE.name && !args.is_empty() =>
+            {
+                self.eval(state, &args[0], at)
+            }
             Expr::Call(h, _) if h.name.contains("readfirstlane") || h.name.contains("readlane") => {
                 Some(Sym::Lane)
             }
@@ -576,46 +581,53 @@ impl Tracer<'_> {
             state.get(&Var::S(load.base)).copied(),
             state.get(&Var::S(load.base + 1)).copied(),
         );
-        match (lo, hi) {
-            (Some(Sym::User(sgpr)), Some(Sym::Const(0))) => {
-                let (dynamic, at) = self.split(state, &load.offset);
-                // The slot the dword is in: a load of eight dwords or more reads image
-                // descriptors, a smaller one a buffer or sampler descriptor.
-                let slot = if self.widths.get(&load.pc).copied().unwrap_or(4) >= 8 {
-                    32
-                } else {
-                    16
-                };
-                let dword = (at % slot) / 4;
-                let byte = at - 4 * dword;
-                let heap = self.layout(sgpr) == Some(UserDataKind::ResourceHeap);
-                let source = if dynamic || heap {
-                    Source::Dynamic {
-                        sgpr,
-                        pc: load.pc,
-                        byte,
-                    }
-                } else {
-                    Source::Slot { sgpr, byte }
-                };
-                let desc = self.source(source);
-                if slot == 32 {
-                    self.wide.insert(desc);
-                }
-                Loaded::Table(Sym::Word {
-                    desc,
-                    dword: dword as u8,
-                })
-            }
+        let pair = match (lo, hi) {
+            (Some(Sym::User(sgpr)), Some(Sym::Const(0))) => (Some(Sym::User(sgpr)), Some(Sym::Const(0))),
             (Some(Sym::User(sgpr)), Some(Sym::User(next))) if next == sgpr + 1 => {
-                Loaded::Root(sgpr)
+                return Loaded::Root(sgpr);
             }
-            // The low half is a code address plus an index. The high half is then the carry
-            // and the sign of the same 64 bit sum, which a program that reads its own tables
-            // keeps at zero: it is accepted unless it is known to be something else.
-            (Some(Sym::Code(_) | Sym::CodeChoices(_)), None | Some(Sym::Const(0))) => Loaded::Code,
-            _ => Loaded::Raw,
+            (Some(Sym::Code(_) | Sym::CodeChoices(_)), None | Some(Sym::Const(0))) => {
+                return Loaded::Code;
+            }
+            _ => match self.guarded.bases.get(&load.pc).copied() {
+                Some(guarded::GuardedBase::Table(sgpr)) => {
+                    (Some(Sym::User(sgpr)), Some(Sym::Const(0)))
+                }
+                Some(guarded::GuardedBase::Root(sgpr)) => return Loaded::Root(sgpr),
+                None => return Loaded::Raw,
+            },
+        };
+        let (Some(Sym::User(sgpr)), Some(Sym::Const(0))) = pair else {
+            return Loaded::Raw;
+        };
+        let (dynamic, at) = self.split(state, &load.offset);
+        // The slot the dword is in: a load of eight dwords or more reads image
+        // descriptors, a smaller one a buffer or sampler descriptor.
+        let slot = if self.widths.get(&load.pc).copied().unwrap_or(4) >= 8 {
+            32
+        } else {
+            16
+        };
+        let dword = (at % slot) / 4;
+        let byte = at - 4 * dword;
+        let heap = self.layout(sgpr) == Some(UserDataKind::ResourceHeap);
+        let source = if dynamic || heap {
+            Source::Dynamic {
+                sgpr,
+                pc: load.pc,
+                byte,
+            }
+        } else {
+            Source::Slot { sgpr, byte }
+        };
+        let desc = self.source(source);
+        if slot == 32 {
+            self.wide.insert(desc);
         }
+        Loaded::Table(Sym::Word {
+            desc,
+            dword: dword as u8,
+        })
     }
 
     /// The value a `Set` gives its destination.
@@ -1356,15 +1368,24 @@ impl Tracer<'_> {
         {
             return self.intern(Origin::SamplerChoices { first, choices }, usage, pc);
         }
-        if sampler
-            && found.is_err()
-            && let Some(&guarded) = self.guarded_slots.get(&(pc, first))
+        if found.is_err()
+            && let Some(&guarded) = self.guarded.descs.get(&(pc, first, words))
         {
             let origin = match guarded {
-                guarded::GuardedSampler::Table { sgpr, offset } => Origin::Table { sgpr, offset },
-                guarded::GuardedSampler::Immediate(words) => Origin::Immediate { words },
+                guarded::GuardedDesc::Table { sgpr, offset } => {
+                    Some(Origin::Table { sgpr, offset })
+                }
+                guarded::GuardedDesc::Immediate(words) if sampler => {
+                    Some(Origin::Immediate { words })
+                }
+                guarded::GuardedDesc::RootView { sgpr } if buffer => {
+                    Some(Origin::RootDescriptor { sgpr })
+                }
+                _ => None,
             };
-            return self.intern(origin, usage, pc);
+            if let Some(origin) = origin {
+                return self.intern(origin, usage, pc);
+            }
         }
         let origin = match found? {
             Found::Slot { sgpr, byte } => Origin::Table { sgpr, offset: byte },
@@ -1703,32 +1724,46 @@ fn select_key(block: usize, epoch: u64) -> u64 {
 pub fn trace(func: &mut Function, program: &StageProgram) -> Result<(), Refusal> {
     let mut body = std::mem::take(&mut func.body);
     let result = (|| {
-        if run(
+        match run(
             &mut body,
             &mut func.resources,
             program,
             func.lanes,
             false,
             None,
-        )? == Retry::Finite
-            && run(
-                &mut body,
-                &mut func.resources,
-                program,
-                func.lanes,
-                true,
-                None,
-            )? == Retry::Guarded
-        {
-            let slots = guarded::sampler_slots(&mut body, program, func.lanes);
-            run(
-                &mut body,
-                &mut func.resources,
-                program,
-                func.lanes,
-                true,
-                Some(slots),
-            )?;
+        )? {
+            Retry::Done => {}
+            Retry::Finite => {
+                if let Retry::Guarded(needed) = run(
+                    &mut body,
+                    &mut func.resources,
+                    program,
+                    func.lanes,
+                    true,
+                    None,
+                )? {
+                    let solved = guarded::solve(&mut body, program, func.lanes, &needed);
+                    run(
+                        &mut body,
+                        &mut func.resources,
+                        program,
+                        func.lanes,
+                        true,
+                        Some(solved),
+                    )?;
+                }
+            }
+            Retry::Guarded(needed) => {
+                let solved = guarded::solve(&mut body, program, func.lanes, &needed);
+                run(
+                    &mut body,
+                    &mut func.resources,
+                    program,
+                    func.lanes,
+                    false,
+                    Some(solved),
+                )?;
+            }
         }
         Ok(())
     })();
@@ -1736,11 +1771,10 @@ pub fn trace(func: &mut Function, program: &StageProgram) -> Result<(), Refusal>
     result
 }
 
-#[derive(PartialEq, Eq)]
 enum Retry {
     Done,
     Finite,
-    Guarded,
+    Guarded(guarded::Needed),
 }
 
 impl<'a> Tracer<'a> {
@@ -1757,7 +1791,7 @@ impl<'a> Tracer<'a> {
             sources: Vec::new(),
             choices: Vec::new(),
             finite_samplers,
-            guarded_slots: HashMap::new(),
+            guarded: guarded::Guarded::default(),
             ids: HashMap::new(),
             widths: HashMap::new(),
             tokens: HashMap::new(),
@@ -1791,13 +1825,13 @@ fn run(
     program: &StageProgram,
     lanes: u8,
     finite_samplers: bool,
-    guarded_slots: Option<guarded::Slots>,
+    guarded_solved: Option<guarded::Guarded>,
 ) -> Result<Retry, Refusal> {
     let mut flow = Flow::build(body, false);
     let mut tracer = Tracer::new(program, resources, lanes, finite_samplers, &flow);
-    let check_guards = guarded_slots.is_none();
-    if let Some(slots) = guarded_slots {
-        tracer.guarded_slots = slots;
+    let check_guards = guarded_solved.is_none();
+    if let Some(solved) = guarded_solved {
+        tracer.guarded = solved;
     }
     // The states to a fixed point.
     let preds = flow.predecessors();
@@ -1835,6 +1869,7 @@ fn run(
         }
     }
     // Which loads have to leave a heap index behind: the uses say.
+    let mut needed = guarded::Needed::default();
     for (b, block) in flow.blocks.iter().enumerate() {
         let (Some(stmts), Some(mut state)) = (block.stmts.as_ref(), entry[b].clone()) else {
             continue;
@@ -1843,21 +1878,53 @@ fn run(
         for s in stmts.iter() {
             // Numeric alternatives can change how offsets are classified elsewhere in the
             // program. Only spend that precision on stages with an unresolved sampler.
-            if check_guards
-                && let Stmt::Image(op, _) = s
-                && let Some(Desc::Regs(first)) = op.sampler
-                && tracer.found(&state, first, 4, op.pc).is_err()
-            {
-                if !finite_samplers {
-                    return Ok(Retry::Finite);
-                }
-                if tracer.sampler_choices(&state, first).is_none() {
-                    return Ok(Retry::Guarded);
+            if check_guards {
+                match s {
+                    Stmt::Image(op, _) => {
+                        if let Some(Desc::Regs(first)) = op.sampler
+                            && tracer.found(&state, first, 4, op.pc).is_err()
+                        {
+                            if !finite_samplers {
+                                return Ok(Retry::Finite);
+                            }
+                            if tracer.sampler_choices(&state, first).is_none() {
+                                needed.descs.insert((op.pc, first, 4));
+                            }
+                        }
+                        if let Desc::Regs(first) = op.image
+                            && tracer.found(&state, first, 8, op.pc).is_err()
+                        {
+                            needed.descs.insert((op.pc, first, 8));
+                        }
+                    }
+                    Stmt::Buffer(op, _) => {
+                        if let Desc::Regs(first) = op.buffer
+                            && tracer.found(&state, first, 4, op.pc).is_err()
+                        {
+                            needed.descs.insert((op.pc, first, 4));
+                        }
+                    }
+                    Stmt::Set {
+                        value: Expr::Load(load),
+                        ..
+                    } => {
+                        if load.buffer {
+                            if tracer.found(&state, load.base, 4, load.pc).is_err() {
+                                needed.descs.insert((load.pc, load.base, 4));
+                            }
+                        } else if matches!(tracer.loaded(&state, load), Loaded::Raw) {
+                            needed.bases.insert(load.pc);
+                        }
+                    }
+                    _ => {}
                 }
             }
             tracer.scan(&state, s);
             tracer.step(&mut state, s, b, &mut epoch);
         }
+    }
+    if !needed.is_empty() {
+        return Ok(Retry::Guarded(needed));
     }
     // The rewrite, block by block with the state each one starts in.
     for (b, block) in flow.blocks.iter_mut().enumerate() {

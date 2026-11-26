@@ -1274,3 +1274,362 @@ fn non_nsa_bvh_marks_its_full_vector_address_span_against_parking() {
     masks.enter(writes[1].pc);
     assert_eq!(masks.parked(), Some(exec::Parked::Mask));
 }
+
+#[test]
+fn dpp_staged_64bit_carry_chain_wave32_reduction() {
+    use decant_shader::decode::Ext;
+
+    let build = |valid_carry: bool| {
+        let mut a = Asm::new();
+        a.push(sop1(Op::s_or_saveexec_b32, s(0), int(-1)));
+        a.push(vop1(Op::v_mov_b32, v(1), int(0)));
+        a.push(vop1(Op::v_mov_b32, v(2), int(0)));
+        a.push(vop3(Op::v_cndmask_b32, v(1), v(1), v(3), s(0)));
+        a.push(vop3(Op::v_cndmask_b32, v(2), v(2), v(4), s(0)));
+        let steps: [(bool, u32); 4] = [
+            (true, 0xde54_c100),
+            (true, 0x9360_1200),
+            (true, 0x0009_2400),
+            (false, 0xff09_4000),
+        ];
+        for (is_dpp8, word) in steps {
+            if is_dpp8 {
+                a.push(dpp8(Op::v_mov_b32, v(5), v(1), Operand::None, word, false));
+                a.push(dpp8(Op::v_mov_b32, v(6), v(2), Operand::None, word, false));
+            } else {
+                a.push(dpp16(Op::v_mov_b32, v(5), v(1), Operand::None, word));
+                a.push(dpp16(Op::v_mov_b32, v(6), v(2), Operand::None, word));
+            }
+            let mut add_lo = vop3(Op::v_add_co_u32_e64, v(1), v(5), v(1), Operand::None);
+            add_lo.dst2 = VCC;
+            a.push(add_lo);
+            let mut add_hi = vop3(
+                Op::v_addc_co_u32,
+                v(2),
+                v(6),
+                v(2),
+                if valid_carry { VCC } else { s(8) },
+            );
+            add_hi.dst2 = VCC;
+            a.push(add_hi);
+        }
+        a.push(vop3(Op::v_permlanex16_b32, v(5), v(1), int(0), int(0)));
+        a.push(vop3(Op::v_permlanex16_b32, v(6), v(2), int(0), int(0)));
+        let mut add_lo = vop3(Op::v_add_co_u32_e64, v(1), v(5), v(1), Operand::None);
+        add_lo.dst2 = VCC;
+        a.push(add_lo);
+        let mut add_hi = vop3(
+            Op::v_addc_co_u32,
+            v(2),
+            v(6),
+            v(2),
+            if valid_carry { VCC } else { s(8) },
+        );
+        add_hi.dst2 = VCC;
+        a.push(add_hi);
+        a.push(vop3(Op::v_readlane_b32_e64, s(2), v(1), int(0), Operand::None));
+        a.push(vop3(Op::v_readlane_b32_e64, s(3), v(2), int(0), Operand::None));
+        a.push(sop1(Op::s_mov_b32, EXEC, s(0)));
+        a.push(sopp(Op::s_endpgm, 0));
+        let mut p = StageProgram::new(Stage::Compute, a.finish());
+        p.threads = [32, 1, 1];
+        let _ = Ext::None;
+        p
+    };
+
+    let good = build(true);
+    let graph = cfg::build(&good.code).unwrap();
+    let masks = exec::analyse(&graph).unwrap();
+    let other_rows = graph
+        .insns()
+        .filter(|i| {
+            masks.enter(i.pc);
+            masks.reduction() == Some(exec::Reduction::OtherRow { identity: 0 })
+        })
+        .count();
+    let results = graph
+        .insns()
+        .filter(|i| {
+            masks.enter(i.pc);
+            matches!(masks.reduction(), Some(exec::Reduction::Result { .. }))
+        })
+        .count();
+    assert_eq!(other_rows, 10);
+    assert_eq!(results, 2);
+    lift_program(&good).unwrap();
+    if let Some(dxc) = common::find_dxc() {
+        let compiled = translate_to_dxil(
+            &[good],
+            &RootSignature::default(),
+            &Options::default(),
+            &CountingHost::default(),
+            &dxc,
+        )
+        .unwrap_or_else(|r| panic!("{r}"));
+        assert_eq!(&compiled[0].dxil[..4], b"DXBC");
+    }
+
+    // Without a proven zero carry from the low word combine, the high word DPP stages stay unmatched.
+    let bad = build(false);
+    let bad_graph = cfg::build(&bad.code).unwrap();
+    let bad_masks = exec::analyse(&bad_graph).unwrap();
+    let bad_other_rows = bad_graph
+        .insns()
+        .filter(|i| {
+            bad_masks.enter(i.pc);
+            bad_masks.reduction() == Some(exec::Reduction::OtherRow { identity: 0 })
+        })
+        .count();
+    assert_eq!(bad_other_rows, 5);
+}
+
+#[test]
+fn multi_block_64_lane_vcmp_ballot_materializes_for_mov_and_cselect() {
+    let build = |from_vcmp: bool| {
+        let mut a = Asm::new();
+        let skip = a.label();
+        let join = a.label();
+        a.push(sop1(Op::s_mov_b64, s(2), EXEC));
+        if from_vcmp {
+            a.push(compare_to(Op::v_cmp_lt_u32, 4, v(0), int(8)));
+        } else {
+            a.push(sop1(Op::s_mov_b64, s(4), EXEC));
+        }
+        a.push(sopc(Op::s_cmp_eq_u32, s(6), int(0)));
+        a.branch(Op::s_cbranch_scc1, skip);
+        a.push(vop1(Op::v_mov_b32, v(1), int(1)));
+        a.branch(Op::s_branch, join);
+        a.bind(skip);
+        a.push(vop1(Op::v_mov_b32, v(1), int(2)));
+        a.bind(join);
+        a.push(sop1(Op::s_mov_b32, s(8), s(4)));
+        a.push(sopc(Op::s_cmp_eq_u32, s(8), int(0)));
+        a.push(sop2(Op::s_cselect_b32, s(9), s(5), s(8)));
+        a.push(vop1(Op::v_mov_b32, v(2), s(9)));
+        a.push(sop1(Op::s_mov_b64, EXEC, s(2)));
+        a.push(sopp(Op::s_endpgm, 0));
+        let mut p = StageProgram::new(Stage::Compute, a.finish());
+        p.threads = [64, 1, 1];
+        p
+    };
+
+    let good = build(true);
+    let graph = cfg::build(&good.code).unwrap();
+    let masks = exec::analyse(&graph).unwrap();
+    let cmp = graph
+        .insns()
+        .find(|i| i.op == Op::v_cmp_lt_u32)
+        .unwrap();
+    masks.enter(cmp.pc);
+    assert_eq!(masks.materialize_ballot(), 3);
+    let mov = graph
+        .insns()
+        .find(|i| i.op == Op::s_mov_b32 && i.dst == s(8))
+        .unwrap();
+    masks.enter(mov.pc);
+    assert!(masks.ballot_ready());
+    let csel = graph
+        .insns()
+        .find(|i| i.op == Op::s_cselect_b32)
+        .unwrap();
+    masks.enter(csel.pc);
+    assert!(masks.ballot_ready());
+    let translated = decant_shader::translate(
+        std::slice::from_ref(&good),
+        &RootSignature::default(),
+        &Options::default(),
+        &CountingHost::default(),
+    )
+    .unwrap();
+    let hlsl = &translated.stages[0].hlsl;
+    assert!(hlsl.contains("[WaveSize(64)]"), "{hlsl}");
+    assert!(hlsl.contains("decant_mask_word("), "{hlsl}");
+    if let Some(dxc) = common::find_dxc() {
+        let compiled = translate_to_dxil(
+            &[good],
+            &RootSignature::default(),
+            &Options::default(),
+            &CountingHost::default(),
+            &dxc,
+        )
+        .unwrap_or_else(|r| panic!("{r}"));
+        assert_eq!(&compiled[0].dxil[..4], b"DXBC");
+    }
+
+    // A non-v_cmp mask (saved EXEC) across multiple blocks must stay refused.
+    let bad = build(false);
+    assert_eq!(lift_program(&bad).unwrap_err().key(), "exec:mask-as-data");
+}
+
+#[test]
+fn zero_test_resolves_to_number_when_mask_only_reaches_under_empty_exec() {
+    let build = |mask_path_v47: i8, observe_scc: bool| {
+        let mut a = Asm::new();
+        let num_path = a.label();
+        let join = a.label();
+        let exit = a.label();
+        a.push(sop1(Op::s_mov_b32, s(10), EXEC));
+        a.push(sopc(Op::s_cmp_eq_u32, s(6), int(0)));
+        a.branch(Op::s_cbranch_scc1, num_path);
+        a.push(sop1(Op::s_mov_b32, s(1), EXEC));
+        a.push(vop1(Op::v_mov_b32, v(47), int(mask_path_v47)));
+        a.branch(Op::s_branch, join);
+        a.bind(num_path);
+        a.push(sop1(Op::s_mov_b32, s(1), int(7)));
+        a.push(vop1(Op::v_mov_b32, v(47), s(7)));
+        a.bind(join);
+        a.push(vopc(Op::v_cmp_eq_u32, int(-1), v(47)));
+        a.push(sop2(Op::s_andn2_b32, VCC, EXEC, VCC));
+        a.branch(Op::s_cbranch_vccnz, exit);
+        a.push(sopc(Op::s_cmp_eq_u32, s(1), int(0)));
+        if observe_scc {
+            a.push(sop2(Op::s_cselect_b32, s(0), int(1), int(0)));
+        } else {
+            a.push(sop2(Op::s_cselect_b32, s(0), EXEC, int(0)));
+        }
+        a.push(sop2(Op::s_and_b32, s(1), s(8), int(4)));
+        a.push(vop1(Op::v_mov_b32, v(2), s(1)));
+        a.bind(exit);
+        a.push(sop1(Op::s_mov_b32, EXEC, s(10)));
+        a.push(sopp(Op::s_endpgm, 0));
+        let mut p = StageProgram::new(Stage::Compute, a.finish());
+        p.threads = [32, 1, 1];
+        p
+    };
+
+    let good = build(0, false);
+    lift_program(&good).unwrap();
+    if let Some(dxc) = common::find_dxc() {
+        let compiled = translate_to_dxil(
+            &[good],
+            &RootSignature::default(),
+            &Options::default(),
+            &CountingHost::default(),
+            &dxc,
+        )
+        .unwrap_or_else(|r| panic!("{r}"));
+        assert_eq!(&compiled[0].dxil[..4], b"DXBC");
+    }
+
+    // Observing SCC with a non-EXEC select keeps `exec:mixed-pair`.
+    assert_eq!(
+        lift_program(&build(0, true)).unwrap_err().key(),
+        "exec:mixed-pair"
+    );
+    // When the mask path matches the compare constant (-1), active lanes can fall through.
+    assert_eq!(
+        lift_program(&build(-1, false)).unwrap_err().key(),
+        "exec:mixed-pair"
+    );
+}
+
+#[test]
+fn wave64_scan_with_waitcnt_and_cross_lane_read_lowers_with_real_wave_intrinsics() {
+    use decant_shader::decode::Ext;
+
+    let build = |with_cross_lane_read: bool| {
+        let mut a = Asm::new();
+        let skip = a.label();
+        // Wave64 exclusive prefix sum with intervening `s_waitcnt`.
+        a.push(sop1(Op::s_or_saveexec_b64, s(2), int(-1)));
+        a.push(sopp(Op::s_waitcnt, 0x3f70));
+        a.push(vop3(Op::v_cndmask_b32, v(1), int(0), v(5), s(2)));
+        a.push(vop1(Op::v_mov_b32, v(2), v(1)));
+        for control in [0xff09_1100, 0xff01_1200, 0xff01_1400, 0xff01_1800] {
+            a.push(dpp16(Op::v_add_u32, v(2), v(2), v(2), control));
+        }
+        a.push(sop1(Op::s_mov_b32, EXEC, lit(0xffff_0000)));
+        a.push(sop1(Op::s_mov_b32, Operand::Reg(decant_shader::decode::Reg::ExecHi), lit(0xffff_0000)));
+        let mut p = vop3(Op::v_permlanex16_b32, v(3), v(2), int(-1), int(-1));
+        p.ext = Ext::Valu {
+            abs: 0,
+            neg: 0,
+            opsel: 9,
+            omod: 0,
+            clamp: false,
+        };
+        a.push(p);
+        a.push(vop2(Op::v_add_u32, v(2), v(3), v(2)));
+        a.push(vop3(Op::v_readlane_b32_e64, s(10), v(2), int(31), Operand::None));
+        a.push(sop1(Op::s_mov_b32, EXEC, int(0)));
+        a.push(sop1(Op::s_mov_b32, Operand::Reg(decant_shader::decode::Reg::ExecHi), int(-1)));
+        a.push(vop2(Op::v_add_u32, v(2), s(10), v(2)));
+        a.push(sop1(Op::s_mov_b32, EXEC, int(-1)));
+        a.push(sop1(Op::s_mov_b32, Operand::Reg(decant_shader::decode::Reg::ExecHi), int(-1)));
+        a.push(vop2(Op::v_sub_u32, v(2), v(2), v(1)));
+        a.push(sop1(Op::s_mov_b64, EXEC, s(2)));
+        a.push(vop1(Op::v_mov_b32, v(6), v(2)));
+        // Wave64 sum reduction, `s_ff1_i32_b64`, and `v_readfirstlane_b32`.
+        a.push(vop3(Op::v_mbcnt_lo_u32_b32, v(8), int(-1), int(0), Operand::None));
+        a.push(vop3(Op::v_mbcnt_hi_u32_b32_e64, v(10), int(-1), v(8), Operand::None));
+        a.push(sop1(Op::s_mov_b64, s(2), EXEC));
+        a.push(vopc(Op::v_cmpx_eq_u32, int(63), v(10)));
+        a.branch(Op::s_cbranch_execz, skip);
+        a.push(vop2(Op::v_add_u32, v(8), v(6), v(5)));
+        a.push(sop1(Op::s_or_saveexec_b64, s(10), int(-1)));
+        a.push(vop3(Op::v_cndmask_b32, v(1), int(0), v(8), s(10)));
+        a.push(dpp8(Op::v_add_u32, v(1), v(1), v(1), 0xde54_c100, false));
+        a.push(dpp8(Op::v_add_u32, v(1), v(1), v(1), 0x9360_1200, false));
+        a.push(dpp8(Op::v_add_u32, v(1), v(1), v(1), 0x0009_2400, false));
+        a.push(dpp16(Op::v_add_u32, v(1), v(1), v(1), 0xff09_4001));
+        a.push(vop3(Op::v_permlanex16_b32, v(2), v(1), int(0), int(0)));
+        a.push(vop2(Op::v_add_u32, v(1), v(2), v(1)));
+        a.push(vop3(Op::v_readlane_b32_e64, s(18), v(1), int(32), Operand::None));
+        a.push(vop2(Op::v_add_u32, v(1), s(18), v(1)));
+        a.push(vop3(Op::v_readlane_b32_e64, s(18), v(1), int(0), Operand::None));
+        a.push(sop1(Op::s_mov_b64, EXEC, s(10)));
+        a.push(sop1(Op::s_ff1_i32_b64, s(19), EXEC));
+        a.push(vop2(Op::v_add_u32, v(8), s(18), v(8)));
+        a.push(vop2(Op::v_add_u32, v(8), s(19), v(8)));
+        a.push(vop1(Op::v_readfirstlane_b32, s(18), v(8)));
+        a.push(vop2(Op::v_add_u32, v(8), s(18), v(8)));
+        a.bind(skip);
+        a.push(sop1(Op::s_mov_b64, EXEC, s(2)));
+        if with_cross_lane_read {
+            a.push(vop3(Op::v_readlane_b32_e64, s(2), v(8), int(63), Operand::None));
+            a.push(vop2(Op::v_add_u32, v(10), s(2), v(6)));
+        }
+        a.push(sopp(Op::s_endpgm, 0));
+        let mut prog = StageProgram::new(Stage::Compute, a.finish());
+        prog.threads = [64, 1, 1];
+        prog
+    };
+
+    let real = build(true);
+    let graph = cfg::build(&real.code).unwrap();
+    let masks = exec::analyse(&graph).unwrap();
+    assert_eq!(masks.lanes(), 64);
+    assert!(masks.real_wave());
+    let translated = decant_shader::translate(
+        std::slice::from_ref(&real),
+        &RootSignature::default(),
+        &Options::default(),
+        &CountingHost::default(),
+    )
+    .unwrap();
+    let hlsl = &translated.stages[0].hlsl;
+    assert!(hlsl.contains("[WaveSize(64)]"), "{hlsl}");
+    assert!(hlsl.contains("WavePrefixSum("), "{hlsl}");
+    assert!(hlsl.contains("WaveActiveSum("), "{hlsl}");
+    assert!(hlsl.contains("decant_wave_ff1_b64("), "{hlsl}");
+    assert!(hlsl.contains("decant_read_first_lane("), "{hlsl}");
+    assert!(hlsl.contains("decant_read_lane("), "{hlsl}");
+    if let Some(dxc) = common::find_dxc() {
+        let compiled = translate_to_dxil(
+            &[real],
+            &RootSignature::default(),
+            &Options::default(),
+            &CountingHost::default(),
+            &dxc,
+        )
+        .unwrap_or_else(|r| panic!("{r}"));
+        assert_eq!(&compiled[0].dxil[..4], b"DXBC");
+    }
+
+    // Without an extra cross lane `v_readlane`, single lane projection stays active.
+    let single = build(false);
+    let s_graph = cfg::build(&single.code).unwrap();
+    let s_masks = exec::analyse(&s_graph).unwrap();
+    assert!(!s_masks.real_wave());
+    lift_program(&single).unwrap();
+}

@@ -43,7 +43,7 @@
 //! that position with [`Masks::enter`] before any rule runs.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::cfg::{Cfg, Cond, Term};
 use crate::decode::{DppCtrl, Ext, Form, Insn, Operand, Reg};
@@ -483,8 +483,14 @@ impl Collector<'_> {
         if let Some((kind, w)) = mask_op(insn.op) {
             let role = match kind {
                 MaskOp::SaveExec(_) | MaskOp::WrExec(_) | MaskOp::Wqm => Role::Mask,
-                MaskOp::Logic(Logic::Mov) if !ours(w) && insn.op == Op::s_mov_b32 && !names(insn, Reg::ExecLo) => {
-                    self.uses(insn.src[0], 1, Role::MaskWord);
+                MaskOp::Logic(Logic::Mov) | MaskOp::Select
+                    if !ours(w)
+                        && matches!(insn.op, Op::s_mov_b32 | Op::s_cselect_b32)
+                        && !names(insn, Reg::ExecLo) =>
+                {
+                    for s in insn.src {
+                        self.uses(s, 1, Role::MaskWord);
+                    }
                     self.defs(insn.dst, 1, Role::Data);
                     return;
                 }
@@ -930,6 +936,18 @@ struct Site {
     parked: u8,
     /// The part the instruction has in a reduction over the wave.
     reduction: Option<Reduction>,
+    /// The part the instruction has in a wave exclusive prefix scan when lifted with real wave
+    /// intrinsics.
+    scan: Option<WaveScan>,
+    /// The part the instruction has in a complete wave reduction when lifted with real wave
+    /// intrinsics.
+    wave_reduce: Option<WaveReducePart>,
+    /// Bitmask of 32 bit ballot words (bit 0 low, bit 1 high) this `v_cmp` must
+    /// materialise into its scalar destination pair for later numeric word reads.
+    materialize_ballot: u8,
+    /// Whether this `s_mov_b32` or `s_cselect_b32` reads mask words already materialised
+    /// into scalar registers at their defining `v_cmp`.
+    ballot_ready: bool,
 }
 
 /// Where the scalar registers of a program hold lane masks.
@@ -938,6 +956,9 @@ pub struct Masks {
     lanes: u8,
     /// Whole mask words can only be collected where all invocations stay together.
     converged: bool,
+    /// Whether matched scans and reductions must lower with real HLSL wave intrinsics because
+    /// the program also reads values across lanes with constant `v_readlane_b32`.
+    real_wave: bool,
     sites: BTreeMap<u32, Site>,
     /// The vector registers that only park scalars, one bit per register.
     parking: [u64; 4],
@@ -948,6 +969,12 @@ pub struct Masks {
 impl Masks {
     pub fn converged(&self) -> bool {
         self.converged
+    }
+
+    /// Whether compute wave operations in this program must use real wave intrinsics rather than
+    /// a single lane projection.
+    pub fn real_wave(&self) -> bool {
+        self.real_wave
     }
 
     /// Whether vector register `v` only parks scalars (`v_writelane_b32` and `v_readlane_b32`
@@ -1012,6 +1039,84 @@ impl Masks {
     pub fn reduction(&self) -> Option<Reduction> {
         self.at.get().reduction
     }
+
+    /// The part the instruction has in a matched wave exclusive prefix scan.
+    pub fn scan(&self) -> Option<WaveScan> {
+        self.at.get().scan
+    }
+
+    /// The part the instruction has in a complete wave reduction for real wave lowering.
+    pub fn wave_reduce(&self) -> Option<WaveReducePart> {
+        self.at.get().wave_reduce
+    }
+
+    /// Which 32 bit ballot words (bit 0 low, bit 1 high) this `v_cmp` must materialise into
+    /// its scalar registers.
+    pub fn materialize_ballot(&self) -> u8 {
+        self.at.get().materialize_ballot
+    }
+
+    /// Whether this `s_mov_b32` or `s_cselect_b32` reads mask words already materialised
+    /// into scalar registers at their defining `v_cmp`.
+    pub fn ballot_ready(&self) -> bool {
+        self.at.get().ballot_ready
+    }
+}
+
+/// How an instruction inside a matched wave exclusive prefix scan lowers in real wave mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaveScan {
+    /// Intermediate lane shuffle or temporary half wave mask step, skipped in real wave mode.
+    Skip,
+    /// Final `v_sub_u32 sum, sum, input`, lowered as `WavePrefixSum(input)`.
+    PrefixSum,
+}
+
+/// Operation of a complete single word wave reduction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaveReduce {
+    AddU32,
+    AddF32,
+    MulU32,
+    MulF32,
+    MinU32,
+    MaxU32,
+    MinI32,
+    MaxI32,
+    MinF32,
+    MaxF32,
+    Or,
+    And,
+    Xor,
+}
+
+/// How a `v_readlane_b32` result instruction of a matched wave reduction lowers in real wave mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaveReducePart {
+    /// First half wave read in a 64 lane reduction, replaced by the operation identity so the
+    /// following combine leaves each lane's masked input intact for the full wave intrinsic.
+    Identity(u32),
+    /// Final read of the reduced wave value, lowered with the matching `WaveActive*` intrinsic.
+    Active(WaveReduce),
+}
+
+fn wave_reduce_op(op: Op) -> Option<WaveReduce> {
+    Some(match op {
+        Op::v_add_u32 => WaveReduce::AddU32,
+        Op::v_add_f32 => WaveReduce::AddF32,
+        Op::v_mul_lo_u32 => WaveReduce::MulU32,
+        Op::v_mul_f32 => WaveReduce::MulF32,
+        Op::v_min_u32 => WaveReduce::MinU32,
+        Op::v_max_u32 => WaveReduce::MaxU32,
+        Op::v_min_i32 => WaveReduce::MinI32,
+        Op::v_max_i32 => WaveReduce::MaxI32,
+        Op::v_min_f32 => WaveReduce::MinF32,
+        Op::v_max_f32 => WaveReduce::MaxF32,
+        Op::v_or_b32 => WaveReduce::Or,
+        Op::v_and_b32 => WaveReduce::And,
+        Op::v_xor_b32 => WaveReduce::Xor,
+        _ => return None,
+    })
 }
 
 /// The part of one instruction in a reduction over the wave (a sum, a minimum, a bitwise or of
@@ -1121,8 +1226,9 @@ fn combines_groups(insn: &Insn) -> Option<u8> {
 /// projection. The final subtraction removes this lane's inclusive value.
 /// Match the complete sequence so an arbitrary lane permutation is never
 /// mistaken for a scan step.
-fn scans(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
+fn scans(cfg: &Cfg, lanes: u8) -> (BTreeMap<u32, Reduction>, BTreeMap<u32, WaveScan>) {
     let mut out = BTreeMap::new();
+    let mut wave_scans = BTreeMap::new();
     let exec = Operand::Reg(Reg::ExecLo);
     let high = Operand::Reg(Reg::ExecHi);
     let scalar = |o| matches!(o, Operand::Reg(Reg::S(_)));
@@ -1141,7 +1247,7 @@ fn scans(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                     }
             )
     };
-    let row_steps = |steps: &[Insn], sum: Operand| {
+    let row_steps = |steps: &[&Insn], sum: Operand| {
         steps
             .iter()
             .zip([0xff09_1100, 0xff01_1200, 0xff01_1400, 0xff01_1800])
@@ -1233,31 +1339,27 @@ fn scans(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                     continue;
                 }
                 let steps = &w[2..6];
-                if !steps
-                    .iter()
-                    .zip([0xff09_1100, 0xff01_1200, 0xff01_1400, 0xff01_1800])
-                    .all(|(i, control)| {
-                        i.op == Op::v_add_u32
-                            && i.dst == sum
-                            && i.src[..2] == [sum, sum]
-                            && i.dpp16().is_some_and(|word| word.0 & !0xff == control)
-                    })
-                {
+                if !row_steps(steps, sum) {
                     continue;
                 }
                 for i in steps {
                     out.insert(i.pc, Reduction::Step);
                 }
                 out.insert(w[7].pc, Reduction::OtherRow { identity: 0 });
+                for i in &w[2..10] {
+                    wave_scans.insert(i.pc, WaveScan::Skip);
+                }
+                wave_scans.insert(w[10].pc, WaveScan::PrefixSum);
             }
         }
-        return out;
+        return (out, wave_scans);
     }
     if lanes != 64 {
-        return out;
+        return (out, wave_scans);
     }
     for block in &cfg.blocks {
-        for w in block.insns.windows(19) {
+        let active: Vec<&Insn> = block.insns.iter().filter(|i| !is_nop(i)).collect();
+        for w in active.windows(19) {
             let saved = w[0].dst;
             let input = w[1].dst;
             let sum = w[2].dst;
@@ -1276,9 +1378,9 @@ fn scans(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                 || sum == input
                 || ![0, 1, 2, 10, 11, 14, 17, 18]
                     .into_iter()
-                    .all(|i| plain(&w[i]))
-                || !move_exec(&w[7], exec, 0xffff_0000)
-                || !move_exec(&w[8], high, 0xffff_0000)
+                    .all(|i| plain(w[i]))
+                || !move_exec(w[7], exec, 0xffff_0000)
+                || !move_exec(w[8], high, 0xffff_0000)
                 || w[9].op != Op::v_permlanex16_b32
                 || !vector(other)
                 || other == input
@@ -1302,13 +1404,13 @@ fn scans(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                 || matches!((saved, total), (Operand::Reg(Reg::S(a)), Operand::Reg(Reg::S(b)))
                     if b == a || b == a.saturating_add(1))
                 || w[11].src[..2] != [sum, Operand::Int(31)]
-                || !move_exec(&w[12], exec, 0)
-                || !move_exec(&w[13], high, u32::MAX)
+                || !move_exec(w[12], exec, 0)
+                || !move_exec(w[13], high, u32::MAX)
                 || w[14].op != Op::v_add_u32
                 || w[14].dst != sum
                 || w[14].src[..2] != [total, sum]
-                || !move_exec(&w[15], exec, u32::MAX)
-                || !move_exec(&w[16], high, u32::MAX)
+                || !move_exec(w[15], exec, u32::MAX)
+                || !move_exec(w[16], high, u32::MAX)
                 || w[17].op != Op::v_sub_u32
                 || w[17].dst != sum
                 || w[17].src[..2] != [sum, input]
@@ -1334,12 +1436,16 @@ fn scans(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                     combined: None,
                 },
             );
+            for i in &w[3..17] {
+                wave_scans.insert(i.pc, WaveScan::Skip);
+            }
+            wave_scans.insert(w[17].pc, WaveScan::PrefixSum);
         }
     }
-    out
+    (out, wave_scans)
 }
 
-fn reductions(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
+fn reductions(cfg: &Cfg, lanes: u8) -> (BTreeMap<u32, Reduction>, BTreeMap<u32, WaveReducePart>) {
     /// A register that is being reduced.
     #[derive(Clone, Copy)]
     struct Chain {
@@ -1351,14 +1457,48 @@ fn reductions(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
         /// half of 32 lanes. The steps have to come in this order, or a lane reads a lane
         /// that already holds its value.
         level: u8,
+        /// Consistent single word reduction op across all steps of the chain.
+        op: Option<WaveReduce>,
+        /// Set when steps mix operations or use multi word carry chains.
+        mixed_op: bool,
+        /// PC of the first half wave `v_readlane_b32` in a 64 lane reduction.
+        first_result: Option<u32>,
     }
+    impl Chain {
+        fn record_op(&mut self, op: Op) {
+            match (self.op, wave_reduce_op(op)) {
+                (None, Some(r)) => self.op = Some(r),
+                (Some(cur), Some(r)) if cur == r => {}
+                _ => self.mixed_op = true,
+            }
+        }
+    }
+    /// A sibling group value staged in a temporary VGPR by `v_mov_b32_dpp`.
+    #[derive(Clone, Copy)]
+    struct Staged {
+        chain: u8,
+        level: u8,
+        identity: u32,
+        pc: u32,
+    }
+    let carry_reg = |op: Operand| match op {
+        Operand::None | Operand::Reg(Reg::VccLo) => Some(VCC),
+        Operand::Reg(Reg::S(r)) if r < VCC => Some(r),
+        _ => None,
+    };
     let mut out = BTreeMap::new();
+    let mut wave_reduces = BTreeMap::new();
     for block in &cfg.blocks {
         let mut all_on = false;
         let mut chains: BTreeMap<u8, Chain> = BTreeMap::new();
-        let mut literal_move = None;
-        // Registers that hold the identity in this lane: the other row of a reduced register.
-        let mut rows: BTreeMap<u8, u32> = BTreeMap::new();
+        let mut literal_moves: BTreeMap<u8, u32> = BTreeMap::new();
+        // Registers that hold the identity in this lane: staged DPP moves or the other row
+        // of a reduced register.
+        let mut staged: BTreeMap<u8, Staged> = BTreeMap::new();
+        let mut rows: BTreeMap<u8, (u8, u32)> = BTreeMap::new();
+        // A carry register guaranteed to be zero from a zero-identity `v_add_co_u32` or
+        // `v_addc_co_u32` reduction combine at the recorded level.
+        let mut carry_zero: Option<(u8, u8)> = None;
         for insn in &block.insns {
             let v = |op: Operand| match op {
                 Operand::Reg(Reg::V(n)) => Some(n),
@@ -1387,61 +1527,105 @@ fn reductions(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                     );
                 chains.clear();
                 rows.clear();
-                literal_move = None;
+                staged.clear();
+                literal_moves.clear();
+                carry_zero = None;
                 continue;
             }
             if matches!(insn.dst, Operand::Reg(Reg::ExecLo | Reg::ExecHi)) {
                 all_on = false;
                 chains.clear();
                 rows.clear();
-                literal_move = None;
+                staged.clear();
+                literal_moves.clear();
+                carry_zero = None;
                 continue;
             }
             let plain = matches!(insn.form, Form::Plain | Form::AsVop3);
+            let no_mods = matches!(
+                insn.ext,
+                Ext::None
+                    | Ext::Valu {
+                        abs: 0,
+                        neg: 0,
+                        opsel: 0,
+                        omod: 0,
+                        clamp: false
+                    }
+            );
             // A literal move under full EXEC can supply the identity to a later cndmask
             // in this block. Only the ordinary VOP1 move writes a new known constant.
-            let identity = literal_move
-                .filter(|&(x, _)| dst == Some(x) && insn.src[0] == Operand::Reg(Reg::V(x)))
-                .map(|(_, value)| value);
+            let identity = dst
+                .filter(|&x| insn.src[0] == Operand::Reg(Reg::V(x)))
+                .and_then(|x| literal_moves.get(&x).copied());
             // Other instructions may have multi-register destinations. Drop the facts for
             // any VGPR write, even for instructions the reduction recognises below.
-            if v(insn.dst).is_some() || v(insn.dst2).is_some() {
-                literal_move = None;
+            if matches!(
+                insn.format(),
+                Format::Mimg | Format::Mubuf | Format::Mtbuf | Format::Ds
+            ) {
+                literal_moves.clear();
+            } else {
+                let (d0, d1, _) = vector_spans(insn);
+                for (op, count) in [(insn.dst, d0), (insn.dst2, d1)] {
+                    if let Some(x) = v(op) {
+                        for k in 0..count {
+                            literal_moves.remove(&x.wrapping_add(k as u8));
+                        }
+                    }
+                }
             }
             if all_on
                 && insn.op == Op::v_mov_b32
                 && insn.form == Form::Plain
                 && let (Some(x), Some(value)) = (dst, constant(insn.src[0]))
             {
-                literal_move = Some((x, value));
+                literal_moves.insert(x, value);
             }
             match (insn.op, insn.form) {
                 // The start: the lanes that do not take part get the identity.
                 (Op::v_cndmask_b32, Form::Plain | Form::AsVop3) if all_on => {
                     if let (Some(x), Some(identity)) = (
                         dst,
-                        constant(insn.src[0]).or_else(|| {
-                            let unchanged = matches!(
-                                insn.ext,
-                                Ext::None
-                                    | Ext::Valu {
-                                        abs: 0,
-                                        neg: 0,
-                                        opsel: 0,
-                                        omod: 0,
-                                        clamp: false
-                                    }
-                            );
-                            identity.filter(|_| unchanged)
-                        }),
+                        constant(insn.src[0]).or_else(|| identity.filter(|_| no_mods)),
                     ) {
                         rows.remove(&x);
+                        rows.retain(|_, (ch, _)| *ch != x);
+                        staged.remove(&x);
+                        staged.retain(|_, s| s.chain != x);
                         chains.insert(
                             x,
                             Chain {
                                 identity,
                                 half: None,
                                 level: 0,
+                                op: None,
+                                mixed_op: false,
+                                first_result: None,
+                            },
+                        );
+                        continue;
+                    }
+                }
+                // A DPP move staging the sibling group's value into a temporary register for
+                // an immediately following combine (for example a 64 bit carry-chain sum).
+                (Op::v_mov_b32, Form::Dpp8 | Form::Dpp16) => {
+                    if let (Some(y), Some(x)) = (dst, v(insn.src[0]))
+                        && y != x
+                        && let Some(c) = chains.get(&x).copied()
+                        && combines_groups(insn) == Some(c.level)
+                    {
+                        chains.remove(&y);
+                        rows.remove(&y);
+                        rows.retain(|_, (ch, _)| *ch != y);
+                        staged.retain(|_, s| s.chain != y);
+                        staged.insert(
+                            y,
+                            Staged {
+                                chain: x,
+                                level: c.level,
+                                identity: c.identity,
+                                pc: insn.pc,
                             },
                         );
                         continue;
@@ -1457,6 +1641,9 @@ fn reductions(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                         && combines_groups(insn) == Some(c.level)
                     {
                         c.level += 1;
+                        c.record_op(insn.op);
+                        rows.retain(|_, (ch, _)| *ch != x);
+                        staged.retain(|_, s| s.chain != x);
                         out.insert(insn.pc, Reduction::Step);
                         continue;
                     }
@@ -1477,7 +1664,10 @@ fn reductions(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                             },
                         );
                         chains.remove(&y);
-                        rows.insert(y, c.identity);
+                        staged.remove(&y);
+                        staged.retain(|_, s| s.chain != y);
+                        rows.retain(|_, (ch, _)| *ch != y);
+                        rows.insert(y, (x, c.identity));
                         continue;
                     }
                 }
@@ -1501,7 +1691,19 @@ fn reductions(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                                         combined: None,
                                     },
                                 );
+                                if lanes == 32 {
+                                    if !c.mixed_op
+                                        && let Some(rop) = c.op
+                                    {
+                                        wave_reduces.insert(insn.pc, WaveReducePart::Active(rop));
+                                    }
+                                } else {
+                                    c.first_result = Some(insn.pc);
+                                }
                                 c.half = Some((r, upper, false));
+                                if carry_zero.is_some_and(|(cr, _)| cr == r) {
+                                    carry_zero = None;
+                                }
                                 continue;
                             }
                             // The other half was combined in: a lane of this half holds the
@@ -1515,15 +1717,24 @@ fn reductions(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                                         combined: Some(scalar),
                                     },
                                 );
+                                if !c.mixed_op
+                                    && let (Some(rop), Some(pc1)) = (c.op, c.first_result)
+                                {
+                                    wave_reduces.insert(pc1, WaveReducePart::Identity(c.identity));
+                                    wave_reduces.insert(insn.pc, WaveReducePart::Active(rop));
+                                }
                                 chains.remove(&x);
+                                if carry_zero.is_some_and(|(cr, _)| cr == r) {
+                                    carry_zero = None;
+                                }
                                 continue;
                             }
                             _ => {}
                         }
                     }
                 }
-                // The plain operation of the reduction: with the other row, or with the result
-                // of the other half. The ordinary rules lift it.
+                // The plain operation of the reduction: with a staged DPP move, with the
+                // other row, or with the result of the other half. The ordinary rules lift it.
                 _ if plain && !ids.is_empty() => {
                     if let Some(x) = dst
                         && let Some(c) = chains.get_mut(&x)
@@ -1535,16 +1746,104 @@ fn reductions(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                         } else {
                             insn.src[1]
                         };
+                        if c.level < 4
+                            && let Some(y) = v(other)
+                            && let Some(&st) = staged.get(&y)
+                            && st.chain == x
+                            && st.level == c.level
+                            && st.identity == c.identity
+                        {
+                            out.insert(
+                                st.pc,
+                                Reduction::OtherRow {
+                                    identity: st.identity,
+                                },
+                            );
+                            staged.remove(&y);
+                            c.level += 1;
+                            c.record_op(insn.op);
+                            continue;
+                        }
                         if c.level == 4
-                            && v(other).is_some_and(|y| rows.get(&y) == Some(&c.identity))
+                            && v(other).is_some_and(|y| rows.get(&y) == Some(&(x, c.identity)))
                         {
                             c.level = 5;
+                            c.record_op(insn.op);
                             continue;
                         }
                         if let Some((scalar, upper, false)) = c.half
                             && other == Operand::Reg(Reg::S(scalar))
                         {
                             c.half = Some((scalar, upper, true));
+                            c.record_op(insn.op);
+                            continue;
+                        }
+                    }
+                }
+                // Multi word unsigned sum reduction: `v_add_co_u32_e64` on the low word
+                // produces a zero carry in a single lane projection, enabling `v_addc_co_u32`
+                // on the high word at the same reduction level.
+                (Op::v_add_co_u32_e64 | Op::v_addc_co_u32, _) if plain && no_mods => {
+                    if let Some(x) = dst
+                        && let Some(c) = chains.get_mut(&x)
+                        && c.identity == 0
+                        && (v(insn.src[0]) == Some(x) || v(insn.src[1]) == Some(x))
+                    {
+                        let other = if v(insn.src[1]) == Some(x) {
+                            insn.src[0]
+                        } else {
+                            insn.src[1]
+                        };
+                        let carry_ok = if insn.op == Op::v_addc_co_u32 {
+                            let cin = if insn.form == Form::AsVop3
+                                || (insn.form == Form::Plain && insn.src[2] != Operand::None)
+                            {
+                                carry_reg(insn.src[2])
+                            } else {
+                                Some(VCC)
+                            };
+                            cin.is_some_and(|r| carry_zero == Some((r, c.level)))
+                        } else {
+                            true
+                        };
+                        if carry_ok
+                            && c.level < 4
+                            && let Some(y) = v(other)
+                            && let Some(&st) = staged.get(&y)
+                            && st.chain == x
+                            && st.level == c.level
+                            && st.identity == 0
+                        {
+                            let old_level = c.level;
+                            out.insert(st.pc, Reduction::OtherRow { identity: 0 });
+                            staged.remove(&y);
+                            c.level += 1;
+                            c.mixed_op = true;
+                            carry_zero = carry_reg(insn.dst2).map(|r| (r, old_level));
+                            if let Operand::Reg(Reg::S(r)) = insn.dst2 {
+                                chains.retain(|_, ch| {
+                                    ch.half.is_none_or(|(scalar, ..)| {
+                                        !(r..=r.saturating_add(1)).contains(&scalar)
+                                    })
+                                });
+                            }
+                            continue;
+                        }
+                        if carry_ok
+                            && c.level == 4
+                            && v(other).is_some_and(|y| rows.get(&y) == Some(&(x, 0)))
+                        {
+                            let old_level = c.level;
+                            c.level = 5;
+                            c.mixed_op = true;
+                            carry_zero = carry_reg(insn.dst2).map(|r| (r, old_level));
+                            if let Operand::Reg(Reg::S(r)) = insn.dst2 {
+                                chains.retain(|_, ch| {
+                                    ch.half.is_none_or(|(scalar, ..)| {
+                                        !(r..=r.saturating_add(1)).contains(&scalar)
+                                    })
+                                });
+                            }
                             continue;
                         }
                     }
@@ -1559,18 +1858,32 @@ fn reductions(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
             ) {
                 chains.clear();
                 rows.clear();
+                staged.clear();
+            }
+            if insn.format() == Format::Vopc {
+                carry_zero = None;
             }
             for op in [insn.dst, insn.dst2] {
                 if let Some(x) = v(op) {
+                    let next = x.wrapping_add(1);
                     chains.remove(&x);
                     rows.remove(&x);
+                    staged.remove(&x);
                     // A 64 bit result takes the next register too.
-                    chains.remove(&x.wrapping_add(1));
-                    rows.remove(&x.wrapping_add(1));
+                    chains.remove(&next);
+                    rows.remove(&next);
+                    staged.remove(&next);
+                    rows.retain(|_, (ch, _)| *ch != x && *ch != next);
+                    staged.retain(|_, s| s.chain != x && s.chain != next);
                 }
                 // The scalar that holds the result of a half must still hold it when it is
                 // combined and read.
                 if let Operand::Reg(Reg::S(r)) = op {
+                    if carry_zero
+                        .is_some_and(|(cr, _)| (r..=r.saturating_add(15)).contains(&cr))
+                    {
+                        carry_zero = None;
+                    }
                     // A scalar load writes up to 16 registers from the one it names.
                     chains.retain(|_, c| {
                         c.half.is_none_or(|(scalar, ..)| {
@@ -1578,10 +1891,15 @@ fn reductions(cfg: &Cfg, lanes: u8) -> BTreeMap<u32, Reduction> {
                         })
                     });
                 }
+                if matches!(op, Operand::Reg(Reg::VccLo | Reg::VccHi))
+                    && carry_zero.is_some_and(|(cr, _)| cr == VCC)
+                {
+                    carry_zero = None;
+                }
             }
         }
     }
-    out
+    (out, wave_reduces)
 }
 
 /// The wave size the instructions that name EXEC or VCC are written for. `None` when the
@@ -1632,6 +1950,7 @@ const NO_PC: u32 = u32::MAX;
 /// The program as the typing sees it.
 struct Typing<'a> {
     cfg: &'a Cfg,
+    lanes: u8,
     touches: Vec<Touch>,
     spans: Vec<Vec<Span>>,
     groups: Vec<Group>,
@@ -1864,9 +2183,409 @@ impl Typing<'_> {
         out
     }
 
+    /// Checks whether a `Role::Number` zero test at `(target_block, target_span_idx)` can only
+    /// receive a lane mask in `loc` along paths where `EXEC` is guaranteed empty and the `SCC`
+    /// written by the compare is unobservable when `EXEC` is empty.
+    fn inactive_mask_only(&self, target_block: usize, target_span_idx: usize, loc: u16) -> bool {
+        let block = &self.cfg.blocks[target_block];
+        let Some(target) = block.insns.get(target_span_idx) else {
+            return false;
+        };
+        if !zero_test(target).is_some_and(|(_, w, _)| w == self.lanes) {
+            return false;
+        }
+        // Step 1: confirm `SCC` written by `target` is only read by `s_cselect _, exec, 0` (or
+        // `0, exec`) before being unconditionally overwritten in the same block with `EXEC`
+        // untouched. Under empty `EXEC`, `select(scc, false, false)` is always false.
+        let mut scc_killed = false;
+        for insn in &block.insns[target_span_idx + 1..] {
+            let info = insn.op.info();
+            let writes_exec = matches!(insn.dst, Operand::Reg(Reg::ExecLo | Reg::ExecHi))
+                || info.defs.iter().any(|s| s.fixed == Fixed::Exec);
+            if writes_exec {
+                return false;
+            }
+            let reads_scc = info.srcs.iter().any(|s| s.fixed == Fixed::Scc)
+                || insn.src.iter().any(|o| matches!(o, Operand::Reg(Reg::Scc)));
+            let writes_scc = info.defs.iter().any(|s| s.fixed == Fixed::Scc);
+            if reads_scc {
+                let exec_or_zero = matches!(mask_op(insn.op), Some((MaskOp::Select, w)) if w == self.lanes)
+                    && ((insn.src[0] == Operand::Reg(Reg::ExecLo) && constant(insn.src[1]) == Some(0))
+                        || (constant(insn.src[0]) == Some(0) && insn.src[1] == Operand::Reg(Reg::ExecLo)));
+                if !exec_or_zero {
+                    return false;
+                }
+            } else if writes_scc {
+                scc_killed = true;
+                break;
+            }
+        }
+        if !scc_killed {
+            return false;
+        }
+        // Step 2: find blocks guarded by `v_cmp_eq_u32 vcc, C, vK` followed by
+        // `s_andn2 vcc, exec, vcc` and a `Cond::VccZero` branch. When `vK != C` in every active
+        // lane, `vcc` equals `exec`, so the zero VCC edge guarantees empty `EXEC`.
+        let plain_valu = |i: &Insn| {
+            matches!(i.form, Form::Plain | Form::AsVop3)
+                && matches!(
+                    i.ext,
+                    Ext::None
+                        | Ext::Valu {
+                            abs: 0,
+                            neg: 0,
+                            opsel: 0,
+                            omod: 0,
+                            clamp: false
+                        }
+                )
+        };
+        let mut guards: Vec<(u8, u32)> = Vec::new();
+        let mut block_guard: Vec<Option<(usize, usize)>> = vec![None; self.cfg.blocks.len()];
+        for (b, blk) in self.cfg.blocks.iter().enumerate() {
+            if !matches!(
+                blk.term,
+                Term::Branch {
+                    cond: Cond::VccZero(_),
+                    ..
+                }
+            ) {
+                continue;
+            }
+            let mut andn2_idx = None;
+            for (i, insn) in blk.insns.iter().enumerate().rev() {
+                if matches!(mask_op(insn.op), Some((MaskOp::Logic(Logic::Andn2), w)) if w == self.lanes)
+                    && insn.dst == Operand::Reg(Reg::VccLo)
+                    && insn.src[0] == Operand::Reg(Reg::ExecLo)
+                    && insn.src[1] == Operand::Reg(Reg::VccLo)
+                {
+                    andn2_idx = Some(i);
+                    break;
+                }
+                let info = insn.op.info();
+                if matches!(
+                    insn.dst,
+                    Operand::Reg(Reg::VccLo | Reg::VccHi | Reg::ExecLo | Reg::ExecHi)
+                ) || matches!(
+                    insn.dst2,
+                    Operand::Reg(Reg::VccLo | Reg::VccHi | Reg::ExecLo | Reg::ExecHi)
+                ) || info.defs.iter().any(|s| s.fixed == Fixed::Exec)
+                    || insn.format() == Format::Vopc
+                {
+                    break;
+                }
+            }
+            let Some(andn2_at) = andn2_idx else {
+                continue;
+            };
+            for (i, insn) in blk.insns[..andn2_at].iter().enumerate().rev() {
+                if insn.op == Op::v_cmp_eq_u32
+                    && plain_valu(insn)
+                    && matches!(insn.dst, Operand::None | Operand::Reg(Reg::VccLo))
+                {
+                    let pair = match (insn.src[0], insn.src[1]) {
+                        (Operand::Reg(Reg::V(v)), other) => constant(other).map(|c| (v, c)),
+                        (other, Operand::Reg(Reg::V(v))) => constant(other).map(|c| (v, c)),
+                        _ => None,
+                    };
+                    if let Some(pair) = pair {
+                        let g_bit = if let Some(pos) = guards.iter().position(|p| *p == pair) {
+                            Some(pos)
+                        } else if guards.len() < 3 {
+                            guards.push(pair);
+                            Some(guards.len() - 1)
+                        } else {
+                            None
+                        };
+                        if let Some(g_bit) = g_bit {
+                            block_guard[b] = Some((i, g_bit));
+                        }
+                    }
+                    break;
+                }
+                let info = insn.op.info();
+                if matches!(
+                    insn.dst,
+                    Operand::Reg(Reg::VccLo | Reg::VccHi | Reg::ExecLo | Reg::ExecHi)
+                ) || matches!(
+                    insn.dst2,
+                    Operand::Reg(Reg::VccLo | Reg::VccHi | Reg::ExecLo | Reg::ExecHi)
+                ) || info.defs.iter().any(|s| s.fixed == Fixed::Exec)
+                    || insn.format() == Format::Vopc
+                {
+                    break;
+                }
+            }
+        }
+        // Step 3: bounded path sensitive reachability over `(has_mask, exec_zero, v_ne_mask)`
+        // with intersected sets of scalar registers proven zero.
+        let n_states = 4usize << guards.len();
+        let state_index = |has_mask: bool, exec_zero: bool, v_ne: u8| -> usize {
+            (usize::from(has_mask) << (guards.len() + 1))
+                | (usize::from(exec_zero) << guards.len())
+                | usize::from(v_ne)
+        };
+        let mut seen: Vec<Vec<Option<u128>>> = vec![vec![None; n_states]; self.cfg.blocks.len()];
+        let mut queue: VecDeque<(usize, bool, bool, u8)> = VecDeque::new();
+        let push = |seen: &mut [Vec<Option<u128>>],
+                    queue: &mut VecDeque<(usize, bool, bool, u8)>,
+                    b: usize,
+                    has_mask: bool,
+                    exec_zero: bool,
+                    v_ne: u8,
+                    zero_regs: u128| {
+            let idx = state_index(has_mask, exec_zero, v_ne);
+            match seen[b][idx] {
+                None => {
+                    seen[b][idx] = Some(zero_regs);
+                    queue.push_back((b, has_mask, exec_zero, v_ne));
+                }
+                Some(old) => {
+                    let merged = old & zero_regs;
+                    if merged != old {
+                        seen[b][idx] = Some(merged);
+                        queue.push_back((b, has_mask, exec_zero, v_ne));
+                    }
+                }
+            }
+        };
+        let wide_mask = self.lanes == 64;
+        let is_zero_mask = |op: Operand, zero_regs: u128| -> bool {
+            if constant(op) == Some(0) {
+                return true;
+            }
+            let Some(r) = followed(op) else {
+                return false;
+            };
+            (zero_regs & bit(r)) != 0
+                && (!wide_mask || (usize::from(r) + 1 < REGS && (zero_regs & bit(r + 1)) != 0))
+        };
+        let v_written = |insn: &Insn, v_reg: u8| -> bool {
+            if insn.op.name().starts_with("v_movrel")
+                || matches!(
+                    insn.format(),
+                    Format::Flat | Format::Global | Format::Scratch
+                )
+            {
+                return true;
+            }
+            let (d0, d1, _) = vector_spans(insn);
+            for (op, count) in [(insn.dst, d0), (insn.dst2, d1)] {
+                if let Operand::Reg(Reg::V(first)) = op
+                    && v_reg >= first
+                    && usize::from(v_reg - first) < count
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        push(&mut seen, &mut queue, 0, false, false, 0, 0);
+        while let Some((b, mut has_mask, mut exec_zero, mut v_ne)) = queue.pop_front() {
+            let idx = state_index(has_mask, exec_zero, v_ne);
+            let mut zero_regs = seen[b][idx].unwrap_or(0);
+            let mut vcc_eq_exec = false;
+            let blk = &self.cfg.blocks[b];
+            for (i, insn) in blk.insns.iter().enumerate() {
+                if b == target_block && i == target_span_idx && has_mask && !exec_zero {
+                    return false;
+                }
+                if let Some((cmp_i, g_bit)) = block_guard[b]
+                    && cmp_i == i
+                    && (exec_zero || (v_ne & (1 << g_bit)) != 0)
+                {
+                    vcc_eq_exec = true;
+                }
+                for (g_bit, &(v_k, c_test)) in guards.iter().enumerate() {
+                    if insn.op == Op::v_mov_b32
+                        && insn.form == Form::Plain
+                        && insn.dst == Operand::Reg(Reg::V(v_k))
+                        && constant(insn.src[0]).is_some_and(|c| c != c_test)
+                    {
+                        v_ne |= 1 << g_bit;
+                    } else if v_written(insn, v_k) {
+                        v_ne &= !(1 << g_bit);
+                    }
+                }
+                let span = &self.spans[b][i];
+                let own = self.own(span);
+                let mut zero_defs = 0u128;
+                let mut all_defs = 0u128;
+                for t in own.iter().filter(|t| t.def) {
+                    if t.loc == loc {
+                        has_mask = written(t, &self.groups) & (LOW | HIGH) != 0;
+                    }
+                    if usize::from(t.loc) < REGS {
+                        all_defs |= bit(t.loc as u8);
+                    }
+                }
+                if insn.format() == Format::Vopc && !insn.op.name().starts_with("v_cmpx_") {
+                    let dst_r = if insn.dst == Operand::None {
+                        Some(VCC)
+                    } else {
+                        followed(insn.dst)
+                    };
+                    if let Some(r) = dst_r {
+                        all_defs |= bit(r);
+                        if wide_mask && usize::from(r) + 1 < REGS {
+                            all_defs |= bit(r + 1);
+                        }
+                        if exec_zero {
+                            zero_defs |= bit(r);
+                            if wide_mask && usize::from(r) + 1 < REGS {
+                                zero_defs |= bit(r + 1);
+                            }
+                        }
+                    }
+                } else if let Some((kind, w)) = mask_op(insn.op)
+                    && w == self.lanes
+                    && let Some(r) = followed(insn.dst)
+                {
+                    let writes_zero = match kind {
+                        MaskOp::Logic(Logic::Mov) => {
+                            (exec_zero && insn.src[0] == Operand::Reg(Reg::ExecLo))
+                                || is_zero_mask(insn.src[0], zero_regs)
+                        }
+                        MaskOp::SaveExec(_) => exec_zero,
+                        MaskOp::Logic(Logic::And) => {
+                            (exec_zero
+                                && (insn.src[0] == Operand::Reg(Reg::ExecLo)
+                                    || insn.src[1] == Operand::Reg(Reg::ExecLo)))
+                                || is_zero_mask(insn.src[0], zero_regs)
+                                || is_zero_mask(insn.src[1], zero_regs)
+                        }
+                        MaskOp::Logic(Logic::Andn2) => {
+                            (exec_zero && insn.src[0] == Operand::Reg(Reg::ExecLo))
+                                || is_zero_mask(insn.src[0], zero_regs)
+                        }
+                        MaskOp::Select => {
+                            let z0 = (exec_zero && insn.src[0] == Operand::Reg(Reg::ExecLo))
+                                || is_zero_mask(insn.src[0], zero_regs);
+                            let z1 = (exec_zero && insn.src[1] == Operand::Reg(Reg::ExecLo))
+                                || is_zero_mask(insn.src[1], zero_regs);
+                            z0 && z1
+                        }
+                        _ => false,
+                    };
+                    if writes_zero {
+                        zero_defs |= bit(r);
+                        if wide_mask && usize::from(r) + 1 < REGS {
+                            zero_defs |= bit(r + 1);
+                        }
+                    }
+                }
+                zero_regs = (zero_regs & !all_defs) | zero_defs;
+                let info = insn.op.info();
+                let writes_exec = matches!(insn.dst, Operand::Reg(Reg::ExecLo | Reg::ExecHi))
+                    || info.defs.iter().any(|s| s.fixed == Fixed::Exec);
+                if writes_exec {
+                    if insn.format() == Format::Vopc && insn.op.name().starts_with("v_cmpx_") {
+                        // Narrows EXEC only.
+                    } else if let Some((kind, w)) = mask_op(insn.op)
+                        && w == self.lanes
+                    {
+                        match kind {
+                            MaskOp::SaveExec(Logic::And) => {
+                                if is_zero_mask(insn.src[0], zero_regs) {
+                                    exec_zero = true;
+                                }
+                            }
+                            MaskOp::Logic(Logic::And) if insn.dst == Operand::Reg(Reg::ExecLo) => {
+                                if insn.src[0] == Operand::Reg(Reg::ExecLo) {
+                                    if is_zero_mask(insn.src[1], zero_regs) {
+                                        exec_zero = true;
+                                    }
+                                } else if insn.src[1] == Operand::Reg(Reg::ExecLo) {
+                                    if is_zero_mask(insn.src[0], zero_regs) {
+                                        exec_zero = true;
+                                    }
+                                } else if is_zero_mask(insn.src[0], zero_regs)
+                                    || is_zero_mask(insn.src[1], zero_regs)
+                                {
+                                    exec_zero = true;
+                                } else {
+                                    exec_zero = false;
+                                    v_ne = 0;
+                                }
+                            }
+                            MaskOp::Logic(Logic::Andn2)
+                                if insn.dst == Operand::Reg(Reg::ExecLo) =>
+                            {
+                                if insn.src[0] == Operand::Reg(Reg::ExecLo) {
+                                    // Narrows EXEC only.
+                                } else if is_zero_mask(insn.src[0], zero_regs) {
+                                    exec_zero = true;
+                                } else {
+                                    exec_zero = false;
+                                    v_ne = 0;
+                                }
+                            }
+                            MaskOp::Logic(Logic::Mov)
+                                if insn.dst == Operand::Reg(Reg::ExecLo)
+                                    && is_zero_mask(insn.src[0], zero_regs) =>
+                            {
+                                exec_zero = true;
+                            }
+                            _ => {
+                                exec_zero = false;
+                                v_ne = 0;
+                            }
+                        }
+                    } else {
+                        exec_zero = false;
+                        v_ne = 0;
+                    }
+                }
+            }
+            let vcc_zero = (zero_regs & bit(VCC)) != 0
+                && (!wide_mask || (zero_regs & bit(VCC + 1)) != 0);
+            match blk.term {
+                Term::End => {}
+                Term::Jump(t) => push(&mut seen, &mut queue, t, has_mask, exec_zero, v_ne, zero_regs),
+                Term::Branch { cond, taken, fall } => match cond {
+                    Cond::ExecZero(true) => {
+                        push(&mut seen, &mut queue, taken, has_mask, true, v_ne, zero_regs);
+                        if !exec_zero {
+                            push(&mut seen, &mut queue, fall, has_mask, false, v_ne, zero_regs);
+                        }
+                    }
+                    Cond::ExecZero(false) => {
+                        if !exec_zero {
+                            push(&mut seen, &mut queue, taken, has_mask, false, v_ne, zero_regs);
+                        }
+                        push(&mut seen, &mut queue, fall, has_mask, true, v_ne, zero_regs);
+                    }
+                    Cond::VccZero(false) if vcc_eq_exec => {
+                        if !exec_zero {
+                            push(&mut seen, &mut queue, taken, has_mask, false, v_ne, zero_regs);
+                        }
+                        push(&mut seen, &mut queue, fall, has_mask, true, v_ne, zero_regs);
+                    }
+                    Cond::VccZero(true) if vcc_eq_exec => {
+                        push(&mut seen, &mut queue, taken, has_mask, true, v_ne, zero_regs);
+                        if !exec_zero {
+                            push(&mut seen, &mut queue, fall, has_mask, false, v_ne, zero_regs);
+                        }
+                    }
+                    Cond::VccZero(false) if vcc_zero => {
+                        push(&mut seen, &mut queue, fall, has_mask, exec_zero, v_ne, zero_regs);
+                    }
+                    Cond::VccZero(true) if vcc_zero => {
+                        push(&mut seen, &mut queue, taken, has_mask, exec_zero, v_ne, zero_regs);
+                    }
+                    _ => {
+                        push(&mut seen, &mut queue, taken, has_mask, exec_zero, v_ne, zero_regs);
+                        push(&mut seen, &mut queue, fall, has_mask, exec_zero, v_ne, zero_regs);
+                    }
+                },
+            }
+        }
+        true
+    }
+
     /// What the instruction of `span` reads and writes as masks, with `cur` the kinds before it
     /// and `later` the answer of [`Typing::later_readers`].
-    fn site(&self, span: &Span, cur: &mut Kinds, later: &[u8]) -> Site {
+    fn site(&self, block_idx: usize, span_idx: usize, span: &Span, cur: &mut Kinds, later: &[u8]) -> Site {
         let mut site = Site::default();
         // The first reason found stays: it is the one closest to the cause.
         fn refuse(site: &mut Site, what: &'static str) {
@@ -1919,6 +2638,8 @@ impl Typing<'_> {
                             NUMBER
                         } else if readers != 0 && readers & NUMBER == 0 {
                             set & readers
+                        } else if self.inactive_mask_only(block_idx, span_idx, t.loc) {
+                            NUMBER
                         } else {
                             refuse(&mut site, "mixed-pair");
                             NUMBER
@@ -2036,6 +2757,7 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
     }
     let mut typing = Typing {
         cfg,
+        lanes,
         touches,
         spans,
         groups,
@@ -2096,8 +2818,8 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
     let mut refused = 0;
     for (b, list) in typing.spans.iter().enumerate() {
         let mut cur = ins[b];
-        for span in list {
-            let site = typing.site(span, &mut cur, &later);
+        for (span_idx, span) in list.iter().enumerate() {
+            let site = typing.site(b, span_idx, span, &mut cur, &later);
             if site.refusal.is_some() {
                 refused += 1;
                 if span.pc == NO_PC {
@@ -2113,13 +2835,163 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
             }
         }
     }
-    for (pc, part) in reductions(cfg, lanes) {
+    let (red_parts, wave_reduces) = reductions(cfg, lanes);
+    let (scan_parts, wave_scans) = scans(cfg, lanes);
+    for (pc, part) in red_parts {
         masks.sites.entry(pc).or_default().reduction = Some(part);
     }
-    for (pc, part) in scans(cfg, lanes) {
+    for (pc, part) in wave_reduces {
+        masks.sites.entry(pc).or_default().wave_reduce = Some(part);
+    }
+    for (pc, part) in scan_parts {
         masks.sites.entry(pc).or_default().reduction = Some(part);
+    }
+    for (pc, part) in wave_scans {
+        masks.sites.entry(pc).or_default().scan = Some(part);
+    }
+    // Enable real HLSL wave lowering for matched scans and reductions when the program also
+    // performs an explicit constant cross lane `v_readlane_b32` outside those patterns and every
+    // matched reduction result has a real wave lowering.
+    let has_wave_pattern = masks
+        .sites
+        .values()
+        .any(|s| s.scan.is_some() || s.wave_reduce.is_some());
+    if has_wave_pattern {
+        let has_cross_lane_read = cfg.insns().any(|insn| {
+            insn.op == Op::v_readlane_b32_e64
+                && matches!(insn.src[1], Operand::Int(l) if (0..i8::try_from(lanes).unwrap_or(0)).contains(&l))
+                && parking.slot(insn).is_none()
+                && masks
+                    .sites
+                    .get(&insn.pc)
+                    .is_none_or(|s| s.reduction.is_none() && s.scan.is_none())
+        });
+        let all_results_supported = masks.sites.values().all(|s| {
+            !matches!(s.reduction, Some(Reduction::Result { .. }))
+                || s.scan.is_some()
+                || s.wave_reduce.is_some()
+        });
+        masks.real_wave = has_cross_lane_read && all_results_supported;
+    }
+    if lanes == 64 && !masks.converged {
+        mark_vcmp_ballots(cfg, &typing, &mut masks);
     }
     Ok((masks, refused))
+}
+
+/// Marks 64 lane `v_cmp_*` definitions whose scalar destination words are read directly as
+/// numeric ballot words by `s_mov_b32` or `s_cselect_b32` without any intervening overwrite.
+/// Because `v_cmp_*` masks its output by EXEC, inactive HLSL invocations already have zero
+/// bits, so materialising `WaveActiveBallot` at the `v_cmp_*` definition preserves the exact
+/// 32 bit words even when later branches or loop iterations read one half at a time.
+fn mark_vcmp_ballots(cfg: &Cfg, typing: &Typing<'_>, masks: &mut Masks) {
+    let is_vcmp_pair = |insn: &Insn| -> Option<u8> {
+        if insn.format() == Format::Vopc
+            && insn.op.name().starts_with("v_cmp_")
+            && let Operand::Reg(Reg::S(n)) = insn.dst
+            && n + 1 < VCC
+        {
+            return Some(n);
+        }
+        None
+    };
+    let reads_word_mask = |insn: &Insn, masks: &Masks| -> bool {
+        matches!(insn.op, Op::s_mov_b32 | Op::s_cselect_b32)
+            && !names(insn, Reg::ExecLo)
+            && masks.sites.get(&insn.pc).is_some_and(|s| s.reads != 0)
+    };
+    if !cfg.insns().any(|insn| reads_word_mask(insn, masks)) {
+        return;
+    }
+    let n = cfg.blocks.len();
+    let mut ins = vec![0u128; n];
+    let mut outs = vec![0u128; n];
+    let mut seen = vec![false; n];
+    let transfer = |b: usize, mut cur: u128| -> u128 {
+        for (idx, insn) in cfg.blocks[b].insns.iter().enumerate() {
+            let span = &typing.spans[b][idx];
+            if let Some(first) = is_vcmp_pair(insn) {
+                cur |= bit(first) | bit(first + 1);
+            } else {
+                for t in typing.own(span).iter().filter(|t| t.def) {
+                    if usize::from(t.loc) < usize::from(VCC) {
+                        cur &= !bit(t.loc as u8);
+                    }
+                }
+            }
+        }
+        cur
+    };
+    seen[0] = true;
+    outs[0] = transfer(0, 0);
+    loop {
+        let mut changed = false;
+        for b in 0..n {
+            let mut incoming = if b == 0 {
+                0u128
+            } else {
+                let mut acc = None;
+                for &p in &typing.preds[b] {
+                    if seen[p] {
+                        acc = Some(acc.map_or(outs[p], |old: u128| old & outs[p]));
+                    }
+                }
+                let Some(v) = acc else { continue };
+                v
+            };
+            if !seen[b] || incoming != ins[b] {
+                seen[b] = true;
+                ins[b] = incoming;
+                incoming = transfer(b, incoming);
+                if incoming != outs[b] {
+                    outs[b] = incoming;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut needed_regs = 0u128;
+    for b in 0..n {
+        if !seen[b] {
+            continue;
+        }
+        let mut cur = ins[b];
+        for (idx, insn) in cfg.blocks[b].insns.iter().enumerate() {
+            if reads_word_mask(insn, masks) {
+                let reads = masks.sites.get(&insn.pc).map_or(0, |s| s.reads);
+                if reads != 0 && (reads & !cur) == 0 {
+                    needed_regs |= reads;
+                    masks.sites.entry(insn.pc).or_default().ballot_ready = true;
+                }
+            }
+            let span = &typing.spans[b][idx];
+            if let Some(first) = is_vcmp_pair(insn) {
+                cur |= bit(first) | bit(first + 1);
+            } else {
+                for t in typing.own(span).iter().filter(|t| t.def) {
+                    if usize::from(t.loc) < usize::from(VCC) {
+                        cur &= !bit(t.loc as u8);
+                    }
+                }
+            }
+        }
+    }
+    if needed_regs == 0 {
+        return;
+    }
+    for insn in cfg.insns() {
+        if let Some(first) = is_vcmp_pair(insn) {
+            let lo = u8::from(needed_regs & bit(first) != 0);
+            let hi = u8::from(needed_regs & bit(first + 1) != 0);
+            let words = lo | (hi << 1);
+            if words != 0 {
+                masks.sites.entry(insn.pc).or_default().materialize_ballot = words;
+            }
+        }
+    }
 }
 
 /// How many rounds the typing runs at most. A program that needs more keeps what it has: the

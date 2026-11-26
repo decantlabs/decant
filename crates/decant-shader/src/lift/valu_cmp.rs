@@ -261,6 +261,23 @@ fn lift_in(cx: &mut Lifter, insn: &Insn, given: Option<Expr>) -> Result<bool, Re
         mask(cx, insn, insn.dst)?
     };
     cx.set(dst, Expr::bin(Bin::LAnd, Expr::Var(Var::Exec), cond));
+    if cx.stage == crate::api::Stage::Compute
+        && let Var::Mask(first) = dst
+    {
+        let words = cx.masks.materialize_ballot();
+        if words & 1 != 0 {
+            cx.set(
+                Var::S(first),
+                Expr::Call(&super::wave::MASK_WORD, vec![Expr::Var(dst), Expr::U32(0)]),
+            );
+        }
+        if words & 2 != 0 && cx.masks.lanes() == 64 {
+            cx.set(
+                Var::S(first + 1),
+                Expr::Call(&super::wave::MASK_WORD, vec![Expr::Var(dst), Expr::U32(1)]),
+            );
+        }
+    }
     Ok(true)
 }
 

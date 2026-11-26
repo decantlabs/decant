@@ -85,7 +85,10 @@ use super::operand::{bits, form, set_vdst, var};
 use super::{Lifter, valu_cmp, valu_float, valu_int};
 use crate::api::Stage;
 use crate::decode::{DppCtrl, Ext, Insn, Operand, Reg};
-use crate::exec::{Logic, MaskOp, Parked, Reduction, VCC, mask_number, mask_op, zero_test};
+use crate::exec::{
+    Logic, MaskOp, Parked, Reduction, VCC, WaveReduce, WaveReducePart, WaveScan, mask_number,
+    mask_op, zero_test,
+};
 use crate::ir::{Bin, Expr, Guard, Helper, Input, Node, Stmt, Ty, Un, Var};
 use crate::refusal::{Refusal, RefusalKind};
 use crate::tables::{Format, Op};
@@ -145,6 +148,206 @@ pub(crate) static WRITE_LANE: Helper = Helper {
     text: "uint decant_write_lane(uint value, uint lane, uint old) { return WaveGetLaneIndex() == lane ? value : old; }",
     needs: &[],
 };
+
+pub(crate) static READ_FIRST_LANE: Helper = Helper {
+    name: "decant_read_first_lane",
+    result: Ty::U32,
+    text: "uint decant_read_first_lane(uint value, bool exec) { uint4 b = WaveActiveBallot(exec); uint lane = b.x != 0u ? firstbitlow(b.x) : (b.y != 0u ? (32u + firstbitlow(b.y)) : WaveGetLaneIndex()); return WaveReadLaneAt(value, lane); }",
+    needs: &[],
+};
+
+static WAVE_LANE_INDEX: Helper = Helper {
+    name: "decant_wave_lane_index",
+    result: Ty::U32,
+    text: "uint decant_wave_lane_index() { return WaveGetLaneIndex(); }",
+    needs: &[],
+};
+
+static WAVE_PREFIX_SUM_U32: Helper = Helper {
+    name: "decant_wave_prefix_sum_u32",
+    result: Ty::U32,
+    text: "uint decant_wave_prefix_sum_u32(uint a) { return WavePrefixSum(a); }",
+    needs: &[],
+};
+
+static WAVE_SUM_U32: Helper = Helper {
+    name: "decant_wave_sum_u32",
+    result: Ty::U32,
+    text: "uint decant_wave_sum_u32(uint a) { return WaveActiveSum(a); }",
+    needs: &[],
+};
+
+static WAVE_SUM_F32: Helper = Helper {
+    name: "decant_wave_sum_f32",
+    result: Ty::U32,
+    text: "uint decant_wave_sum_f32(uint a) { return asuint(WaveActiveSum(asfloat(a))); }",
+    needs: &[],
+};
+
+static WAVE_MUL_U32: Helper = Helper {
+    name: "decant_wave_mul_u32",
+    result: Ty::U32,
+    text: "uint decant_wave_mul_u32(uint a) { return WaveActiveProduct(a); }",
+    needs: &[],
+};
+
+static WAVE_MUL_F32: Helper = Helper {
+    name: "decant_wave_mul_f32",
+    result: Ty::U32,
+    text: "uint decant_wave_mul_f32(uint a) { return asuint(WaveActiveProduct(asfloat(a))); }",
+    needs: &[],
+};
+
+static WAVE_MIN_U32: Helper = Helper {
+    name: "decant_wave_min_u32",
+    result: Ty::U32,
+    text: "uint decant_wave_min_u32(uint a) { return WaveActiveMin(a); }",
+    needs: &[],
+};
+
+static WAVE_MAX_U32: Helper = Helper {
+    name: "decant_wave_max_u32",
+    result: Ty::U32,
+    text: "uint decant_wave_max_u32(uint a) { return WaveActiveMax(a); }",
+    needs: &[],
+};
+
+static WAVE_MIN_I32: Helper = Helper {
+    name: "decant_wave_min_i32",
+    result: Ty::U32,
+    text: "uint decant_wave_min_i32(uint a) { return asuint(WaveActiveMin(asint(a))); }",
+    needs: &[],
+};
+
+static WAVE_MAX_I32: Helper = Helper {
+    name: "decant_wave_max_i32",
+    result: Ty::U32,
+    text: "uint decant_wave_max_i32(uint a) { return asuint(WaveActiveMax(asint(a))); }",
+    needs: &[],
+};
+
+static WAVE_MIN_F32: Helper = Helper {
+    name: "decant_wave_min_f32",
+    result: Ty::U32,
+    text: "uint decant_wave_min_f32(uint a) { return asuint(WaveActiveMin(asfloat(a))); }",
+    needs: &[],
+};
+
+static WAVE_MAX_F32: Helper = Helper {
+    name: "decant_wave_max_f32",
+    result: Ty::U32,
+    text: "uint decant_wave_max_f32(uint a) { return asuint(WaveActiveMax(asfloat(a))); }",
+    needs: &[],
+};
+
+static WAVE_OR_U32: Helper = Helper {
+    name: "decant_wave_or_u32",
+    result: Ty::U32,
+    text: "uint decant_wave_or_u32(uint a) { return WaveActiveBitOr(a); }",
+    needs: &[],
+};
+
+static WAVE_AND_U32: Helper = Helper {
+    name: "decant_wave_and_u32",
+    result: Ty::U32,
+    text: "uint decant_wave_and_u32(uint a) { return WaveActiveBitAnd(a); }",
+    needs: &[],
+};
+
+static WAVE_XOR_U32: Helper = Helper {
+    name: "decant_wave_xor_u32",
+    result: Ty::U32,
+    text: "uint decant_wave_xor_u32(uint a) { return WaveActiveBitXor(a); }",
+    needs: &[],
+};
+
+static WAVE_BCNT1_B32: Helper = Helper {
+    name: "decant_wave_bcnt1_b32",
+    result: Ty::U32,
+    text: "uint decant_wave_bcnt1_b32(bool v) { return countbits(WaveActiveBallot(v).x); }",
+    needs: &[],
+};
+
+static WAVE_BCNT1_B64: Helper = Helper {
+    name: "decant_wave_bcnt1_b64",
+    result: Ty::U32,
+    text: "uint decant_wave_bcnt1_b64(bool v) { uint4 b = WaveActiveBallot(v); return countbits(b.x) + countbits(b.y); }",
+    needs: &[],
+};
+
+static WAVE_FF1_B32: Helper = Helper {
+    name: "decant_wave_ff1_b32",
+    result: Ty::U32,
+    text: "uint decant_wave_ff1_b32(bool v) { uint m = WaveActiveBallot(v).x; return m != 0u ? firstbitlow(m) : 0xffffffffu; }",
+    needs: &[],
+};
+
+static WAVE_FF1_B64: Helper = Helper {
+    name: "decant_wave_ff1_b64",
+    result: Ty::U32,
+    text: "uint decant_wave_ff1_b64(bool v) { uint4 b = WaveActiveBallot(v); return b.x != 0u ? firstbitlow(b.x) : (b.y != 0u ? (32u + firstbitlow(b.y)) : 0xffffffffu); }",
+    needs: &[],
+};
+
+static WAVE_FF0_B32: Helper = Helper {
+    name: "decant_wave_ff0_b32",
+    result: Ty::U32,
+    text: "uint decant_wave_ff0_b32(bool v) { uint m = ~WaveActiveBallot(v).x; return m != 0u ? firstbitlow(m) : 0xffffffffu; }",
+    needs: &[],
+};
+
+static WAVE_FF0_B64: Helper = Helper {
+    name: "decant_wave_ff0_b64",
+    result: Ty::U32,
+    text: "uint decant_wave_ff0_b64(bool v) { uint4 b = WaveActiveBallot(v); uint lo = ~b.x; uint hi = ~b.y; return lo != 0u ? firstbitlow(lo) : (hi != 0u ? (32u + firstbitlow(hi)) : 0xffffffffu); }",
+    needs: &[],
+};
+
+static WAVE_FLBIT_B32: Helper = Helper {
+    name: "decant_wave_flbit_b32",
+    result: Ty::U32,
+    text: "uint decant_wave_flbit_b32(bool v) { uint m = WaveActiveBallot(v).x; return m != 0u ? (31u - firstbithigh(m)) : 0xffffffffu; }",
+    needs: &[],
+};
+
+static WAVE_FLBIT_B64: Helper = Helper {
+    name: "decant_wave_flbit_b64",
+    result: Ty::U32,
+    text: "uint decant_wave_flbit_b64(bool v) { uint4 b = WaveActiveBallot(v); return b.y != 0u ? (31u - firstbithigh(b.y)) : (b.x != 0u ? (63u - firstbithigh(b.x)) : 0xffffffffu); }",
+    needs: &[],
+};
+
+static WAVE_BITCMP_B32: Helper = Helper {
+    name: "decant_wave_bitcmp_b32",
+    result: Ty::Bool,
+    text: "bool decant_wave_bitcmp_b32(bool v, uint bit) { return ((WaveActiveBallot(v).x >> (bit & 31u)) & 1u) != 0u; }",
+    needs: &[],
+};
+
+static WAVE_BITCMP_B64: Helper = Helper {
+    name: "decant_wave_bitcmp_b64",
+    result: Ty::Bool,
+    text: "bool decant_wave_bitcmp_b64(bool v, uint bit) { uint4 b = WaveActiveBallot(v); uint idx = bit & 63u; return (((idx < 32u ? b.x : b.y) >> (idx & 31u)) & 1u) != 0u; }",
+    needs: &[],
+};
+
+fn wave_reduce_helper(op: WaveReduce) -> &'static Helper {
+    match op {
+        WaveReduce::AddU32 => &WAVE_SUM_U32,
+        WaveReduce::AddF32 => &WAVE_SUM_F32,
+        WaveReduce::MulU32 => &WAVE_MUL_U32,
+        WaveReduce::MulF32 => &WAVE_MUL_F32,
+        WaveReduce::MinU32 => &WAVE_MIN_U32,
+        WaveReduce::MaxU32 => &WAVE_MAX_U32,
+        WaveReduce::MinI32 => &WAVE_MIN_I32,
+        WaveReduce::MaxI32 => &WAVE_MAX_I32,
+        WaveReduce::MinF32 => &WAVE_MIN_F32,
+        WaveReduce::MaxF32 => &WAVE_MAX_F32,
+        WaveReduce::Or => &WAVE_OR_U32,
+        WaveReduce::And => &WAVE_AND_U32,
+        WaveReduce::Xor => &WAVE_XOR_U32,
+    }
+}
 
 /// The lane of a pixel in its 2 by 2 block, from the position (as float patterns).
 static QUAD_INDEX: Helper = Helper {
@@ -347,8 +550,54 @@ fn mask_number_instruction(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal
     let value = source(cx, insn, insn.src[0])?;
     cx.set(bit, value);
     let bit = Expr::Var(bit);
-    let lane = Expr::Input(Input::LaneIndex);
     let number = |n: u32| Expr::U32(n);
+    if cx.stage == Stage::Compute && cx.masks.real_wave() {
+        let wide = lanes == 64;
+        let (value, scc) = match insn.op {
+            Op::s_bcnt1_i32_b32 | Op::s_bcnt1_i32_b64 => {
+                let c = cx.tmp();
+                let h = if wide { &WAVE_BCNT1_B64 } else { &WAVE_BCNT1_B32 };
+                cx.set(c, Expr::Call(h, vec![bit]));
+                (Expr::Var(c), Some(Expr::bin(Bin::Ne, Expr::Var(c), number(0))))
+            }
+            Op::s_bcnt0_i32_b32 | Op::s_bcnt0_i32_b64 => {
+                let c = cx.tmp();
+                let h = if wide { &WAVE_BCNT1_B64 } else { &WAVE_BCNT1_B32 };
+                cx.set(
+                    c,
+                    Expr::bin(Bin::Sub, number(u32::from(lanes)), Expr::Call(h, vec![bit])),
+                );
+                (Expr::Var(c), Some(Expr::bin(Bin::Ne, Expr::Var(c), number(0))))
+            }
+            Op::s_ff1_i32_b32 | Op::s_ff1_i32_b64 => {
+                let h = if wide { &WAVE_FF1_B64 } else { &WAVE_FF1_B32 };
+                (Expr::Call(h, vec![bit]), None)
+            }
+            Op::s_ff0_i32_b32 | Op::s_ff0_i32_b64 => {
+                let h = if wide { &WAVE_FF0_B64 } else { &WAVE_FF0_B32 };
+                (Expr::Call(h, vec![bit]), None)
+            }
+            Op::s_flbit_i32_b32 | Op::s_flbit_i32_b64 => {
+                let h = if wide { &WAVE_FLBIT_B64 } else { &WAVE_FLBIT_B32 };
+                (Expr::Call(h, vec![bit]), None)
+            }
+            Op::s_bitcmp0_b32 | Op::s_bitcmp1_b32 | Op::s_bitcmp0_b64 | Op::s_bitcmp1_b64 => {
+                let h = if wide { &WAVE_BITCMP_B64 } else { &WAVE_BITCMP_B32 };
+                let set = Expr::Call(h, vec![bit, bits(insn, 1)?]);
+                let wanted = matches!(insn.op, Op::s_bitcmp1_b32 | Op::s_bitcmp1_b64);
+                cx.set(Var::Scc, if wanted { set } else { not(set) });
+                return Ok(true);
+            }
+            _ => return Ok(false),
+        };
+        let dst = var(insn, insn.dst)?;
+        cx.set(dst, value);
+        if let Some(scc) = scc {
+            cx.set(Var::Scc, scc);
+        }
+        return Ok(true);
+    }
+    let lane = Expr::Input(Input::LaneIndex);
     let lanes = u32::from(lanes);
     let none = number(u32::MAX);
     let (value, scc) = match insn.op {
@@ -398,7 +647,12 @@ fn mask_number_instruction(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal
 /// `v_mbcnt_lo_u32_b32` and `v_mbcnt_hi_u32_b32`: the bits of the mask half below this lane,
 /// plus the second source.
 fn count_below(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
-    let lane = Expr::Input(Input::LaneIndex);
+    let real_wave = cx.stage == Stage::Compute && cx.masks.real_wave();
+    let lane = if real_wave {
+        Expr::Call(&WAVE_LANE_INDEX, vec![])
+    } else {
+        Expr::Input(Input::LaneIndex)
+    };
     let half = Expr::U32(32);
     let low = insn.op == Op::v_mbcnt_lo_u32_b32;
     let below = match insn.src[0] {
@@ -413,7 +667,34 @@ fn count_below(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
             Expr::bin(Bin::Sub, lane, half),
             Expr::U32(0),
         ),
-        // A real mask holds this lane's bit and no other: no lane of it is below this one.
+        // A real mask holds this lane's bit in single lane mode, or a wave ballot in real wave mode.
+        Operand::Reg(Reg::ExecLo | Reg::ExecHi) if real_wave => {
+            let word = Expr::Call(
+                &MASK_WORD,
+                vec![
+                    Expr::Var(Var::Exec),
+                    Expr::U32(u32::from(matches!(insn.src[0], Operand::Reg(Reg::ExecHi)))),
+                ],
+            );
+            Expr::Call(if low { &MBCNT_LO } else { &MBCNT_HI }, vec![word, lane])
+        }
+        op if real_wave && reads_mask(cx, op) => {
+            let high = matches!(op, Operand::Reg(Reg::VccHi))
+                || matches!(op, Operand::Reg(Reg::S(n)) if cx.masks.reads_high_mask(n));
+            let mask_expr = match op {
+                Operand::Reg(Reg::VccHi) => Expr::Var(Var::Vcc),
+                Operand::Reg(Reg::S(n)) if high => {
+                    if !n.is_multiple_of(2) {
+                        Expr::Var(Var::Mask(n - 1))
+                    } else {
+                        return Err(refuse(insn, "mask-as-data"));
+                    }
+                }
+                _ => source(cx, insn, op)?,
+            };
+            let word = Expr::Call(&MASK_WORD, vec![mask_expr, Expr::U32(u32::from(high))]);
+            Expr::Call(if low { &MBCNT_LO } else { &MBCNT_HI }, vec![word, lane])
+        }
         Operand::Reg(Reg::ExecLo | Reg::ExecHi) => Expr::U32(0),
         op if reads_mask(cx, op) => Expr::U32(0),
         // A number: its bits below the lane number.
@@ -467,7 +748,7 @@ fn park(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
     Ok(true)
 }
 
-static MASK_WORD: Helper = Helper {
+pub(crate) static MASK_WORD: Helper = Helper {
     name: "decant_mask_word",
     result: Ty::U32,
     text: "uint decant_mask_word(bool value, uint word) { return WaveActiveBallot(value)[word]; }",
@@ -1206,36 +1487,95 @@ pub fn lift(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
         return Err(refuse(insn, what));
     }
     if cx.masks.lanes() == 64
-        && insn.op == Op::s_mov_b32
+        && matches!(insn.op, Op::s_mov_b32 | Op::s_cselect_b32)
         && let Operand::Reg(Reg::S(dst)) = insn.dst
         && !cx.masks.writes_mask(dst)
     {
-        let mask_src = match insn.src[0] {
-            Operand::Reg(Reg::ExecLo) => Some((Var::Exec, false)),
-            Operand::Reg(Reg::ExecHi) => Some((Var::Exec, true)),
-            Operand::Reg(Reg::VccLo) if cx.masks.reads_mask(VCC) => Some((Var::Vcc, false)),
-            Operand::Reg(Reg::VccHi) if cx.masks.reads_mask(VCC + 1) => Some((Var::Vcc, true)),
-            Operand::Reg(Reg::S(n)) if cx.masks.reads_mask(n) => {
-                if cx.masks.reads_high_mask(n) {
-                    if !n.is_multiple_of(2) {
-                        Some((Var::Mask(n - 1), true))
+        let mask_word = |op: Operand| -> Result<Option<(Var, bool)>, Refusal> {
+            Ok(match op {
+                Operand::Reg(Reg::ExecLo) => Some((Var::Exec, false)),
+                Operand::Reg(Reg::ExecHi) => Some((Var::Exec, true)),
+                Operand::Reg(Reg::VccLo) if cx.masks.reads_mask(VCC) => Some((Var::Vcc, false)),
+                Operand::Reg(Reg::VccHi) if cx.masks.reads_mask(VCC + 1) => Some((Var::Vcc, true)),
+                Operand::Reg(Reg::S(n)) if cx.masks.reads_mask(n) => {
+                    if cx.masks.reads_high_mask(n) {
+                        if !n.is_multiple_of(2) {
+                            Some((Var::Mask(n - 1), true))
+                        } else {
+                            return Err(refuse(insn, "mask-as-data"));
+                        }
                     } else {
-                        return Err(refuse(insn, "mask-as-data"));
+                        Some((Var::Mask(n), false))
                     }
-                } else {
-                    Some((Var::Mask(n), false))
+                }
+                _ => None,
+            })
+        };
+        if insn.op == Op::s_mov_b32 {
+            if let Some((mask_var, high)) = mask_word(insn.src[0])? {
+                if cx.stage == Stage::Compute && cx.masks.ballot_ready() {
+                    return Ok(false);
+                }
+                if !cx.masks.converged() {
+                    return Err(refuse(insn, "mask-as-data"));
+                }
+                cx.set(
+                    Var::S(dst),
+                    Expr::Call(
+                        &MASK_WORD,
+                        vec![Expr::Var(mask_var), Expr::U32(u32::from(high))],
+                    ),
+                );
+                return Ok(true);
+            }
+        } else {
+            let m0 = mask_word(insn.src[0])?;
+            let m1 = mask_word(insn.src[1])?;
+            if m0.is_some() || m1.is_some() {
+                if cx.stage == Stage::Compute && cx.masks.ballot_ready() {
+                    return Ok(false);
+                }
+                if !cx.masks.converged() {
+                    return Err(refuse(insn, "mask-as-data"));
+                }
+                let word_expr = |m: Option<(Var, bool)>, idx: usize| -> Result<Expr, Refusal> {
+                    match m {
+                        Some((mask_var, high)) => Ok(Expr::Call(
+                            &MASK_WORD,
+                            vec![Expr::Var(mask_var), Expr::U32(u32::from(high))],
+                        )),
+                        None => bits(insn, idx),
+                    }
+                };
+                let a = word_expr(m0, 0)?;
+                let b = word_expr(m1, 1)?;
+                cx.set(Var::S(dst), Expr::select(Expr::Var(Var::Scc), a, b));
+                return Ok(true);
+            }
+        }
+    }
+    if cx.stage == Stage::Compute && cx.masks.real_wave() {
+        if let Some(scan) = cx.masks.scan() {
+            match scan {
+                WaveScan::Skip => return Ok(true),
+                WaveScan::PrefixSum => {
+                    let input = bits(insn, 1)?;
+                    let res = cx.tmp();
+                    cx.set(res, Expr::Call(&WAVE_PREFIX_SUM_U32, vec![input]));
+                    set_vdst(cx, insn, Expr::Var(res))?;
+                    return Ok(true);
                 }
             }
-            _ => None,
-        };
-        if let Some((mask_var, high)) = mask_src {
-            if !cx.masks.converged() {
-                return Err(refuse(insn, "mask-as-data"));
-            }
-            cx.set(
-                Var::S(dst),
-                Expr::Call(&MASK_WORD, vec![Expr::Var(mask_var), Expr::U32(u32::from(high))]),
-            );
+        }
+        if let Some(part) = cx.masks.wave_reduce() {
+            let value = match part {
+                WaveReducePart::Identity(id) => Expr::U32(id),
+                WaveReducePart::Active(op) => {
+                    Expr::Call(wave_reduce_helper(op), vec![bits(insn, 0)?])
+                }
+            };
+            let dst = var(insn, insn.dst)?;
+            cx.set(dst, value);
             return Ok(true);
         }
     }
@@ -1329,7 +1669,14 @@ pub fn lift(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
             // A scalar write: the machine does it whatever EXEC says.
             let value = bits(insn, 0)?;
             let dst = var(insn, insn.dst)?;
-            cx.set(dst, value);
+            if cx.stage == Stage::Compute && cx.masks.real_wave() {
+                cx.set(
+                    dst,
+                    Expr::Call(&READ_FIRST_LANE, vec![value, Expr::Var(Var::Exec)]),
+                );
+            } else {
+                cx.set(dst, value);
+            }
             Ok(true)
         }
         _ if matches!(insn.op, Op::v_mbcnt_lo_u32_b32 | Op::v_mbcnt_hi_u32_b32_e64) => {

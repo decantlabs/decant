@@ -875,3 +875,114 @@ fn image_and_buffer_loads_clear_stale_descriptor_words_in_vgprs() {
     let buf = buffer_load(Op::buffer_load_dword, v(57), v(0), s(16), 0, true);
     placed(&build(Some(buf))).unwrap();
 }
+
+#[test]
+fn routed_jump_flags_preserve_buffer_descriptors_across_irreducible_exits() {
+    let build = |uninit_reaches_load: bool| {
+        let mut a = Asm::new();
+        let path_b = a.label();
+        let use_buf = a.label();
+        let exit = a.label();
+        a.push(sop1(Op::s_mov_b32, s(5), int(0)));
+        a.push(sopc(Op::s_cmp_eq_u32, s(6), int(0)));
+        a.branch(Op::s_cbranch_scc1, path_b);
+        // Path A: loads buffer descriptor into s12..s15 and jumps into `use_buf`.
+        a.push(smem(Op::s_load_dwordx4, s(12), s(4), 0x20));
+        a.push(sopc(Op::s_cmp_eq_u32, s(7), int(0)));
+        a.branch(Op::s_cbranch_scc1, use_buf);
+        a.push(vop1(Op::v_mov_b32, v(2), int(1)));
+        a.branch(Op::s_branch, exit);
+        // Path B: either bypasses `use_buf` to `exit`, or falls into `use_buf` uninitialised.
+        a.bind(path_b);
+        a.push(vop1(Op::v_mov_b32, v(2), int(2)));
+        if !uninit_reaches_load {
+            a.branch(Op::s_branch, exit);
+        }
+        a.bind(use_buf);
+        a.push(buffer_load(
+            Op::buffer_load_format_x,
+            v(2),
+            v(0),
+            s(12),
+            0,
+            true,
+        ));
+        a.bind(exit);
+        a.push(vop1(Op::v_mov_b32, v(3), v(2)));
+        a.push(sopp(Op::s_endpgm, 0));
+        let mut p = program(Stage::Compute, a);
+        p.threads = [32, 1, 1];
+        p.user_data = vec![UserDataSlot {
+            sgpr: 4,
+            kind: UserDataKind::Table,
+        }];
+        p.binding_table = vec![record(RegisterClass::Srv, 0, 4, 8)];
+        p
+    };
+
+    let good = build(false);
+    let (func, _) = placed(&good).unwrap();
+    assert_eq!(func.resources.len(), 1);
+    if let Some(dxc) = common::find_dxc() {
+        let compiled = decant_shader::translate_to_dxil(
+            &[good],
+            &RootSignature::default(),
+            &Options::default(),
+            &CountingHost::default(),
+            &dxc,
+        )
+        .unwrap_or_else(|r| panic!("{r}"));
+        assert_eq!(&compiled[0].dxil[..4], b"DXBC");
+    }
+
+    let bad = build(true);
+    let refusal = placed(&bad).unwrap_err();
+    assert_eq!(refusal.key(), "resource:untraced-descriptor");
+}
+
+#[test]
+fn guarded_image_descriptor_and_table_base_after_wqm_and_saveexec() {
+    let mut a = Asm::new();
+    let skip = a.label();
+    a.push(sop1(Op::s_mov_b32, s(26), EXEC));
+    a.push(sop1(Op::s_wqm_b32, EXEC, EXEC));
+    a.push(sop1(Op::s_mov_b32, s(5), int(0)));
+    a.push(sop1(Op::s_mov_b32, s(24), s(4)));
+    a.push(sop1(Op::s_and_saveexec_b32, s(6), s(26)));
+    a.branch(Op::s_cbranch_execz, skip);
+    a.push(sop1(Op::s_mov_b32, s(25), int(0)));
+    a.push(smem(Op::s_load_dwordx8, s(8), s(4), 0x20));
+    a.push(smem(Op::s_load_dwordx4, s(16), s(4), 0x40));
+    a.bind(skip);
+    a.push(sop1(Op::s_mov_b32, EXEC, s(6)));
+    a.push(smem(Op::s_load_dwordx4, s(20), s(24), 0x60));
+    a.push(image(Op::image_sample, v(4), v(0), s(8), s(16), 1, 0xf));
+    a.push(buffer_load(Op::buffer_load_dword, v(8), v(0), s(20), 0, true));
+    a.push(vop2(Op::v_add_f32, v(4), v(4), v(8)));
+    a.push(sopp(Op::s_endpgm, 0));
+
+    let mut p = program(Stage::Compute, a);
+    p.threads = [32, 1, 1];
+    p.user_data = vec![UserDataSlot {
+        sgpr: 4,
+        kind: UserDataKind::Table,
+    }];
+    p.binding_table = vec![
+        record(RegisterClass::Srv, 0, 4, 8),
+        record(RegisterClass::Sampler, 0, 4, 16),
+        record(RegisterClass::Srv, 1, 4, 24),
+    ];
+    let (func, _) = placed(&p).unwrap();
+    assert_eq!(func.resources.len(), 3);
+    if let Some(dxc) = common::find_dxc() {
+        let compiled = decant_shader::translate_to_dxil(
+            &[p],
+            &RootSignature::default(),
+            &Options::default(),
+            &CountingHost::default(),
+            &dxc,
+        )
+        .unwrap_or_else(|r| panic!("{r}"));
+        assert_eq!(&compiled[0].dxil[..4], b"DXBC");
+    }
+}

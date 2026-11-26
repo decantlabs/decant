@@ -1,19 +1,57 @@
-//! Tracks table sampler words through branches controlled by EXEC and saved lane masks.
+//! Tracks static descriptor origins and scalar table bases through branches controlled by
+//! structured control flow flags, loop selectors, EXEC, and saved lane masks.
 
 use super::{
     Bin, Desc, Expr, Flow, Found, Source, StageProgram, State, Stmt, Sym, Tracer, Ty, Un, Var,
     forget_pair,
 };
 use crate::ir::{Guard, Node};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum GuardedSampler {
+pub(super) enum GuardedDesc {
     Table { sgpr: u8, offset: u32 },
     Immediate([u32; 4]),
+    RootView { sgpr: u8 },
 }
 
-pub(super) type Slots = HashMap<(u32, u8), GuardedSampler>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum GuardedBase {
+    Table(u8),
+    Root(u8),
+}
+
+#[derive(Default)]
+pub(super) struct Guarded {
+    pub(super) descs: HashMap<(u32, u8, u8), GuardedDesc>,
+    pub(super) bases: HashMap<u32, GuardedBase>,
+}
+
+#[derive(Default)]
+pub(super) struct Needed {
+    pub(super) descs: HashSet<(u32, u8, u8)>,
+    pub(super) bases: HashSet<u32>,
+}
+
+impl Needed {
+    pub(super) fn is_empty(&self) -> bool {
+        self.descs.is_empty() && self.bases.is_empty()
+    }
+
+    fn covered_by(&self, g: &Guarded) -> bool {
+        self.descs.iter().all(|k| g.descs.contains_key(k))
+            && self.bases.iter().all(|k| g.bases.contains_key(k))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Only track synthetic flags and selectors inserted by the structure pass.
+    StructureOnly,
+    /// Track all live boolean masks, EXEC guards, and structured selectors.
+    Full,
+}
 
 const MAX_STATES: usize = 16_000;
 const MAX_STATES_PER_BLOCK: usize = 128;
@@ -67,199 +105,535 @@ fn truth(tracer: &Tracer, state: &State, expr: &Expr) -> Option<bool> {
     }
 }
 
-fn constrain(tracer: &Tracer, state: &mut State, expr: &Expr, value: bool) -> bool {
+fn constrain(
+    tracer: &Tracer,
+    state: &mut State,
+    expr: &Expr,
+    value: bool,
+    tracked: &HashMap<Var, usize>,
+) -> bool {
     if let Some(known) = truth(tracer, state, expr) {
         return known == value;
     }
     match expr {
-        Expr::Var(v) if v.ty() == Ty::Bool => {
+        Expr::Var(v) if v.ty() == Ty::Bool && tracked.contains_key(v) => {
             state.insert(*v, Sym::Const(u32::from(value)));
         }
-        Expr::Un(Un::LNot, x) => return constrain(tracer, state, x, !value),
+        Expr::Un(Un::LNot, x) => return constrain(tracer, state, x, !value, tracked),
+        Expr::Bin(Bin::Eq, a, b) if value => match (&**a, &**b) {
+            (Expr::Var(v), Expr::U32(k)) | (Expr::U32(k), Expr::Var(v))
+                if tracked.contains_key(v) =>
+            {
+                state.insert(*v, Sym::Const(*k));
+            }
+            _ => {}
+        },
+        Expr::Bin(Bin::Ne, a, b) if !value => match (&**a, &**b) {
+            (Expr::Var(v), Expr::U32(k)) | (Expr::U32(k), Expr::Var(v))
+                if tracked.contains_key(v) =>
+            {
+                state.insert(*v, Sym::Const(*k));
+            }
+            _ => {}
+        },
         _ => {}
     }
     true
 }
 
-fn live_flags(flow: &Flow<'_>) -> Vec<HashSet<Var>> {
-    let dependencies: Vec<_> = flow
-        .blocks
-        .iter()
-        .map(|block| {
-            let mut reads = HashSet::new();
-            let mut written = HashSet::new();
-            for stmt in block.stmts.iter().flat_map(|stmts| stmts.iter()) {
-                crate::resource::stmt_reads(stmt, &mut |v| {
-                    if v.ty() == Ty::Bool && !written.contains(&v) {
-                        reads.insert(v);
+/// Synthetic `structure` control variables (`Var::Flag` and `Var::Tmp`) that enclose any
+/// unresolved descriptor or base site in `needed`, closed under enclosing conditions of
+/// their own writes. Keeping only relevant flags prevents state explosion on large shaders
+/// with hundreds of unrelated multi-level jump flags.
+fn needed_synthetic(body: &[Node], needed: &Needed) -> HashSet<Var> {
+    fn walk_sites(nodes: &[Node], stack: &mut Vec<Var>, needed: &Needed, out: &mut HashSet<Var>) {
+        for node in nodes {
+            match node {
+                Node::Block(stmts) => {
+                    for s in stmts {
+                        let hit = match s {
+                            Stmt::Image(op, _) => {
+                                matches!(op.image, Desc::Regs(f) if needed.descs.contains(&(op.pc, f, 8)))
+                                    || matches!(op.sampler, Some(Desc::Regs(f)) if needed.descs.contains(&(op.pc, f, 4)))
+                            }
+                            Stmt::Buffer(op, _) => {
+                                matches!(op.buffer, Desc::Regs(f) if needed.descs.contains(&(op.pc, f, 4)))
+                            }
+                            Stmt::Set {
+                                value: Expr::Load(load),
+                                ..
+                            } => {
+                                if load.buffer {
+                                    needed.descs.contains(&(load.pc, load.base, 4))
+                                } else {
+                                    needed.bases.contains(&load.pc)
+                                }
+                            }
+                            _ => false,
+                        };
+                        if hit {
+                            out.extend(stack.iter().copied());
+                        }
                     }
-                });
-                if let Stmt::Set {
-                    dst,
-                    guard: Guard::Always,
-                    ..
-                } = stmt
-                    && dst.ty() == Ty::Bool
-                {
-                    written.insert(*dst);
+                }
+                Node::If { cond, then, els } => {
+                    let before = stack.len();
+                    crate::resource::reads(cond, &mut |v| {
+                        if matches!(v, Var::Tmp(_) | Var::Flag(_)) {
+                            stack.push(v);
+                        }
+                    });
+                    walk_sites(then, stack, needed, out);
+                    walk_sites(els, stack, needed, out);
+                    stack.truncate(before);
+                }
+                Node::Loop(inner) | Node::Once(inner) => walk_sites(inner, stack, needed, out),
+                Node::Break | Node::Continue | Node::Return => {}
+            }
+        }
+    }
+    fn walk_writes(nodes: &[Node], stack: &mut Vec<Var>, out: &mut HashSet<Var>) -> bool {
+        let mut changed = false;
+        for node in nodes {
+            match node {
+                Node::Block(stmts) => {
+                    for s in stmts {
+                        if let Stmt::Set { dst, .. } = s
+                            && out.contains(dst)
+                        {
+                            for &v in stack.iter() {
+                                changed |= out.insert(v);
+                            }
+                        }
+                    }
+                }
+                Node::If { cond, then, els } => {
+                    let before = stack.len();
+                    crate::resource::reads(cond, &mut |v| {
+                        if matches!(v, Var::Tmp(_) | Var::Flag(_)) {
+                            stack.push(v);
+                        }
+                    });
+                    changed |= walk_writes(then, stack, out);
+                    changed |= walk_writes(els, stack, out);
+                    stack.truncate(before);
+                }
+                Node::Loop(inner) | Node::Once(inner) => {
+                    changed |= walk_writes(inner, stack, out);
+                }
+                Node::Break | Node::Continue | Node::Return => {}
+            }
+        }
+        changed
+    }
+    let mut out = HashSet::new();
+    let mut stack = Vec::new();
+    walk_sites(body, &mut stack, needed, &mut out);
+    while walk_writes(body, &mut stack, &mut out) {}
+    out
+}
+
+fn collect_tracked(
+    flow: &Flow<'_>,
+    mode: Mode,
+    focus: Option<&HashSet<Var>>,
+) -> (HashMap<Var, usize>, HashSet<Var>) {
+    let mut synth = HashSet::new();
+    let mut index = HashMap::new();
+    let mut add = |v: Var| {
+        let next = index.len();
+        index.entry(v).or_insert(next);
+    };
+    for block in &flow.blocks {
+        if let Some((cond, _)) = block.condition {
+            crate::resource::reads(cond, &mut |v| {
+                if matches!(v, Var::Tmp(_) | Var::Flag(_)) {
+                    if focus.is_none_or(|f| f.contains(&v)) {
+                        synth.insert(v);
+                        add(v);
+                    }
+                } else if mode == Mode::Full && v.ty() == Ty::Bool {
+                    add(v);
+                }
+            });
+        }
+        if mode == Mode::Full {
+            for stmt in block.stmts.iter().flat_map(|s| s.iter()) {
+                match stmt {
+                    Stmt::Set { dst, value, guard } => {
+                        if *guard == Guard::Exec {
+                            add(Var::Exec);
+                        }
+                        if dst.ty() == Ty::Bool {
+                            add(*dst);
+                            crate::resource::reads(value, &mut |v| {
+                                if v.ty() == Ty::Bool {
+                                    add(v);
+                                }
+                            });
+                        }
+                    }
+                    Stmt::Image(_, Guard::Exec)
+                    | Stmt::Buffer(_, Guard::Exec)
+                    | Stmt::Effect {
+                        guard: Guard::Exec, ..
+                    } => add(Var::Exec),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (index, synth)
+}
+
+/// Bitset liveness for tracked control variables at each block entry.
+fn live_controls(
+    flow: &Flow<'_>,
+    mode: Mode,
+    tracked: &HashMap<Var, usize>,
+) -> (Vec<Vec<u64>>, usize) {
+    let words = tracked.len().div_ceil(64);
+    let n = flow.blocks.len();
+    if words == 0 {
+        return (vec![Vec::new(); n], 0);
+    }
+    let set_bit = |bits: &mut [u64], id: usize| bits[id / 64] |= 1u64 << (id % 64);
+    let clear_bit = |bits: &mut [u64], id: usize| bits[id / 64] &= !(1u64 << (id % 64));
+    let has_bit = |bits: &[u64], id: usize| (bits[id / 64] >> (id % 64)) & 1 != 0;
+
+    let exec_id = tracked.get(&Var::Exec).copied();
+    let mut live = vec![vec![0u64; words]; n];
+    let mut cur = vec![0u64; words];
+    loop {
+        let mut changed = false;
+        for (i, block) in flow.blocks.iter().enumerate().rev() {
+            cur.fill(0);
+            for &next in &block.succs {
+                for (dst, &src) in cur.iter_mut().zip(&live[next]) {
+                    *dst |= src;
+                }
+            }
+            if let Some(stmts) = block.stmts.as_ref() {
+                for stmt in stmts.iter().rev() {
+                    if mode == Mode::Full
+                        && let Some(eid) = exec_id
+                        && matches!(
+                            stmt,
+                            Stmt::Set {
+                                guard: Guard::Exec,
+                                ..
+                            } | Stmt::Image(_, Guard::Exec)
+                                | Stmt::Buffer(_, Guard::Exec)
+                                | Stmt::Effect {
+                                    guard: Guard::Exec,
+                                    ..
+                                }
+                        )
+                    {
+                        set_bit(&mut cur, eid);
+                    }
+                    if let Stmt::Set {
+                        dst, value, guard, ..
+                    } = stmt
+                        && let Some(&did) = tracked.get(dst)
+                        && has_bit(&cur, did)
+                    {
+                        if *guard == Guard::Always {
+                            clear_bit(&mut cur, did);
+                        }
+                        crate::resource::reads(value, &mut |v| {
+                            if let Some(&vid) = tracked.get(&v) {
+                                set_bit(&mut cur, vid);
+                            }
+                        });
+                    }
                 }
             }
             if let Some((cond, _)) = block.condition {
                 crate::resource::reads(cond, &mut |v| {
-                    reads.insert(v);
+                    if let Some(&vid) = tracked.get(&v) {
+                        set_bit(&mut cur, vid);
+                    }
                 });
             }
-            (reads, written)
-        })
-        .collect();
-    let mut live = vec![HashSet::new(); flow.blocks.len()];
-    loop {
-        let mut changed = false;
-        for (i, block) in flow.blocks.iter().enumerate().rev() {
-            let (reads, written) = &dependencies[i];
-            let mut needed = reads.clone();
-            for &next in &block.succs {
-                needed.extend(live[next].difference(written).copied());
+            if cur != live[i] {
+                live[i].copy_from_slice(&cur);
+                changed = true;
             }
-            changed |= needed != live[i];
-            live[i] = needed;
         }
         if !changed {
-            return live;
+            return (live, words);
         }
     }
 }
 
-fn partition(state: &State) -> Vec<(Var, Sym)> {
+fn partition(state: &State, tracked: &HashMap<Var, usize>) -> Vec<(Var, Sym)> {
     let mut parts: Vec<_> = state
         .iter()
-        .filter(|(v, _)| v.ty() == Ty::Bool)
+        .filter(|(v, _)| tracked.contains_key(v))
         .map(|(v, value)| (*v, *value))
         .collect();
     parts.sort_unstable_by_key(|(v, _)| *v);
     parts
 }
 
-/// A sample can bind a static slot when every feasible active path supplies the same four words.
-pub(super) fn sampler_slots(body: &mut [Node], program: &StageProgram, lanes: u8) -> Slots {
+fn record_desc(
+    found_map: &mut HashMap<(u32, u8, u8), Option<GuardedDesc>>,
+    tracer: &Tracer,
+    state: &State,
+    pc: u32,
+    first: u8,
+    words: u8,
+) {
+    let slot = match tracer.found(state, first, words, pc) {
+        Ok(Found::Slot { sgpr, byte }) => Some(GuardedDesc::Table { sgpr, offset: byte }),
+        Ok(Found::Immediate(imm)) if words == 4 => Some(GuardedDesc::Immediate(imm)),
+        Ok(Found::RootView { sgpr }) if words == 4 => Some(GuardedDesc::RootView { sgpr }),
+        _ => None,
+    };
+    found_map
+        .entry((pc, first, words))
+        .and_modify(|agreed| {
+            if *agreed != slot {
+                *agreed = None;
+            }
+        })
+        .or_insert(slot);
+}
+
+fn record_base(
+    base_map: &mut HashMap<u32, Option<GuardedBase>>,
+    state: &State,
+    pc: u32,
+    base: u8,
+) {
+    let lo = state.get(&Var::S(base)).copied();
+    let hi = state.get(&Var::S(base + 1)).copied();
+    let kind = match (lo, hi) {
+        (Some(Sym::User(sgpr)), Some(Sym::Const(0))) => Some(GuardedBase::Table(sgpr)),
+        (Some(Sym::User(sgpr)), Some(Sym::User(next))) if next == sgpr + 1 => {
+            Some(GuardedBase::Root(sgpr))
+        }
+        _ => None,
+    };
+    base_map
+        .entry(pc)
+        .and_modify(|agreed| {
+            if *agreed != kind {
+                *agreed = None;
+            }
+        })
+        .or_insert(kind);
+}
+
+fn run_mode(
+    body: &mut [Node],
+    program: &StageProgram,
+    lanes: u8,
+    mode: Mode,
+    focus: Option<&HashSet<Var>>,
+) -> Guarded {
     let flow = Flow::build(body, true);
     let mut resources = Vec::new();
     let mut tracer = Tracer::new(program, &mut resources, lanes, false, &flow);
 
-    let live = live_flags(&flow);
-    // Keep states with different live mask values separate at a join. Within each
+    let (tracked, synth) = collect_tracked(&flow, mode, focus);
+    if mode == Mode::StructureOnly && synth.is_empty() {
+        return Guarded::default();
+    }
+    let (live, words) = live_controls(&flow, mode, &tracked);
+    let is_live = |block: usize, v: Var| -> bool {
+        let Some(&id) = tracked.get(&v) else {
+            return true;
+        };
+        words > 0 && ((live[block][id / 64] >> (id % 64)) & 1 != 0)
+    };
+    let max_states = if mode == Mode::StructureOnly {
+        MAX_STATES.max(flow.blocks.len().saturating_mul(8))
+    } else {
+        MAX_STATES
+    };
+    let max_edges = if mode == Mode::StructureOnly {
+        MAX_EDGES.max(flow.blocks.len().saturating_mul(64))
+    } else {
+        MAX_EDGES
+    };
+    // Structure lowering flags are hoisted and initialised to `false` at function entry.
+    let mut entry_state = State::default();
+    for &v in &synth {
+        if matches!(v, Var::Flag(_)) && is_live(0, v) {
+            entry_state.insert(v, Sym::Const(0));
+        }
+    }
+    // Keep states with different live control values separate at a join. Within each
     // partition, keep only the register facts that agree on every incoming edge.
     let mut entries = vec![HashMap::<Vec<(Var, Sym)>, State>::new(); flow.blocks.len()];
-    let mut pending = VecDeque::from([(0, State::default())]);
+    let mut inbox: Vec<Vec<State>> = vec![Vec::new(); flow.blocks.len()];
+    let mut queued = vec![false; flow.blocks.len()];
+    let mut work = BinaryHeap::new();
+    inbox[0].push(entry_state);
+    queued[0] = true;
+    work.push(Reverse(0usize));
+
     let mut count = 0;
     let mut partitions = 0;
-    let mut samples = HashMap::<(u32, u8), Option<GuardedSampler>>::new();
-    while let Some((block, mut incoming)) = pending.pop_front() {
-        count += 1;
-        if count > MAX_EDGES || partitions > MAX_STATES {
-            return HashMap::new();
-        }
+    let mut found_map = HashMap::<(u32, u8, u8), Option<GuardedDesc>>::new();
+    let mut base_map = HashMap::<u32, Option<GuardedBase>>::new();
+    while let Some(Reverse(block)) = work.pop() {
+        queued[block] = false;
+        let batch = std::mem::take(&mut inbox[block]);
         let node = &flow.blocks[block];
-        if let Some((cond, want)) = node.condition
-            && !constrain(&tracer, &mut incoming, cond, want)
-        {
-            continue;
-        }
-        incoming.retain(|v, _| v.ty() != Ty::Bool || live[block].contains(v));
-        let parts = partition(&incoming);
-        let states = &mut entries[block];
-        if let Some(old) = states.get_mut(&parts) {
-            let n = old.len();
-            old.retain(|v, sym| incoming.get(v) == Some(sym));
-            if old.len() == n {
+        for mut incoming in batch {
+            count += 1;
+            if count > max_edges || partitions > max_states {
+                return Guarded::default();
+            }
+            if let Some((cond, want)) = node.condition
+                && !constrain(&tracer, &mut incoming, cond, want, &tracked)
+            {
                 continue;
             }
-            incoming = old.clone();
-        } else {
-            if states.len() >= MAX_STATES_PER_BLOCK {
-                return HashMap::new();
-            }
-            states.insert(parts, incoming.clone());
-            partitions += 1;
-        }
-        let mut active = vec![incoming];
-        for stmt in node.stmts.iter().flat_map(|s| s.iter()) {
-            let guard = match stmt {
-                Stmt::Set { guard, .. }
-                | Stmt::Image(_, guard)
-                | Stmt::Buffer(_, guard)
-                | Stmt::Effect { guard, .. } => *guard,
-                _ => Guard::Always,
-            };
-            let exec = Expr::Var(Var::Exec);
-            if guard == Guard::Exec {
-                let mut disabled = Vec::new();
-                for unknown in active.iter_mut().filter(|s| !s.contains_key(&Var::Exec)) {
-                    let mut other = unknown.clone();
-                    other.insert(Var::Exec, Sym::Const(0));
-                    unknown.insert(Var::Exec, Sym::Const(1));
-                    disabled.push(other);
-                }
-                active.extend(disabled);
-                if active.len() > MAX_STATES_PER_BLOCK {
-                    return HashMap::new();
-                }
-            }
-            for state in &mut active {
-                if guard == Guard::Exec && truth(&tracer, state, &exec) == Some(false) {
+            incoming.retain(|v, _| is_live(block, *v));
+            let parts = partition(&incoming, &tracked);
+            let states = &mut entries[block];
+            if let Some(old) = states.get_mut(&parts) {
+                let n = old.len();
+                old.retain(|v, sym| incoming.get(v) == Some(sym));
+                if old.len() == n {
                     continue;
                 }
-                match stmt {
-                    Stmt::Set { dst, value, .. } if dst.ty() == Ty::Bool => {
-                        if let Some(value) = truth(&tracer, state, value) {
-                            state.insert(*dst, Sym::Const(u32::from(value)));
-                            forget_pair(state, *dst, lanes);
-                        } else {
+                incoming = old.clone();
+            } else {
+                if states.len() >= MAX_STATES_PER_BLOCK {
+                    return Guarded::default();
+                }
+                states.insert(parts, incoming.clone());
+                partitions += 1;
+            }
+            let mut active = vec![incoming];
+            for stmt in node.stmts.iter().flat_map(|s| s.iter()) {
+                let guard = match stmt {
+                    Stmt::Set { guard, .. }
+                    | Stmt::Image(_, guard)
+                    | Stmt::Buffer(_, guard)
+                    | Stmt::Effect { guard, .. } => *guard,
+                    _ => Guard::Always,
+                };
+                let exec = Expr::Var(Var::Exec);
+                if mode == Mode::Full && guard == Guard::Exec {
+                    let mut disabled = Vec::new();
+                    for unknown in active.iter_mut().filter(|s| !s.contains_key(&Var::Exec)) {
+                        let mut other = unknown.clone();
+                        other.insert(Var::Exec, Sym::Const(0));
+                        unknown.insert(Var::Exec, Sym::Const(1));
+                        disabled.push(other);
+                    }
+                    active.extend(disabled);
+                    if active.len() > MAX_STATES_PER_BLOCK {
+                        return Guarded::default();
+                    }
+                }
+                for state in &mut active {
+                    if mode == Mode::Full
+                        && guard == Guard::Exec
+                        && truth(&tracer, state, &exec) == Some(false)
+                    {
+                        continue;
+                    }
+                    match stmt {
+                        Stmt::Set { dst, value, .. }
+                            if dst.ty() == Ty::Bool && tracked.contains_key(dst) =>
+                        {
+                            if let Some(value) = truth(&tracer, state, value) {
+                                state.insert(*dst, Sym::Const(u32::from(value)));
+                                forget_pair(state, *dst, lanes);
+                            } else {
+                                tracer.step(state, stmt, block, &mut 0);
+                            }
+                        }
+                        Stmt::Set {
+                            value: Expr::Load(load),
+                            ..
+                        } => {
+                            if load.buffer {
+                                record_desc(&mut found_map, &tracer, state, load.pc, load.base, 4);
+                            } else {
+                                record_base(&mut base_map, state, load.pc, load.base);
+                            }
                             tracer.step(state, stmt, block, &mut 0);
                         }
-                    }
-                    Stmt::Image(op, _) => {
-                        if let Some(Desc::Regs(first)) = op.sampler {
-                            let slot = match tracer.found(state, first, 4, op.pc) {
-                                Ok(Found::Slot { sgpr, byte }) => {
-                                    Some(GuardedSampler::Table { sgpr, offset: byte })
+                        Stmt::Image(op, _) => {
+                            if let Desc::Regs(first) = op.image {
+                                record_desc(&mut found_map, &tracer, state, op.pc, first, 8);
+                            }
+                            if let Some(Desc::Regs(first)) = op.sampler {
+                                record_desc(&mut found_map, &tracer, state, op.pc, first, 4);
+                            }
+                            for r in op.data_writes() {
+                                state.remove(&Var::V(r));
+                            }
+                        }
+                        Stmt::Buffer(op, _) => {
+                            if let Desc::Regs(first) = op.buffer {
+                                record_desc(&mut found_map, &tracer, state, op.pc, first, 4);
+                            }
+                            if !op.store || (op.glc && op.op.name().contains("atomic")) {
+                                for r in op.data..op.data.saturating_add(op.count) {
+                                    state.remove(&Var::V(r));
                                 }
-                                Ok(Found::Immediate(words)) => {
-                                    Some(GuardedSampler::Immediate(words))
-                                }
-                                _ => None,
-                            };
-                            samples
-                                .entry((op.pc, first))
-                                .and_modify(|agreed| {
-                                    if *agreed != slot {
-                                        *agreed = None;
-                                    }
-                                })
-                                .or_insert(slot);
+                            }
                         }
-                        for r in op.data_writes() {
-                            state.remove(&Var::V(r));
-                        }
+                        _ => tracer.step(state, stmt, block, &mut 0),
                     }
-                    Stmt::Buffer(op, _) if !op.store => {
-                        for r in op.data..op.data + op.count {
-                            state.remove(&Var::V(r));
-                        }
-                    }
-                    _ => tracer.step(state, stmt, block, &mut 0),
                 }
             }
-        }
-        for mut state in active {
-            state.retain(|v, _| !matches!(v, Var::Tmp(_) | Var::Flag(_)));
-            for &next in &node.succs {
-                pending.push_back((next, state.clone()));
+            for mut state in active {
+                state.retain(|v, _| !matches!(v, Var::Tmp(_) | Var::Flag(_)) || tracked.contains_key(v));
+                for &next in &node.succs {
+                    inbox[next].push(state.clone());
+                    if !queued[next] {
+                        queued[next] = true;
+                        work.push(Reverse(next));
+                    }
+                }
             }
         }
     }
-    samples
-        .into_iter()
-        .filter_map(|(site, slot)| Some((site, slot?)))
-        .collect()
+    Guarded {
+        descs: found_map
+            .into_iter()
+            .filter_map(|(site, slot)| Some((site, slot?)))
+            .collect(),
+        bases: base_map
+            .into_iter()
+            .filter_map(|(pc, base)| Some((pc, base?)))
+            .collect(),
+    }
+}
+
+/// Resolves static descriptor origins and scalar table bases along feasible paths.
+/// Starts with structured control flow flags and loop selectors alone (fast on large programs)
+/// and falls back to full EXEC and mask tracking only when needed sites remain unresolved.
+pub(super) fn solve(
+    body: &mut [Node],
+    program: &StageProgram,
+    lanes: u8,
+    needed: &Needed,
+) -> Guarded {
+    let focus = needed_synthetic(body, needed);
+    let mut out = if focus.is_empty() {
+        Guarded::default()
+    } else {
+        run_mode(body, program, lanes, Mode::StructureOnly, Some(&focus))
+    };
+    if !needed.covered_by(&out) {
+        let full = run_mode(body, program, lanes, Mode::Full, None);
+        for (k, v) in full.descs {
+            out.descs.entry(k).or_insert(v);
+        }
+        for (k, v) in full.bases {
+            out.bases.entry(k).or_insert(v);
+        }
+    }
+    out
 }

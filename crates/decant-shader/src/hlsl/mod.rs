@@ -810,7 +810,11 @@ pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
     }
     let helpers = collect_helpers(func);
     let uses_wave_lanes = helpers.iter().any(|h| {
-        h.name == crate::lift::wave::READ_LANE.name || h.name == crate::lift::wave::WRITE_LANE.name
+        h.name == crate::lift::wave::READ_LANE.name
+            || h.name == crate::lift::wave::WRITE_LANE.name
+            || h.name == crate::lift::wave::MASK_WORD.name
+            || h.name == crate::lift::wave::READ_FIRST_LANE.name
+            || h.name.starts_with("decant_wave_")
     });
     let uses_wave_swizzle = helpers
         .iter()

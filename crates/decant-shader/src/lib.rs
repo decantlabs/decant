@@ -75,7 +75,8 @@ pub fn lift_program(program: &StageProgram) -> Result<ir::Function, Refusal> {
             if std::ptr::eq(*h, &lift::wave::DPP_ADD)
                 || std::ptr::eq(*h, &lift::wave::PERMLANE)
                 || std::ptr::eq(*h, &lift::wave::BPERMUTE)
-                || std::ptr::eq(*h, &lift::wave::DPP8_MOV))
+                || std::ptr::eq(*h, &lift::wave::DPP8_MOV)
+                || (!masks.converged() && std::ptr::eq(*h, &lift::wave::MASK_WORD)))
     }) {
         lift::wave::check_dpp_context(&graph, &masks)?;
     }
