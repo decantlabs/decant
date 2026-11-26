@@ -17,9 +17,9 @@
 //! not packed (record flags 1, the flat inputs of the pixel side) has the half float in the low
 //! half of each channel. Without a container every output register opens its own slot, except
 //! 16 bit registers that fit into the open packed slot.
-//! The other position targets (13 to 15: point size, layer, viewport, clip distances) are not
-//! written yet. A parameter export to a slot no register takes is dropped, since nothing reads
-//! it.
+//! Target 13 is the miscellaneous position vector (layer in `.z`, viewport in `.w`); targets
+//! 14 and 15 (clip/cull distances) are not written yet. A parameter export to a slot no register
+//! takes is dropped, since nothing reads it.
 
 use super::pixel::{Layout, Place, Walked, register_mask, walk};
 use super::{Interface, field, ordered, refuse};
@@ -183,6 +183,25 @@ fn export(
                 },
                 value: word(chan),
             });
+        }
+        return Ok(());
+    }
+    if e.target == 13 {
+        // POS1: .z carries SV_RenderTargetArrayIndex (4), .w carries SV_ViewportArrayIndex (5).
+        // Unused .x/.y (point size / edge flag) and absent signature elements are ignored.
+        for (src_chan, sysval) in [(2u8, 4u32), (3u8, 5u32)] {
+            if enabled(src_chan)
+                && let Some(element) = outputs.iter().position(|o| o.system_value == sysval)
+            {
+                let chan = outputs[element].mask.trailing_zeros() as u8;
+                out.push(Stmt::Output {
+                    to: OutputRef {
+                        element: element as u16,
+                        chan,
+                    },
+                    value: word(src_chan),
+                });
+            }
         }
         return Ok(());
     }

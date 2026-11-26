@@ -334,3 +334,35 @@ fn a_clip_distance_slot_links() {
     assert!(vhlsl.contains("decant_out.o1 = asfloat(v12)"), "{vhlsl}");
     assert!(phlsl.contains("v3 = asuint(decant_in.i1)"), "{phlsl}");
 }
+
+#[test]
+fn pos1_exports_render_target_and_viewport_array_indices() {
+    let mut a = Asm::new();
+    a.push(sopp(Op::s_swappc_b64, 0));
+    a.push(export(32, 0xf, [8, 9, 10, 11], false, false, false));
+    a.push(export(12, 0xf, [4, 5, 6, 7], false, false, false));
+    a.push(export(13, 0b1101, [12, 0, 13, 14], false, true, false));
+    a.push(sopp(Op::s_endpgm, 0));
+    let vs = StageProgram {
+        inputs: vec![el("POSITION", 0, 0, 0, 15, 3)],
+        outputs: vec![
+            el("TEXCOORD", 0, 0, 0, 15, 3),
+            el("SV_Position", 0, 1, 1, 15, 3),
+            el("SV_RenderTargetArrayIndex", 0, 4, 2, 1, 1),
+            el("SV_ViewportArrayIndex", 0, 5, 3, 1, 1),
+        ],
+        param_exports: vec![param(0, 6, 0, 0)],
+        name: "vertex_pos1".to_owned(),
+        ..StageProgram::new(Stage::Vertex, a.finish())
+    };
+    let ps = pixel_reading(
+        &[(0, 0)],
+        vec![el("TEXCOORD", 0, 0, 0, 15, 3)],
+        vec![input(0, 6, 0, None, 0x02)],
+    );
+    let (vhlsl, _phlsl) = link(&vs, &ps);
+    assert!(vhlsl.contains("uint o2 : SV_RenderTargetArrayIndex;"), "{vhlsl}");
+    assert!(vhlsl.contains("uint o3 : SV_ViewportArrayIndex;"), "{vhlsl}");
+    assert!(vhlsl.contains("decant_out.o2 = v13;"), "{vhlsl}");
+    assert!(vhlsl.contains("decant_out.o3 = v14;"), "{vhlsl}");
+}
