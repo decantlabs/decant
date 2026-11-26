@@ -496,6 +496,25 @@ fn note_async_left_out(number: u32, waited: Duration) {
     }
 }
 
+/// Parses `DECANT_D3D12X_PREWARM_HISTORY` (default on when direct mode and async PSO creation are active).
+fn parse_prewarm_history(setting: Option<&str>, direct: bool, async_make: bool) -> bool {
+    if !direct || !async_make {
+        return false;
+    }
+    !matches!(setting.map(str::trim).filter(|s| !s.is_empty()), Some(s) if matches!(s.to_ascii_lowercase().as_str(), "0" | "off" | "false"))
+}
+
+fn prewarm_history_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_prewarm_history(
+            std::env::var("DECANT_D3D12X_PREWARM_HISTORY").ok().as_deref(),
+            crate::compile_service::direct_enabled(),
+            async_make_enabled(),
+        )
+    })
+}
+
 /// Whether the PC `Create*PipelineState` calls run on worker threads, away from the title's
 /// recording threads. `DECANT_D3D12X_ASYNC_PSO=0` turns this off.
 fn async_make_enabled() -> bool {
@@ -517,16 +536,27 @@ struct MakeJob {
     service: Option<&'static crate::compile_service::Service>,
 }
 
-/// Jobs for the maker workers. Compute jobs are served before graphics and mesh jobs.
+enum QueueJob {
+    Live(MakeJob),
+    Prewarm(&'static Lazy),
+}
+
+/// Jobs for the maker workers. Compute jobs are served before graphics and mesh jobs, and live
+/// first-bind jobs always take priority over background history prewarm jobs.
 #[derive(Default)]
 struct MakerQueues {
     compute: VecDeque<MakeJob>,
     graphics: VecDeque<MakeJob>,
+    prewarm: VecDeque<&'static Lazy>,
 }
 
 impl MakerQueues {
-    fn next(&mut self) -> Option<MakeJob> {
-        self.compute.pop_front().or_else(|| self.graphics.pop_front())
+    fn next(&mut self) -> Option<QueueJob> {
+        self.compute
+            .pop_front()
+            .map(QueueJob::Live)
+            .or_else(|| self.graphics.pop_front().map(QueueJob::Live))
+            .or_else(|| self.prewarm.pop_front().map(QueueJob::Prewarm))
     }
 }
 
@@ -578,8 +608,49 @@ fn maker_loop() {
                 waiting = wake.wait(waiting).unwrap_or_else(|e| e.into_inner());
             }
         };
-        run_job(job.lazy, job.source, job.service);
+        match job {
+            QueueJob::Live(job) => run_job(job.lazy, job.source, job.service),
+            QueueJob::Prewarm(lazy) => run_prewarm(lazy),
+        }
     }
+}
+
+fn run_prewarm(lazy: &'static Lazy) {
+    if lazy.made.get().is_some() || lazy.making.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(service) = crate::direct_pso::current_service() else {
+        lazy.making.store(false, Ordering::Release);
+        return;
+    };
+    let source = {
+        let guard = lazy.recipe.owned.read().unwrap_or_else(|e| e.into_inner());
+        let Some(owned) = guard.as_ref() else {
+            lazy.making.store(false, Ordering::Release);
+            return;
+        };
+        match crate::direct_pso::choose_with_budget(lazy as *const Lazy as usize, owned, lazy.precompile_key, Duration::from_secs(5)) {
+            crate::direct_pso::Choice::Pending => {
+                lazy.making.store(false, Ordering::Release);
+                return;
+            }
+            crate::direct_pso::Choice::Direct(patched) => MakeSource::Direct(patched),
+            crate::direct_pso::Choice::Original => MakeSource::Original,
+        }
+    };
+    run_job(lazy, source, Some(service));
+}
+
+fn submit_prewarm(lazy: &'static Lazy) {
+    if start_makers() == 0 {
+        return;
+    }
+    let (queues, wake) = &*MAKER_JOBS;
+    {
+        let mut waiting = queues.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.prewarm.push_back(lazy);
+    }
+    wake.notify_one();
 }
 
 /// Hands a job to the workers. Without any worker, the calling thread makes the pipeline.
@@ -686,8 +757,16 @@ pub unsafe fn defer(device: usize, owned: Owned, riid: *const GUID, out: *mut *m
         making: AtomicBool::new(false),
         pending_logged: AtomicBool::new(false),
     });
+    let raw = Box::into_raw(object);
     // SAFETY: by the contract above. The object is never freed, see `release`.
-    unsafe { *out = Box::into_raw(object).cast() };
+    unsafe { *out = raw.cast() };
+    if prewarm_history_enabled()
+        && let Some(key) = precompile_key
+        && crate::precompile_queue::in_history(key)
+    {
+        // SAFETY: `Lazy` is never freed for the lifetime of the process.
+        submit_prewarm(unsafe { &*raw });
+    }
     0
 }
 
@@ -1211,18 +1290,30 @@ mod tests {
     }
 
     #[test]
-    fn compute_jobs_are_served_before_graphics_jobs() {
+    fn compute_jobs_are_served_before_graphics_jobs_and_live_before_prewarm() {
         let shader = b"DXBC0123456789abcdefqueued";
         let compute = defer_compute(1, shader, counting_create);
         let graphics = defer_compute(2, shader, counting_create);
-        // SAFETY: both are our `Lazy` objects, which are never freed.
-        let (compute, graphics): (&'static Lazy, &'static Lazy) = unsafe { (&*compute.cast::<Lazy>(), &*graphics.cast::<Lazy>()) };
+        let prewarm = defer_compute(3, shader, counting_create);
+        // SAFETY: all three are our `Lazy` objects, which are never freed.
+        let (compute, graphics, prewarm): (&'static Lazy, &'static Lazy, &'static Lazy) = unsafe {
+            (&*compute.cast::<Lazy>(), &*graphics.cast::<Lazy>(), &*prewarm.cast::<Lazy>())
+        };
         let mut queues = MakerQueues::default();
+        queues.prewarm.push_back(prewarm);
         queues.graphics.push_back(MakeJob { lazy: graphics, source: MakeSource::Original, service: None });
         queues.compute.push_back(MakeJob { lazy: compute, source: MakeSource::Original, service: None });
-        assert!(std::ptr::eq(queues.next().unwrap().lazy, compute));
-        assert!(std::ptr::eq(queues.next().unwrap().lazy, graphics));
+        assert!(matches!(queues.next(), Some(QueueJob::Live(job)) if std::ptr::eq(job.lazy, compute)));
+        assert!(matches!(queues.next(), Some(QueueJob::Live(job)) if std::ptr::eq(job.lazy, graphics)));
+        assert!(matches!(queues.next(), Some(QueueJob::Prewarm(p)) if std::ptr::eq(p, prewarm)));
         assert!(queues.next().is_none());
+
+        assert!(parse_prewarm_history(None, true, true));
+        assert!(parse_prewarm_history(Some("1"), true, true));
+        assert!(!parse_prewarm_history(Some("0"), true, true));
+        assert!(!parse_prewarm_history(Some("off"), true, true));
+        assert!(!parse_prewarm_history(None, false, true));
+        assert!(!parse_prewarm_history(None, true, false));
     }
 
     #[test]

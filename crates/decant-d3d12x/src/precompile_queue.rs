@@ -50,6 +50,23 @@ fn read_history(dir: &Path) -> Option<Vec<u128>> {
     (keys.iter().collect::<HashSet<_>>().len() == keys.len()).then_some(keys)
 }
 
+fn read_history_set(dir: &Path) -> HashSet<u128> {
+    read_history(dir).unwrap_or_default().into_iter().collect()
+}
+
+/// Returns true when `key` was bound in a previous run's persisted `bind-order.bin` history.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn in_history(key: u128) -> bool {
+    static KEYS: std::sync::OnceLock<HashSet<u128>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let Some(cache) = crate::direct_cache::DiskCache::from_env() else {
+            return HashSet::new();
+        };
+        read_history_set(cache.dir())
+    })
+    .contains(&key)
+}
+
 fn write_history(dir: &Path, keys: &[u128]) -> io::Result<()> {
     let keys = &keys[..keys.len().min(MAX_ENTRIES)];
     let mut bytes = MAGIC.to_vec();
@@ -1426,5 +1443,8 @@ mod tests {
         assert_eq!(read_history(&dir.0), None);
         write_history(&dir.0, &[]).unwrap();
         assert_eq!(read_history(&dir.0), Some(Vec::new()));
+        write_history(&dir.0, &[11, 22]).unwrap();
+        let set = read_history_set(&dir.0);
+        assert!(set.contains(&11) && set.contains(&22) && !set.contains(&33));
     }
 }
