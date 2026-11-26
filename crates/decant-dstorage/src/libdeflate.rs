@@ -60,7 +60,8 @@ pub fn gdeflate_compress(data: &[u8], level: i32) -> Option<Vec<u8>> {
     // SAFETY: a null compressor asks for the bound over every compressor, `npages` is writable.
     let scratch_size = unsafe { libdeflate_gdeflate_compress_bound(std::ptr::null_mut(), TILE_BYTES, &mut npages) };
     let mut scratch = vec![0u8; scratch_size];
-    let mut tiles: Vec<Vec<u8>> = Vec::new();
+    let tile_count = data.len().div_ceil(TILE_BYTES);
+    let mut tiles: Vec<Vec<u8>> = Vec::with_capacity(tile_count);
     for chunk in data.chunks(TILE_BYTES) {
         let mut page = OutPage { data: scratch.as_mut_ptr().cast(), nbytes: scratch_size };
         // SAFETY: one page whose buffer holds `scratch_size` bytes, and `chunk` is readable.

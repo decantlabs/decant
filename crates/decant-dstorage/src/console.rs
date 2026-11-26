@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{OnceLock, PoisonError, RwLock};
 
 use windows_sys::Win32::Foundation::{HANDLE, HMODULE};
 use windows_sys::Win32::Storage::FileSystem::GetFileAttributesW;
@@ -66,11 +66,24 @@ impl Drop for ConsoleObject {
 }
 
 static SPEC: OnceLock<Option<&'static Loaded>> = OnceLock::new();
-/// Our live console objects, to validate pointers passed back.
-static REGISTRY: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+/// Sharded live console objects, to validate pointers passed back without global lock contention.
+const REGISTRY_SHARDS: usize = 16;
+static REGISTRY: [RwLock<BTreeSet<usize>>; REGISTRY_SHARDS] = [const { RwLock::new(BTreeSet::new()) }; REGISTRY_SHARDS];
 
-fn registry() -> std::sync::MutexGuard<'static, BTreeSet<usize>> {
-    REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
+fn registry_shard(addr: usize) -> &'static RwLock<BTreeSet<usize>> {
+    &REGISTRY[(addr >> 4) & (REGISTRY_SHARDS - 1)]
+}
+
+fn registry_insert(addr: usize) {
+    registry_shard(addr).write().unwrap_or_else(PoisonError::into_inner).insert(addr);
+}
+
+fn registry_remove(addr: usize) {
+    registry_shard(addr).write().unwrap_or_else(PoisonError::into_inner).remove(&addr);
+}
+
+fn registry_contains(addr: usize) -> bool {
+    registry_shard(addr).read().unwrap_or_else(PoisonError::into_inner).contains(&addr)
 }
 
 fn guid_of(iid: &GUID) -> Guid {
@@ -84,7 +97,7 @@ fn loaded() -> &'static Loaded {
 
 /// The live console object of a given role at `p`, or `None` when `p` is not one of ours.
 fn lookup(p: *mut c_void, role: Role) -> Option<&'static ConsoleObject> {
-    if p.is_null() || !registry().contains(&(p as usize)) {
+    if p.is_null() || !registry_contains(p as usize) {
         return None;
     }
     // SAFETY: registered pointers are live `ConsoleObject`s, which stay allocated until their last release removes them.
@@ -105,7 +118,7 @@ unsafe fn give_out(live: Option<&'static Live>, engine: *mut c_void, riid: &GUID
         return E_NOINTERFACE;
     };
     let object = Box::into_raw(Box::new(ConsoleObject { vtbl: live.vtbl.as_ptr(), refs: AtomicU32::new(1), live, engine }));
-    registry().insert(object as usize);
+    registry_insert(object as usize);
     // SAFETY: `out` is writable.
     unsafe { *out = object.cast() };
     S_OK
@@ -145,7 +158,7 @@ unsafe extern "system" fn release_slot(this: *mut ConsoleObject) -> u32 {
     unsafe {
         let n = (*this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
         if n == 0 {
-            registry().remove(&(this as usize));
+            registry_remove(this as usize);
             drop(Box::from_raw(this));
         }
         n
@@ -482,5 +495,26 @@ pub unsafe fn console_get_factory(iid: *const GUID, out: *mut *mut c_void) -> HR
         };
         storage_log(&format!("DStorageGetFactory console iid={} interface={} status={}\n", guid_text(iid), live.iface.label, live.iface.status));
         give_out(Some(live), engine.into_raw().cast(), iid, out, "DStorageGetFactory")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sharded_registry_tracks_and_removes_addresses() {
+        let addrs: Vec<usize> = (0..64).map(|i| 0x1000_0000usize + i * 16).collect();
+        for &a in &addrs {
+            registry_insert(a);
+        }
+        for &a in &addrs {
+            assert!(registry_contains(a));
+        }
+        for &a in &addrs {
+            registry_remove(a);
+            assert!(!registry_contains(a));
+        }
+        assert!(!registry_contains(0));
     }
 }

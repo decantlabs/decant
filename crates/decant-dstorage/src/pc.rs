@@ -71,6 +71,7 @@ const _: () = assert!(std::mem::offset_of!(RawRequest, uncompressed_size) == 80 
 
 impl RawRequest {
     /// A file to memory request, compressed with `compression` (0 none, 1 GDeflate).
+    #[inline]
     pub fn file_to_memory(compression: u8, file: *mut c_void, offset: u64, source_size: u32, buffer: *mut c_void, buffer_size: u32) -> RawRequest {
         RawRequest {
             compression,
@@ -147,6 +148,7 @@ impl Pc {
         NonNull::new(raw).map(Pc)
     }
 
+    #[inline]
     pub fn as_ptr(&self) -> *mut c_void {
         self.0.as_ptr()
     }
@@ -155,6 +157,7 @@ impl Pc {
     ///
     /// # Safety
     /// The object must be the interface `V` describes.
+    #[inline]
     pub unsafe fn vtbl<V>(&self) -> &V {
         // SAFETY: the caller states the interface.
         unsafe { crate::decant::vtable::<V>(self.as_ptr()) }
