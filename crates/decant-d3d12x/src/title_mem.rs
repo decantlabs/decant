@@ -1575,8 +1575,6 @@ struct State {
     /// Index of the most recently matched section in `sections`.
     last_section: usize,
     tracking: bool,
-    last_guard: Instant,
-    stats: Stats,
     /// Rotating zero-page observations, advanced only by the memory sampler.
     zero_scan: ZeroScan,
     /// Reused between syncs.
@@ -1711,12 +1709,33 @@ fn drain_journal(api: &Api, cursor: &mut DrainCursor) -> DrainBatch {
     }
 }
 
-/// Last `DecantXmemJournalSeq` drained into `STATE` (`u64::MAX` when unknown).
+/// Last `DecantXmemJournalSeq` applied to `STATE` (`u64::MAX` when unknown).
 static LAST_JOURNAL_SEQ: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Last `DecantXmemJournalSeq` drained into `PENDING_JOURNAL` (`u64::MAX` when unknown).
+static DRAINED_JOURNAL_SEQ: AtomicU64 = AtomicU64::new(u64::MAX);
+/// `ACTIVE_STATE_ID` associated with `DRAINED_JOURNAL_SEQ`.
+static DRAINED_STATE_ID: AtomicU64 = AtomicU64::new(0);
+/// True while `PENDING_JOURNAL` is non-empty or a drained batch is being applied under `APPLY_LOCK`.
+static HAS_PENDING_JOURNAL: AtomicBool = AtomicBool::new(false);
+/// True when `Mirror` may have un-drained `TileCall` updates for `sync()`.
+static MIRROR_MAY_HAVE_PENDING: AtomicBool = AtomicBool::new(false);
 /// True once `DecantXmemGpuTrack(1)` has been enabled, so `with_state` can skip `DRAIN_LOCK`.
 static TRACKING_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// True when `Mirror` has added slots whose window buffers have not been confirmed built yet.
 static MISSING_WINDOWS: AtomicBool = AtomicBool::new(false);
+
+struct PendingBatch {
+    state_id: u64,
+    snapshot: bool,
+    seq: u64,
+    journal_seq: Option<u64>,
+    records: Vec<GpuChange>,
+}
+
+/// Queue of coalesced journal batches drained under `DRAIN_LOCK` and waiting for `APPLY_LOCK`.
+static PENDING_JOURNAL: Mutex<Vec<PendingBatch>> = Mutex::new(Vec::new());
+/// Serializes `Mirror` batch application under `STATE.write()` without holding `DRAIN_LOCK`.
+static APPLY_LOCK: Mutex<()> = Mutex::new(());
 
 fn journal_unchanged(api: &Api) -> bool {
     if !TRACKING_ACTIVE.load(Ordering::Acquire) {
@@ -1728,6 +1747,136 @@ fn journal_unchanged(api: &Api) -> bool {
     let last = LAST_JOURNAL_SEQ.load(Ordering::Acquire);
     last != u64::MAX && last == cur_seq
 }
+
+fn drained_journal_unchanged(api: &Api, active_id: u64) -> bool {
+    if !TRACKING_ACTIVE.load(Ordering::Acquire) || DRAINED_STATE_ID.load(Ordering::Acquire) != active_id {
+        return false;
+    }
+    let Some(get_seq) = api.journal_seq else { return false };
+    // SAFETY: `DecantXmemJournalSeq` is a lock-free atomic load returning `u64`.
+    let cur_seq = unsafe { get_seq() };
+    let drained = DRAINED_JOURNAL_SEQ.load(Ordering::Acquire);
+    drained != u64::MAX && drained == cur_seq
+}
+
+fn known_holding(res_bounds: &std::collections::BTreeMap<u64, u64>, va: u64) -> Option<(u64, u64)> {
+    let (&base, &end) = res_bounds.range(..=va).next_back()?;
+    (va < end).then_some((base, end))
+}
+
+/// Compacts drained journal records before acquiring `STATE.write()`:
+/// - merges consecutive page-adjacent `MAP` records inside the same known `RESERVE`
+/// - merges consecutive page-adjacent `UNMAP` records inside the same known `RESERVE`
+/// - collapses `RESERVE(va)` + intra-`va` `MAP`/`UNMAP` + `RELEASE(va)` in one batch into `RELEASE(va)`.
+fn coalesce_changes(records: &mut Vec<GpuChange>) {
+    if records.len() < 2 {
+        return;
+    }
+    let mut out: Vec<GpuChange> = Vec::with_capacity(records.len());
+    let mut res_bounds: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    let mut open_res: HashMap<u64, (usize, bool)> = HashMap::new();
+
+    for &c in records.iter() {
+        match c.kind {
+            RESERVE => {
+                // Invalidate any overlapping prior tracked reservation bounds in this batch.
+                let new_end = c.va.saturating_add(u64::from(c.pages).saturating_mul(PAGE));
+                let stale: Vec<u64> = res_bounds
+                    .iter()
+                    .filter(|&(&b, &e)| b < new_end && e > c.va)
+                    .map(|(&b, _)| b)
+                    .collect();
+                for b in stale {
+                    res_bounds.remove(&b);
+                    open_res.remove(&b);
+                }
+                for (_, pure) in open_res.values_mut() {
+                    *pure = false;
+                }
+                res_bounds.insert(c.va, new_end);
+                open_res.insert(c.va, (out.len(), true));
+                out.push(c);
+            }
+            RELEASE => {
+                res_bounds.remove(&c.va);
+                if let Some((idx, pure)) = open_res.remove(&c.va)
+                    && pure
+                    && idx < out.len()
+                    && out[idx].kind == RESERVE
+                    && out[idx].va == c.va
+                {
+                    out.truncate(idx);
+                    out.push(c);
+                    continue;
+                }
+                for (_, pure) in open_res.values_mut() {
+                    *pure = false;
+                }
+                out.push(c);
+            }
+            MAP => {
+                let target_base = known_holding(&res_bounds, c.va).map(|(b, _)| b);
+                for (&base, (_, pure)) in open_res.iter_mut() {
+                    if target_base != Some(base) {
+                        *pure = false;
+                    }
+                }
+                if c.pages > 0
+                    && let Some(prev) = out.last_mut()
+                    && prev.kind == MAP
+                    && prev.pages > 0
+                    && prev.va.checked_add(u64::from(prev.pages) * PAGE) == Some(c.va)
+                    && prev.first_page.checked_add(prev.pages) == Some(c.first_page)
+                    && let Some(merged_pages) = prev.pages.checked_add(c.pages)
+                    && let Some((base, end)) = known_holding(&res_bounds, prev.va)
+                    && known_holding(&res_bounds, c.va).is_some_and(|(b2, _)| b2 == base)
+                    && c.va.checked_add(u64::from(c.pages) * PAGE).is_some_and(|e| e <= end)
+                {
+                    prev.pages = merged_pages;
+                    prev.seq = prev.seq.max(c.seq);
+                    continue;
+                }
+                out.push(c);
+            }
+            UNMAP => {
+                let target_base = known_holding(&res_bounds, c.va).map(|(b, _)| b);
+                for (&base, (_, pure)) in open_res.iter_mut() {
+                    if target_base != Some(base) {
+                        *pure = false;
+                    }
+                }
+                if c.pages > 0
+                    && let Some(prev) = out.last_mut()
+                    && prev.kind == UNMAP
+                    && prev.pages > 0
+                    && prev.va.checked_add(u64::from(prev.pages) * PAGE) == Some(c.va)
+                    && let Some(merged_pages) = prev.pages.checked_add(c.pages)
+                    && let Some((base, end)) = known_holding(&res_bounds, prev.va)
+                    && known_holding(&res_bounds, c.va).is_some_and(|(b2, _)| b2 == base)
+                    && c.va.checked_add(u64::from(c.pages) * PAGE).is_some_and(|e| e <= end)
+                {
+                    prev.pages = merged_pages;
+                    prev.seq = prev.seq.max(c.seq);
+                    continue;
+                }
+                out.push(c);
+            }
+            _ => {
+                out.push(c);
+            }
+        }
+    }
+
+    *records = out;
+}
+
+struct CachedSyncState {
+    state_id: u64,
+    map_queue: ID3D12CommandQueue,
+    map_fence: ID3D12Fence,
+    fence_value: Arc<AtomicU64>,
+}
+
 struct SyncScratch {
     jobs: Vec<CopyJob>,
     dirty: Vec<u32>,
@@ -1736,6 +1885,10 @@ struct SyncScratch {
     l1_prints: L1Fingerprints,
     /// The map fence value each submitting queue has waited for.
     waited: Option<HashMap<usize, u64>>,
+    /// Cached device queue/fence handles for `state_id`, cleared on `device_created`.
+    cached: Option<CachedSyncState>,
+    stats: Stats,
+    last_guard: Option<Instant>,
 }
 
 /// Serializes `sync` and `device_created` across queues so `execute_copies` and staging GPU
@@ -1747,6 +1900,20 @@ static SYNC_LOCK: Mutex<SyncScratch> = Mutex::new(SyncScratch {
     staging: None,
     l1_prints: L1Fingerprints { heaps: Vec::new() },
     waited: None,
+    cached: None,
+    stats: Stats {
+        syncs: 0,
+        pages: 0,
+        copied_bytes: 0,
+        skipped_bytes: 0,
+        ranges: 0,
+        micros: 0,
+        take_micros: 0,
+        copy_micros: 0,
+        tile_micros: 0,
+        worst_micros: 0,
+    },
+    last_guard: None,
 });
 
 /// Serializes window buffer creation outside `STATE`.
@@ -2021,6 +2188,7 @@ impl State {
         if matches!(c.kind, RELEASE | UNMAP) {
             bump_unmap_gen();
         }
+        MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
         if let Some(bytes) = self.mirror.apply(change)
             && REFUSED.fetch_add(1, Ordering::Relaxed) == 0
         {
@@ -2080,6 +2248,7 @@ impl State {
         self.mirror.reset();
         bump_mapping_gen();
         bump_unmap_gen();
+        MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
         for c in &records {
             self.apply(c);
         }
@@ -2111,6 +2280,7 @@ impl State {
         let res = self.plan_runs(api, pages, jobs, runs, &mut total);
         if new_tile {
             bump_tile_gen();
+            MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
         }
         res.map(|()| total)
     }
@@ -2252,12 +2422,20 @@ pub unsafe fn device_created(device: *mut c_void) {
     sync_guard.staging = staging;
     sync_guard.l1_prints.clear();
     sync_guard.waited = Some(HashMap::new());
+    sync_guard.cached = None;
+    sync_guard.stats = Stats::default();
+    sync_guard.last_guard = Some(Instant::now());
     let mut st = STATE.write().unwrap_or_else(PoisonError::into_inner);
     if st.is_some() {
         xs_log!("title memory: a second PC device, the heaps of the first are not used for it");
     }
     bump_mapping_gen();
     bump_unmap_gen();
+    PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    HAS_PENDING_JOURNAL.store(false, Ordering::Release);
+    MIRROR_MAY_HAVE_PENDING.store(false, Ordering::Release);
+    DRAINED_STATE_ID.store(0, Ordering::Release);
+    DRAINED_JOURNAL_SEQ.store(u64::MAX, Ordering::Release);
     LAST_JOURNAL_SEQ.store(u64::MAX, Ordering::Release);
     MISSING_WINDOWS.store(false, Ordering::Release);
     let id = NEXT_STATE.fetch_add(1, Ordering::Relaxed);
@@ -2285,8 +2463,6 @@ pub unsafe fn device_created(device: *mut c_void) {
         sections: Vec::new(),
         last_section: 0,
         tracking: false,
-        last_guard: Instant::now(),
-        stats: Stats::default(),
         zero_scan: ZeroScan::default(),
         scratch: Vec::new(),
         written: Vec::new(),
@@ -2442,11 +2618,12 @@ fn sync_journal_and_windows(api: &Api) -> bool {
     if active_id == 0 {
         return false;
     }
-    if journal_unchanged(api) {
+    if journal_unchanged(api) && !HAS_PENDING_JOURNAL.load(Ordering::Acquire) {
         ensure_missing_windows();
         return true;
     }
-    let missing = {
+    let mut need_apply = HAS_PENDING_JOURNAL.load(Ordering::Acquire);
+    if !drained_journal_unchanged(api, active_id) {
         let mut cursor = decant_trace::timed_lock("title_mem::DRAIN_LOCK", || DRAIN_LOCK.lock().unwrap_or_else(PoisonError::into_inner));
         let active_id = ACTIVE_STATE_ID.load(Ordering::Acquire);
         if active_id == 0 {
@@ -2459,71 +2636,125 @@ fn sync_journal_and_windows(api: &Api) -> bool {
             TRACKING_ACTIVE.store(true, Ordering::Release);
             xs_log!("title memory: xmem.dll tracks written pages now, every mapped page is copied at the first sync");
         }
-        if cursor.state_id == active_id && journal_unchanged(api) {
-            None
-        } else {
+        if !drained_journal_unchanged(api, active_id) {
             let batch = drain_journal(api, &mut cursor);
-            let skip_state_write = matches!(batch, DrainBatch::Unchanged)
-                && cursor.state_id == active_id
-                && LAST_JOURNAL_SEQ.load(Ordering::Acquire) != u64::MAX;
-            if skip_state_write {
-                None
-            } else {
+            match batch {
+                DrainBatch::Unchanged => {
+                    if api.journal_seq.is_none() || LAST_JOURNAL_SEQ.load(Ordering::Acquire) == u64::MAX {
+                        PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner).push(PendingBatch {
+                            state_id: active_id,
+                            snapshot: false,
+                            seq: cursor.seq,
+                            journal_seq: cursor.last_journal_seq,
+                            records: Vec::new(),
+                        });
+                        HAS_PENDING_JOURNAL.store(true, Ordering::Release);
+                        need_apply = true;
+                    }
+                }
+                DrainBatch::Changes { state_id, seq, journal_seq } => {
+                    let mut records = std::mem::take(&mut cursor.records);
+                    coalesce_changes(&mut records);
+                    PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner).push(PendingBatch {
+                        state_id,
+                        snapshot: false,
+                        seq,
+                        journal_seq,
+                        records,
+                    });
+                    HAS_PENDING_JOURNAL.store(true, Ordering::Release);
+                    if let Some(jseq) = journal_seq {
+                        DRAINED_STATE_ID.store(state_id, Ordering::Release);
+                        DRAINED_JOURNAL_SEQ.store(jseq, Ordering::Release);
+                    }
+                    need_apply = true;
+                }
+                DrainBatch::Snapshot { state_id, seq, journal_seq } => {
+                    let mut records = std::mem::take(&mut cursor.records);
+                    coalesce_changes(&mut records);
+                    PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner).push(PendingBatch {
+                        state_id,
+                        snapshot: true,
+                        seq,
+                        journal_seq,
+                        records,
+                    });
+                    HAS_PENDING_JOURNAL.store(true, Ordering::Release);
+                    if let Some(jseq) = journal_seq {
+                        DRAINED_STATE_ID.store(state_id, Ordering::Release);
+                        DRAINED_JOURNAL_SEQ.store(jseq, Ordering::Release);
+                    }
+                    need_apply = true;
+                }
+            }
+        }
+        // `DRAIN_LOCK` is released here so `APPLY_LOCK` / `STATE.write()` never stalls draining.
+    }
+
+    let mut missing = None;
+    if need_apply || HAS_PENDING_JOURNAL.load(Ordering::Acquire) {
+        let _apply = decant_trace::timed_lock("title_mem::APPLY_LOCK", || APPLY_LOCK.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut batches = std::mem::take(&mut *PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner));
+        loop {
+            if !batches.is_empty() {
                 let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
                 let Some(st) = guard.as_mut() else {
+                    HAS_PENDING_JOURNAL.store(false, Ordering::Release);
                     return false;
                 };
                 st.tracking = true;
-                match batch {
-                    DrainBatch::Unchanged => {
-                        if cursor.state_id != st.id {
-                            st.drain(api);
-                            cursor.state_id = st.id;
-                            cursor.seq = st.seq;
-                            cursor.last_journal_seq = st.last_journal_seq;
-                        }
+                for b in batches.drain(..) {
+                    if b.state_id != st.id {
+                        continue;
                     }
-                    DrainBatch::Changes { state_id, seq, journal_seq } if st.id == state_id => {
-                        for c in &cursor.records {
+                    if b.snapshot {
+                        xs_log!("title memory: the journal of xmem.dll overran, starting again from a snapshot of {} records", b.records.len());
+                        st.mirror.reset();
+                        bump_mapping_gen();
+                        bump_unmap_gen();
+                        MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
+                        for c in &b.records {
+                            st.apply(c);
+                        }
+                        st.seq = b.seq;
+                        st.last_journal_seq = b.journal_seq;
+                    } else {
+                        for c in &b.records {
                             if c.seq > st.seq {
                                 st.apply(c);
                             }
                         }
-                        st.seq = st.seq.max(seq);
-                        st.last_journal_seq = journal_seq;
-                        if let Some(jseq) = journal_seq {
-                            LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
+                        st.seq = st.seq.max(b.seq);
+                        if b.journal_seq.is_some() {
+                            st.last_journal_seq = b.journal_seq;
                         }
                     }
-                    DrainBatch::Snapshot { state_id, seq, journal_seq } if st.id == state_id => {
-                        xs_log!("title memory: the journal of xmem.dll overran, starting again from a snapshot of {} records", cursor.records.len());
-                        st.mirror.reset();
-                        bump_mapping_gen();
-                        bump_unmap_gen();
-                        for c in &cursor.records {
-                            st.apply(c);
-                        }
-                        st.seq = seq;
-                        st.last_journal_seq = journal_seq;
-                        if let Some(jseq) = journal_seq {
-                            LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
-                        }
-                    }
-                    DrainBatch::Changes { .. } | DrainBatch::Snapshot { .. } => {
-                        st.drain(api);
-                        cursor.state_id = st.id;
-                        cursor.seq = st.seq;
-                        cursor.last_journal_seq = st.last_journal_seq;
+                    if let Some(jseq) = b.journal_seq {
+                        LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
                     }
                 }
-                let missing = st.missing_window_sizes();
-                if missing.is_some() {
+                let m = st.missing_window_sizes();
+                if m.is_some() {
                     MISSING_WINDOWS.store(true, Ordering::Release);
                 }
-                missing
+                missing = m;
             }
+            let next = {
+                let mut p = PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner);
+                if p.is_empty() {
+                    HAS_PENDING_JOURNAL.store(false, Ordering::Release);
+                    Vec::new()
+                } else {
+                    std::mem::take(&mut *p)
+                }
+            };
+            if next.is_empty() {
+                break;
+            }
+            batches = next;
         }
-    };
+    }
+
     if let Some((state_id, device, start_idx, sizes)) = missing {
         ensure_windows_outside_state(state_id, &device, start_idx, &sizes);
         let still_missing = {
@@ -2686,6 +2917,7 @@ impl State {
             self.mirror.give_span(va, len.clamp(1, ADDRESS_REACH));
             if self.mirror.tiles_given() != prev_tiles {
                 bump_tile_gen();
+                MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
             }
         }
         let placed = self.mirror.translate(va, len)?;
@@ -2911,7 +3143,11 @@ pub fn place_buffer(va: u64, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_S
     }
     let (state_id, device, map_queue, map_fence, fence_value, pages) = with_state(|st, api| {
         st.give(api, va, span_len);
+        let prev_tiles = st.mirror.tiles_given();
         let pages = st.mirror.mirror_tiles(va, tiles)?;
+        if st.mirror.tiles_given() != prev_tiles {
+            MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
+        }
         Some((st.id, st.device.clone(), st.map_queue.clone(), st.map_fence.clone(), st.fence_value.clone(), pages))
     })??;
     let mut buffer: Option<ID3D12Resource> = None;
@@ -2972,6 +3208,62 @@ fn take_dirty_outside_state(api: &Api, dirty: &mut Vec<u32>) -> u64 {
     asked.elapsed().as_micros() as u64
 }
 
+#[derive(Default, Clone, Copy)]
+struct SyncBatchMetrics {
+    pages: u64,
+    copied_bytes: u64,
+    skipped_bytes: u64,
+    ranges: u64,
+    copy_micros: u64,
+    tile_micros: u64,
+}
+
+fn maybe_stats_and_guard(
+    stats: &mut Stats,
+    guard_timer: &mut Option<Instant>,
+    m: SyncBatchMetrics,
+    started: Instant,
+    run_guard: &mut bool,
+) {
+    let guard = guard_timer.get_or_insert_with(Instant::now);
+    if guard.elapsed() >= GUARD_EVERY {
+        *guard = Instant::now();
+        *run_guard = true;
+    }
+    let micros = started.elapsed().as_micros() as u64;
+    stats.syncs += 1;
+    stats.pages += m.pages;
+    stats.copied_bytes += m.copied_bytes;
+    stats.skipped_bytes += m.skipped_bytes;
+    stats.ranges += m.ranges;
+    stats.copy_micros += m.copy_micros;
+    stats.tile_micros += m.tile_micros;
+    stats.micros += micros;
+    stats.worst_micros = stats.worst_micros.max(micros);
+    if stats.syncs.is_multiple_of(STATS_EVERY) {
+        let slots = STATE
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |st| st.mirror.slots().len());
+        xs_log!(
+            "title memory: {} syncs, {} pages ({} MiB copied, {} MiB skipped by subpage diff), {} tile ranges updated, {} us in total ({} us asking for written pages, {} us copying, {} us mapping tiles), {} us at worst, {} slots",
+            stats.syncs,
+            stats.pages,
+            stats.copied_bytes >> 20,
+            stats.skipped_bytes >> 20,
+            stats.ranges,
+            stats.micros,
+            stats.take_micros,
+            stats.copy_micros,
+            stats.tile_micros,
+            stats.worst_micros,
+            slots
+        );
+        *stats = Stats { syncs: stats.syncs, ..Stats::default() };
+    }
+}
+
 pub unsafe fn sync(queue: *mut c_void) {
     if !enabled() {
         return;
@@ -2980,20 +3272,73 @@ pub unsafe fn sync(queue: *mut c_void) {
     // SAFETY: by the contract above.
     let Some(queue_ref) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
     let Some(api_ref) = api() else { return };
+    if ACTIVE_STATE_ID.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let _ = sync_journal_and_windows(api_ref);
+
     let mut sync_scratch = decant_trace::timed_lock("title_mem::SYNC_LOCK", || SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-    let SyncScratch { jobs, dirty, runs, staging, l1_prints, waited } = &mut *sync_scratch;
+    let SyncScratch { jobs, dirty, runs, staging, l1_prints, waited, cached, stats, last_guard } = &mut *sync_scratch;
     let waited = waited.get_or_insert_with(HashMap::new);
     thread_local! {
         static SYNC_WRITTEN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     }
     let mut written = SYNC_WRITTEN.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     written.clear();
+    let started = Instant::now();
     let take_micros = take_dirty_outside_state(api_ref, dirty);
+    stats.take_micros += take_micros;
     static CORES: OnceLock<usize> = OnceLock::new();
     let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from));
 
+    if dirty.is_empty() && !MIRROR_MAY_HAVE_PENDING.load(Ordering::Acquire) {
+        let cur_id = ACTIVE_STATE_ID.load(Ordering::Acquire);
+        if cur_id == 0 {
+            SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
+            return;
+        }
+        if !cached.as_ref().is_some_and(|c| c.state_id == cur_id) {
+            let guard = decant_trace::timed_lock("title_mem::STATE_READ", || STATE.read().unwrap_or_else(PoisonError::into_inner));
+            if let Some(st) = guard.as_ref().filter(|st| st.id == cur_id) {
+                *cached = Some(CachedSyncState {
+                    state_id: st.id,
+                    map_queue: st.map_queue.clone(),
+                    map_fence: st.map_fence.clone(),
+                    fence_value: st.fence_value.clone(),
+                });
+            }
+        }
+        if let Some(c) = cached.as_ref().filter(|c| c.state_id == cur_id) {
+            let cur_fence = c.fence_value.load(Ordering::Acquire);
+            if cur_fence > 0 && waited.get(&(queue as usize)).is_none_or(|&v| v < cur_fence) {
+                // SAFETY: both objects are live. The queue waits on the GPU, the CPU does not.
+                match unsafe { queue_ref.Wait(&c.map_fence, cur_fence) } {
+                    Ok(()) => {
+                        waited.insert(queue as usize, cur_fence);
+                    }
+                    Err(e) => xs_log!("title memory: a queue cannot wait for the tile mappings ({e})"),
+                }
+            }
+            crate::diagnose::removed_after(|| "a sync of 0 pages and 0 tile ranges".to_string());
+            let mut run_guard = false;
+            maybe_stats_and_guard(stats, last_guard, SyncBatchMetrics::default(), started, &mut run_guard);
+            drop(sync_scratch);
+            if run_guard {
+                // SAFETY: the export takes no argument.
+                unsafe { (api_ref.guard_modules)() };
+            }
+            SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
+            return;
+        }
+    }
+
     let mut total_pages = 0u64;
+    let mut total_copied_bytes = 0u64;
+    let mut total_skipped_bytes = 0u64;
     let mut total_ranges = 0u64;
+    let mut total_copy_micros = 0u64;
+    let mut total_tile_micros = 0u64;
+    let mut last_fence: Option<(ID3D12Fence, Arc<AtomicU64>)> = None;
     let mut run_guard = false;
     let max_batch_pages = staging.as_ref().map_or(STAGING_MAX_PAGES, |r| r.size / PAGE as usize);
     let mut first_batch = true;
@@ -3005,14 +3350,40 @@ pub unsafe fn sync(queue: *mut c_void) {
         chunk_start = chunk_end;
         jobs.clear();
         runs.clear();
-        let started = Instant::now();
-        let Some((phase1_id, pages, map_queue, map_fence, fence_value, target_heaps)) = ({
-            let mut batch_take = if total_pages == 0 && total_ranges == 0 { take_micros } else { 0 };
+        let Some((phase1_id, pages, map_queue, map_fence, fence_value, target_heaps)) = (if batch_pages.is_empty() {
+            let cur_id = ACTIVE_STATE_ID.load(Ordering::Acquire);
+            if cur_id == 0 {
+                None
+            } else {
+                if !cached.as_ref().is_some_and(|c| c.state_id == cur_id) {
+                    let guard = decant_trace::timed_lock("title_mem::STATE_READ", || STATE.read().unwrap_or_else(PoisonError::into_inner));
+                    if let Some(st) = guard.as_ref().filter(|st| st.id == cur_id) {
+                        *cached = Some(CachedSyncState {
+                            state_id: st.id,
+                            map_queue: st.map_queue.clone(),
+                            map_fence: st.map_fence.clone(),
+                            fence_value: st.fence_value.clone(),
+                        });
+                    }
+                }
+                cached
+                    .as_ref()
+                    .filter(|c| c.state_id == cur_id)
+                    .map(|c| (c.state_id, 0u64, c.map_queue.clone(), c.map_fence.clone(), c.fence_value.clone(), Vec::new()))
+            }
+        } else {
             loop {
                 jobs.clear();
                 runs.clear();
                 let res = with_state(|st, api| {
-                    st.stats.take_micros += batch_take;
+                    if !cached.as_ref().is_some_and(|c| c.state_id == st.id) {
+                        *cached = Some(CachedSyncState {
+                            state_id: st.id,
+                            map_queue: st.map_queue.clone(),
+                            map_fence: st.map_fence.clone(),
+                            fence_value: st.fence_value.clone(),
+                        });
+                    }
                     match st.plan_upload(api, batch_pages, jobs, runs) {
                         Ok(pages) => {
                             let mut batch_written = std::mem::take(&mut st.written);
@@ -3036,7 +3407,6 @@ pub unsafe fn sync(queue: *mut c_void) {
                         Err(missing_heaps) => Err((st.id, missing_heaps)),
                     }
                 });
-                batch_take = 0;
                 match res {
                     None => break None,
                     Some(Ok(ok)) => break Some(ok),
@@ -3089,9 +3459,10 @@ pub unsafe fn sync(queue: *mut c_void) {
         let skipped_bytes = l1_skipped_bytes + l0_skipped_bytes;
 
         let tile_started = Instant::now();
-        let (calls, missing_heaps, window_resources, mut heap_objs) = {
+        let (calls, missing_heaps, window_resources, mut heap_objs) = if MIRROR_MAY_HAVE_PENDING.load(Ordering::Acquire) {
             let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
             if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
+                MIRROR_MAY_HAVE_PENDING.store(false, Ordering::Release);
                 let calls = st.mirror.drain_updates();
                 let mut missing_heaps = Vec::new();
                 let mut window_resources: Vec<Option<ID3D12Resource>> = Vec::new();
@@ -3117,6 +3488,8 @@ pub unsafe fn sync(queue: *mut c_void) {
             } else {
                 (Vec::new(), Vec::new(), Vec::new(), HashMap::new())
             }
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), HashMap::new())
         };
         let mut ranges = 0u64;
         if !calls.is_empty() {
@@ -3150,53 +3523,17 @@ pub unsafe fn sync(queue: *mut c_void) {
                 }
             }
         }
-        let tile_micros = tile_started.elapsed().as_micros() as u64;
+        total_pages += pages;
+        total_copied_bytes += copied_bytes;
+        total_skipped_bytes += skipped_bytes;
         total_ranges += ranges;
-
-        let mut wait_target = None;
-        {
-            let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
-            if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
-                st.stats.copy_micros += copy_micros;
-                st.stats.tile_micros += tile_micros;
-                let cur_fence = st.fence_value.load(Ordering::Acquire);
-                if cur_fence > 0 && waited.get(&(queue as usize)).is_none_or(|&v| v < cur_fence) {
-                    wait_target = Some(cur_fence);
-                }
-                crate::diagnose::removed_after(|| format!("a sync of {pages} pages and {ranges} tile ranges"));
-                if st.last_guard.elapsed() >= GUARD_EVERY {
-                    st.last_guard = Instant::now();
-                    run_guard = true;
-                }
-                let micros = started.elapsed().as_micros() as u64;
-                let s = &mut st.stats;
-                s.syncs += 1;
-                s.pages += pages;
-                s.copied_bytes += copied_bytes;
-                s.skipped_bytes += skipped_bytes;
-                s.ranges += ranges;
-                s.micros += micros;
-                s.worst_micros = s.worst_micros.max(micros);
-                if s.syncs.is_multiple_of(STATS_EVERY) {
-                    xs_log!(
-                        "title memory: {} syncs, {} pages ({} MiB copied, {} MiB skipped by subpage diff), {} tile ranges updated, {} us in total ({} us asking for written pages, {} us copying, {} us mapping tiles), {} us at worst, {} slots",
-                        s.syncs,
-                        s.pages,
-                        s.copied_bytes >> 20,
-                        s.skipped_bytes >> 20,
-                        s.ranges,
-                        s.micros,
-                        s.take_micros,
-                        s.copy_micros,
-                        s.tile_micros,
-                        s.worst_micros,
-                        st.mirror.slots().len()
-                    );
-                    st.stats = Stats { syncs: st.stats.syncs, ..Stats::default() };
-                }
-            }
-        }
-        if let Some(cur_fence) = wait_target {
+        total_copy_micros += copy_micros;
+        total_tile_micros += tile_started.elapsed().as_micros() as u64;
+        last_fence = Some((map_fence, fence_value));
+    }
+    if let Some((map_fence, fence_value)) = last_fence {
+        let cur_fence = fence_value.load(Ordering::Acquire);
+        if cur_fence > 0 && waited.get(&(queue as usize)).is_none_or(|&v| v < cur_fence) {
             // SAFETY: both objects are live. The queue waits on the GPU, the CPU does not.
             match unsafe { queue_ref.Wait(&map_fence, cur_fence) } {
                 Ok(()) => {
@@ -3205,8 +3542,22 @@ pub unsafe fn sync(queue: *mut c_void) {
                 Err(e) => xs_log!("title memory: a queue cannot wait for the tile mappings ({e})"),
             }
         }
-        total_pages += pages;
     }
+    crate::diagnose::removed_after(|| format!("a sync of {total_pages} pages and {total_ranges} tile ranges"));
+    maybe_stats_and_guard(
+        stats,
+        last_guard,
+        SyncBatchMetrics {
+            pages: total_pages,
+            copied_bytes: total_copied_bytes,
+            skipped_bytes: total_skipped_bytes,
+            ranges: total_ranges,
+            copy_micros: total_copy_micros,
+            tile_micros: total_tile_micros,
+        },
+        started,
+        &mut run_guard,
+    );
     drop(sync_scratch);
     if run_guard {
         // SAFETY: the export takes no argument.
@@ -3263,8 +3614,17 @@ pub fn spans_touch(spans: &[(u64, u64)], written: &HashSet<u32>) -> Vec<Option<b
 /// mapped pages of one reservation. `None` for anything else (including the module being off).
 pub fn tiles_of(va: u64, len: u64) -> Option<Vec<u32>> {
     let (first, pages) = crate::title_mirror::page_span(va, len);
-    with_state_read(|st| st.mirror.mirror_tiles_read(first, pages))
-        .or_else(|| with_state(|st, _| st.mirror.mirror_tiles(first, pages)).flatten())
+    with_state_read(|st| st.mirror.mirror_tiles_read(first, pages)).or_else(|| {
+        with_state(|st, _| {
+            let prev_tiles = st.mirror.tiles_given();
+            let got = st.mirror.mirror_tiles(first, pages);
+            if st.mirror.tiles_given() != prev_tiles {
+                MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
+            }
+            got
+        })
+        .flatten()
+    })
 }
 
 /// Mirror tiles for each `(va, len)` span under one state lock, taking only `STATE.read()` for
@@ -3295,11 +3655,15 @@ pub fn tiles_of_batch(spans: &[(u64, u64)], out: &mut Vec<Option<Vec<u32>>>) {
         return;
     }
     if with_state(|st, _| {
+        let prev_tiles = st.mirror.tiles_given();
         for (slot, &(va, len)) in partial.iter_mut().zip(spans) {
             if slot.is_none() {
                 let (first, pages) = crate::title_mirror::page_span(va, len);
                 *slot = st.mirror.mirror_tiles(first, pages);
             }
+        }
+        if st.mirror.tiles_given() != prev_tiles {
+            MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
         }
     })
     .is_none()
@@ -4072,5 +4436,132 @@ mod tests {
         LAST_JOURNAL_SEQ.store(prev_seq, Ordering::Release);
         TRACKING_ACTIVE.store(prev_track, Ordering::Release);
         ACTIVE_STATE_ID.store(prev_id, Ordering::Release);
+    }
+
+    #[test]
+    fn drain_lock_never_blocks_on_state_write() {
+        unsafe extern "system" fn stub_track(_: i32) {}
+        unsafe extern "system" fn stub_changes(_: u64, out: *mut GpuChange, cap: u32, written: *mut u32) -> i32 {
+            if cap >= 1 {
+                // SAFETY: caller provides a valid buffer of at least `cap` elements.
+                unsafe {
+                    *out = GpuChange { seq: 100, kind: RESERVE, pages: 4, va: 0x3000_0000, first_page: 0, flags: 0 };
+                    *written = 1;
+                }
+            }
+            1
+        }
+        unsafe extern "system" fn stub_snapshot(_: *mut GpuChange, _: u32, _: *mut u32, _: *mut u64) -> i32 { 1 }
+        unsafe extern "system" fn stub_take(_: *mut u32, _: u32) -> u32 { 0 }
+        unsafe extern "system" fn stub_view(_: u32, _: *mut usize, _: *mut u32, _: *mut u32) -> i32 { 0 }
+        unsafe extern "system" fn stub_guard() {}
+        unsafe extern "system" fn stub_writable(_: usize, _: usize) -> i32 { 0 }
+        unsafe extern "system" fn stub_use(_: usize, _: usize) -> u32 { 0 }
+        unsafe extern "system" fn stub_seq_101() -> u64 { 101 }
+
+        let api = Api {
+            track: stub_track,
+            changes: stub_changes,
+            snapshot: stub_snapshot,
+            take_dirty: stub_take,
+            section_view: stub_view,
+            guard_modules: stub_guard,
+            writable: stub_writable,
+            gpu_use: stub_use,
+            show: None,
+            journal_seq: Some(stub_seq_101),
+        };
+        let prev_id = ACTIVE_STATE_ID.swap(77, Ordering::AcqRel);
+        let prev_track = TRACKING_ACTIVE.swap(true, Ordering::AcqRel);
+        let prev_seq = LAST_JOURNAL_SEQ.swap(u64::MAX, Ordering::AcqRel);
+        let prev_drained_seq = DRAINED_JOURNAL_SEQ.swap(u64::MAX, Ordering::AcqRel);
+        let prev_drained_id = DRAINED_STATE_ID.swap(0, Ordering::AcqRel);
+        let prev_has_pending = HAS_PENDING_JOURNAL.swap(false, Ordering::AcqRel);
+
+        let _state_write = STATE.write().unwrap_or_else(PoisonError::into_inner);
+        let drained_without_blocking = std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut cursor = DRAIN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+                let _ = drain_journal(&api, &mut cursor);
+                assert!(DRAINED_JOURNAL_SEQ.load(Ordering::Acquire) == u64::MAX);
+                true
+            })
+            .join()
+            .unwrap()
+        });
+        assert!(drained_without_blocking);
+
+        drop(_state_write);
+        PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        HAS_PENDING_JOURNAL.store(prev_has_pending, Ordering::Release);
+        DRAINED_STATE_ID.store(prev_drained_id, Ordering::Release);
+        DRAINED_JOURNAL_SEQ.store(prev_drained_seq, Ordering::Release);
+        LAST_JOURNAL_SEQ.store(prev_seq, Ordering::Release);
+        TRACKING_ACTIVE.store(prev_track, Ordering::Release);
+        ACTIVE_STATE_ID.store(prev_id, Ordering::Release);
+    }
+
+    #[test]
+    fn coalesce_changes_merges_contiguous_maps_and_unmaps_within_reservation() {
+        let mut recs = vec![
+            // Adjacent MAPs with unknown reservation (pre-existing) must NOT be merged.
+            GpuChange { seq: 1, kind: MAP, pages: 2, va: 0x1000_0000, first_page: 10, flags: 0 },
+            GpuChange { seq: 2, kind: MAP, pages: 3, va: 0x1000_0000 + 2 * PAGE, first_page: 12, flags: 0 },
+            // Known reservation: contiguous MAPs inside same RESERVE merge cleanly.
+            GpuChange { seq: 3, kind: RESERVE, pages: 16, va: 0x2000_0000, first_page: 0, flags: 0 },
+            GpuChange { seq: 4, kind: MAP, pages: 4, va: 0x2000_0000, first_page: 100, flags: 0 },
+            GpuChange { seq: 5, kind: MAP, pages: 6, va: 0x2000_0000 + 4 * PAGE, first_page: 104, flags: 0 },
+            // Discontiguous first_page must not merge.
+            GpuChange { seq: 6, kind: MAP, pages: 2, va: 0x2000_0000 + 10 * PAGE, first_page: 200, flags: 0 },
+            // Contiguous UNMAPs inside same known RESERVE merge cleanly.
+            GpuChange { seq: 7, kind: UNMAP, pages: 4, va: 0x2000_0000, first_page: 0, flags: 0 },
+            GpuChange { seq: 8, kind: UNMAP, pages: 6, va: 0x2000_0000 + 4 * PAGE, first_page: 0, flags: 0 },
+            // Ephemeral RESERVE + MAP + UNMAP + RELEASE in one batch collapses to RELEASE.
+            GpuChange { seq: 9, kind: RESERVE, pages: 8, va: 0x3000_0000, first_page: 0, flags: 0 },
+            GpuChange { seq: 10, kind: MAP, pages: 8, va: 0x3000_0000, first_page: 300, flags: 0 },
+            GpuChange { seq: 11, kind: UNMAP, pages: 8, va: 0x3000_0000, first_page: 0, flags: 0 },
+            GpuChange { seq: 12, kind: RELEASE, va: 0x3000_0000, ..GpuChange::default() },
+        ];
+        coalesce_changes(&mut recs);
+        assert_eq!(recs.len(), 7);
+        assert_eq!((recs[0].kind, recs[0].pages), (MAP, 2));
+        assert_eq!((recs[1].kind, recs[1].pages), (MAP, 3));
+        assert_eq!((recs[2].kind, recs[2].va, recs[2].pages), (RESERVE, 0x2000_0000, 16));
+        assert_eq!((recs[3].kind, recs[3].pages, recs[3].first_page, recs[3].seq), (MAP, 10, 100, 5));
+        assert_eq!((recs[4].kind, recs[4].pages, recs[4].first_page), (MAP, 2, 200));
+        assert_eq!((recs[5].kind, recs[5].pages, recs[5].seq), (UNMAP, 10, 8));
+        assert_eq!((recs[6].kind, recs[6].va, recs[6].seq), (RELEASE, 0x3000_0000, 12));
+    }
+
+    #[test]
+    fn sync_fast_path_skips_state_write_when_dirty_empty_and_mirror_clean() {
+        let prev_mirror_pending = MIRROR_MAY_HAVE_PENDING.swap(false, Ordering::AcqRel);
+        let mut stats = Stats::default();
+        let mut guard_timer = Some(Instant::now());
+        let started = Instant::now();
+
+        // Hold STATE.read() concurrently: any attempt to take STATE.write() on another thread blocks.
+        let _state_read = STATE.read().unwrap_or_else(PoisonError::into_inner);
+        assert!(STATE.try_write().is_err());
+
+        let (ok, syncs) = std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut run_guard = false;
+                for _ in 0..(STATS_EVERY - 1) {
+                    maybe_stats_and_guard(&mut stats, &mut guard_timer, SyncBatchMetrics::default(), started, &mut run_guard);
+                }
+                // Even on the STATS_EVERY tick, logging only uses STATE.read(), never STATE.write().
+                maybe_stats_and_guard(&mut stats, &mut guard_timer, SyncBatchMetrics::default(), started, &mut run_guard);
+                assert!(!MIRROR_MAY_HAVE_PENDING.load(Ordering::Acquire));
+                (true, stats.syncs)
+            })
+            .join()
+            .unwrap()
+        });
+        assert!(ok);
+        assert_eq!(syncs, STATS_EVERY);
+
+        drop(_state_read);
+        MIRROR_MAY_HAVE_PENDING.store(prev_mirror_pending, Ordering::Release);
     }
 }
