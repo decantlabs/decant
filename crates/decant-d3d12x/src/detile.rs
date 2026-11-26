@@ -995,8 +995,6 @@ struct Registry {
     /// Resources that currently want a fill (`Placed::wants_fill`), so a flush visits only dirty
     /// textures instead of scanning the whole table.
     pending: FastSet<usize>,
-    /// Transitions noted per PC command list as `(resource, subresource, state after)`.
-    noted: HashMap<usize, Vec<(usize, u32, u32)>>,
     /// Kinds of textures and refusal reasons logged so far, to log each once.
     logged: HashSet<(u32, u32)>,
     logged_refused: HashSet<String>,
@@ -1276,6 +1274,19 @@ struct DetilerState {
 static REGISTRY: RwLock<Option<Registry>> = RwLock::new(None);
 static DETILER: Mutex<DetilerState> = Mutex::new(DetilerState { detiler: None, unavailable: false });
 
+#[derive(Default)]
+struct NotedState {
+    lists: FastMap<usize, Vec<(usize, u32, u32)>>,
+    scratch: Vec<(usize, u32, u32)>,
+}
+
+static NOTED: Mutex<Option<NotedState>> = Mutex::new(None);
+
+fn with_noted<R>(f: impl FnOnce(&mut NotedState) -> R) -> R {
+    let mut guard = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(NotedState::default))
+}
+
 fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
     let mut guard = decant_trace::timed_lock("detile::REGISTRY", || REGISTRY.write().unwrap_or_else(|e| e.into_inner()));
     f(guard.get_or_insert_with(Registry::default))
@@ -1492,7 +1503,12 @@ pub fn note_tiles(tiles: &[u32]) {
             let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
             return Err((false, current_layout, items, spans));
         }
-        Ok(report || tiles.iter().any(|t| r.tile_to_textures.contains_key(t)))
+        Ok(report
+            || tiles.iter().any(|t| {
+                r.tile_to_textures
+                    .get(t)
+                    .is_some_and(|list| list.iter().any(|res| r.textures.get(res).is_some_and(|tex| !(tex.dirty && tex.attempts == 0))))
+            }))
     }) else {
         return;
     };
@@ -1562,16 +1578,16 @@ pub fn note_transitions(list: usize, transitions: &[(usize, u32, u32)]) {
     if !enabled() || transitions.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
-    if with_registry_read(|r| transitions.iter().any(|(res, _, _)| r.textures.contains_key(res))) != Some(true) {
+    let filtered: Vec<(usize, u32, u32)> = with_registry_read(|r| {
+        transitions.iter().filter(|(res, _, _)| r.textures.contains_key(res)).copied().collect()
+    })
+    .unwrap_or_default();
+    if filtered.is_empty() {
         return;
     }
-    with_registry(|r| {
-        let mut iter = transitions.iter().filter(|(res, _, _)| r.textures.contains_key(res)).copied().peekable();
-        if iter.peek().is_some() {
-            let entry = r.noted.entry(list).or_default();
-            entry.extend(iter);
-            NOTED_COUNT.store(r.noted.len(), Ordering::Release);
-        }
+    with_noted(|n| {
+        n.lists.entry(list).or_default().extend(filtered);
+        NOTED_COUNT.store(n.lists.len(), Ordering::Release);
     });
 }
 
@@ -1580,11 +1596,8 @@ pub fn list_reset(list: usize) {
     if NOTED_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
-    if with_registry_read(|r| r.noted.get(&list).is_some_and(|v| !v.is_empty())) != Some(true) {
-        return;
-    }
-    with_registry(|r| {
-        if let Some(entries) = r.noted.get_mut(&list) {
+    with_noted(|n| {
+        if let Some(entries) = n.lists.get_mut(&list) {
             entries.clear();
         }
     });
@@ -1618,28 +1631,30 @@ pub fn submitted(lists: &[usize]) {
     if lists.is_empty() || NOTED_COUNT.load(Ordering::Acquire) == 0 || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
-    if with_registry_read(|r| !r.noted.is_empty() && lists.iter().any(|l| r.noted.get(l).is_some_and(|v| !v.is_empty()))) != Some(true) {
+    let mut changes = with_noted(|n| {
+        let mut out = std::mem::take(&mut n.scratch);
+        out.clear();
+        for list in lists {
+            if let Some(entries) = n.lists.get(list) {
+                out.extend_from_slice(entries);
+            }
+        }
+        out
+    });
+    if changes.is_empty() {
+        with_noted(|n| n.scratch = changes);
         return;
     }
     with_registry(|r| {
-        if r.noted.is_empty() {
-            return;
-        }
-        let mut changes = std::mem::take(&mut r.scratch.changes);
-        changes.clear();
-        for list in lists {
-            if let Some(entries) = r.noted.get(list) {
-                changes.extend_from_slice(entries);
-            }
-        }
         for &(res, sub, after) in &changes {
             if let Some(texture) = r.textures.get_mut(&res) {
                 let count = (texture.plan.mips.len() as u32 * texture.plan.slices) as usize;
                 apply_transition(Arc::make_mut(&mut texture.states), count, sub, after);
             }
         }
-        r.scratch.changes = changes;
     });
+    changes.clear();
+    with_noted(|n| n.scratch = changes);
 }
 
 /// Detiles every dirty texture on the PC direct queue `queue`, ahead of the title's lists that run
@@ -1717,27 +1732,36 @@ pub unsafe fn flush(queue: *mut c_void) {
         return;
     }
 
-    let collected = with_registry(|r| {
+    let collected = with_registry_read(|r| {
         if r.pending.is_empty() {
             HAS_PENDING_FILLS.store(false, Ordering::Release);
             return None;
         }
-        let mut pending_items = std::mem::take(&mut r.scratch.pending_items);
-        let mut pending_spans = std::mem::take(&mut r.scratch.pending_spans);
-        let mut exhausted = std::mem::take(&mut r.scratch.exhausted);
-        collect_pending_items(r, &mut pending_items, &mut pending_spans, &mut exhausted);
-        if pending_items.is_empty() {
-            r.scratch.pending_items = pending_items;
-            r.scratch.pending_spans = pending_spans;
-            r.scratch.exhausted = exhausted;
-            return None;
+        let mut pending_items = Vec::with_capacity(r.pending.len());
+        let mut pending_spans = Vec::with_capacity(r.pending.len());
+        let mut has_exhausted = false;
+        for &res in &r.pending {
+            if let Some(texture) = r.textures.get(&res).filter(|t| t.wants_fill()) {
+                pending_items.push((res, texture.va, texture.plan.size));
+                pending_spans.push((texture.va, texture.plan.size));
+            } else {
+                has_exhausted = true;
+            }
         }
-        let translated = std::mem::take(&mut r.scratch.translated);
-        Some((pending_items, pending_spans, exhausted, translated))
-    });
-    let Some((mut pending_items, mut pending_spans, mut exhausted, mut translated)) = collected else {
+        Some((pending_items, pending_spans, has_exhausted))
+    })
+    .flatten();
+    let Some((mut pending_items, mut pending_spans, has_exhausted)) = collected else {
         return;
     };
+    let mut exhausted = Vec::new();
+    if pending_items.is_empty() {
+        if has_exhausted {
+            with_registry(|r| collect_pending_items(r, &mut pending_items, &mut pending_spans, &mut exhausted));
+        }
+        return;
+    }
+    let mut translated = Vec::with_capacity(pending_spans.len());
 
     // Translate outside REGISTRY so title_mem::STATE never nests under REGISTRY.
     crate::title_mem::translate_fresh_batch(&pending_spans, &mut translated);
@@ -2247,5 +2271,19 @@ mod tests {
         .unwrap();
         assert!(!has_101 && has_102 && !has_103);
         forget_many(&[102]);
+    }
+
+    #[test]
+    fn noted_transitions_are_isolated_from_registry_and_reset_clears_list() {
+        with_noted(|n| n.lists.clear());
+        NOTED_COUNT.store(0, Ordering::Release);
+        list_reset(0xABCD);
+        submitted(&[0xABCD]);
+        with_noted(|n| {
+            n.lists.insert(0xABCD, vec![(0x1111, 0, 1)]);
+            NOTED_COUNT.store(n.lists.len(), Ordering::Release);
+        });
+        list_reset(0xABCD);
+        assert!(with_noted(|n| n.lists.get(&0xABCD).is_some_and(Vec::is_empty)));
     }
 }
