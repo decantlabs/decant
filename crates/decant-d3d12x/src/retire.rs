@@ -30,6 +30,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
@@ -55,20 +56,20 @@ type Target = (usize, u64);
 
 /// An object kept back and the targets it waits for.
 struct Parked<T> {
-    item: T,
+    item: Option<T>,
     targets: Vec<Target>,
 }
 
 /// The parked objects in the order they were parked. It makes no GPU call, so tests run it on
 /// invented data.
 pub(crate) struct Parking<T> {
-    entries: VecDeque<Parked<T>>,
+    entries: Vec<Parked<T>>,
     most: usize,
 }
 
 impl<T> Default for Parking<T> {
     fn default() -> Self {
-        Self { entries: VecDeque::new(), most: 0 }
+        Self { entries: Vec::new(), most: 0 }
     }
 }
 
@@ -79,7 +80,7 @@ impl<T> Parking<T> {
         if targets.is_empty() {
             return Some(item);
         }
-        self.entries.push_back(Parked { item, targets });
+        self.entries.push(Parked { item: Some(item), targets });
         self.most = self.most.max(self.entries.len());
         None
     }
@@ -87,15 +88,20 @@ impl<T> Parking<T> {
     /// Splits off every entry for which `ready` says that it can go. `ready` may change what the
     /// entry waits for.
     fn extract(&mut self, mut ready: impl FnMut(&mut Vec<Target>) -> bool) -> Vec<T> {
-        let (mut out, mut stay) = (Vec::new(), VecDeque::with_capacity(self.entries.len()));
-        for mut entry in self.entries.drain(..) {
-            if ready(&mut entry.targets) {
-                out.push(entry.item);
-            } else {
-                stay.push_back(entry);
-            }
+        if self.entries.is_empty() {
+            return Vec::new();
         }
-        self.entries = stay;
+        let mut out = Vec::new();
+        self.entries.retain_mut(|entry| {
+            if ready(&mut entry.targets) {
+                if let Some(item) = entry.item.take() {
+                    out.push(item);
+                }
+                false
+            } else {
+                true
+            }
+        });
         out
     }
 
@@ -112,6 +118,10 @@ impl<T> Parking<T> {
             targets.retain(|(key, _)| !keys.contains(key));
             targets.is_empty()
         })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -191,15 +201,36 @@ fn wait_target(reached: u64, last_signal: u64, unsignalled: bool) -> Option<u64>
     }
 }
 
+#[derive(Default)]
+struct FastUsizeHasher(u64);
+
+impl Hasher for FastUsizeHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(b);
+        }
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type FastMap<V> = HashMap<usize, V, BuildHasherDefault<FastUsizeHasher>>;
+
 struct State {
-    queues: HashMap<usize, QueueTrack>,
+    queues: FastMap<QueueTrack>,
     parked: Parking<Retired>,
     recent: VecDeque<Freed>,
 }
 
 fn state() -> MutexGuard<'static, State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(State { queues: HashMap::new(), parked: Parking::default(), recent: VecDeque::new() })).lock().unwrap_or_else(|e| e.into_inner())
+    STATE.get_or_init(|| Mutex::new(State { queues: FastMap::default(), parked: Parking::default(), recent: VecDeque::new() })).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// How many releases had to wait for work in flight, how many were done, how many presents there were.
@@ -224,12 +255,34 @@ unsafe fn fence_value(fence: usize) -> u64 {
 }
 
 /// The value reached by the target key `key`. A queue without a fence never gets anywhere.
-fn reached(queues: &HashMap<usize, QueueTrack>, key: usize) -> u64 {
+#[cfg(test)]
+fn reached(queues: &FastMap<QueueTrack>, key: usize) -> u64 {
     if queues.get(&key).is_some_and(|q| q.fence == 0) {
         return 0;
     }
     // SAFETY: every other key is a fence from the table, and those are live.
     unsafe { fence_value(key) }
+}
+
+/// Queries each tracked queue's fence at most once for the current call.
+fn snapshot_reached(queues: &FastMap<QueueTrack>) -> Vec<(usize, u64)> {
+    queues
+        .iter()
+        .map(|(&queue, track)| {
+            let key = track.key(queue);
+            let val = if track.fence == 0 {
+                0
+            } else {
+                // SAFETY: every non-zero fence in `queues` is live while `state()` is held.
+                unsafe { fence_value(key) }
+            };
+            (key, val)
+        })
+        .collect()
+}
+
+fn reached_in(snapshot: &[(usize, u64)], key: usize) -> u64 {
+    snapshot.iter().find(|&&(k, _)| k == key).map_or(u64::MAX, |&(_, v)| v)
 }
 
 /// Starts a submission to the PC queue `queue`, before any `ExecuteCommandLists` of it. Objects
@@ -284,12 +337,12 @@ pub(crate) unsafe fn submitted(queue: *mut c_void) {
 }
 
 /// The targets of a release now: one per queue that has work in flight or a submission under way.
-fn targets_now(queues: &HashMap<usize, QueueTrack>) -> Vec<Target> {
+fn targets_from_snapshot(queues: &FastMap<QueueTrack>, snapshot: &[(usize, u64)]) -> Vec<Target> {
     queues
         .iter()
         .filter_map(|(&queue, track)| {
             let key = track.key(queue);
-            wait_target(reached(queues, key), track.last_signal, track.unsignalled).map(|value| (key, value))
+            wait_target(reached_in(snapshot, key), track.last_signal, track.unsignalled).map(|value| (key, value))
         })
         .collect()
 }
@@ -316,20 +369,28 @@ fn retire(object: *mut c_void, what: &'static str, charge: Option<Charge>) {
     if object.is_null() {
         return;
     }
-    let mut st = state();
-    let targets = targets_now(&st.queues);
-    if !targets.is_empty() {
-        let count = HELD_BACK.fetch_add(1, Ordering::Relaxed) + 1;
-        if count <= 20 || count.is_multiple_of(1000) {
-            let label = describe(object, what).2;
-            xs_log!("deferred release {count}: {label} goes while {} queues still have work in flight, held until it finishes", targets.len());
+    let ready = {
+        let mut st = state();
+        let snapshot = snapshot_reached(&st.queues);
+        let targets = targets_from_snapshot(&st.queues, &snapshot);
+        if !targets.is_empty() {
+            let count = HELD_BACK.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 20 || count.is_multiple_of(1000) {
+                let label = describe(object, what).2;
+                xs_log!("deferred release {count}: {label} goes while {} queues still have work in flight, held until it finishes", targets.len());
+            }
         }
+        let mut ready: Vec<Retired> = st.parked.park(Retired { object: object as usize, what, charge }, targets).into_iter().collect();
+        if !st.parked.is_empty() {
+            ready.extend(st.parked.release_reached(|key| reached_in(&snapshot, key)));
+        }
+        ready
+    };
+    if !ready.is_empty() {
+        // SAFETY: each item was parked once (or bypassed parking) and is released once outside the lock.
+        let freed = unsafe { release_retired(ready) };
+        record_freed(freed);
     }
-    let mut ready: Vec<Retired> = st.parked.park(Retired { object: object as usize, what, charge }, targets).into_iter().collect();
-    let State { queues, parked, .. } = &mut *st;
-    ready.extend(parked.release_reached(|key| reached(queues, key)));
-    // SAFETY: each item was parked once and is released once.
-    unsafe { free(&mut st, ready) };
 }
 
 /// Waits until each fence of `targets` has reached its value, for at most [`FLUSH_WAIT_MS`] each.
@@ -357,11 +418,13 @@ unsafe fn wait_for(targets: &[Target]) {
     }
 }
 
-/// Names, records and releases `items`.
+/// Names and releases `items` without holding `state()`, returning fault-report records.
 ///
 /// # Safety
 /// The object of each item is a live PC object, and the reference of the layer is released here once.
-unsafe fn free(st: &mut State, items: Vec<Retired>) {
+unsafe fn release_retired(items: Vec<Retired>) -> Vec<Freed> {
+    let mut freed = Vec::with_capacity(items.len());
+    let now = ms_now();
     for item in items {
         let raw = item.object as *mut c_void;
         let (va, bytes, label) = describe(raw, item.what);
@@ -371,16 +434,27 @@ unsafe fn free(st: &mut State, items: Vec<Retired>) {
                 let _ = named.SetName(&HSTRING::from(format!("decant {label}")));
             }
         }
-        if st.recent.len() == RECENT {
-            st.recent.pop_front();
-        }
-        st.recent.push_back(Freed { va, bytes, label, at_ms: ms_now() });
+        freed.push(Freed { va, bytes, label, at_ms: now });
         RELEASED.fetch_add(1, Ordering::Relaxed);
         if let Some(charge) = item.charge {
             crate::mem_owners::remove_charge(charge);
         }
         // SAFETY: by the contract above.
         unsafe { drop(IUnknown::from_raw(raw)) };
+    }
+    freed
+}
+
+fn record_freed(freed: Vec<Freed>) {
+    if freed.is_empty() {
+        return;
+    }
+    let mut st = state();
+    for entry in freed {
+        if st.recent.len() == RECENT {
+            st.recent.pop_front();
+        }
+        st.recent.push_back(entry);
     }
 }
 
@@ -401,13 +475,31 @@ fn describe(raw: *mut c_void, what: &'static str) -> (u64, u64, String) {
 
 /// Called at each present. Releases what the GPU is done with and now and then logs the counters.
 pub(crate) fn present() {
-    let mut st = state();
-    let State { queues, parked, .. } = &mut *st;
-    let ready = parked.release_reached(|key| reached(queues, key));
-    // SAFETY: each item is released once.
-    unsafe { free(&mut st, ready) };
     let presents = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let ready = {
+        let mut st = state();
+        if st.parked.is_empty() {
+            if presents.is_multiple_of(SUMMARY_EVERY) {
+                xs_log!(
+                    "deferred release at present {presents}: {} objects held now (peak {}), {} released in all, {} of them held back for work in flight",
+                    st.parked.len(),
+                    st.parked.most(),
+                    RELEASED.load(Ordering::Relaxed),
+                    HELD_BACK.load(Ordering::Relaxed)
+                );
+            }
+            return;
+        }
+        let snapshot = snapshot_reached(&st.queues);
+        st.parked.release_reached(|key| reached_in(&snapshot, key))
+    };
+    if !ready.is_empty() {
+        // SAFETY: each item is released once outside the lock.
+        let freed = unsafe { release_retired(ready) };
+        record_freed(freed);
+    }
     if presents.is_multiple_of(SUMMARY_EVERY) {
+        let st = state();
         xs_log!(
             "deferred release at present {presents}: {} objects held now (peak {}), {} released in all, {} of them held back for work in flight",
             st.parked.len(),
@@ -432,22 +524,28 @@ fn device_identity(device: &impl Interface) -> usize {
 pub(crate) unsafe fn flush(device: *mut c_void) {
     // SAFETY: by the contract above.
     let device_id = unsafe { IUnknown::from_raw_borrowed(&device) }.map_or(0, device_identity);
-    let mut st = state();
-    let teardown = Teardown::of(&st.queues, device_id);
-    if !teardown.kept.is_empty() {
-        xs_log!("deferred release: the device goes while {} of its queues are inside a submission or have no fence, what they hold back stays held", teardown.kept.len());
-    }
-    // SAFETY: the fences in the table are live.
-    unsafe { wait_for(&teardown.to_wait_for) };
-    let ready = st.parked.drop_keys(&teardown.keys);
-    // SAFETY: each item is released once.
-    unsafe { free(&mut st, ready) };
-    for queue in teardown.queues {
-        let Some(track) = st.queues.remove(&queue) else { continue };
-        if track.fence != 0 {
-            // SAFETY: the table held the one reference to the fence and it is released here once.
-            unsafe { drop(ID3D12Fence::from_raw(track.fence as *mut c_void)) };
+    let ready = {
+        let mut st = state();
+        let teardown = Teardown::of(&st.queues, device_id);
+        if !teardown.kept.is_empty() {
+            xs_log!("deferred release: the device goes while {} of its queues are inside a submission or have no fence, what they hold back stays held", teardown.kept.len());
         }
+        // SAFETY: the fences in the table are live.
+        unsafe { wait_for(&teardown.to_wait_for) };
+        let ready = st.parked.drop_keys(&teardown.keys);
+        for queue in teardown.queues {
+            let Some(track) = st.queues.remove(&queue) else { continue };
+            if track.fence != 0 {
+                // SAFETY: the table held the one reference to the fence and it is released here once.
+                unsafe { drop(ID3D12Fence::from_raw(track.fence as *mut c_void)) };
+            }
+        }
+        ready
+    };
+    if !ready.is_empty() {
+        // SAFETY: each item is released once outside the lock.
+        let freed = unsafe { release_retired(ready) };
+        record_freed(freed);
     }
 }
 
@@ -469,7 +567,7 @@ struct Teardown {
 }
 
 impl Teardown {
-    fn of(queues: &HashMap<usize, QueueTrack>, device: usize) -> Self {
+    fn of(queues: &FastMap<QueueTrack>, device: usize) -> Self {
         let mut own: Vec<(usize, QueueTrack)> = queues.iter().filter(|(_, t)| t.device == device).map(|(&q, &t)| (q, t)).collect();
         own.sort_by_key(|&(queue, _)| queue);
         let (going, kept): (Vec<_>, Vec<_>) = own.into_iter().partition(|(_, t)| t.open == 0 && t.fence != 0);
@@ -586,7 +684,7 @@ mod tests {
 
     #[test]
     fn a_device_teardown_only_frees_what_its_own_queues_hold() {
-        let queues = HashMap::from([(100, track(10, 0xA, 3)), (200, track(20, 0xB, 7))]);
+        let queues: FastMap<QueueTrack> = [(100, track(10, 0xA, 3)), (200, track(20, 0xB, 7))].into_iter().collect();
         let t = Teardown::of(&queues, 0xA);
         assert_eq!(t, Teardown { queues: vec![100], kept: vec![], keys: vec![10], to_wait_for: vec![(10, 3)] });
         let mut p = Parking::default();
@@ -602,7 +700,7 @@ mod tests {
     #[test]
     fn a_queue_without_a_fence_holds_what_it_gets_for_good() {
         let mut t = QueueTrack { open: 1, unsignalled: true, ..track(0, 0xA, 0) };
-        let queues = HashMap::from([(300, t)]);
+        let queues: FastMap<QueueTrack> = [(300, t)].into_iter().collect();
         assert_eq!(t.key(300), 300);
         assert_eq!(reached(&queues, 300), 0);
         let target = wait_target(0, t.last_signal, t.unsignalled).expect("held while it has work");
@@ -611,7 +709,7 @@ mod tests {
         t.close(|_| false);
         assert_eq!(wait_target(0, t.last_signal, t.unsignalled), Some(1), "later releases wait too");
         assert!(p.release_reached(|key| reached(&queues, key)).is_empty());
-        let teardown = Teardown::of(&HashMap::from([(300, t)]), 0xA);
+        let teardown = Teardown::of(&[(300, t)].into_iter().collect(), 0xA);
         assert_eq!(teardown, Teardown { queues: vec![], kept: vec![300], keys: vec![], to_wait_for: vec![] });
         assert!(p.drop_keys(&teardown.keys).is_empty());
         assert_eq!(p.len(), 1);
@@ -620,7 +718,7 @@ mod tests {
     #[test]
     fn a_teardown_leaves_a_queue_inside_a_submission_alone() {
         let busy = QueueTrack { open: 1, unsignalled: true, ..track(10, 0xA, 3) };
-        let queues = HashMap::from([(100, busy), (200, track(20, 0xA, 5)), (300, track(30, 0xC, 1))]);
+        let queues: FastMap<QueueTrack> = [(100, busy), (200, track(20, 0xA, 5)), (300, track(30, 0xC, 1))].into_iter().collect();
         let t = Teardown::of(&queues, 0xA);
         assert_eq!(t, Teardown { queues: vec![200], kept: vec![100], keys: vec![20], to_wait_for: vec![(20, 5)] });
         let mut p = Parking::default();
@@ -639,5 +737,17 @@ mod tests {
         assert_eq!(labels(0x5000), ["mid", "high"]);
         assert_eq!(labels(0x100), ["low"], "nothing below");
         assert_eq!(labels(0x9000), ["high"], "nothing above");
+    }
+
+    #[test]
+    fn empty_parking_and_snapshot_lookup_behave_cleanly() {
+        let mut p: Parking<u32> = Parking::default();
+        assert!(p.is_empty());
+        assert!(p.release_reached(|_| panic!("should not query empty parking")).is_empty());
+        assert!(p.drop_keys(&[1, 2]).is_empty());
+        let snap = [(10usize, 5u64), (20usize, 9u64)];
+        assert_eq!(reached_in(&snap, 10), 5);
+        assert_eq!(reached_in(&snap, 20), 9);
+        assert_eq!(reached_in(&snap, 99), u64::MAX);
     }
 }

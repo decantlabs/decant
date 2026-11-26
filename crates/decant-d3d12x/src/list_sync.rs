@@ -9,6 +9,7 @@
 //! The state is a table keyed by the address of the list proxy. A reset of the list drops all of it.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -78,12 +79,33 @@ struct Recording {
     index_view: Option<[u8; 16]>,
 }
 
-static TABLE: Mutex<Option<HashMap<usize, Recording>>> = Mutex::new(None);
+#[derive(Default)]
+struct FastUsizeHasher(u64);
+
+impl Hasher for FastUsizeHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(b);
+        }
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type FastMap<V> = HashMap<usize, V, BuildHasherDefault<FastUsizeHasher>>;
+
+static TABLE: Mutex<Option<FastMap<Recording>>> = Mutex::new(None);
 
 /// Runs `f` on the recording of `list`, made if there is none yet.
 fn with_recording<R>(list: usize, f: impl FnOnce(&mut Recording) -> R) -> R {
     let mut guard = lock();
-    f(guard.get_or_insert_with(HashMap::new).entry(list).or_default())
+    f(guard.get_or_insert_with(FastMap::default).entry(list).or_default())
 }
 
 /// Runs `f` on the recording of `list` if it has one.
@@ -91,7 +113,7 @@ fn peek<R>(list: usize, f: impl FnOnce(&Recording) -> R) -> Option<R> {
     lock().as_ref().and_then(|t| t.get(&list)).map(f)
 }
 
-fn lock() -> MutexGuard<'static, Option<HashMap<usize, Recording>>> {
+fn lock() -> MutexGuard<'static, Option<FastMap<Recording>>> {
     TABLE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -110,10 +132,15 @@ pub fn cpu_writes_of(list_keys: &[usize]) -> Vec<CpuWrite> {
 
 /// Notes the index buffer view (a 16 byte `D3D12_INDEX_BUFFER_VIEW`) bound on `list`, or that none is.
 pub fn set_index_view(list: usize, view: Option<[u8; 16]>) {
-    if view.is_none() && peek(list, |_| ()).is_none() {
-        return;
+    let mut guard = lock();
+    match view {
+        Some(_) => guard.get_or_insert_with(FastMap::default).entry(list).or_default().index_view = view,
+        None => {
+            if let Some(r) = guard.as_mut().and_then(|t| t.get_mut(&list)) {
+                r.index_view = None;
+            }
+        }
     }
-    with_recording(list, |r| r.index_view = view);
 }
 
 /// The index buffer view bound on `list` since its last reset.
@@ -121,10 +148,13 @@ pub fn index_view(list: usize) -> Option<[u8; 16]> {
     peek(list, |r| r.index_view).flatten()
 }
 
-/// `list` was reset: all that was recorded on it belonged to the old recording.
+/// `list` was reset: all that was recorded on it belonged to the old recording, keeping vector
+/// capacities for reuse on the next recording.
 pub fn forget(list: usize) {
-    if let Some(table) = lock().as_mut() {
-        table.remove(&list);
+    if let Some(r) = lock().as_mut().and_then(|t| t.get_mut(&list)) {
+        r.writes.clear();
+        r.waits.clear();
+        r.index_view = None;
     }
 }
 
@@ -271,5 +301,20 @@ mod tests {
         assert!(!has_cpu_write_over(0x6_0000, 0x2008, 4));
         assert!(!has_cpu_write_over(0x6_0001, 0x1000, 8), "another list");
         forget(0x6_0000);
+    }
+
+    #[test]
+    fn forget_reuses_recording_allocations() {
+        let list = 0x7_0000usize;
+        record_cpu_write(list, 0x1000, vec![1, 2]);
+        record_wait(list, PendingWait { va: 0, width: 4, comparison: 5, value: 0, mask: u64::MAX });
+        let caps_before = peek(list, |r| (r.writes.capacity(), r.waits.capacity())).unwrap();
+        assert!(caps_before.0 >= 1 && caps_before.1 >= 1);
+        forget(list);
+        let state_after = peek(list, |r| (r.writes.len(), r.writes.capacity(), r.waits.len(), r.waits.capacity(), r.index_view));
+        assert_eq!(state_after, Some((0, caps_before.0, 0, caps_before.1, None)));
+        if let Some(table) = lock().as_mut() {
+            table.remove(&list);
+        }
     }
 }

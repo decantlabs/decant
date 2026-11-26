@@ -17,15 +17,16 @@
 use crate::log::xs_log;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, INFINITE, WaitForSingleObject};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, EnumWindows, GetClientRect, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
@@ -45,16 +46,20 @@ pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 }
 
 fn enabled() -> bool {
-    std::env::var_os("DECANT_D3D12X_PRESENT").is_none_or(|v| v != "0")
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DECANT_D3D12X_PRESENT").is_none_or(|v| v != "0"))
 }
 
 struct Presenter {
+    dev: ID3D12Device,
     queue: ID3D12CommandQueue,
     swap: IDXGISwapChain3,
+    buffers: [ID3D12Resource; 2],
     size: (u32, u32, DXGI_FORMAT),
     allocators: [ID3D12CommandAllocator; 2],
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
+    wait_event: Option<HANDLE>,
     /// The fence value that marks the last copy into each back buffer.
     marks: [u64; 2],
     next: u64,
@@ -70,6 +75,12 @@ struct Presenter {
 
 impl Drop for Presenter {
     fn drop(&mut self) {
+        if let Some(ev) = self.wait_event.take() {
+            // SAFETY: `ev` was created in `make` and is closed once here.
+            unsafe {
+                let _ = CloseHandle(ev);
+            }
+        }
         if let Some(charge) = self.marker_charge {
             crate::mem_owners::remove_charge(charge);
         }
@@ -486,12 +497,31 @@ fn make(queue: &ID3D12CommandQueue, w: u32, h: u32, fmt: DXGI_FORMAT) -> windows
         };
         let swap: IDXGISwapChain3 = factory.CreateSwapChainForHwnd(queue, hwnd, &desc, None, None)?.cast()?;
         let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+        let buffers = [swap.GetBuffer(0)?, swap.GetBuffer(1)?];
         let allocators = [dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?, dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?];
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocators[0], None)?;
         list.Close()?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let wait_event = CreateEventW(None, false, false, None).ok();
         xs_log!("present: swap chain {w}x{h} format {} on the title window {:?}", fmt.0, hwnd.0);
-        Ok(Presenter { queue: queue.clone(), swap, size: (w, h, fmt), allocators, list, fence, marks: [0; 2], next: 0, probe: None, target_probe: None, marker: None, marker_charge: None, frames: 0 })
+        Ok(Presenter {
+            dev,
+            queue: queue.clone(),
+            swap,
+            buffers,
+            size: (w, h, fmt),
+            allocators,
+            list,
+            fence,
+            wait_event,
+            marks: [0; 2],
+            next: 0,
+            probe: None,
+            target_probe: None,
+            marker: None,
+            marker_charge: None,
+            frames: 0,
+        })
     }
 }
 
@@ -541,12 +571,17 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
             let i = p.swap.GetCurrentBackBufferIndex() as usize % 2;
             if p.fence.GetCompletedValue() < p.marks[i] {
                 let _wait = decant_trace::span("present", "fence_wait");
-                // A null event makes the call wait until the value is reached.
-                p.fence.SetEventOnCompletion(p.marks[i], windows::Win32::Foundation::HANDLE::default())?;
+                if let Some(ev) = p.wait_event {
+                    p.fence.SetEventOnCompletion(p.marks[i], ev)?;
+                    WaitForSingleObject(ev, INFINITE);
+                } else {
+                    // A null event makes the call wait until the value is reached.
+                    p.fence.SetEventOnCompletion(p.marks[i], HANDLE::default())?;
+                }
             }
             p.allocators[i].Reset()?;
             p.list.Reset(&p.allocators[i], None)?;
-            let back: ID3D12Resource = p.swap.GetBuffer(i as u32)?;
+            let back = &p.buffers[i];
             // A console title usually presents its back buffer in RENDER_TARGET, but it may also
             // leave it in COMMON or PRESENT. The tracked state avoids a mismatch with the barrier.
             let src_state = source_state(source.as_raw() as usize);
@@ -556,18 +591,14 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
                 before[before_len] = transition(source, src_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 before_len += 1;
             }
-            before[before_len] = transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+            before[before_len] = transition(back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
             before_len += 1;
             p.list.ResourceBarrier(&before[..before_len]);
-            p.list.CopyResource(&back, source);
+            p.list.CopyResource(back, source);
             p.frames += 1;
             let probing = probe_enabled() && (p.frames <= 4 || p.frames % 16 == 0 || (dump_dir().is_some() && burst_frame(p.frames)));
             if probing && p.probe.is_none() {
-                let mut dev: Option<ID3D12Device> = None;
-                p.queue.GetDevice(&mut dev)?;
-                if let Some(dev) = dev {
-                    p.probe = make_probe(&dev, &d).ok();
-                }
+                p.probe = make_probe(&p.dev, &d).ok();
             }
             let probe = if probing { p.probe.as_ref().map(|(b, f)| (b.resource.clone(), *f)) } else { None };
             if let Some((buf, fp)) = &probe {
@@ -601,9 +632,7 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
                 if let Some(o) = ID3D12Resource::from_raw_borrowed(&raw) {
                     let od = o.GetDesc();
                     if p.target_probe.as_ref().is_none_or(|t| t.2.Width != od.Width || t.2.Height != od.Height || t.2.Format != od.Format) {
-                        let mut dev: Option<ID3D12Device> = None;
-                        p.queue.GetDevice(&mut dev)?;
-                        p.target_probe = dev.and_then(|dev| make_probe(&dev, &od).ok()).map(|(b, f)| (b, f, od));
+                        p.target_probe = make_probe(&p.dev, &od).ok().map(|(b, f)| (b, f, od));
                     }
                     if let Some((buf, fp, od)) = p.target_probe.as_ref().map(|(b, f, d)| (b.resource.clone(), *f, *d))
                         && od.Format.0 != 0
@@ -621,32 +650,24 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
             }
             let back_state = if marker_enabled() {
                 if p.marker.is_none() {
-                    let mut dev: Option<ID3D12Device> = None;
-                    p.queue.GetDevice(&mut dev)?;
-                    if let Some(dev) = dev {
-                        let desc = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() };
-                        p.marker = dev.CreateDescriptorHeap(&desc).ok();
-                        if p.marker.is_some() {
-                            let increment = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-                            let charge = crate::mem_owners::Charge {
-                                kind: crate::mem_owners::Kind::DescriptorHeap,
-                                segment: crate::mem_owners::Segment::Local,
-                                bytes: u64::from(increment),
-                            };
-                            crate::mem_owners::add_charge(charge);
-                            p.marker_charge = Some(charge);
-                        }
+                    let desc = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() };
+                    p.marker = p.dev.CreateDescriptorHeap(&desc).ok();
+                    if p.marker.is_some() {
+                        let increment = p.dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+                        let charge = crate::mem_owners::Charge {
+                            kind: crate::mem_owners::Kind::DescriptorHeap,
+                            segment: crate::mem_owners::Segment::Local,
+                            bytes: u64::from(increment),
+                        };
+                        crate::mem_owners::add_charge(charge);
+                        p.marker_charge = Some(charge);
                     }
                 }
                 match &p.marker {
                     Some(heap) => {
-                        let mut dev: Option<ID3D12Device> = None;
-                        p.queue.GetDevice(&mut dev)?;
                         let rtv = heap.GetCPUDescriptorHandleForHeapStart();
-                        if let Some(dev) = dev {
-                            dev.CreateRenderTargetView(&back, None, rtv);
-                        }
-                        p.list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                        p.dev.CreateRenderTargetView(back, None, rtv);
+                        p.list.ResourceBarrier(&[transition(back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
                         let square = RECT { left: 64, top: 64, right: 576, bottom: 576 };
                         p.list.ClearRenderTargetView(rtv, &[1.0, 0.0, 1.0, 1.0], Some(&[square]));
                         D3D12_RESOURCE_STATE_RENDER_TARGET
@@ -662,7 +683,7 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
                 after[after_len] = transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, src_state);
                 after_len += 1;
             }
-            after[after_len] = transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT);
+            after[after_len] = transition(back, back_state, D3D12_RESOURCE_STATE_PRESENT);
             after_len += 1;
             p.list.ResourceBarrier(&after[..after_len]);
             p.list.Close()?;
@@ -767,9 +788,30 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
 }
 
 #[derive(Default)]
+struct FastUsizeHasher(u64);
+
+impl Hasher for FastUsizeHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(b);
+        }
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type FastMap<V> = HashMap<usize, V, BuildHasherDefault<FastUsizeHasher>>;
+
+#[derive(Default)]
 struct StateTracker {
-    resources: HashMap<usize, u32>,
-    list_notes: HashMap<usize, Vec<(usize, u32)>>,
+    resources: FastMap<u32>,
+    list_notes: FastMap<Vec<(usize, u32)>>,
 }
 
 static STATES: Mutex<Option<StateTracker>> = Mutex::new(None);
@@ -793,16 +835,13 @@ pub(crate) fn note_list_transitions(list: usize, transitions: &[(usize, u32, u32
     if list == 0 || transitions.is_empty() {
         return;
     }
-    let kept: Vec<(usize, u32)> = transitions
-        .iter()
-        .filter(|(res, sub, _)| *res != 0 && (*sub == 0 || *sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES))
-        .map(|&(res, _, after)| (res, after))
-        .collect();
-    if !kept.is_empty() {
-        with_states(|s| {
-            s.list_notes.entry(list).or_default().extend(kept);
-        });
+    let relevant = |&(res, sub, _): &(usize, u32, u32)| res != 0 && (sub == 0 || sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    if !transitions.iter().any(relevant) {
+        return;
     }
+    with_states(|s| {
+        s.list_notes.entry(list).or_default().extend(transitions.iter().filter(|t| relevant(t)).map(|&(res, _, after)| (res, after)));
+    });
 }
 
 /// Clears recorded transitions when PC command list `list` is reset or released.
@@ -1050,5 +1089,15 @@ mod tests {
         with_states(|s| {
             s.list_notes.remove(&list);
         });
+    }
+
+    #[test]
+    fn note_list_transitions_skips_irrelevant_subresources() {
+        let res = 0xCAFE_0021usize;
+        let list = 0xCAFE_0022usize;
+        list_reset(list);
+        note_list_transitions(list, &[(res, 1, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32), (0, 0, 1)]);
+        let has_entry = with_states(|s| s.list_notes.contains_key(&list));
+        assert!(!has_entry);
     }
 }

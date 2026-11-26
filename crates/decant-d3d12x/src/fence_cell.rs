@@ -15,6 +15,7 @@
 use crate::log::xs_log;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -115,11 +116,32 @@ fn settle(fence: usize, k: &mut Known) -> u64 {
     }
 }
 
+#[derive(Default)]
+struct FastUsizeHasher(u64);
+
+impl Hasher for FastUsizeHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(b);
+        }
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type FastMap<V> = HashMap<usize, V, BuildHasherDefault<FastUsizeHasher>>;
+
 /// All fences seen, by address. A fence stays here for the life of the process: the fence proxy
 /// holds a reference and the title never frees a fence it polls.
-static KNOWN: Mutex<Option<HashMap<usize, Known>>> = Mutex::new(None);
+static KNOWN: Mutex<Option<FastMap<Known>>> = Mutex::new(None);
 
-fn known() -> MutexGuard<'static, Option<HashMap<usize, Known>>> {
+fn known() -> MutexGuard<'static, Option<FastMap<Known>>> {
     KNOWN.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -177,8 +199,11 @@ fn copy_values() {
 
 /// `GetCompletedValue` as the title is given it (slot 8): the same answer the cell holds (R1, R2).
 pub fn completed_value(fence: Object) -> u64 {
+    if fence.is_null() {
+        return 0;
+    }
     let mut guard = known();
-    let k = guard.get_or_insert_with(HashMap::new).entry(fence as usize).or_default();
+    let k = guard.get_or_insert_with(FastMap::default).entry(fence as usize).or_default();
     let value = settle(fence as usize, k);
     if let Some(cell) = k.cell {
         cell.0.store(value, Ordering::Release);
@@ -199,35 +224,38 @@ fn wake_at(fence: usize, value: u64) {
     }
 }
 
+/// Whether `queued` needs to register a wake-up event for `value` given the fence's `has_cell` and `last` known value.
+fn should_wake(has_cell: bool, value: u64, last: u64) -> bool {
+    has_cell && value > last
+}
+
 /// A queue was told to signal `fence` up to `value`.
 pub fn queued(fence: Object, value: u64) {
     if fence.is_null() {
         return;
     }
-    let has_cell = {
+    let wake = {
         let mut guard = known();
-        let k = guard.get_or_insert_with(HashMap::new).entry(fence as usize).or_default();
+        let k = guard.get_or_insert_with(FastMap::default).entry(fence as usize).or_default();
         k.highest_queued = k.highest_queued.max(value);
-        k.cell.is_some()
+        should_wake(k.cell.is_some(), value, k.last)
     };
-    if has_cell {
+    if wake {
         wake_at(fence as usize, value);
     }
 }
 
-/// The CPU signalled `fence` to `value`: the highest value known moves with it, then the cells follow.
+/// The CPU signalled `fence` to `value`: the highest value known moves with it, then its cell follows.
 pub fn cpu_signalled(fence: Object, value: u64) {
     if fence.is_null() {
         return;
     }
-    let has_cell = {
-        let mut guard = known();
-        let k = guard.get_or_insert_with(HashMap::new).entry(fence as usize).or_default();
-        k.highest_queued = k.highest_queued.max(value);
-        k.cell.is_some()
-    };
-    if has_cell {
-        copy_values();
+    let mut guard = known();
+    let k = guard.get_or_insert_with(FastMap::default).entry(fence as usize).or_default();
+    k.highest_queued = k.highest_queued.max(value);
+    if let Some(cell) = k.cell {
+        let settled = settle(fence as usize, k);
+        cell.0.store(settled, Ordering::Release);
     }
 }
 
@@ -235,7 +263,7 @@ pub fn cpu_signalled(fence: Object, value: u64) {
 pub fn address(fence: Object) -> *const u64 {
     let (cell, queued_before) = {
         let mut guard = known();
-        let k = guard.get_or_insert_with(HashMap::new).entry(fence as usize).or_default();
+        let k = guard.get_or_insert_with(FastMap::default).entry(fence as usize).or_default();
         if let Some(cell) = k.cell {
             return cell.0.as_ptr();
         }
@@ -263,7 +291,17 @@ mod tests {
     #[test]
     fn a_null_fence_is_ignored() {
         queued(std::ptr::null_mut(), 5);
+        cpu_signalled(std::ptr::null_mut(), 5);
+        assert_eq!(completed_value(std::ptr::null_mut()), 0);
         assert!(known().as_ref().is_none_or(|t| !t.contains_key(&0)));
+    }
+
+    #[test]
+    fn queued_skips_wake_when_value_is_already_reached() {
+        assert!(!should_wake(false, 10, 5));
+        assert!(!should_wake(true, 5, 5));
+        assert!(!should_wake(true, 4, 5));
+        assert!(should_wake(true, 6, 5));
     }
 }
 
