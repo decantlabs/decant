@@ -224,30 +224,24 @@ impl Store {
     /// The blob stored for `key`. `None` on a miss or a file that fails any check.
     pub fn read(&self, key: u128) -> Option<Vec<u8>> {
         let mut file = File::open(self.path(key)).ok()?;
-        let len = file.metadata().ok()?.len();
-        if len <= HEADER as u64 || len > (HEADER + MAX_BLOB_BYTES) as u64 {
-            return None;
-        }
-        let mut bytes = vec![0u8; len as usize];
-        file.read_exact(&mut bytes).ok()?;
-        self.parse(key, &bytes)?;
-        bytes.copy_within(HEADER.., 0);
-        bytes.truncate(bytes.len() - HEADER);
-        Some(bytes)
+        let mut header = [0u8; HEADER];
+        file.read_exact(&mut header).ok()?;
+        let (blob_len, expected_hash) = self.parse_header(key, &header)?;
+        let mut blob = vec![0u8; blob_len];
+        file.read_exact(&mut blob).ok()?;
+        (Fnv128::default().bytes(&blob).finish() == expected_hash).then_some(blob)
     }
 
-    /// The blob of a file's bytes, when the header names this store and `key` and the length and
-    /// checksum match.
-    fn parse<'a>(&self, key: u128, bytes: &'a [u8]) -> Option<&'a [u8]> {
-        let (header, blob) = bytes.split_at_checked(HEADER)?;
+    /// Validates the 64-byte header for `key` and returns `(blob_len, expected_fnv128)`.
+    fn parse_header(&self, key: u128, header: &[u8; HEADER]) -> Option<(usize, u128)> {
         let u128_at = |at: usize| header[at..at + 16].try_into().ok().map(u128::from_le_bytes);
+        let blob_len = u64::from_le_bytes(header[40..48].try_into().ok()?) as usize;
         let valid = &header[0..4] == MAGIC
             && header[4..8] == FORMAT.to_le_bytes()
             && u128_at(8)? == self.context
             && u128_at(24)? == key
-            && header[40..48] == (blob.len() as u64).to_le_bytes()
-            && u128_at(48)? == Fnv128::default().bytes(blob).finish();
-        valid.then_some(blob)
+            && (1..=MAX_BLOB_BYTES).contains(&blob_len);
+        valid.then_some(u128_at(48)?).map(|hash| (blob_len, hash))
     }
 
     /// The file of `blob` under `key`, header first.

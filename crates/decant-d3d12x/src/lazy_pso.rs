@@ -653,8 +653,19 @@ impl Drop for LargePsoGuard<'_> {
 
 static LARGE_PSO_GATE: LazyLock<LargePsoGate> = LazyLock::new(|| LargePsoGate::new(large_pso_limit()));
 
+fn has_cached_pso(desc: &[u8]) -> bool {
+    let Some(at) = crate::pso_library::cached_field(desc.len()) else {
+        return false;
+    };
+    desc.get(at..at + 16).is_some_and(|field| {
+        let ptr = u64::from_le_bytes(field[..8].try_into().unwrap_or_default());
+        let len = u64::from_le_bytes(field[8..16].try_into().unwrap_or_default());
+        ptr != 0 && len != 0
+    })
+}
+
 fn is_large_compute(lazy: &Lazy, desc: &[u8]) -> bool {
-    if !lazy.recipe.is_compute || desc.len() < 24 {
+    if !lazy.recipe.is_compute || desc.len() < 24 || has_cached_pso(desc) {
         return false;
     }
     let cs_len = u64::from_le_bytes(desc[16..24].try_into().unwrap_or_default()) as usize;
@@ -782,7 +793,9 @@ fn run_job(lazy: &Lazy, source: MakeSource, service: Option<&'static crate::comp
             match guard.as_ref() {
                 None => Some(0),
                 Some(owned) => match source {
-                    MakeSource::Direct(patched) => match make(lazy, owned, patched.desc(), true, service) {
+                    MakeSource::Direct(mut patched) => {
+                        crate::direct_pso::prepare_patched(owned, &mut patched);
+                        match make(lazy, owned, patched.desc(), true, service) {
                         MakeOutcome::Made(direct) => {
                             crate::direct_pso::kind_made(direct, owned);
                             Some(direct)
@@ -793,7 +806,8 @@ fn run_job(lazy: &Lazy, source: MakeSource, service: Option<&'static crate::comp
                             MakeOutcome::RetryOom => None,
                             MakeOutcome::Refused => Some(0),
                         },
-                    },
+                    }
+                    }
                     MakeSource::Original => {
                         crate::direct_pso::pipeline_done_for(service, owned, None);
                         match make(lazy, owned, owned.desc(), false, service) {
@@ -1761,5 +1775,41 @@ mod tests {
         run_job(invalid_lazy, MakeSource::Original, None);
         assert_eq!(invalid_lazy.made.get().copied(), Some(0));
         assert_eq!(CALLS_INVALID.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cached_pso_bypasses_large_compute_gate() {
+        let large_cs = vec![0u8; LARGE_COMPUTE_DXIL_BYTES + 64];
+        let mut desc = compute_desc(&large_cs);
+        unsafe fn noop_create(_: usize, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+            0
+        }
+        let lazy = Lazy {
+            vtbl: &VTBL,
+            refs: AtomicU32::new(1),
+            number: 0,
+            packet: [0; 8],
+            recipe: Recipe {
+                device: 0x1234,
+                create: noop_create,
+                riid: GUID { data1: 0, data2: 0, data3: 0, data4: [0; 8] },
+                is_compute: true,
+                owned: RwLock::new(None),
+            },
+            made: OnceLock::new(),
+            precompile_key: None,
+            waited: AtomicBool::new(false),
+            late: AtomicBool::new(false),
+            making: AtomicBool::new(false),
+            pending_logged: AtomicBool::new(false),
+            oom_retries: AtomicU8::new(0),
+        };
+
+        assert!(is_large_compute(&lazy, &desc));
+        let blob = [1u8; 64];
+        let at = crate::pso_library::cached_field(desc.len()).unwrap();
+        desc[at..at + 8].copy_from_slice(&(blob.as_ptr() as u64).to_le_bytes());
+        desc[at + 8..at + 16].copy_from_slice(&(blob.len() as u64).to_le_bytes());
+        assert!(!is_large_compute(&lazy, &desc));
     }
 }

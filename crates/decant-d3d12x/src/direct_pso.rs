@@ -528,6 +528,7 @@ pub struct Patched {
     desc: Vec<u8>,
     dxil: Vec<Arc<[u8]>>,
     _blob: Option<Vec<u8>>,
+    blob_checked: bool,
 }
 
 impl Patched {
@@ -616,17 +617,22 @@ pub(crate) fn choose_with_budget(object: usize, owned: &Owned, key: Option<u128>
 }
 
 /// The choice that follows a poll answer.
-fn choice_from(owned: &Owned, verdict: Poll) -> Choice {
+fn choice_from(_owned: &Owned, verdict: Poll) -> Choice {
     match verdict {
-        Poll::Ready(dxil) => {
-            let mut patched = patch(owned.desc(), &dxil);
-            if let Some(library) = library() {
-                attach_blob(library, owned, &mut patched);
-            }
-            Choice::Direct(patched)
-        }
+        Poll::Ready(dxil) => Choice::Direct(patch(_owned.desc(), &dxil)),
         Poll::Refused(_) => Choice::Original,
         Poll::Pending => Choice::Pending,
+    }
+}
+
+/// Attaches any stored driver blob to `patched` off the recording thread before pipeline creation.
+pub(crate) fn prepare_patched(owned: &Owned, patched: &mut Patched) {
+    if patched.blob_checked {
+        return;
+    }
+    patched.blob_checked = true;
+    if let Some(library) = library() {
+        attach_blob(library, owned, patched);
     }
 }
 
@@ -788,7 +794,7 @@ fn patch(desc: &[u8], dxil: &[Arc<[u8]>]) -> Patched {
         copy[at..at + 8].copy_from_slice(&(d.as_ptr() as u64).to_le_bytes());
         copy[at + 8..at + 16].copy_from_slice(&(d.len() as u64).to_le_bytes());
     }
-    Patched { desc: copy, dxil: dxil.to_vec(), _blob: None }
+    Patched { desc: copy, dxil: dxil.to_vec(), _blob: None, blob_checked: false }
 }
 
 /// Points `patched` at the stored driver blob of its pipeline, when the library has one, and
@@ -1233,5 +1239,25 @@ mod tests {
         let patched = patch(&desc, &dxil);
         let expected = crate::pso_library::pipeline_key(patched.desc(), &[&b"DXBCcs"[..]], 999);
         assert_eq!(library_key(&patched), expected);
+    }
+
+    #[test]
+    fn choice_from_defers_blob_lookup_until_prepare_patched() {
+        let mut desc = [0u8; COMPUTE_DESC_SIZE];
+        let cs = [1u8; 8];
+        desc[8..16].copy_from_slice(&(cs.as_ptr() as u64).to_le_bytes());
+        desc[16..24].copy_from_slice(&(cs.len() as u64).to_le_bytes());
+        // SAFETY: `desc` and `cs` are live for `copy_compute`.
+        let owned = unsafe { crate::lazy_pso::copy_compute(desc.as_ptr().cast()) };
+        let dxil = vec![Arc::<[u8]>::from(&b"DXBCcs"[..])];
+        let Choice::Direct(mut patched) = choice_from(&owned, Poll::Ready(dxil)) else {
+            panic!("expected Choice::Direct");
+        };
+        assert!(!patched.blob_checked);
+        prepare_patched(&owned, &mut patched);
+        assert!(patched.blob_checked);
+        // Calling `prepare_patched` again is a no-op.
+        prepare_patched(&owned, &mut patched);
+        assert!(patched.blob_checked);
     }
 }
