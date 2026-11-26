@@ -1581,7 +1581,6 @@ struct State {
     zero_scan: ZeroScan,
     /// Reused between syncs.
     scratch: Vec<GpuChange>,
-    tile_scratch: TileScratch,
     /// The mirror tiles of the pages the current sync copied: what the title wrote since the last one.
     written: Vec<u32>,
 }
@@ -1746,6 +1745,18 @@ static SYNC_LOCK: Mutex<SyncScratch> = Mutex::new(SyncScratch {
     staging: None,
     l1_prints: L1Fingerprints { heaps: Vec::new() },
     waited: None,
+});
+
+/// Serializes window buffer creation outside `STATE`.
+static WINDOW_MAKE_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes pool heap creation outside `STATE`.
+static HEAP_MAKE_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes `UpdateTileMappings` + `Signal` on `map_queue` outside `STATE`.
+static MAP_QUEUE_LOCK: Mutex<TileScratch> = Mutex::new(TileScratch {
+    coords: Vec::new(),
+    sizes: Vec::new(),
+    counts: Vec::new(),
+    flags: Vec::new(),
 });
 
 fn should_skip_drain(last_seq: Option<u64>, current_seq: Option<u64>) -> bool {
@@ -1919,90 +1930,13 @@ fn make_window(device: &ID3D12Device, bytes: u64, index: usize) -> windows::core
 }
 
 impl State {
-    /// The pool heap `index` as `(mapped_ptr, is_l1)`, made when first needed. `None` when it cannot be made.
-    fn heap(&mut self, index: u32) -> Option<(usize, bool)> {
-        let i = index as usize;
-        if self.heaps.len() <= i {
-            self.heaps.resize_with(i + 1, || None);
-        }
-        if self.heaps[i].is_none() && !self.failed.contains(&index) {
-            let (budget, current_usage) = self
-                .adapter
-                .as_ref()
-                .and_then(local_vram_info)
-                .unwrap_or((self.fallback_budget, 0));
-            let want_l1 = self.has_staging
-                && should_use_l1(
-                    self.pool_mode,
-                    budget,
-                    current_usage,
-                    self.l1_heaps * POOL_HEAP_BYTES,
-                    self.m_cap_override,
-                );
-            let made = if want_l1 {
-                match make_heap(&self.device, index, MirrorPool::L1) {
-                    Ok(h) => Ok(h),
-                    Err(e) => {
-                        xs_log!("title memory: L1 pool heap {index} failed ({e}), spilling to L0");
-                        make_heap(&self.device, index, MirrorPool::L0)
-                    }
-                }
-            } else {
-                let allow_l0 = if let Some((total_phys, avail_phys, avail_pagefile)) = host_ram_status() {
-                    let l0_cap = host_ram_l0_cap(total_phys, avail_phys, avail_pagefile, self.l0_cap_override);
-                    let l0_bytes = self.l0_heaps * POOL_HEAP_BYTES;
-                    let ok = can_grow_l0(l0_bytes, l0_cap, avail_phys, avail_pagefile);
-                    if !ok {
-                        static L0_PRESSURE_LOGGED: std::sync::Once = std::sync::Once::new();
-                        L0_PRESSURE_LOGGED.call_once(|| {
-                            xs_log!(
-                                "title memory: L0 host RAM cap reached ({} MiB / {} MiB, avail phys {} MiB, avail pagefile {} MiB), skipping further L0 heap growth",
-                                l0_bytes >> 20,
-                                l0_cap >> 20,
-                                avail_phys >> 20,
-                                avail_pagefile >> 20
-                            );
-                        });
-                    }
-                    ok
-                } else {
-                    true
-                };
-                if !allow_l0 {
-                    self.failed.insert(index);
-                    return None;
-                }
-                make_heap(&self.device, index, MirrorPool::L0)
-            };
-            match made {
-                Ok(heap) => {
-                    if heap.is_l1 {
-                        self.l1_heaps += 1;
-                    } else {
-                        self.l0_heaps += 1;
-                    }
-                    self.heaps[i] = Some(heap);
-                }
-                Err(e) => {
-                    self.failed.insert(index);
-                    xs_log!("title memory: pool heap {index} cannot be made ({e}), its pages stay invisible to the GPU");
-                }
-            }
-        }
-        self.heaps[i].as_ref().map(|h| (h.ptr, h.is_l1))
-    }
-
-    /// Makes the window buffers the mirror has slots in.
-    fn make_windows(&mut self) {
+    /// Returns `(state_id, device, start_idx, new_sizes)` if new window buffers are needed.
+    fn missing_window_sizes(&self) -> Option<(u64, ID3D12Device, usize, Vec<u64>)> {
         let sizes = self.mirror.buffer_bytes();
-        for (i, &bytes) in sizes.iter().enumerate().skip(self.windows.len()) {
-            let made = make_window(&self.device, bytes, i);
-            match &made {
-                Ok(w) => xs_log!("title memory: window buffer {i} of {} GiB at GPU address {:#x}", bytes >> 30, w.gpu),
-                Err(e) => xs_log!("title memory: window buffer {i} of {} GiB cannot be made ({e}), its slots stay invisible to the GPU", bytes >> 30),
-            }
-            self.windows.push(made.ok());
+        if sizes.len() <= self.windows.len() {
+            return None;
         }
+        Some((self.id, self.device.clone(), self.windows.len(), sizes[self.windows.len()..].to_vec()))
     }
 
     /// The address of pool page `page` in the read only view of its section.
@@ -2122,7 +2056,6 @@ impl State {
                 break;
             }
         }
-        self.make_windows();
         self.last_journal_seq = cur_seq;
         if let Some(seq) = cur_seq {
             LAST_JOURNAL_SEQ.store(seq, Ordering::Release);
@@ -2152,36 +2085,11 @@ impl State {
     }
 
     /// Applies the pending tile mappings on the private queue and signals the fence. Returns the ranges.
-    fn update_tiles(&mut self) -> u64 {
-        let _trace = decant_trace::span("title_mem", "update_tiles");
-        let calls = self.mirror.drain_updates();
-        if calls.is_empty() {
-            return 0;
-        }
-        let mut ranges = 0;
-        for mut call in calls {
-            // A heap that cannot be made shows nothing, as the tiles of a release do.
-            if let Some(h) = call.heap
-                && self.heap(h).is_none()
-            {
-                call.heap = None;
-            }
-            let Some(window) = self.windows.get(call.buffer).and_then(|w| w.as_ref()) else { continue };
-            ranges += call.ranges.len() as u64;
-            update_call(&self.map_queue, &window.resource, &call, call.heap.and_then(|h| self.heaps.get(h as usize)).and_then(|h| h.as_ref()).map(|h| &h._heap), &mut self.tile_scratch);
-        }
-        let next_val = self.fence_value.fetch_add(1, Ordering::AcqRel) + 1;
-        // SAFETY: both objects are live.
-        if let Err(e) = unsafe { self.map_queue.Signal(&self.map_fence, next_val) } {
-            xs_log!("title memory: the map fence cannot be signalled ({e})");
-        }
-        ranges
-    }
-
-    /// Collects copy jobs for sorted unique pool pages written since the last sync, ensuring heaps and sections exist.
-    fn plan_upload(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, runs: &mut Vec<UploadRun>) -> u64 {
+    /// Collects copy jobs for sorted unique pool pages written since the last sync, ensuring heaps
+    /// are either ready or returned in `Err(missing_heaps)` to be created outside `STATE`.
+    fn plan_upload(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, runs: &mut Vec<UploadRun>) -> Result<u64, Vec<u32>> {
         if pages.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let _trace = decant_trace::span("title_mem", "upload");
         let mut total = 0;
@@ -2198,14 +2106,15 @@ impl State {
                 new_tile = true;
             }
         }
-        self.plan_runs(api, pages, jobs, runs, &mut total);
+        let res = self.plan_runs(api, pages, jobs, runs, &mut total);
         if new_tile {
             bump_tile_gen();
         }
-        total
+        res.map(|()| total)
     }
 
-    fn plan_runs(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, runs: &mut Vec<UploadRun>, copied: &mut u64) {
+    fn plan_runs(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, runs: &mut Vec<UploadRun>, copied: &mut u64) -> Result<(), Vec<u32>> {
+        let mut missing_heaps = Vec::new();
         let mut i = 0;
         while i < pages.len() {
             let first = pages[i];
@@ -2222,13 +2131,24 @@ impl State {
             {
                 n += 1;
             }
-            let (Some((dst, use_staging)), Some((src, in_section))) = (self.heap(heap), self.source_section(api, first)) else {
+            let heap_info = self.heaps.get(heap as usize).and_then(Option::as_ref).map(|h| (h.ptr, h.is_l1));
+            if heap_info.is_none() && !self.failed.contains(&heap) {
+                if !missing_heaps.contains(&heap) {
+                    missing_heaps.push(heap);
+                }
+                i += n;
+                continue;
+            }
+            let (Some((dst, use_staging)), Some((src, in_section))) = (heap_info, self.source_section(api, first)) else {
                 i += n;
                 continue;
             };
             // One run never leaves its section: the tail of a section is cut off and copied by page.
             let head = n.min(in_section);
             i += head;
+            if !missing_heaps.is_empty() {
+                continue;
+            }
             if use_staging {
                 runs.push(UploadRun {
                     source: src,
@@ -2245,6 +2165,7 @@ impl State {
                 self.written.extend(first_tile..first_tile + head as u32);
             }
         }
+        if missing_heaps.is_empty() { Ok(()) } else { Err(missing_heaps) }
     }
 }
 
@@ -2365,9 +2286,130 @@ pub unsafe fn device_created(device: *mut c_void) {
         stats: Stats::default(),
         zero_scan: ZeroScan::default(),
         scratch: Vec::new(),
-        tile_scratch: TileScratch::default(),
         written: Vec::new(),
     });
+}
+
+/// Creates any missing window buffers outside `STATE`, holding only `WINDOW_MAKE_LOCK` across
+/// `CreateReservedResource` and taking `STATE.write()` only for the O(1) push.
+fn ensure_windows_outside_state(state_id: u64, device: &ID3D12Device, start_idx: usize, sizes: &[u64]) {
+    if sizes.is_empty() {
+        return;
+    }
+    let _make_guard = WINDOW_MAKE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    for (offset, &bytes) in sizes.iter().enumerate() {
+        let i = start_idx + offset;
+        let already = {
+            let guard = STATE.read().unwrap_or_else(PoisonError::into_inner);
+            guard.as_ref().is_none_or(|st| st.id != state_id || st.windows.len() > i)
+        };
+        if already {
+            continue;
+        }
+        let made = make_window(device, bytes, i);
+        match &made {
+            Ok(w) => xs_log!("title memory: window buffer {i} of {} GiB at GPU address {:#x}", bytes >> 30, w.gpu),
+            Err(e) => xs_log!("title memory: window buffer {i} of {} GiB cannot be made ({e}), its slots stay invisible to the GPU", bytes >> 30),
+        }
+        let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
+        if let Some(st) = guard.as_mut().filter(|st| st.id == state_id && st.windows.len() == i) {
+            st.windows.push(made.ok());
+        }
+    }
+}
+
+/// Creates any missing pool heaps in `indices` outside `STATE`, holding `HEAP_MAKE_LOCK` across
+/// `CreateHeap`/`CreatePlacedResource`/`Map` and taking `STATE.write()` only to insert the handle.
+fn ensure_heaps_outside_state(state_id: u64, indices: &[u32]) {
+    if indices.is_empty() {
+        return;
+    }
+    let _make_guard = HEAP_MAKE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    for &index in indices {
+        let snap = {
+            let guard = STATE.read().unwrap_or_else(PoisonError::into_inner);
+            let Some(st) = guard.as_ref().filter(|st| st.id == state_id) else {
+                return;
+            };
+            let i = index as usize;
+            if st.heaps.get(i).and_then(Option::as_ref).is_some() || st.failed.contains(&index) {
+                continue;
+            }
+            (
+                st.device.clone(),
+                st.adapter.clone(),
+                st.pool_mode,
+                st.fallback_budget,
+                st.has_staging,
+                st.l1_heaps,
+                st.l0_heaps,
+                st.m_cap_override,
+                st.l0_cap_override,
+            )
+        };
+        let (device, adapter, pool_mode, fallback_budget, has_staging, l1_heaps, l0_heaps, m_cap_override, l0_cap_override) = snap;
+        let (budget, current_usage) = adapter.as_ref().and_then(local_vram_info).unwrap_or((fallback_budget, 0));
+        let want_l1 = has_staging && should_use_l1(pool_mode, budget, current_usage, l1_heaps * POOL_HEAP_BYTES, m_cap_override);
+        let made = if want_l1 {
+            match make_heap(&device, index, MirrorPool::L1) {
+                Ok(h) => Ok(Some(h)),
+                Err(e) => {
+                    xs_log!("title memory: L1 pool heap {index} failed ({e}), spilling to L0");
+                    make_heap(&device, index, MirrorPool::L0).map(Some)
+                }
+            }
+        } else {
+            let allow_l0 = if let Some((total_phys, avail_phys, avail_pagefile)) = host_ram_status() {
+                let l0_cap = host_ram_l0_cap(total_phys, avail_phys, avail_pagefile, l0_cap_override);
+                let l0_bytes = l0_heaps * POOL_HEAP_BYTES;
+                let ok = can_grow_l0(l0_bytes, l0_cap, avail_phys, avail_pagefile);
+                if !ok {
+                    static L0_PRESSURE_LOGGED: std::sync::Once = std::sync::Once::new();
+                    L0_PRESSURE_LOGGED.call_once(|| {
+                        xs_log!(
+                            "title memory: L0 host RAM cap reached ({} MiB / {} MiB, avail phys {} MiB, avail pagefile {} MiB), skipping further L0 heap growth",
+                            l0_bytes >> 20,
+                            l0_cap >> 20,
+                            avail_phys >> 20,
+                            avail_pagefile >> 20
+                        );
+                    });
+                }
+                ok
+            } else {
+                true
+            };
+            if !allow_l0 { Ok(None) } else { make_heap(&device, index, MirrorPool::L0).map(Some) }
+        };
+        let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
+        let Some(st) = guard.as_mut().filter(|st| st.id == state_id) else {
+            return;
+        };
+        let i = index as usize;
+        if st.heaps.len() <= i {
+            st.heaps.resize_with(i + 1, || None);
+        }
+        if st.heaps[i].is_some() || st.failed.contains(&index) {
+            continue;
+        }
+        match made {
+            Ok(Some(heap)) => {
+                if heap.is_l1 {
+                    st.l1_heaps += 1;
+                } else {
+                    st.l0_heaps += 1;
+                }
+                st.heaps[i] = Some(heap);
+            }
+            Ok(None) => {
+                st.failed.insert(index);
+            }
+            Err(e) => {
+                st.failed.insert(index);
+                xs_log!("title memory: pool heap {index} cannot be made ({e}), its pages stay invisible to the GPU");
+            }
+        }
+    }
 }
 
 /// Runs `f` on the state, with the exports of `xmem.dll`, once tracking is on and the journal is read.
@@ -2401,7 +2443,7 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
     }
     let batch = drain_journal(api, &mut cursor);
     let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
-    let st = guard.as_mut()?;
+    let mut st = guard.as_mut()?;
     st.tracking = true;
     match batch {
         DrainBatch::Unchanged => {}
@@ -2410,7 +2452,6 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
                 st.apply(c);
             }
             st.seq = seq;
-            st.make_windows();
             st.last_journal_seq = journal_seq;
             if let Some(jseq) = journal_seq {
                 LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
@@ -2425,7 +2466,6 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
                 st.apply(c);
             }
             st.seq = seq;
-            st.make_windows();
             st.last_journal_seq = journal_seq;
             if let Some(jseq) = journal_seq {
                 LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
@@ -2437,6 +2477,13 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
             cursor.seq = st.seq;
             cursor.last_journal_seq = st.last_journal_seq;
         }
+    }
+    if let Some((state_id, device, start_idx, sizes)) = st.missing_window_sizes() {
+        drop(guard);
+        ensure_windows_outside_state(state_id, &device, start_idx, &sizes);
+        guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
+        st = guard.as_mut()?;
+        st.tracking = true;
     }
     let res = f(st, api);
     if st.seq != cursor.seq {
@@ -2675,28 +2722,44 @@ fn reserved_desc(desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES) -> D3
     D3D12_RESOURCE_DESC { Alignment: 0, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: flags, ..*desc }
 }
 
-impl State {
-    /// Maps the tiles of `buffer` onto the mirror tiles `pages` (one per buffer tile, in order), one
-    /// `UpdateTileMappings` call per pool heap, and signals the map fence. `None` when a heap is missing.
-    fn map_to_pool(&mut self, buffer: &ID3D12Resource, pages: &[u32]) -> Option<()> {
-        for (heap, runs) in runs_by_heap(pages) {
-            self.heap(heap)?;
-            let pool = self.heaps.get(heap as usize)?.as_ref()?;
-            let call = TileCall {
-                buffer: 0,
-                heap: Some(heap),
-                ranges: runs.iter().map(|&(at, n, _)| (at, n)).collect(),
-                heap_tiles: runs.iter().map(|&(_, _, t)| t).collect(),
-            };
-            update_call(&self.map_queue, buffer, &call, Some(&pool._heap), &mut self.tile_scratch);
+/// Maps `buffer` onto `pages` outside `STATE`, ensuring any missing pool heaps exist first.
+fn map_buffer_to_pool_outside_state(
+    state_id: u64,
+    map_queue: &ID3D12CommandQueue,
+    map_fence: &ID3D12Fence,
+    fence_value: &AtomicU64,
+    buffer: &ID3D12Resource,
+    pages: &[u32],
+) -> Option<()> {
+    let heap_runs = runs_by_heap(pages);
+    let missing_indices: Vec<u32> = heap_runs.iter().map(|&(h, _)| h).collect();
+    ensure_heaps_outside_state(state_id, &missing_indices);
+    let heaps: Vec<ID3D12Heap> = {
+        let guard = STATE.read().unwrap_or_else(PoisonError::into_inner);
+        let st = guard.as_ref().filter(|st| st.id == state_id)?;
+        let mut out = Vec::with_capacity(heap_runs.len());
+        for &(heap, _) in &heap_runs {
+            let pool = st.heaps.get(heap as usize)?.as_ref()?;
+            out.push(pool._heap.clone());
         }
-        let next_val = self.fence_value.fetch_add(1, Ordering::AcqRel) + 1;
-        // SAFETY: both objects are live.
-        if let Err(e) = unsafe { self.map_queue.Signal(&self.map_fence, next_val) } {
-            xs_log!("title memory: the map fence cannot be signalled ({e})");
-        }
-        Some(())
+        out
+    };
+    let mut scratch = MAP_QUEUE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    for ((heap, runs), pool_heap) in heap_runs.into_iter().zip(heaps) {
+        let call = TileCall {
+            buffer: 0,
+            heap: Some(heap),
+            ranges: runs.iter().map(|&(at, n, _)| (at, n)).collect(),
+            heap_tiles: runs.iter().map(|&(_, _, t)| t).collect(),
+        };
+        update_call(map_queue, buffer, &call, Some(&pool_heap), &mut scratch);
     }
+    let next_val = fence_value.fetch_add(1, Ordering::AcqRel) + 1;
+    // SAFETY: both objects are live.
+    if let Err(e) = unsafe { map_queue.Signal(map_fence, next_val) } {
+        xs_log!("title memory: the map fence cannot be signalled ({e})");
+    }
+    Some(())
 }
 
 /// A PC buffer for a buffer the title places at title address `va` (`CreatePlacedResourceX`): a reserved
@@ -2716,22 +2779,22 @@ pub fn place_buffer(va: u64, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_S
     }
     let tiles = u32::try_from(desc.Width.div_ceil(PAGE)).ok()?;
     let reserved = reserved_desc(desc, state);
-    let made = with_state(|st, api| {
+    let (state_id, device, map_queue, map_fence, fence_value, pages) = with_state(|st, api| {
         st.give(api, va, u64::from(tiles) * PAGE);
         let pages = st.mirror.mirror_tiles(va, tiles)?;
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain D3D12 call on a live device with a description of plain data.
-        let created = unsafe { st.device.CreateReservedResource(&reserved, state, None, &mut buffer) };
-        if let Err(e) = created {
-            if FAILED.fetch_add(1, Ordering::Relaxed) < 4 {
-                xs_log!("title memory: the buffer placed at {va:#x} ({} bytes) cannot be a reserved buffer ({e})", desc.Width);
-            }
-            return None;
-        }
-        let buffer = buffer?;
-        st.map_to_pool(&buffer, &pages)?;
-        Some(buffer)
+        Some((st.id, st.device.clone(), st.map_queue.clone(), st.map_fence.clone(), st.fence_value.clone(), pages))
     })??;
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain D3D12 call on a live device with a description of plain data.
+    let created = unsafe { device.CreateReservedResource(&reserved, state, None, &mut buffer) };
+    if let Err(e) = created {
+        if FAILED.fetch_add(1, Ordering::Relaxed) < 4 {
+            xs_log!("title memory: the buffer placed at {va:#x} ({} bytes) cannot be a reserved buffer ({e})", desc.Width);
+        }
+        return None;
+    }
+    let made = buffer?;
+    map_buffer_to_pool_outside_state(state_id, &map_queue, &map_fence, &fence_value, &made, &pages)?;
     if PLACED.fetch_add(1, Ordering::Relaxed) < 8 {
         // SAFETY: a live resource.
         let gpu = unsafe { made.GetGPUVirtualAddress() };
@@ -2813,27 +2876,45 @@ pub unsafe fn sync(queue: *mut c_void) {
         jobs.clear();
         runs.clear();
         let started = Instant::now();
-        let batch_take = if total_pages == 0 && total_ranges == 0 { take_micros } else { 0 };
-        let Some((phase1_id, pages, map_queue, map_fence, fence_value, target_heaps)) = with_state(|st, api| {
-            st.stats.take_micros += batch_take;
-            let pages = st.plan_upload(api, batch_pages, jobs, runs);
-            let mut batch_written = std::mem::take(&mut st.written);
-            written.append(&mut batch_written);
-            st.written = batch_written;
-            let mut target_heaps: Vec<Option<ID3D12Resource>> = Vec::new();
-            if !runs.is_empty() {
-                let max_heap = runs.iter().map(|r| r.heap as usize).max().unwrap_or(0);
-                target_heaps.resize(max_heap + 1, None);
-                for r in runs.iter() {
-                    let idx = r.heap as usize;
-                    if target_heaps[idx].is_none()
-                        && let Some(Some(h)) = st.heaps.get(idx)
-                    {
-                        target_heaps[idx] = Some(h.buffer.clone());
+        let Some((phase1_id, pages, map_queue, map_fence, fence_value, target_heaps)) = ({
+            let mut batch_take = if total_pages == 0 && total_ranges == 0 { take_micros } else { 0 };
+            loop {
+                jobs.clear();
+                runs.clear();
+                let res = with_state(|st, api| {
+                    st.stats.take_micros += batch_take;
+                    match st.plan_upload(api, batch_pages, jobs, runs) {
+                        Ok(pages) => {
+                            let mut batch_written = std::mem::take(&mut st.written);
+                            written.append(&mut batch_written);
+                            st.written = batch_written;
+                            let mut target_heaps: Vec<Option<ID3D12Resource>> = Vec::new();
+                            if !runs.is_empty() {
+                                let max_heap = runs.iter().map(|r| r.heap as usize).max().unwrap_or(0);
+                                target_heaps.resize(max_heap + 1, None);
+                                for r in runs.iter() {
+                                    let idx = r.heap as usize;
+                                    if target_heaps[idx].is_none()
+                                        && let Some(Some(h)) = st.heaps.get(idx)
+                                    {
+                                        target_heaps[idx] = Some(h.buffer.clone());
+                                    }
+                                }
+                            }
+                            Ok((st.id, pages, st.map_queue.clone(), st.map_fence.clone(), st.fence_value.clone(), target_heaps))
+                        }
+                        Err(missing_heaps) => Err((st.id, missing_heaps)),
+                    }
+                });
+                batch_take = 0;
+                match res {
+                    None => break None,
+                    Some(Ok(ok)) => break Some(ok),
+                    Some(Err((state_id, missing_heaps))) => {
+                        ensure_heaps_outside_state(state_id, &missing_heaps);
                     }
                 }
             }
-            (st.id, pages, st.map_queue.clone(), st.map_fence.clone(), st.fence_value.clone(), target_heaps)
         }) else {
             SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
             return;
@@ -2877,15 +2958,77 @@ pub unsafe fn sync(queue: *mut c_void) {
         };
         let skipped_bytes = l1_skipped_bytes + l0_skipped_bytes;
 
+        let tile_started = Instant::now();
+        let (calls, missing_heaps, window_resources, mut heap_objs) = {
+            let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
+            if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
+                let calls = st.mirror.drain_updates();
+                let mut missing_heaps = Vec::new();
+                let mut window_resources: Vec<Option<ID3D12Resource>> = Vec::new();
+                let mut heap_objs: HashMap<u32, ID3D12Heap> = HashMap::new();
+                for call in &calls {
+                    if let Some(h) = call.heap {
+                        if let Some(Some(pool)) = st.heaps.get(h as usize) {
+                            heap_objs.entry(h).or_insert_with(|| pool._heap.clone());
+                        } else if !st.failed.contains(&h) && !missing_heaps.contains(&h) {
+                            missing_heaps.push(h);
+                        }
+                    }
+                    if window_resources.len() <= call.buffer {
+                        window_resources.resize(call.buffer + 1, None);
+                    }
+                    if window_resources[call.buffer].is_none()
+                        && let Some(Some(w)) = st.windows.get(call.buffer)
+                    {
+                        window_resources[call.buffer] = Some(w.resource.clone());
+                    }
+                }
+                (calls, missing_heaps, window_resources, heap_objs)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), HashMap::new())
+            }
+        };
+        let mut ranges = 0u64;
+        if !calls.is_empty() {
+            let _tile_span = decant_trace::span("title_mem", "update_tiles");
+            if !missing_heaps.is_empty() {
+                ensure_heaps_outside_state(phase1_id, &missing_heaps);
+                let guard = STATE.read().unwrap_or_else(PoisonError::into_inner);
+                if let Some(st) = guard.as_ref().filter(|st| st.id == phase1_id) {
+                    for h in missing_heaps {
+                        if let Some(Some(pool)) = st.heaps.get(h as usize) {
+                            heap_objs.insert(h, pool._heap.clone());
+                        }
+                    }
+                }
+            }
+            {
+                let mut scratch = MAP_QUEUE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+                for mut call in calls {
+                    let Some(Some(window)) = window_resources.get(call.buffer) else { continue };
+                    let heap = call.heap.and_then(|h| heap_objs.get(&h));
+                    if call.heap.is_some() && heap.is_none() {
+                        call.heap = None;
+                    }
+                    ranges += call.ranges.len() as u64;
+                    update_call(&map_queue, window, &call, heap, &mut scratch);
+                }
+                let next_val = fence_value.fetch_add(1, Ordering::AcqRel) + 1;
+                // SAFETY: both objects are live.
+                if let Err(e) = unsafe { map_queue.Signal(&map_fence, next_val) } {
+                    xs_log!("title memory: the map fence cannot be signalled ({e})");
+                }
+            }
+        }
+        let tile_micros = tile_started.elapsed().as_micros() as u64;
+        total_ranges += ranges;
+
         let mut wait_target = None;
         {
             let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
             if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
                 st.stats.copy_micros += copy_micros;
-                let tiles = Instant::now();
-                let ranges = st.update_tiles();
-                total_ranges += ranges;
-                st.stats.tile_micros += tiles.elapsed().as_micros() as u64;
+                st.stats.tile_micros += tile_micros;
                 let cur_fence = st.fence_value.load(Ordering::Acquire);
                 if cur_fence > 0 && waited.get(&(queue as usize)).is_none_or(|&v| v < cur_fence) {
                     wait_target = Some(cur_fence);
@@ -3364,6 +3507,14 @@ mod tests {
         assert!(read_guard.is_ok(), "STATE.read() must not block while SYNC_LOCK / staging is held");
         drop(read_guard);
         sync_guard.waited = None;
+    }
+
+    #[test]
+    fn leaf_creation_and_map_queue_locks_do_not_block_state_read() {
+        let _w = WINDOW_MAKE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _h = HEAP_MAKE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _m = MAP_QUEUE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(STATE.try_read().is_ok(), "STATE.read() must not block while leaf creation/map locks are held");
     }
 
     #[test]
