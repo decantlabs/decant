@@ -117,16 +117,15 @@ fn native_dpp_accepts_scalar_branches_and_unconditional_jumps() {
 }
 
 #[test]
-fn native_dpp_still_refuses_lane_dependent_branches() {
+fn native_dpp_lowers_lane_dependent_branches() {
     for branch in [
         Op::s_cbranch_execz,
         Op::s_cbranch_execnz,
         Op::s_cbranch_vccz,
     ] {
-        assert_eq!(
-            lift_program(&dpp_branch(branch)).unwrap_err().key(),
-            "exec:dpp-control-flow"
-        );
+        let p = dpp_branch(branch);
+        lift_program(&p).unwrap();
+        compile(&p);
     }
 }
 

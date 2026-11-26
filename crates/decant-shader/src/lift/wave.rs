@@ -746,53 +746,10 @@ fn swizzle(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
     Ok(true)
 }
 
-fn successors(block: &crate::cfg::Block) -> [Option<usize>; 2] {
-    match block.term {
-        crate::cfg::Term::End => [None, None],
-        crate::cfg::Term::Jump(t) => [Some(t), None],
-        crate::cfg::Term::Branch { taken, fall, .. } => [Some(taken), Some(fall)],
-    }
-}
-
-fn reaches_from_succ(graph: &crate::cfg::Cfg, start: usize, target: usize) -> bool {
-    let mut seen = vec![false; graph.blocks.len()];
-    let mut stack: Vec<usize> = successors(&graph.blocks[start]).into_iter().flatten().collect();
-    while let Some(b) = stack.pop() {
-        if b == target {
-            return true;
-        }
-        if !seen[b] {
-            seen[b] = true;
-            stack.extend(successors(&graph.blocks[b]).into_iter().flatten());
-        }
-    }
-    false
-}
-
-fn post_dominates(graph: &crate::cfg::Cfg, dom: usize, start: usize) -> bool {
-    if dom == start {
-        return true;
-    }
-    let mut seen = vec![false; graph.blocks.len()];
-    seen[dom] = true;
-    let mut stack = vec![start];
-    while let Some(b) = stack.pop() {
-        if matches!(graph.blocks[b].term, crate::cfg::Term::End) {
-            return false;
-        }
-        for succ in successors(&graph.blocks[b]).into_iter().flatten() {
-            if !seen[succ] {
-                seen[succ] = true;
-                stack.push(succ);
-            }
-        }
-    }
-    true
-}
-
 /// Native lane reads permit scalar control flow when its condition is uniform.
 /// Mask tests and scalar wave substitutions can make that condition differ by invocation.
-/// Refuse those combinations before structuring the control flow.
+/// Compute DPP, permlane and bpermute helpers emulate lane reads with `WaveActiveBallot` and
+/// `WaveReadLaneAt` over active lanes, so only scalar wave substitutions are refused here.
 pub(crate) fn check_dpp_context(
     graph: &crate::cfg::Cfg,
     masks: &crate::exec::Masks,
@@ -804,33 +761,6 @@ pub(crate) fn check_dpp_context(
         Operand::Reg(Reg::S(n)) => masks.reads_mask(n),
         _ => false,
     };
-    let is_lane_branch = |b: usize| {
-        matches!(
-            graph.blocks[b].term,
-            crate::cfg::Term::Branch {
-                cond: crate::cfg::Cond::ExecZero(_) | crate::cfg::Cond::VccZero(_),
-                ..
-            }
-        )
-    };
-    let has_dpp = |b: usize| {
-        graph.blocks[b].insns.iter().any(|insn| {
-            matches!(insn.form, crate::decode::Form::Dpp16 | crate::decode::Form::Dpp8)
-                || matches!(insn.op, Op::v_permlane16_b32 | Op::v_permlanex16_b32 | Op::ds_bpermute_b32)
-        })
-    };
-    for b in 0..graph.blocks.len() {
-        if has_dpp(b)
-            && (0..graph.blocks.len()).any(|br| {
-                is_lane_branch(br) && reaches_from_succ(graph, br, b) && !post_dominates(graph, b, br)
-            })
-        {
-            return Err(Refusal::new(
-                RefusalKind::Exec("dpp-control-flow"),
-                "native DPP requires converged compute control flow",
-            ));
-        }
-    }
     for insn in graph.insns() {
         masks.enter(insn.pc);
         if masks.reduction().is_some()
@@ -1278,6 +1208,40 @@ pub fn lift(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
     if let Some(what) = cx.masks.refusal() {
         return Err(refuse(insn, what));
     }
+    if cx.masks.lanes() == 64
+        && insn.op == Op::s_mov_b32
+        && let Operand::Reg(Reg::S(dst)) = insn.dst
+        && !cx.masks.writes_mask(dst)
+    {
+        let mask_src = match insn.src[0] {
+            Operand::Reg(Reg::ExecLo) => Some((Var::Exec, false)),
+            Operand::Reg(Reg::ExecHi) => Some((Var::Exec, true)),
+            Operand::Reg(Reg::VccLo) if cx.masks.reads_mask(VCC) => Some((Var::Vcc, false)),
+            Operand::Reg(Reg::VccHi) if cx.masks.reads_mask(VCC + 1) => Some((Var::Vcc, true)),
+            Operand::Reg(Reg::S(n)) if cx.masks.reads_mask(n) => {
+                if cx.masks.reads_high_mask(n) {
+                    if !n.is_multiple_of(2) {
+                        Some((Var::Mask(n - 1), true))
+                    } else {
+                        return Err(refuse(insn, "mask-as-data"));
+                    }
+                } else {
+                    Some((Var::Mask(n), false))
+                }
+            }
+            _ => None,
+        };
+        if let Some((mask_var, high)) = mask_src {
+            if !cx.masks.converged() {
+                return Err(refuse(insn, "mask-as-data"));
+            }
+            cx.set(
+                Var::S(dst),
+                Expr::Call(&MASK_WORD, vec![Expr::Var(mask_var), Expr::U32(u32::from(high))]),
+            );
+            return Ok(true);
+        }
+    }
     // A scalar move replaces only the named 32 bits. Every invocation keeps
     // its old bit when it belongs to the other half, even under empty EXEC.
     if cx.masks.lanes() == 64
@@ -1404,7 +1368,7 @@ mod tests {
     use crate::asm::*;
 
     #[test]
-    fn converged_dpp_allows_unrelated_execz_branch_and_still_refuses_divergent_dpp() {
+    fn divergent_compute_dpp_lowers_with_wave_emulation() {
         let mut converged = Asm::new();
         let skip = converged.label();
         let join = converged.label();
@@ -1426,6 +1390,18 @@ mod tests {
         divergent.bind(done);
         divergent.push(sopp(Op::s_endpgm, 0));
         let divergent_prog = crate::api::StageProgram::new(Stage::Compute, divergent.finish());
-        assert_eq!(crate::lift_program(&divergent_prog).unwrap_err().key(), "exec:dpp-control-flow");
+        assert!(crate::lift_program(&divergent_prog).is_ok());
+    }
+
+    #[test]
+    fn move_b32_extracts_64_lane_mask_word_with_wave_ballot() {
+        let mut a = Asm::new();
+        a.push(sop1(Op::s_mov_b64, s(26), EXEC));
+        a.push(sop1(Op::s_mov_b32, s(40), s(26)));
+        a.push(sop1(Op::s_mov_b32, s(41), s(27)));
+        a.push(sopp(Op::s_endpgm, 0));
+        let prog = crate::api::StageProgram::new(Stage::Compute, a.finish());
+        let lifted = crate::lift_program(&prog).expect("64 lane s_mov_b32 of mask word lifts cleanly");
+        assert_eq!(lifted.lanes, 64);
     }
 }

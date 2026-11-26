@@ -224,6 +224,8 @@ enum Role {
     Same,
     /// Read as a number when it is a number, as a whole mask when it is a mask. No evidence.
     Number,
+    /// Read as a 32 bit word of a 64 lane mask or as a numeric scalar, writing a numeric scalar.
+    MaskWord,
 }
 
 /// One location an instruction reads or writes: a followed register or a parked scalar.
@@ -454,6 +456,11 @@ impl Collector<'_> {
         if let Some((kind, w)) = mask_op(insn.op) {
             let role = match kind {
                 MaskOp::SaveExec(_) | MaskOp::WrExec(_) | MaskOp::Wqm => Role::Mask,
+                MaskOp::Logic(Logic::Mov) if !ours(w) && insn.op == Op::s_mov_b32 && !names(insn, Reg::ExecLo) => {
+                    self.uses(insn.src[0], 1, Role::MaskWord);
+                    self.defs(insn.dst, 1, Role::Data);
+                    return;
+                }
                 MaskOp::Logic(_) | MaskOp::Select if !ours(w) => Role::Data,
                 MaskOp::Logic(_) | MaskOp::Select => {
                     // A constant other than "no lane" and "all lanes" is a number.
@@ -855,7 +862,7 @@ impl Group {
 fn written(t: &Touch, groups: &[Group]) -> u8 {
     match t.role {
         Role::Mask => word_kind(t.half) | SURE,
-        Role::Data | Role::Number => NUMBER | SURE,
+        Role::Data | Role::Number | Role::MaskWord => NUMBER | SURE,
         Role::Same => {
             let g = groups[t.group as usize];
             g.kinds | if g.sure { SURE } else { 0 }
@@ -866,7 +873,7 @@ fn written(t: &Touch, groups: &[Group]) -> u8 {
 /// The kinds a read accepts in its location.
 fn wanted(t: &Touch, groups: &[Group]) -> u8 {
     match t.role {
-        Role::Number => 0,
+        Role::Number | Role::MaskWord => 0,
         _ => written(t, groups),
     }
 }
@@ -1856,6 +1863,13 @@ impl Typing<'_> {
                     }
                     NUMBER
                 }
+                Role::MaskWord => {
+                    if set != 0 && set & NUMBER == 0 {
+                        set
+                    } else {
+                        NUMBER
+                    }
+                }
                 Role::Number => {
                     if set & NUMBER == 0 && set != 0 {
                         set
@@ -1890,7 +1904,7 @@ impl Typing<'_> {
         for t in self.own(span).iter().filter(|t| t.def) {
             let kind = match t.role {
                 Role::Mask => word_kind(t.half),
-                Role::Data | Role::Number => NUMBER,
+                Role::Data | Role::Number | Role::MaskWord => NUMBER,
                 Role::Same => group_kind(&mut site, t),
             };
             if usize::from(t.loc) >= REGS {
@@ -2105,19 +2119,20 @@ mod tests {
         (graph, masks)
     }
 
-    /// In a 64 lane program, `s_mov_b32` reads a 32 bit scalar as numeric data. When the source
-    /// only ever holds a live 64 lane mask word, refusing `mask-as-data` keeps the scalar lifter
-    /// from reading an unwritten `Var::S` instead of `Var::Mask`. Supporting that pattern needs
-    /// explicit mask word lifting in `lift::wave`.
+    /// In a 64 lane program, `s_mov_b32` on a live 64 lane mask word reads the mask word and
+    /// writes a numeric scalar (`NUMBER`) so `lift::wave` can extract it via `WaveActiveBallot`.
     #[test]
-    fn move_b32_of_live_64_lane_mask_word_is_refused_as_mask_as_data() {
+    fn move_b32_of_live_64_lane_mask_word_reads_mask_and_writes_number() {
         let mut a = Asm::new();
         a.push(sop1(Op::s_mov_b64, s(26), EXEC));
         a.push(sop1(Op::s_mov_b32, s(40), s(26)));
         let (graph, masks) = analyse_asm(a);
+        assert_eq!(masks.lanes(), 64);
         let mov = graph.insns().find(|i| i.op == Op::s_mov_b32).unwrap();
         masks.enter(mov.pc);
-        assert_eq!(masks.refusal(), Some("mask-as-data"));
+        assert_eq!(masks.refusal(), None);
+        assert!(masks.reads_mask(26));
+        assert!(!masks.writes_mask(40));
     }
 
     #[test]
