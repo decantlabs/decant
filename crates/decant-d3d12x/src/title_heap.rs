@@ -419,6 +419,11 @@ pub struct Pager {
     lists: HashMap<usize, HashSet<u32>>,
     /// The page map changed since it was last taken.
     map_changed: bool,
+    /// Next host page index to check for a free (`NONE`) slot.
+    free_hint: u32,
+    /// Reusable scratch buffers for zero allocation flushes.
+    flush_buf: Vec<Fill>,
+    map_buf: Vec<u32>,
     stats: PageStats,
 }
 
@@ -439,6 +444,9 @@ impl Pager {
             dirty: vec![None; host_pages],
             lists: HashMap::new(),
             map_changed: true,
+            free_hint: 0,
+            flush_buf: Vec::new(),
+            map_buf: Vec::new(),
             stats: PageStats { host_pages: host_pages as u32, ..PageStats::default() },
         }
     }
@@ -476,18 +484,59 @@ impl Pager {
             return None;
         }
         let holds = |h: u32, k: u32| self.console_of[(h + k) as usize] == c0 + k;
-        let fits = |h: u32, ok: &dyn Fn(u32) -> bool| h + n <= hp && (0..n).all(|k| holds(h, k) || ok(h + k));
         let cold = |h: u32| self.cold(h, now);
-        let before = if c0 > 0 { self.copies[c0 as usize - 1].iter().map(|&p| p + 1).collect() } else { Vec::new() };
-        if let Some(h) = self.copies[c0 as usize].iter().copied().chain(before).find(|&h| fits(h, &cold)) {
+        let fits = |h: u32| h + n <= hp && (0..n).all(|k| holds(h, k) || cold(h + k));
+        let prev_next = c0.checked_sub(1).into_iter().flat_map(|prev| self.copies[prev as usize].iter().map(|&p| p + 1));
+        if let Some(h) = self.copies[c0 as usize].iter().copied().chain(prev_next).find(|&h| fits(h)) {
             return Some((h, false));
         }
-        let age = |h: u32, k: u32| if holds(h, k) || self.console_of[(h + k) as usize] == NONE { 0 } else { self.used[(h + k) as usize] + 1 };
-        let oldest = |ok: &dyn Fn(u32) -> bool| (0..=hp - n).filter(|&h| fits(h, ok)).min_by_key(|&h| (0..n).map(|k| age(h, k)).max().unwrap_or(0));
-        if let Some(h) = oldest(&cold) {
+        if n == 1 && self.stats.in_use < hp {
+            let start = (self.free_hint as usize).min(hp as usize);
+            if let Some(rel) = self.console_of[start..].iter().position(|&c| c == NONE) {
+                return Some(((start + rel) as u32, false));
+            }
+            if let Some(pos) = self.console_of[..start].iter().position(|&c| c == NONE) {
+                return Some((pos as u32, false));
+            }
+        }
+        let mut best_cold: Option<(u64, u32)> = None;
+        let mut best_early: Option<(u64, u32)> = None;
+        for h in 0..=hp - n {
+            let mut max_age = 0u64;
+            let mut all_cold = true;
+            let mut all_unpinned = true;
+            for k in 0..n {
+                let idx = (h + k) as usize;
+                let c = self.console_of[idx];
+                if c == c0 + k || c == NONE {
+                    continue;
+                }
+                if self.pins[idx] != 0 || self.kept(h + k) {
+                    all_unpinned = false;
+                    all_cold = false;
+                    break;
+                }
+                let used = self.used[idx];
+                if used + KEEP_PRESENTS > now {
+                    all_cold = false;
+                }
+                max_age = max_age.max(used + 1);
+            }
+            if all_cold {
+                if max_age == 0 {
+                    return Some((h, false));
+                }
+                if best_cold.is_none_or(|(best_age, _)| max_age < best_age) {
+                    best_cold = Some((max_age, h));
+                }
+            } else if all_unpinned && best_cold.is_none() && best_early.is_none_or(|(best_age, _)| max_age < best_age) {
+                best_early = Some((max_age, h));
+            }
+        }
+        if let Some((_, h)) = best_cold {
             return Some((h, false));
         }
-        oldest(&|h| self.pins[h as usize] == 0 && !self.kept(h)).map(|h| (h, true))
+        best_early.map(|(_, h)| (h, true))
     }
 
     /// Host page `h` holds console page `c` from now on.
@@ -496,6 +545,10 @@ impl Pager {
         if old == NONE {
             self.stats.in_use += 1;
             self.stats.peak = self.stats.peak.max(self.stats.in_use);
+            let hp = self.host_pages();
+            if hp > 0 {
+                self.free_hint = (h + 1) % hp;
+            }
         } else {
             self.stats.evictions += 1;
             let o = old as usize;
@@ -616,12 +669,36 @@ impl Pager {
         out
     }
 
+    /// Collects dirty fills into the internal scratch buffer without allocating.
+    fn take_flush_into(&mut self) -> Vec<Fill> {
+        let mut out = std::mem::take(&mut self.flush_buf);
+        out.clear();
+        for (h, d) in self.dirty.iter_mut().enumerate() {
+            if let Some((lo, hi)) = d.take() {
+                let c = self.console_of[h];
+                out.push(Fill { from: c * PAGE + lo, to: h as u32 * PAGE + lo, count: hi - lo });
+            }
+        }
+        out
+    }
+
     /// The page map, when it changed since the last call.
     pub fn take_map(&mut self) -> Option<Vec<u32>> {
         if !std::mem::take(&mut self.map_changed) {
             return None;
         }
         Some(self.canonical.iter().map(|&h| if h == NONE { UNMAPPED } else { h * PAGE }).collect())
+    }
+
+    /// Writes the updated page map into the internal scratch buffer when changed.
+    fn take_map_into(&mut self) -> Option<Vec<u32>> {
+        if !std::mem::take(&mut self.map_changed) {
+            return None;
+        }
+        let mut out = std::mem::take(&mut self.map_buf);
+        out.clear();
+        out.extend(self.canonical.iter().map(|&h| if h == NONE { UNMAPPED } else { h * PAGE }));
+        Some(out)
     }
 
     /// Whether [`take_map`](Self::take_map) has a new map.
@@ -1021,13 +1098,16 @@ pub fn flush(copy: CopyFn, map: MapFn) {
     }
     let mut g = PAGED.lock().unwrap_or_else(|e| e.into_inner());
     for p in g.iter_mut() {
-        for f in p.pager.take_flush() {
+        let fills = p.pager.take_flush_into();
+        for &f in &fills {
             run_fill(p, f, copy);
         }
-        if let Some(m) = p.pager.take_map()
-            && p.map_cpu != 0
-        {
-            map(p.map_cpu, &m);
+        p.pager.flush_buf = fills;
+        if let Some(m) = p.pager.take_map_into() {
+            if p.map_cpu != 0 {
+                map(p.map_cpu, &m);
+            }
+            p.pager.map_buf = m;
         }
     }
 }
@@ -1449,6 +1529,30 @@ mod pager_tests {
         assert_eq!(page_map_released(0x77), Some((0x79, None)));
         assert!(!paged(handle));
         assert_eq!(page_map_address(GPU), None);
+    }
+
+    #[test]
+    fn pager_free_hint_and_scratch_buffers_reuse_capacity() {
+        let mut p = Pager::new(6 * PAGE, 3 * PAGE);
+        assert!(p.written(0, 1, 0));
+        assert!(p.written(2 * PAGE, 1, 0));
+        assert_eq!(p.free_hint, 2);
+        let fills = p.take_flush_into();
+        assert_eq!(fills.len(), 2);
+        p.flush_buf = fills;
+        let cap = p.flush_buf.capacity();
+        assert!(p.written(4 * PAGE, 1, 0));
+        assert_eq!(p.free_hint, 0);
+        let fills2 = p.take_flush_into();
+        assert_eq!(fills2.len(), 1);
+        assert_eq!(fills2.capacity(), cap);
+        p.flush_buf = fills2;
+        let map = p.take_map_into().expect("initial map");
+        assert_eq!(map[0], 0);
+        assert_eq!(map[2], PAGE);
+        assert_eq!(map[4], 2 * PAGE);
+        p.map_buf = map;
+        assert!(p.take_map_into().is_none());
     }
 }
 

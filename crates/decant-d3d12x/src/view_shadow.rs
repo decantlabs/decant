@@ -53,6 +53,8 @@ struct HeapRows {
     /// The view texture (`views_at::ViewTextures`) each slot's view was made of, 0 for none: a slot that
     /// holds one is a reference the texture must not be released under.
     owners: Vec<usize>,
+    /// Number of non zero entries in `owners`, so `referenced` skips empty heaps in constant time.
+    owner_count: usize,
     /// The upload buffer of a shader visible heap.
     buffer: Option<Buffer>,
 }
@@ -78,7 +80,10 @@ impl HeapRows {
 
     fn write(&mut self, slot: usize, row: Row) {
         self.rows[slot] = row;
-        self.owners[slot] = 0;
+        if self.owners[slot] != 0 {
+            self.owners[slot] = 0;
+            self.owner_count -= 1;
+        }
         self.upload(slot..slot + 1);
     }
 
@@ -108,7 +113,7 @@ impl Shadows {
     pub fn add(&mut self, heap: usize, cpu_start: usize, gpu_start: u64, count: u32, increment: u32, buffer: Option<Buffer>) {
         self.heaps.retain(|h| h.heap != heap && h.cpu_start != cpu_start);
         let at = self.heaps.partition_point(|h| h.cpu_start < cpu_start);
-        self.heaps.insert(at, HeapRows { heap, cpu_start, gpu_start, increment, rows: vec![[0; 4]; count as usize], owners: vec![0; count as usize], buffer });
+        self.heaps.insert(at, HeapRows { heap, cpu_start, gpu_start, increment, rows: vec![[0; 4]; count as usize], owners: vec![0; count as usize], owner_count: 0, buffer });
     }
 
     /// Forgets the heap `heap` and gives its buffer back to be released.
@@ -153,11 +158,21 @@ impl Shadows {
             let source = ss..ss + count;
             if sh == dh {
                 self.heaps[dh].rows.copy_within(source.clone(), ds);
-                self.heaps[dh].owners.copy_within(source, ds);
+                if self.heaps[dh].owner_count > 0 {
+                    let removed = self.heaps[dh].owners[destination.clone()].iter().filter(|&&r| r != 0).count();
+                    let added = self.heaps[dh].owners[source.clone()].iter().filter(|&&r| r != 0).count();
+                    self.heaps[dh].owners.copy_within(source, ds);
+                    self.heaps[dh].owner_count = self.heaps[dh].owner_count - removed + added;
+                }
             } else {
                 let [dst_heap, src_heap] = self.heaps.get_disjoint_mut([dh, sh]).expect("distinct heap indices");
                 dst_heap.rows[destination.clone()].copy_from_slice(&src_heap.rows[source.clone()]);
-                dst_heap.owners[destination.clone()].copy_from_slice(&src_heap.owners[source]);
+                if dst_heap.owner_count > 0 || src_heap.owner_count > 0 {
+                    let removed = dst_heap.owners[destination.clone()].iter().filter(|&&r| r != 0).count();
+                    let added = src_heap.owners[source.clone()].iter().filter(|&&r| r != 0).count();
+                    dst_heap.owners[destination.clone()].copy_from_slice(&src_heap.owners[source]);
+                    dst_heap.owner_count = dst_heap.owner_count - removed + added;
+                }
             }
             self.heaps[dh].upload(destination);
             return;
@@ -184,13 +199,27 @@ impl Shadows {
         if res != 0
             && let Some((h, s)) = self.find(cpu)
         {
+            if self.heaps[h].owners[s] == 0 {
+                self.heaps[h].owner_count += 1;
+            }
             self.heaps[h].owners[s] = res;
         }
     }
 
     /// Every texture some slot of some view heap holds a view of.
     pub fn referenced(&self) -> std::collections::HashSet<usize> {
-        self.heaps.iter().flat_map(|h| h.owners.iter().copied()).filter(|&r| r != 0).collect()
+        let mut out = std::collections::HashSet::new();
+        for h in &self.heaps {
+            if h.owner_count == 0 {
+                continue;
+            }
+            for &r in &h.owners {
+                if r != 0 {
+                    out.insert(r);
+                }
+            }
+        }
+        out
     }
 
     /// The buffer of the shader visible heap whose GPU start is `gpu_start`.
@@ -446,5 +475,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn owner_count_tracks_writes_and_copies_for_referenced() {
+        let mut s = Shadows::default();
+        s.add(0xA, 0x1000, 0, 4, INC, None);
+        s.add(0xB, 0x2000, 0, 4, INC, None);
+        assert!(s.referenced().is_empty());
+        s.view_made(0x1000, rec(4, 1));
+        s.set_owner(0x1000, 0xDEAD);
+        assert_eq!(s.heaps[0].owner_count, 1);
+        assert_eq!(s.heaps[1].owner_count, 0);
+        assert_eq!(s.referenced().into_iter().collect::<Vec<_>>(), [0xDEAD]);
+        s.copied(0x2000, 0x1000, 2);
+        assert_eq!(s.heaps[1].owner_count, 1);
+        s.view_made(0x1000, rec(4, 2));
+        assert_eq!(s.heaps[0].owner_count, 0);
+        assert_eq!(s.referenced().into_iter().collect::<Vec<_>>(), [0xDEAD]);
+        s.view_made(0x2000, rec(4, 3));
+        assert_eq!(s.heaps[1].owner_count, 0);
+        assert!(s.referenced().is_empty());
     }
 }
