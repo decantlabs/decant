@@ -983,6 +983,7 @@ fn make(lazy: &Lazy, owned: &Owned, desc: &[u8], direct: bool, service: Option<&
     let mut out: *mut c_void = std::ptr::null_mut();
     let hr = {
         let _large_guard = is_large_compute(lazy, desc).then(|| LARGE_PSO_GATE.acquire());
+        let _span = decant_trace::span("lazy_pso", "create");
         // SAFETY: the recipe holds the device and a description that the creation path took the same
         // way when the title called it, or a copy of it with other shaders.
         unsafe { (recipe.create)(recipe.device, desc.as_ptr().cast(), &recipe.riid, &mut out) }
