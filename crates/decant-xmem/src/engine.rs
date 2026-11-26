@@ -1967,7 +1967,7 @@ impl Engine {
         if !was_held && is_held {
             let hot = HOT.fetch_add(1, Ordering::Relaxed) + 1;
             if hot <= 8 || hot.is_multiple_of(1000) {
-                decant_log::trace(&format!("[xmem] suivi des pages : page {index} (0x{page:x}) ecrite a chaque copie, ouverte et copiee a chaque synchronisation pour {} s ({hot} fois)\r\n", track::hot_hold().as_secs()));
+                decant_log::trace(&format!("[xmem] suivi des pages : page {index} (0x{page:x}) ecrite a chaque copie, ouverte et copiee a chaque synchronisation pour {} ms ({hot} fois)\r\n", track::hot_hold().as_millis()));
             }
         }
         let n = FAULTS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3988,6 +3988,31 @@ mod tests {
             e_ref.finish_io_write(area, P);
             opener.join().unwrap();
         });
+
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
+    }
+
+    #[test]
+    fn guard_rest_coalesces_writes_and_protects_after_rest_elapses() {
+        let Some(e) = held(|| Engine::load_limited(4, 4)) else { return };
+        e.set_tracking(true);
+        let area = e.reserve(0, P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(1).unwrap();
+        e.map_frames(area, &frames).unwrap();
+        write(area, 0, 1);
+        assert_eq!(e.take_dirty(10).len(), 1);
+        assert!(!accessible(area, true));
+
+        assert!(e.on_write_fault(area));
+        assert!(accessible(area, true));
+        // Immediate take_dirty keeps the page writable during guard rest.
+        assert_eq!(e.take_dirty(10).len(), 1);
+        assert!(accessible(area, true));
+
+        std::thread::sleep(track::GUARD_REST + std::time::Duration::from_millis(5));
+        assert_eq!(e.take_dirty(10).len(), 1);
+        assert!(!accessible(area, true));
 
         e.release(area).unwrap();
         e.free_pages(&frames).unwrap();

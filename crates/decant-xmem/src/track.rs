@@ -26,6 +26,8 @@ pub const HOT_WINDOW: Duration = Duration::from_millis(250);
 pub const HOT_FAULTS: u8 = 3;
 /// How long a hot page stays unprotected and is copied at every sync by default.
 pub const HOT_HOLD: Duration = Duration::from_millis(250);
+/// Minimum writable rest after a CPU write fault before `take` re-protects the page by default.
+pub const GUARD_REST: Duration = Duration::from_millis(8);
 
 /// Parses a hold duration in milliseconds from an optional string, falling back to `default`.
 fn parse_hold_ms(raw: Option<&str>, default: Duration) -> Duration {
@@ -45,10 +47,21 @@ pub fn parse_io_hold_ms(raw: Option<&str>) -> Duration {
     parse_hold_ms(raw, IO_HOLD)
 }
 
+/// Parses `DECANT_XMEM_GUARD_REST_MS` from an optional string, falling back to [`GUARD_REST`].
+pub fn parse_guard_rest_ms(raw: Option<&str>) -> Duration {
+    parse_hold_ms(raw, GUARD_REST)
+}
+
 /// How long a hot page stays unprotected and is copied at every sync.
 pub fn hot_hold() -> Duration {
     static HOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *HOLD.get_or_init(|| parse_hot_hold_ms(std::env::var("DECANT_XMEM_HOT_HOLD_MS").ok().as_deref()))
+}
+
+/// How long a faulted page stays writable before `take` re-protects it.
+pub fn guard_rest() -> Duration {
+    static REST: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *REST.get_or_init(|| parse_guard_rest_ms(std::env::var("DECANT_XMEM_GUARD_REST_MS").ok().as_deref()))
 }
 
 /// How long a page that a kernel write may still reach stays unprotected.
@@ -206,6 +219,12 @@ impl Track {
                 self.held.insert(page, now + hot_hold());
                 self.io_held.remove(&page);
             }
+        }
+        let rest = guard_rest();
+        if !rest.is_zero() && self.aliases.contains_key(&page) {
+            let until = now + rest;
+            let held = self.held.entry(page).or_insert(until);
+            *held = (*held).max(until);
         }
         Some(self.dirty(page))
     }
@@ -535,12 +554,13 @@ mod tests {
         for round in 1..HOT_FAULTS {
             now += Duration::from_millis(30);
             assert!(t.on_fault(8, now).is_some());
+            now += GUARD_REST;
             let (pages, protect) = t.take(now, 10, all);
             assert_eq!((pages, protect.len()), (vec![8], 2), "quick fault {round}: copied and protected again");
         }
         now += Duration::from_millis(30);
         assert!(t.on_fault(8, now).is_some());
-        assert!(t.is_held(8, now), "the third quick fault in a row makes it hot");
+        assert!(t.is_held(8, now + GUARD_REST), "the third quick fault in a row makes it hot");
         for _ in 0..3 {
             now += Duration::from_millis(30);
             assert_eq!(t.take(now, 10, all), (vec![8], vec![]), "a hot page is copied at every sync and stays writable");
@@ -558,6 +578,7 @@ mod tests {
         for _ in 0..10 {
             now += HOT_WINDOW + Duration::from_millis(1);
             assert!(t.on_fault(9, now).is_some());
+            now += GUARD_REST;
             assert!(!t.is_held(9, now), "a page written now and then stays tracked by faults");
             t.take(now, 10, all);
         }
@@ -672,5 +693,28 @@ mod tests {
         assert!(t.is_clean_addr(0x10_1000));
         let _ = t.on_fault(0, now);
         assert!(!t.is_clean_addr(0x10_0000));
+    }
+
+    #[test]
+    fn parse_guard_rest_ms_parses_override_and_defaults_to_8_ms() {
+        assert_eq!(parse_guard_rest_ms(None), GUARD_REST);
+        assert_eq!(parse_guard_rest_ms(Some("0")), Duration::ZERO);
+        assert_eq!(parse_guard_rest_ms(Some(" 16 ")), Duration::from_millis(16));
+        assert_eq!(parse_guard_rest_ms(Some("bad")), GUARD_REST);
+    }
+
+    #[test]
+    fn guard_rest_keeps_faulted_page_writable_until_rest_elapses() {
+        let mut t = track();
+        let t0 = Instant::now();
+        t.on_map(1, 0x10_0000, true);
+        assert_eq!(t.take(t0, 10, all), (vec![1], vec![0x10_0000]));
+
+        assert_eq!(t.on_fault(1, t0), Some(vec![0x10_0000]));
+        // Immediately after fault, take copies the page but keeps it writable during guard rest.
+        assert_eq!(t.take(t0 + Duration::from_millis(1), 10, all), (vec![1], vec![]));
+        // Once guard rest elapses, take copies and protects it again.
+        assert_eq!(t.take(t0 + GUARD_REST, 10, all), (vec![1], vec![0x10_0000]));
+        assert_eq!(t.take(t0 + GUARD_REST, 10, all), (vec![], vec![]));
     }
 }
