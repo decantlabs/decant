@@ -2,6 +2,7 @@
 
 #![allow(unsafe_code)]
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
@@ -86,8 +87,11 @@ impl Drop for Com {
     }
 }
 
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(Some(0)).collect()
+fn push_wide(buf: &mut Vec<u16>, text: &str) -> usize {
+    let start = buf.len();
+    buf.extend(text.encode_utf16());
+    buf.push(0);
+    start
 }
 
 fn wide_path(path: &Path) -> Vec<u16> {
@@ -179,7 +183,19 @@ impl Dxc {
     /// The first DXC of the search order. The error lists what was tried.
     pub fn load() -> Result<Dxc, String> {
         let mut tried = Vec::new();
-        for dir in candidate_dirs() {
+        if let Some(dir) = std::env::var_os("DECANT_DXC_DIR").filter(|d| !d.is_empty()) {
+            match Dxc::load_from(Some(Path::new(&dir))) {
+                Ok(d) => return Ok(d),
+                Err(e) => tried.push(e),
+            }
+        }
+        if let Some(dir) = own_dir() {
+            match Dxc::load_from(Some(&dir)) {
+                Ok(d) => return Ok(d),
+                Err(e) => tried.push(e),
+            }
+        }
+        for dir in sdk_dirs() {
             match Dxc::load_from(Some(&dir)) {
                 Ok(d) => return Ok(d),
                 Err(e) => tried.push(e),
@@ -271,6 +287,26 @@ fn co_task_mem_free(ptr: *mut c_void) {
     }
 }
 
+struct ThreadDxcState {
+    compiler: Option<(usize, Com)>,
+    wide_buf: Vec<u16>,
+    offsets: Vec<usize>,
+}
+
+impl ThreadDxcState {
+    const fn new() -> Self {
+        Self {
+            compiler: None,
+            wide_buf: Vec::new(),
+            offsets: Vec::new(),
+        }
+    }
+}
+
+thread_local! {
+    static THREAD_DXC: RefCell<ThreadDxcState> = const { RefCell::new(ThreadDxcState::new()) };
+}
+
 impl Dxc {
     /// The compiler version for cache keys: `dxc <version>`, with ` unsigned` when the DXIL is
     /// not signed.
@@ -281,38 +317,85 @@ impl Dxc {
     /// The DXIL container of `hlsl` for `entry` and `profile`, or the compiler's message. Debug
     /// information and reflection are stripped, `extra` are further DXC arguments, each one item.
     pub fn compile(&self, hlsl: &str, entry: &str, profile: &str, extra: &[String]) -> Result<Vec<u8>, String> {
-        let compiler = self.instance(&IID_DXC_COMPILER3).ok_or("no IDxcCompiler3 instance")?;
-        let mut args: Vec<&str> = vec!["-E", entry, "-T", profile, "-Qstrip_debug", "-Qstrip_reflect"];
-        args.extend(extra.iter().map(String::as_str));
-        let wide_args: Vec<Vec<u16>> = args.iter().map(|a| wide(a)).collect();
-        let arg_ptrs: Vec<*const u16> = wide_args.iter().map(|a| a.as_ptr()).collect();
-        let source = DxcBuffer { ptr: hlsl.as_ptr().cast(), size: hlsl.len(), encoding: CP_UTF8 };
-        let mut out = std::ptr::null_mut();
-        type Compile = unsafe extern "system" fn(*mut c_void, *const DxcBuffer, *const *const u16, u32, *mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
-        // SAFETY: IDxcCompiler3::Compile is slot 3. The buffer, arguments and out pointer are live.
-        let hr = unsafe { compiler.slot::<Compile>(3)(compiler.0, &source, arg_ptrs.as_ptr(), arg_ptrs.len() as u32, std::ptr::null_mut(), &IID_DXC_RESULT, &mut out) };
-        if hr < 0 || out.is_null() {
-            return Err(format!("IDxcCompiler3::Compile failed, hr=0x{:08X}", hr as u32));
-        }
-        let result = Com(out);
-        let mut status: HRESULT = 0;
-        // SAFETY: IDxcOperationResult::GetStatus is slot 3.
-        unsafe { result.slot::<unsafe extern "system" fn(*mut c_void, *mut HRESULT) -> HRESULT>(3)(result.0, &mut status) };
-        let get = |slot: usize| {
-            let mut blob = std::ptr::null_mut();
-            // SAFETY: IDxcOperationResult::GetResult (4) and GetErrorBuffer (5) write a blob or null.
-            let hr = unsafe { result.slot::<unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT>(slot)(result.0, &mut blob) };
-            (hr >= 0 && !blob.is_null()).then(|| Com(blob).blob_bytes())
-        };
-        if status < 0 {
-            let text = get(5).map(|b| String::from_utf8_lossy(&b).trim_end_matches('\0').trim().to_string()).unwrap_or_default();
-            return Err(if text.is_empty() { format!("DXC status 0x{:08X}", status as u32) } else { text });
-        }
-        let dxil = get(4).unwrap_or_default();
-        if dxil.is_empty() {
-            return Err("DXC gave no object".to_string());
-        }
-        Ok(dxil)
+        let create_key = self.create as usize;
+        THREAD_DXC.with(|cell| {
+            let mut state = cell.borrow_mut();
+            let needs_new = state.compiler.as_ref().is_none_or(|(k, _)| *k != create_key);
+            if needs_new {
+                let instance = self.instance(&IID_DXC_COMPILER3).ok_or("no IDxcCompiler3 instance")?;
+                state.compiler = Some((create_key, instance));
+            }
+            let ThreadDxcState { compiler, wide_buf, offsets } = &mut *state;
+            let compiler = &compiler.as_ref().ok_or("no IDxcCompiler3 instance")?.1;
+
+            wide_buf.clear();
+            offsets.clear();
+            let entry_off = push_wide(wide_buf, entry);
+            let profile_off = push_wide(wide_buf, profile);
+            for arg in extra {
+                offsets.push(push_wide(wide_buf, arg));
+            }
+
+            let base = wide_buf.as_ptr();
+            // SAFETY: `offsets` are valid offsets into `wide_buf`, which is not mutated while `arg_ptrs` is live.
+            let fixed = unsafe {
+                [
+                    windows_sys::w!("-E"),
+                    base.add(entry_off),
+                    windows_sys::w!("-T"),
+                    base.add(profile_off),
+                    windows_sys::w!("-Qstrip_debug"),
+                    windows_sys::w!("-Qstrip_reflect"),
+                ]
+            };
+            let mut stack_ptrs = [std::ptr::null::<u16>(); 16];
+            let mut heap_ptrs = Vec::new();
+            let total_args = fixed.len() + offsets.len();
+            let arg_ptrs: &[*const u16] = if total_args <= stack_ptrs.len() {
+                stack_ptrs[..fixed.len()].copy_from_slice(&fixed);
+                for (slot, &off) in stack_ptrs[fixed.len()..total_args].iter_mut().zip(offsets.iter()) {
+                    // SAFETY: `off` is a valid offset into `wide_buf`.
+                    *slot = unsafe { base.add(off) };
+                }
+                &stack_ptrs[..total_args]
+            } else {
+                heap_ptrs.reserve(total_args);
+                heap_ptrs.extend_from_slice(&fixed);
+                for &off in offsets.iter() {
+                    // SAFETY: `off` is a valid offset into `wide_buf`.
+                    heap_ptrs.push(unsafe { base.add(off) });
+                }
+                &heap_ptrs
+            };
+
+            let source = DxcBuffer { ptr: hlsl.as_ptr().cast(), size: hlsl.len(), encoding: CP_UTF8 };
+            let mut out = std::ptr::null_mut();
+            type Compile = unsafe extern "system" fn(*mut c_void, *const DxcBuffer, *const *const u16, u32, *mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+            // SAFETY: IDxcCompiler3::Compile is slot 3. The buffer, arguments and out pointer are live.
+            let hr = unsafe { compiler.slot::<Compile>(3)(compiler.0, &source, arg_ptrs.as_ptr(), arg_ptrs.len() as u32, std::ptr::null_mut(), &IID_DXC_RESULT, &mut out) };
+            if hr < 0 || out.is_null() {
+                return Err(format!("IDxcCompiler3::Compile failed, hr=0x{:08X}", hr as u32));
+            }
+            let result = Com(out);
+            let mut status: HRESULT = 0;
+            // SAFETY: IDxcOperationResult::GetStatus is slot 3.
+            unsafe { result.slot::<unsafe extern "system" fn(*mut c_void, *mut HRESULT) -> HRESULT>(3)(result.0, &mut status) };
+            let get = |slot: usize| {
+                let mut blob = std::ptr::null_mut();
+                // SAFETY: IDxcOperationResult::GetResult (4) and GetErrorBuffer (5) write a blob or null.
+                let hr = unsafe { result.slot::<unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT>(slot)(result.0, &mut blob) };
+                (hr >= 0 && !blob.is_null()).then(|| Com(blob).blob_bytes())
+            };
+            if status < 0 {
+                let text = get(5).map(|b| String::from_utf8_lossy(&b).trim_end_matches('\0').trim().to_string()).unwrap_or_default();
+                return Err(if text.is_empty() { format!("DXC status 0x{:08X}", status as u32) } else { text });
+            }
+            let dxil = get(4).unwrap_or_default();
+            if dxil.is_empty() {
+                return Err("DXC gave no object".to_string());
+            }
+            Ok(dxil)
+        })
     }
 }
 
@@ -356,5 +439,28 @@ mod tests {
         let Some(dxc) = dxc() else { return };
         let err = dxc.compile("float4 main() : SV_Target0 { return undeclared; }", "main", "ps_6_0", &[]).expect_err("does not compile");
         assert!(err.contains("undeclared"), "{err}");
+    }
+
+    #[test]
+    fn thread_local_compiler_reuses_instance_and_handles_many_extra_args_across_threads() {
+        let Some(dxc) = dxc() else { return };
+        let extra: Vec<String> = (0..12).map(|i| format!("-DDUMMY_MACRO_{i}=1")).collect();
+        let dxil = dxc
+            .compile("[numthreads(1, 1, 1)] void main() {}", "main", "cs_6_0", &extra)
+            .expect("compile with >10 extra args");
+        assert_eq!(&dxil[..4], b"DXBC");
+
+        std::thread::scope(|scope| {
+            let dxc = &dxc;
+            for t in 0..4 {
+                scope.spawn(move || {
+                    for _ in 0..3 {
+                        let shader = format!("[numthreads(1, 1, 1)] void main() {{ uint x = {t}; }}");
+                        let out = dxc.compile(&shader, "main", "cs_6_0", &[]).expect("thread compile");
+                        assert_eq!(&out[..4], b"DXBC");
+                    }
+                });
+            }
+        });
     }
 }
