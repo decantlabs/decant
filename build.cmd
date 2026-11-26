@@ -15,8 +15,10 @@ pushd "%R%" || exit /b 1
 cargo build --release --locked --target-dir "%DECANT_BUILD%\cargo" -p decant-ffx -p decant-bvh -p decant-gdk-config -p decant-xmem -p decant-d3d12x -p decant-xaudio2 -p decant-xgameruntime -p decant-xma2 -p decant-dstorage -p decant-dstorage-xcrdapi -p decant-xg -p decant-acphal -p decant-xapu -p decant-chad -p decant-gameinput || (popd & exit /b 1)
 popd
 for %%F in (decant_ffx.dll decant_bvh.dll ffxtest.exe decant_bvh_test.exe gdk_config_reader.exe xmem.dll loadtest.exe xmem_abitest.exe d3d12_xs.dll d3d12xs_test.exe decant_xaudio2.dll xaudio2test.exe gameinputtest.exe xgameruntime.dll xgameruntime_test.exe decant_xma2.dll xma2test.exe dstorage_xs.dll xcrdapi.dll dstoragetest.exe dstorage_abi_test.exe xg_xs.dll AcpHal.dll xapu.dll chad.dll GameInput.dll decant-pad.exe) do copy /y "%DECANT_BUILD%\cargo\release\%%F" "%DECANT_BUILD%\%%F" >nul || exit /b 1
+for %%F in (decant_ffx decant_bvh xmem d3d12_xs decant_xaudio2 xgameruntime decant_xma2 dstorage_xs xcrdapi xg_xs AcpHal xapu chad GameInput) do if exist "%DECANT_BUILD%\cargo\release\%%F.pdb" copy /y "%DECANT_BUILD%\cargo\release\%%F.pdb" "%DECANT_BUILD%\%%F.pdb" >nul || exit /b 1
 rem XboxBvhBuilder.dll is decant_bvh.dll under the package name (it exports the mangled XboxBvhBuilder members too), so the shim staging replaces the console builder.
 copy /y "%DECANT_BUILD%\cargo\release\decant_bvh.dll" "%DECANT_BUILD%\XboxBvhBuilder.dll" >nul || exit /b 1
+if exist "%DECANT_BUILD%\cargo\release\decant_bvh.pdb" copy /y "%DECANT_BUILD%\cargo\release\decant_bvh.pdb" "%DECANT_BUILD%\XboxBvhBuilder.pdb" >nul || exit /b 1
 if defined DECANT_GDEFLATE_ROOT if exist "%DECANT_GDEFLATE_ROOT%\3rdparty\libdeflate\COPYING" (
   copy /y "%DECANT_GDEFLATE_ROOT%\3rdparty\libdeflate\COPYING" "%DECANT_BUILD%\decant-storage-libdeflate-license.txt" >nul || exit /b 1
   copy /y "%DECANT_GDEFLATE_ROOT%\GDeflate\LICENSE" "%DECANT_BUILD%\decant-storage-apache-license.txt" >nul || exit /b 1

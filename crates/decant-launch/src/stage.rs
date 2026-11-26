@@ -286,7 +286,7 @@ pub fn stage_with_renderer(package: &Path, overlay: &Path, shims: Option<&Path>,
                 .filter_map(Result::ok)
                 .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
                 .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dll")))
+                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dll") || x.eq_ignore_ascii_case("pdb")))
                 .filter_map(|p| Some((p.file_name()?.to_string_lossy().into_owned(), p)))
                 .collect();
             found.sort();
@@ -616,5 +616,17 @@ mod tests {
         fs::write(shims.path().join("xmem.dll"), b"our updated shim").unwrap();
         stage(package.path(), overlay.path(), Some(shims.path())).unwrap();
         assert_eq!(fs::read(&xmem_dst).unwrap(), b"our updated shim");
+    }
+
+    #[test]
+    fn shim_pdbs_are_staged_alongside_dlls() {
+        let (package, shims, overlay) = package();
+        fs::write(shims.path().join("xmem.pdb"), b"shim pdb").unwrap();
+        fs::write(shims.path().join("d3d12_xs.pdb"), b"placeholder pdb").unwrap();
+        let made = stage(package.path(), overlay.path(), Some(shims.path())).unwrap();
+        assert_eq!(fs::read(overlay.path().join("xmem.pdb")).unwrap(), b"shim pdb");
+        assert_eq!(fs::read(overlay.path().join("d3d12_xs.pdb")).unwrap(), b"placeholder pdb");
+        assert!(made.iter().any(|e| e.name == "xmem.pdb" && e.made == Made::Shim));
+        assert!(made.iter().any(|e| e.name == "d3d12_xs.pdb" && e.made == Made::Shim));
     }
 }

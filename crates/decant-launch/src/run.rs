@@ -930,7 +930,7 @@ mod platform {
         }
 
         type SymSetOptionsFn = unsafe extern "system" fn(u32) -> u32;
-        type SymInitializeFn = unsafe extern "system" fn(HANDLE, *const u8, i32) -> i32;
+        type SymInitializeWFn = unsafe extern "system" fn(HANDLE, *const u16, i32) -> i32;
         type SymCleanupFn = unsafe extern "system" fn(HANDLE) -> i32;
         type SymRefreshModuleListFn = unsafe extern "system" fn(HANDLE) -> i32;
         type SymFromAddrFn = unsafe extern "system" fn(HANDLE, u64, *mut u64, *mut SymbolInfo) -> i32;
@@ -945,7 +945,8 @@ mod platform {
         }
 
         impl DbgHelp {
-            fn open(process: HANDLE) -> Option<Self> {
+            fn open(process: HANDLE, search_dir: Option<&Path>) -> Option<Self> {
+                use std::os::windows::ffi::OsStrExt;
                 use windows_sys::Win32::Foundation::FreeLibrary;
                 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
                 let name: Vec<u16> = "dbghelp.dll\0".encode_utf16().collect();
@@ -960,7 +961,7 @@ mod platform {
                         FreeLibrary(dll);
                         return None;
                     };
-                    let Some(init) = GetProcAddress(dll, c"SymInitialize".as_ptr().cast()) else {
+                    let Some(init) = GetProcAddress(dll, c"SymInitializeW".as_ptr().cast()) else {
                         FreeLibrary(dll);
                         return None;
                     };
@@ -973,13 +974,15 @@ mod platform {
                         return None;
                     };
                     let sym_set_opts = std::mem::transmute::<unsafe extern "system" fn() -> isize, SymSetOptionsFn>(set_opts);
-                    let sym_init = std::mem::transmute::<unsafe extern "system" fn() -> isize, SymInitializeFn>(init);
+                    let sym_init = std::mem::transmute::<unsafe extern "system" fn() -> isize, SymInitializeWFn>(init);
                     let sym_cleanup = std::mem::transmute::<unsafe extern "system" fn() -> isize, SymCleanupFn>(cleanup);
                     let sym_from_addr = std::mem::transmute::<unsafe extern "system" fn() -> isize, SymFromAddrFn>(from_addr);
                     let sym_refresh = GetProcAddress(dll, c"SymRefreshModuleList".as_ptr().cast())
                         .map(|f| std::mem::transmute::<unsafe extern "system" fn() -> isize, SymRefreshModuleListFn>(f));
                     sym_set_opts(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-                    if sym_init(process, std::ptr::null(), 1) == 0 {
+                    let search_wide: Option<Vec<u16>> = search_dir.map(|p| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect());
+                    let search_ptr = search_wide.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+                    if sym_init(process, search_ptr, 1) == 0 {
                         FreeLibrary(dll);
                         return None;
                     }
@@ -1074,7 +1077,7 @@ mod platform {
             use windows_sys::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
             let _ = std::fs::write(&out, format!("thread samples every {} ms (no debugger)\n", every.as_millis()));
             let mod_api = ModuleApi::load();
-            let mut dbghelp = DbgHelp::open(process);
+            let mut dbghelp = DbgHelp::open(process, out.parent());
             let mut modules = mod_api.as_ref().map(|api| api.snapshot(process)).unwrap_or_default();
             let started = Instant::now();
             let mut last_mod_refresh = started;
