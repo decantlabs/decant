@@ -4,10 +4,12 @@
 //! 27 use the addrlib tables of [`crate::tiling`]. All the others come from `equations_data.rs`, which holds
 //! them as text rows (see `docs/CONSOLE_LIBS.md`, section 1).
 
-use super::equations_data::{GROUP_A, GROUP_B, GROUP_C};
-use crate::tiling::{self, Layout};
+use std::sync::OnceLock;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use super::equations_data::{GROUP_A, GROUP_B, GROUP_C};
+use crate::tiling::{self, Bit, Layout};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Term {
     bit: u8,
     x: u32,
@@ -17,34 +19,68 @@ struct Term {
 }
 
 /// One address equation: for each output bit, the coordinate bits whose parity it takes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq)]
 pub struct Equation {
-    terms: Vec<Term>,
+    terms: [Term; Self::MAX_TERMS],
+    len: u8,
+}
+
+impl PartialEq for Equation {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
 }
 
 impl Equation {
+    const MAX_TERMS: usize = 24;
+
+    #[inline]
+    fn as_slice(&self) -> &[Term] {
+        &self.terms[..usize::from(self.len)]
+    }
+
     /// The byte offset for element (x, y), array or depth slice z, sample s. The result is not reduced to the block.
+    #[inline]
     pub fn eval(&self, x: u32, y: u32, z: u32, s: u32) -> u32 {
-        self.terms.iter().fold(0u32, |offset, t| {
-            let parity = ((x & t.x).count_ones() + (y & t.y).count_ones() + (z & t.z).count_ones() + (s & t.s).count_ones()) & 1;
-            offset | (parity << t.bit)
-        })
+        let mut offset = 0u32;
+        for t in self.as_slice() {
+            let parity = ((x & t.x) ^ (y & t.y) ^ (z & t.z) ^ (s & t.s)).count_ones() & 1;
+            offset |= parity << t.bit;
+        }
+        offset
     }
 
     /// The terms as `(output bit, x mask, y mask, z mask)`, for a caller that evaluates the equation elsewhere (a shader). The sample
     /// mask is left out: it is 0 for every one sample surface.
     pub fn terms(&self) -> Vec<(u32, u32, u32, u32)> {
-        self.terms.iter().map(|t| (u32::from(t.bit), t.x, t.y, t.z)).collect()
+        self.as_slice().iter().map(|t| (u32::from(t.bit), t.x, t.y, t.z)).collect()
+    }
+
+    /// Writes the terms into `out` as `(output bit, x mask, y mask, z mask)` without allocating when `out` has capacity.
+    pub fn write_terms(&self, out: &mut Vec<(u32, u32, u32, u32)>) {
+        out.clear();
+        out.extend(self.as_slice().iter().map(|t| (u32::from(t.bit), t.x, t.y, t.z)));
     }
 
     /// The number of the highest output bit plus one (the block size is a power of two at least this large).
     pub fn bit_count(&self) -> u32 {
-        self.terms.iter().map(|t| u32::from(t.bit) + 1).max().unwrap_or(0)
+        self.as_slice().iter().map(|t| u32::from(t.bit) + 1).max().unwrap_or(0)
     }
 
-    fn from_masks(masks: &[(u16, u16, u16)]) -> Equation {
-        let terms = masks.iter().enumerate().filter(|(_, m)| **m != (0, 0, 0)).map(|(bit, &(x, y, z))| Term { bit: bit as u8, x: u32::from(x), y: u32::from(y), z: u32::from(z), s: 0 }).collect();
-        Equation { terms }
+    fn from_bits(bits: &[Bit]) -> Option<Equation> {
+        let mut terms = [Term::default(); Self::MAX_TERMS];
+        let mut len = 0usize;
+        for (bit, b) in bits.iter().enumerate() {
+            if b.x == 0 && b.y == 0 && b.z == 0 {
+                continue;
+            }
+            if len >= Self::MAX_TERMS {
+                return None;
+            }
+            terms[len] = Term { bit: bit as u8, x: u32::from(b.x), y: u32::from(b.y), z: u32::from(b.z), s: 0 };
+            len += 1;
+        }
+        Some(Equation { terms, len: len as u8 })
     }
 
     /// Parses a row of the appendices: `from bit N: x0 y0 x1^y1 ...`.
@@ -52,8 +88,12 @@ impl Equation {
         let rest = row.strip_prefix("from bit ")?;
         let (first, list) = rest.split_once(':')?;
         let first: u8 = first.trim().parse().ok()?;
-        let mut terms = Vec::new();
+        let mut terms = [Term::default(); Self::MAX_TERMS];
+        let mut len = 0usize;
         for (i, token) in list.split_whitespace().enumerate() {
+            if len >= Self::MAX_TERMS {
+                return None;
+            }
             let mut term = Term { bit: first + i as u8, x: 0, y: 0, z: 0, s: 0 };
             for part in token.split('^') {
                 let (axis, index) = part.split_at(1);
@@ -66,43 +106,101 @@ impl Equation {
                     _ => return None,
                 }
             }
-            terms.push(term);
+            terms[len] = term;
+            len += 1;
         }
-        Some(Equation { terms })
+        Some(Equation { terms, len: len as u8 })
     }
 }
 
 fn from_core(mode: u32, bpe: usize, rb_plus: bool, pipes_log2: u32) -> Option<Equation> {
     let mode = super::modes::core_mode(mode)?;
     let layout = Layout { pipes_log2, rb_plus, ..Layout::default() };
-    Some(Equation::from_masks(&tiling::equation_masks(mode, &layout, bpe)?))
+    Equation::from_bits(tiling::equation_bits(mode, &layout, bpe)?)
 }
 
-/// The equation of a 2D texture (also an array, a 1D texture and a depth slice of a thin volume), with `samples` 1, 2, 4 or
-/// 8. `None` when the console library has none for the combination.
-pub fn equation_2d(mode: u32, bpe: u32, samples: u32, v4: bool) -> Option<Equation> {
-    let mode = mode & 0x1F;
-    let lb = bpe.checked_ilog2()? as u8;
-    if samples > 1 {
-        let row = GROUP_B.iter().find(|r| r.0 == v4 && u32::from(r.1) == mode && r.2 == lb && u32::from(r.3) == samples)?;
-        return Equation::parse(row.4);
-    }
+fn compute_equation_2d_1s(mode: u32, bpe: u32, v4: bool) -> Option<Equation> {
     match mode {
         1 | 5 | 9 => from_core(mode, bpe as usize, false, 0),
         2 | 6 | 10 => from_core(mode, bpe as usize, true, 0),
         21 | 22 | 24..=27 if v4 => from_core(mode, bpe as usize, true, 5),
         _ => {
+            let lb = bpe.ilog2() as u8;
             let row = GROUP_A.iter().find(|r| r.0 == v4 && u32::from(r.1) == mode && r.2 == lb)?;
             Equation::parse(row.3)
         }
     }
 }
 
+/// The equation of a 2D texture (also an array, a 1D texture and a depth slice of a thin volume), with `samples` 1, 2, 4 or
+/// 8. `None` when the console library has none for the combination.
+pub fn equation_2d(mode: u32, bpe: u32, samples: u32, v4: bool) -> Option<Equation> {
+    if !bpe.is_power_of_two() || bpe > 16 {
+        return None;
+    }
+    let mode = mode & 0x1F;
+    let lb = bpe.ilog2();
+    if samples > 1 {
+        if !samples.is_power_of_two() || samples > 8 {
+            return None;
+        }
+        static TABLE_MSAA: OnceLock<Box<[Option<Equation>; 2 * 32 * 5 * 3]>> = OnceLock::new();
+        let table = TABLE_MSAA.get_or_init(|| {
+            let mut entries = vec![None; 2 * 32 * 5 * 3].into_boxed_slice();
+            for &(rv4, rmode, rlb, rsamples, row) in GROUP_B {
+                if let Some(ls) = rsamples.checked_ilog2()
+                    && (1..=3).contains(&ls)
+                    && rmode < 32
+                    && rlb <= 4
+                {
+                    let idx = usize::from(rv4) * 480 + usize::from(rmode) * 15 + usize::from(rlb) * 3 + (ls as usize - 1);
+                    entries[idx] = Equation::parse(row);
+                }
+            }
+            entries.try_into().expect("exact MSAA table size")
+        });
+        let ls = samples.ilog2() as usize;
+        let idx = usize::from(v4) * 480 + (mode as usize) * 15 + (lb as usize) * 3 + (ls - 1);
+        return table[idx];
+    }
+    static TABLE_1S: OnceLock<Box<[Option<Equation>; 2 * 32 * 5]>> = OnceLock::new();
+    let table = TABLE_1S.get_or_init(|| {
+        let mut entries = vec![None; 2 * 32 * 5].into_boxed_slice();
+        for v4_idx in 0..2usize {
+            let rv4 = v4_idx != 0;
+            for rmode in 0..32u32 {
+                for rlb in 0..5u32 {
+                    let idx = v4_idx * 160 + (rmode as usize) * 5 + (rlb as usize);
+                    entries[idx] = compute_equation_2d_1s(rmode, 1 << rlb, rv4);
+                }
+            }
+        }
+        entries.try_into().expect("exact 2D table size")
+    });
+    let idx = usize::from(v4) * 160 + (mode as usize) * 5 + (lb as usize);
+    table[idx]
+}
+
 /// The equation of a thick 3D mode (5, 9, 17, 21, 25, 26). Mode 26 has no row for 8 and 16 byte elements.
 pub fn equation_3d(mode: u32, bpe: u32, v4: bool) -> Option<Equation> {
-    let lb = bpe.checked_ilog2()? as u8;
-    let row = GROUP_C.iter().find(|r| r.0 == v4 && u32::from(r.1) == (mode & 0x1F) && r.2 == lb)?;
-    Equation::parse(row.3)
+    if !bpe.is_power_of_two() || bpe > 16 {
+        return None;
+    }
+    let mode = mode & 0x1F;
+    let lb = bpe.ilog2();
+    static TABLE_3D: OnceLock<Box<[Option<Equation>; 2 * 32 * 5]>> = OnceLock::new();
+    let table = TABLE_3D.get_or_init(|| {
+        let mut entries = vec![None; 2 * 32 * 5].into_boxed_slice();
+        for &(rv4, rmode, rlb, row) in GROUP_C {
+            if rmode < 32 && rlb <= 4 {
+                let idx = usize::from(rv4) * 160 + usize::from(rmode) * 5 + usize::from(rlb);
+                entries[idx] = Equation::parse(row);
+            }
+        }
+        entries.try_into().expect("exact 3D table size")
+    });
+    let idx = usize::from(v4) * 160 + (mode as usize) * 5 + (lb as usize);
+    table[idx]
 }
 
 #[cfg(test)]

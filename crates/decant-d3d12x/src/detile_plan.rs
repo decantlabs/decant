@@ -15,29 +15,150 @@
 //! (also arrays and cube maps), textures the GPU writes (render target, depth, unordered access),
 //! thick 3D modes, formats the XG layout does not model, and textures of 4 GiB or more.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use decant_texture::xg::d3d12::{D3d12ResourceDesc, texture_desc_from_d3d12};
-use decant_texture::xg::{Dim, compute_layout};
+use decant_texture::xg::{Dim, compute_footprint, compute_layout};
 
 /// D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ALLOW_DEPTH_STENCIL and ALLOW_UNORDERED_ACCESS: the GPU writes the texture.
 pub const GPU_WRITTEN_FLAGS: u32 = 0x1 | 0x2 | 0x4;
 
-/// The most entries a planner or footprint cache keeps before it clears on the next miss.
+/// The most entries a planner or footprint cache keeps before evicting the oldest entry.
 const CACHE_LIMIT: usize = 4096;
+/// Direct-mapped thread-local L1 cache size (power of two).
+const L1_SLOTS: usize = 64;
 
-/// The key of a layout query: the 0x38 bytes of the console description with `Alignment` cleared
-/// (bytes 8 to 16, which `D3d12ResourceDesc::from_bytes` ignores) and the hardware version flag.
-type PlanKey = ([u8; 0x38], bool);
-type PlanCache = HashMap<PlanKey, Result<Arc<Plan>, String>>;
-type FootprintCache = HashMap<PlanKey, Option<(u64, u64)>>;
+#[derive(Default)]
+struct FxHasher(u64);
 
-fn plan_key(raw: &[u8; 0x38], v4: bool) -> PlanKey {
-    let mut canonical = *raw;
-    canonical[8..16].fill(0);
-    (canonical, v4)
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517cc1b727220a95;
+        let mut h = self.0;
+        let (chunks, rem) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            let word = u64::from_le_bytes(*chunk);
+            h = (h.rotate_left(5) ^ word).wrapping_mul(K);
+        }
+        if !rem.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rem.len()].copy_from_slice(rem);
+            let word = u64::from_le_bytes(buf);
+            h = (h.rotate_left(5) ^ word).wrapping_mul(K);
+        }
+        self.0 = h;
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        const K: u64 = 0x517cc1b727220a95;
+        self.0 = (self.0.rotate_left(5) ^ u64::from(i)).wrapping_mul(K);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        const K: u64 = 0x517cc1b727220a95;
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(K);
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.write_u32(u32::from(i));
+    }
 }
+
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
+
+/// Canonical key of a layout query: only the fields of `D3D12_RESOURCE_DESC` that affect XG layout,
+/// plus the hardware version flag.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PlanKey {
+    dimension: u32,
+    width: u32,
+    height: u32,
+    depth_mips: u32,
+    format: u32,
+    sample_count: u32,
+    layout: u32,
+    flags: u32,
+    v4: bool,
+}
+
+impl PlanKey {
+    #[inline]
+    fn from_raw(raw: &[u8; 0x38], v4: bool) -> Self {
+        let u32_at = |at: usize| u32::from_le_bytes(raw[at..at + 4].try_into().unwrap());
+        Self {
+            dimension: u32_at(0),
+            width: u32_at(0x10),
+            height: u32_at(0x18),
+            depth_mips: u32_at(0x1C),
+            format: u32_at(0x20),
+            sample_count: u32_at(0x24),
+            layout: u32_at(0x2C),
+            flags: u32_at(0x30),
+            v4,
+        }
+    }
+
+    #[inline]
+    fn fast_hash(&self) -> usize {
+        let mut h = FxHasher::default();
+        self.hash(&mut h);
+        h.finish() as usize
+    }
+}
+
+struct BoundedCache<V> {
+    map: HashMap<PlanKey, V, FxBuildHasher>,
+    ring: Vec<PlanKey>,
+    cursor: usize,
+}
+
+impl<V> BoundedCache<V> {
+    fn new() -> Self {
+        Self {
+            map: HashMap::with_capacity_and_hasher(CACHE_LIMIT, FxBuildHasher::default()),
+            ring: Vec::with_capacity(CACHE_LIMIT),
+            cursor: 0,
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: &PlanKey) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    fn insert(&mut self, key: PlanKey, value: V) {
+        if let Some(slot) = self.map.get_mut(&key) {
+            *slot = value;
+            return;
+        }
+        if self.ring.len() < CACHE_LIMIT {
+            self.ring.push(key);
+        } else {
+            let evicted = self.ring[self.cursor];
+            self.map.remove(&evicted);
+            self.ring[self.cursor] = key;
+            self.cursor = (self.cursor + 1) % CACHE_LIMIT;
+        }
+        self.map.insert(key, value);
+    }
+}
+
+type PlanCache = BoundedCache<Result<Arc<Plan>, String>>;
+type FootprintCache = BoundedCache<Option<(u64, u64)>>;
+type L1PlanCache = RefCell<[Option<(PlanKey, Arc<Plan>)>; L1_SLOTS]>;
+type L1FootprintCache = RefCell<[Option<(PlanKey, Option<(u64, u64)>)>; L1_SLOTS]>;
 
 /// One mip level, field for field what the shader reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +198,7 @@ impl Plan {
     pub const MAX_TERMS: usize = 24;
 
     /// The byte offset of element (x, y) of mip `mip` in slice `z`, computed as the shader does.
+    #[inline]
     pub fn offset(&self, mip: usize, x: u32, y: u32, z: u32) -> u32 {
         let l = &self.mips[mip];
         let z_base = z.wrapping_mul(self.slice_size);
@@ -86,14 +208,18 @@ impl Plan {
         let (ex, ey) = if l.in_tail { (x + l.tail_x, y + l.tail_y) } else { (x, y) };
         let mut e = 0u32;
         for &(bit, mx, my, mz) in &self.terms {
-            let parity = ((ex & mx).count_ones() + (ey & my).count_ones() + (z & mz).count_ones()) & 1;
+            let parity = ((ex & mx) ^ (ey & my) ^ (z & mz)).count_ones() & 1;
             e |= parity << bit;
         }
         let reduced = e & ((1u32 << self.block_bits) - 1);
         if l.in_tail {
             return z_base.wrapping_add(reduced);
         }
-        let block_index = (y / self.block_height).wrapping_mul(l.blocks_x).wrapping_add(x / self.block_width);
+        let block_index = if self.block_width.is_power_of_two() && self.block_height.is_power_of_two() {
+            (y >> self.block_height.trailing_zeros()).wrapping_mul(l.blocks_x).wrapping_add(x >> self.block_width.trailing_zeros())
+        } else {
+            (y / self.block_height).wrapping_mul(l.blocks_x).wrapping_add(x / self.block_width)
+        };
         z_base.wrapping_add(l.level_offset).wrapping_add(block_index << self.block_bits).wrapping_add(reduced)
     }
 }
@@ -162,18 +288,40 @@ fn compute_plan(raw: &[u8; 0x38], v4: bool) -> Result<Plan, String> {
 /// equations.
 pub fn plan_shared(raw: &[u8; 0x38], v4: bool) -> Result<Arc<Plan>, String> {
     static CACHE: OnceLock<Mutex<PlanCache>> = OnceLock::new();
-    let key = plan_key(raw, v4);
-    let mutex = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    thread_local! {
+        static L1: L1PlanCache = const { RefCell::new([const { None }; L1_SLOTS]) };
+    }
+    let key = PlanKey::from_raw(raw, v4);
+    let slot = key.fast_hash() & (L1_SLOTS - 1);
+    if let Some(hit) = L1.with(|l1| {
+        l1.borrow()[slot].as_ref().and_then(|(k, p)| (*k == key).then(|| Arc::clone(p)))
+    }) {
+        return Ok(hit);
+    }
+    let mutex = CACHE.get_or_init(|| Mutex::new(BoundedCache::new()));
     if let Some(hit) = mutex.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() {
+        if let Ok(ref plan) = hit {
+            L1.with(|l1| {
+                l1.borrow_mut()[slot] = Some((key, Arc::clone(plan)));
+            });
+        }
         return hit;
     }
-    let computed = compute_plan(&key.0, v4).map(Arc::new);
+    let computed = compute_plan(raw, v4).map(Arc::new);
     let mut guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= CACHE_LIMIT {
-        guard.clear();
+    let result = if let Some(existing) = guard.get(&key) {
+        existing.clone()
+    } else {
+        guard.insert(key, computed.clone());
+        computed
+    };
+    drop(guard);
+    if let Ok(ref plan) = result {
+        L1.with(|l1| {
+            l1.borrow_mut()[slot] = Some((key, Arc::clone(plan)));
+        });
     }
-    guard.insert(key, computed.clone());
-    computed
+    result
 }
 
 /// The plan of the texture whose console description is `raw` (the 0x38 bytes the title passed), laid
@@ -184,8 +332,8 @@ pub fn plan(raw: &[u8; 0x38], v4: bool) -> Result<Plan, String> {
 
 fn compute_console_footprint(raw: &[u8; 0x38], v4: bool) -> Option<(u64, u64)> {
     let desc = texture_desc_from_d3d12(&D3d12ResourceDesc::from_bytes(raw)).ok()?;
-    let layout = compute_layout(&desc, v4).ok()?;
-    (layout.layout.size_bytes != 0).then_some((layout.layout.size_bytes, layout.layout.base_alignment_bytes))
+    let (size_bytes, base_alignment_bytes) = compute_footprint(&desc, v4).ok()?;
+    (size_bytes != 0).then_some((size_bytes, base_alignment_bytes))
 }
 
 /// The bytes and alignment the console's XG layout gives the resource whose console description is
@@ -193,18 +341,36 @@ fn compute_console_footprint(raw: &[u8; 0x38], v4: bool) -> Option<(u64, u64)> {
 /// differs: the title sizes its display target block with XG and asserts the block is used up.
 pub fn console_footprint(raw: &[u8; 0x38], v4: bool) -> Option<(u64, u64)> {
     static CACHE: OnceLock<Mutex<FootprintCache>> = OnceLock::new();
-    let key = plan_key(raw, v4);
-    let mutex = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(&hit) = mutex.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+    thread_local! {
+        static L1: L1FootprintCache = const { RefCell::new([None; L1_SLOTS]) };
+    }
+    let key = PlanKey::from_raw(raw, v4);
+    let slot = key.fast_hash() & (L1_SLOTS - 1);
+    if let Some(hit) = L1.with(|l1| {
+        l1.borrow()[slot].and_then(|(k, v)| (k == key).then_some(v))
+    }) {
         return hit;
     }
-    let computed = compute_console_footprint(&key.0, v4);
-    let mut guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= CACHE_LIMIT {
-        guard.clear();
+    let mutex = CACHE.get_or_init(|| Mutex::new(BoundedCache::new()));
+    if let Some(&hit) = mutex.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        L1.with(|l1| {
+            l1.borrow_mut()[slot] = Some((key, hit));
+        });
+        return hit;
     }
-    guard.insert(key, computed);
-    computed
+    let computed = compute_console_footprint(raw, v4);
+    let mut guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+    let result = if let Some(&existing) = guard.get(&key) {
+        existing
+    } else {
+        guard.insert(key, computed);
+        computed
+    };
+    drop(guard);
+    L1.with(|l1| {
+        l1.borrow_mut()[slot] = Some((key, result));
+    });
+    result
 }
 
 #[cfg(test)]
@@ -320,5 +486,37 @@ mod tests {
         let plan_v4 = plan_shared(&a, true).expect("a v4 plan");
         assert_eq!(plan_a.size, plan_v4.size);
         assert_eq!(console_footprint(&a, false), console_footprint(&b, false));
+    }
+
+    #[test]
+    fn shared_plans_and_footprints_ignore_unused_descriptor_fields() {
+        let a = raw(512, 256, 1, 5, 28, 0, 0);
+        let mut b = a;
+        b[4..8].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        b[8..16].copy_from_slice(&0x1_0000u64.to_le_bytes());
+        b[0x28..0x2C].copy_from_slice(&7u32.to_le_bytes());
+        b[0x34..0x38].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        let plan_a = plan_shared(&a, false).expect("a plan");
+        let plan_b = plan_shared(&b, false).expect("b plan");
+        assert!(Arc::ptr_eq(&plan_a, &plan_b));
+        assert_eq!(console_footprint(&a, false), console_footprint(&b, false));
+    }
+
+    #[test]
+    fn bounded_cache_evicts_oldest_without_clearing_all() {
+        let mut cache = BoundedCache::new();
+        let make_key = |w: u32| PlanKey::from_raw(&raw(u64::from(w), 64, 1, 1, 28, 0, 0), false);
+        for i in 1..=CACHE_LIMIT as u32 {
+            cache.insert(make_key(i), i);
+        }
+        assert_eq!(cache.map.len(), CACHE_LIMIT);
+        for i in (CACHE_LIMIT as u32 + 1)..=(CACHE_LIMIT as u32 + 10) {
+            cache.insert(make_key(i), i);
+        }
+        assert_eq!(cache.map.len(), CACHE_LIMIT);
+        assert_eq!(cache.get(&make_key(1)), None);
+        assert_eq!(cache.get(&make_key(10)), None);
+        assert_eq!(cache.get(&make_key(11)), Some(&11));
+        assert_eq!(cache.get(&make_key(CACHE_LIMIT as u32 + 10)), Some(&(CACHE_LIMIT as u32 + 10)));
     }
 }

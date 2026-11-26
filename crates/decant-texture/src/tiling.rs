@@ -39,10 +39,10 @@ use tables as t;
 
 /// One byte offset bit: the x, y and slice (z) bits whose parity it takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Bit {
-    x: u16,
-    y: u16,
-    z: u16,
+pub(crate) struct Bit {
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) z: u16,
 }
 
 /// A GFX10 swizzle mode. `S`/`D`/`R`/`Z` is the in-block order family, `X` a mode that mixes in the
@@ -198,6 +198,12 @@ impl Mode {
         let (w_log2, h_log2) = self.block_shape(bpe)?;
         Some((width.div_ceil(1 << w_log2) * height.div_ceil(1 << h_log2)) << self.block_log2())
     }
+}
+
+/// The offset bits for elements of `bpe` bytes; `None` for an element size or pipe count the
+/// tables do not have.
+pub(crate) fn equation_bits(mode: Mode, layout: &Layout, bpe: usize) -> Option<&'static [Bit]> {
+    mode.bits(layout, bpe)
 }
 
 /// The address equation of `mode` for elements of `bpe` bytes, one entry per offset bit from bit 0 upward: the masks of

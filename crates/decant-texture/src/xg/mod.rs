@@ -25,5 +25,5 @@ pub enum XgError {
     Fail,
 }
 
-pub use layout::{Dim, Level, Plane, ResourceLayout, TextureDesc, TextureLayout, buffer_layout, compute_layout};
+pub use layout::{Dim, Level, Plane, ResourceLayout, TextureDesc, TextureLayout, buffer_layout, compute_footprint, compute_layout};
 pub use swizzle::{SwizzleQuery, compute_optimal_swizzle_mode};

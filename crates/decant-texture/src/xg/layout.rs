@@ -459,16 +459,39 @@ fn thick_chain(c: &Common) -> Chain {
 /// Validates a description and computes its layout. `v4` is the hardware version flag of `XGSetHardwareVersion`.
 pub fn compute_layout(desc: &TextureDesc, v4: bool) -> Result<TextureLayout, XgError> {
     match desc.dim {
-        Dim::D2 => compute_2d(desc, v4),
-        Dim::D1 | Dim::D3 => compute_1d_3d(desc, v4),
+        Dim::D2 => {
+            let c = validate_2d(desc, v4)?;
+            build(&c, Dim::D2, desc, Volume::No)
+        }
+        Dim::D1 | Dim::D3 => {
+            let (c, volume) = validate_1d_3d(desc, v4)?;
+            let layout = build(&c, desc.dim, desc, volume)?;
+            if layout.layout.size_bytes >= 1 << 40 {
+                return Err(XgError::NotImpl);
+            }
+            Ok(layout)
+        }
     }
+}
+
+/// Validates a description and computes only `(size_bytes, base_alignment_bytes)` without allocating level or plane vectors.
+pub fn compute_footprint(desc: &TextureDesc, v4: bool) -> Result<(u64, u64), XgError> {
+    let (c, volume) = match desc.dim {
+        Dim::D2 => (validate_2d(desc, v4)?, Volume::No),
+        Dim::D1 | Dim::D3 => validate_1d_3d(desc, v4)?,
+    };
+    let (size_bytes, alignment) = build_footprint(&c, desc.dim, desc, volume)?;
+    if matches!(desc.dim, Dim::D1 | Dim::D3) && size_bytes >= 1 << 40 {
+        return Err(XgError::NotImpl);
+    }
+    Ok((size_bytes, alignment))
 }
 
 fn wrap_dimension(v: u32) -> u32 {
     ((v - 1) % 65536) + 1
 }
 
-fn compute_2d(d: &TextureDesc, v4: bool) -> Result<TextureLayout, XgError> {
+fn validate_2d(d: &TextureDesc, v4: bool) -> Result<Common, XgError> {
     if d.misc_flags & MISC_400000 != 0 && d.misc_flags & MISC_64K_D != 0 {
         return Err(XgError::InvalidArg);
     }
@@ -508,11 +531,10 @@ fn compute_2d(d: &TextureDesc, v4: bool) -> Result<TextureLayout, XgError> {
     if matches!(mode, 24 | 28) && blk == 4 && !(d.bind_flags & BIND_RENDER_TARGET != 0 && s == 1 && n == 1) {
         return Err(XgError::InvalidArg);
     }
-    let c = Common { mode, bpe, blk, w, h, a: d.depth_or_array, n, s, v4, pitch: 0, three_d: false };
-    build(&c, Dim::D2, d, Volume::No)
+    Ok(Common { mode, bpe, blk, w, h, a: d.depth_or_array, n, s, v4, pitch: 0, three_d: false })
 }
 
-fn compute_1d_3d(d: &TextureDesc, v4: bool) -> Result<TextureLayout, XgError> {
+fn validate_1d_3d(d: &TextureDesc, v4: bool) -> Result<(Common, Volume), XgError> {
     let is_1d = d.dim == Dim::D1;
     let height = if is_1d { 1 } else { d.height };
     if d.width == 0 || height == 0 || d.depth_or_array == 0 {
@@ -565,11 +587,94 @@ fn compute_1d_3d(d: &TextureDesc, v4: bool) -> Result<TextureLayout, XgError> {
         return Err(XgError::InvalidArg);
     }
     let c = Common { mode, bpe, blk, w: d.width, h: height, a: d.depth_or_array, n, s: 1, v4, pitch: d.pitch, three_d: !is_1d };
-    let layout = build(&c, d.dim, d, if is_1d { Volume::No } else { volume })?;
-    if layout.layout.size_bytes >= 1 << 40 {
-        return Err(XgError::NotImpl);
+    Ok((c, if is_1d { Volume::No } else { volume }))
+}
+
+fn chain_footprint(c: &Common, thick: bool) -> (u64, u64, u32) {
+    if c.mode == 0 {
+        let mut run = 0u64;
+        for i in 0..c.n {
+            let w = level_elements(c.w, c.blk, i);
+            let h = level_elements(c.h, c.blk, i);
+            let wanted = if i == 0 { w.max(c.pitch) } else { w };
+            let pitch_bytes = align_up(u64::from(wanted) * u64::from(c.bpe), 256);
+            run += pitch_bytes * u64::from(h);
+        }
+        return (run, 256, 1);
     }
-    Ok(layout)
+    let lb = c.bpe.ilog2();
+    let bits = modes::block_bits(c.mode, c.v4);
+    let block_size = 1u64 << bits;
+    if thick {
+        let (bw, bh, bd) = thick_shape(bits, lb);
+        let (fw, fh) = if bits.is_multiple_of(3) { (bw, bh / 2) } else { (bw / 2, bh) };
+        let max_tail = if bits == 12 { 5 } else { 10 };
+        let mut first = c.n;
+        if c.n > 1 {
+            for i in 0..c.n {
+                if level_elements(c.w, c.blk, i) <= fw && level_elements(c.h, c.blk, i) <= fh {
+                    first = i.max(c.n.saturating_sub(max_tail));
+                    break;
+                }
+            }
+        }
+        let mut run = if first < c.n { block_size } else { 0 };
+        for i in 0..first {
+            let pad_w = align_up(u64::from(level_elements(c.w, c.blk, i)), u64::from(bw));
+            let pad_h = align_up(u64::from(level_elements(c.h, c.blk, i)), u64::from(bh));
+            run += pad_w * pad_h * u64::from(c.bpe) * u64::from(bd);
+        }
+        return (align_up(run, block_size), block_size, bd);
+    }
+    let (bw, bh) = block_shape(bits, lb, c.s.ilog2());
+    let (tw, th) = (bw / 2, bh);
+    let (fw, fh) = match (c.mode & 0x1F, c.bpe) {
+        (24 | 28, 1) => (tw / 2, th / 2),
+        (24 | 28, 2) => (tw / 2, th),
+        _ => (tw, th),
+    };
+    let mut first = c.n;
+    if bits > 8 && c.n > 1 {
+        for i in 0..c.n {
+            if level_elements(c.w, c.blk, i) <= fw && level_elements(c.h, c.blk, i) <= fh {
+                first = i.max(c.n.saturating_sub(bits - 4));
+                break;
+            }
+        }
+    }
+    let mut run = if first < c.n { block_size } else { 0 };
+    for i in 0..first {
+        let pad_w = align_up(u64::from(level_elements(c.w, c.blk, i)), u64::from(bw));
+        let pad_h = align_up(u64::from(level_elements(c.h, c.blk, i)), u64::from(bh));
+        run += pad_w * pad_h * u64::from(c.bpe) * u64::from(c.s);
+    }
+    (align_up(run, block_size), block_size, 1)
+}
+
+fn check_equation_exists(c: &Common, thick: bool) -> Result<(), XgError> {
+    if c.mode == 0 {
+        return Ok(());
+    }
+    if thick {
+        equation_3d(c.mode, c.bpe, c.v4).map(|_| ()).ok_or(XgError::NotImpl)
+    } else {
+        equation_2d(c.mode, c.bpe, c.s, c.v4).map(|_| ()).ok_or(XgError::InvalidArg)
+    }
+}
+
+fn build_footprint(c: &Common, dim: Dim, d: &TextureDesc, volume: Volume) -> Result<(u64, u64), XgError> {
+    let thick = c.mode != 0 && c.three_d && volume == Volume::Thick;
+    check_equation_exists(c, thick)?;
+    let (slice_size, alignment, block_d) = chain_footprint(c, thick);
+    let slices: u64 = if thick { u64::from(align_up(u64::from(c.a), u64::from(block_d)) as u32) / u64::from(block_d) } else { u64::from(c.a) };
+    let main_size = u64::try_from(u128::from(slice_size) * u128::from(slices)).map_err(|_| XgError::InvalidArg)?;
+    let compressed_z = matches!(c.mode, 24 | 28) && c.blk == 4;
+    if dim == Dim::D2 && d.bind_flags & BIND_RENDER_TARGET != 0 && c.s == 1 && c.n == 1 && d.misc_flags & MISC_64K_D == 0 && !compressed_z {
+        let size = align_up(u64::from(c.w), 1024) * align_up(u64::from(c.h), 1024) / 128 * u64::from(c.a);
+        let base = align_up(main_size, 0x2000);
+        return Ok((base + size, alignment.max(0x2000)));
+    }
+    Ok((main_size, alignment))
 }
 
 /// Runs the chain builder for the validated parameters and assembles the planes.
@@ -728,9 +833,11 @@ impl TextureLayout {
             let e = eq.eval((x as u32).wrapping_add(l.tail_x), y.wrapping_add(l.tail_y), z, s);
             return Some(z_base + reduce(e));
         }
-        let blocks_x = l.padded_width / self.block_w;
-        let block_index = u64::from((y / self.block_h).wrapping_mul(blocks_x).wrapping_add(x as u32 / self.block_w));
-        Some(z_base + l.offset_bytes + block_index * block + reduce(eq.eval(x as u32, y, z, s)))
+        let bw_shift = self.block_w.trailing_zeros();
+        let bh_shift = self.block_h.trailing_zeros();
+        let blocks_x = l.padded_width >> bw_shift;
+        let block_index = u64::from((y >> bh_shift).wrapping_mul(blocks_x).wrapping_add((x as u32) >> bw_shift));
+        Some(z_base + l.offset_bytes + (block_index << self.block_bits) + reduce(eq.eval(x as u32, y, z, s)))
     }
 }
 
@@ -891,5 +998,28 @@ mod tests {
         assert_eq!(buffer_layout(0x64, 0, 0x8000_0000), Err(XgError::InvalidArg));
         assert_eq!(buffer_layout(0x20000, 0, 0x400_0000).unwrap().base_alignment_bytes, 0x10000);
         assert_eq!(buffer_layout(0x64, 0, 0x800_0000).unwrap().base_alignment_bytes, 0x10000);
+    }
+
+    #[test]
+    fn compute_footprint_matches_compute_layout() {
+        let cases = [
+            desc(Dim::D2, 100, 20, 1, 1, 28, 0),
+            desc(Dim::D2, 256, 256, 3, 0, 71, 5),
+            TextureDesc { bind_flags: 0x20 | 0x8, ..desc(Dim::D2, 1920, 1080, 1, 1, 28, 27) },
+            TextureDesc { sample_count: 4, ..desc(Dim::D2, 512, 512, 1, 1, 28, 27) },
+            desc(Dim::D1, 512, 1, 2, 0, 28, 0),
+            desc(Dim::D3, 64, 64, 32, 0, 28, 9),
+            desc(Dim::D3, 64, 64, 32, 0, 28, 10),
+            desc(Dim::D3, 16385, 64, 8, 1, 28, 5),
+            desc(Dim::D3, 64, 64, 8, 1, 10, 26),
+            desc(Dim::D2, 0, 64, 1, 1, 28, 5),
+        ];
+        for d in cases {
+            for v4 in [false, true] {
+                let want = compute_layout(&d, v4).map(|l| (l.layout.size_bytes, l.layout.base_alignment_bytes));
+                let got = compute_footprint(&d, v4);
+                assert_eq!(got, want, "desc {d:?} v4 {v4}");
+            }
+        }
     }
 }
