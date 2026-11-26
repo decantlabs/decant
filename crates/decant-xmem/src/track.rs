@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use crate::pages::PAGE_BYTES;
 
-/// How long a page that a kernel write may still reach (`prepare`) stays unprotected.
-pub const IO_HOLD: Duration = Duration::from_secs(2);
+/// How long a page that a kernel write may still reach (`prepare`) stays unprotected by default.
+pub const IO_HOLD: Duration = Duration::from_millis(500);
 /// How long a page stays open for a write that ends when a call returns (`Engine::begin_write`) at most,
 /// should the call never come back.
 pub const CALL_HOLD: Duration = Duration::from_secs(600);
@@ -25,20 +25,36 @@ pub const HOT_WINDOW: Duration = Duration::from_millis(250);
 /// Quick faults in a row that make a page hot.
 pub const HOT_FAULTS: u8 = 3;
 /// How long a hot page stays unprotected and is copied at every sync by default.
-pub const HOT_HOLD: Duration = Duration::from_secs(2);
+pub const HOT_HOLD: Duration = Duration::from_millis(250);
+
+/// Parses a hold duration in milliseconds from an optional string, falling back to `default`.
+fn parse_hold_ms(raw: Option<&str>, default: Duration) -> Duration {
+    match raw.and_then(|s| s.trim().parse::<u64>().ok()) {
+        Some(ms) => Duration::from_millis(ms),
+        None => default,
+    }
+}
 
 /// Parses `DECANT_XMEM_HOT_HOLD_MS` from an optional string, falling back to [`HOT_HOLD`].
 pub fn parse_hot_hold_ms(raw: Option<&str>) -> Duration {
-    match raw.and_then(|s| s.trim().parse::<u64>().ok()) {
-        Some(ms) => Duration::from_millis(ms),
-        None => HOT_HOLD,
-    }
+    parse_hold_ms(raw, HOT_HOLD)
+}
+
+/// Parses `DECANT_XMEM_IO_HOLD_MS` from an optional string, falling back to [`IO_HOLD`].
+pub fn parse_io_hold_ms(raw: Option<&str>) -> Duration {
+    parse_hold_ms(raw, IO_HOLD)
 }
 
 /// How long a hot page stays unprotected and is copied at every sync.
 pub fn hot_hold() -> Duration {
     static HOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *HOLD.get_or_init(|| parse_hot_hold_ms(std::env::var("DECANT_XMEM_HOT_HOLD_MS").ok().as_deref()))
+}
+
+/// How long a page that a kernel write may still reach stays unprotected.
+pub fn io_hold() -> Duration {
+    static HOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| parse_io_hold_ms(std::env::var("DECANT_XMEM_IO_HOLD_MS").ok().as_deref()))
 }
 
 /// One title view page of a pool page: its address and whether the title protection is read write.
@@ -201,10 +217,10 @@ impl Track {
         let _ = self.dirty(page);
     }
 
-    /// A kernel write may land in the page: it is dirty, unprotected and held for `IO_HOLD`. Returns the
+    /// A kernel write may land in the page: it is dirty, unprotected and held for `io_hold()`. Returns the
     /// views to make read write again.
     pub fn prepare(&mut self, page: u32, now: Instant) -> Vec<usize> {
-        self.prepare_until(page, now + IO_HOLD)
+        self.prepare_until(page, now + io_hold())
     }
 
     /// As `prepare`, held until `until` (a longer hold already there stays).
@@ -216,13 +232,14 @@ impl Track {
         self.dirty(page)
     }
 
-    /// The write a long hold was for ended at `now`: the page is held for `IO_HOLD` from now. That
+    /// The write a long hold was for ended at `now`: the page is held for `io_hold()` from now. That
     /// shortens a `CALL_HOLD` (any hold that ends later than the longest other one, `hot_hold()`) and
     /// keeps a hot or kernel write hold that ends later.
     pub fn hold_from(&mut self, page: u32, now: Instant) {
         if let Some(until) = self.held.get_mut(&page) {
-            let end = now + IO_HOLD;
-            if *until > now + hot_hold().max(IO_HOLD) || *until < end {
+            let hold = io_hold();
+            let end = now + hold;
+            if *until > now + hot_hold().max(hold) || *until < end {
                 *until = end;
             }
         }
@@ -385,7 +402,7 @@ mod tests {
         assert_eq!(t.prepare(5, now), [0x10_0000], "the clean page is opened");
         let (pages, protect) = t.take(now, 10, all);
         assert_eq!((pages, protect), (vec![5], vec![]));
-        assert_eq!(t.take(now + Duration::from_secs(1), 10, all), (vec![5], vec![]), "still held");
+        assert_eq!(t.take(now + IO_HOLD / 2, 10, all), (vec![5], vec![]), "still held");
         let (pages, protect) = t.take(now + IO_HOLD, 10, all);
         assert_eq!((pages, protect), (vec![5], vec![0x10_0000]), "the hold ended, the page is protected again");
         assert_eq!(t.take(now + IO_HOLD, 10, all).0, Vec::<u32>::new());
@@ -499,11 +516,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_hot_hold_ms_parses_override_and_defaults_to_two_seconds() {
-        assert_eq!(HOT_HOLD, Duration::from_secs(2));
-        assert_eq!(parse_hot_hold_ms(None), Duration::from_millis(2000));
-        assert_eq!(parse_hot_hold_ms(Some("")), Duration::from_millis(2000));
-        assert_eq!(parse_hot_hold_ms(Some("invalid")), Duration::from_millis(2000));
+    fn parse_hot_hold_ms_parses_override_and_defaults_to_250_ms() {
+        assert_eq!(HOT_HOLD, Duration::from_millis(250));
+        assert_eq!(parse_hot_hold_ms(None), Duration::from_millis(250));
+        assert_eq!(parse_hot_hold_ms(Some("")), Duration::from_millis(250));
+        assert_eq!(parse_hot_hold_ms(Some("invalid")), Duration::from_millis(250));
         assert_eq!(parse_hot_hold_ms(Some(" 750 ")), Duration::from_millis(750));
+    }
+
+    #[test]
+    fn parse_io_hold_ms_parses_override_and_defaults_to_500_ms() {
+        assert_eq!(IO_HOLD, Duration::from_millis(500));
+        assert_eq!(parse_io_hold_ms(None), Duration::from_millis(500));
+        assert_eq!(parse_io_hold_ms(Some("")), Duration::from_millis(500));
+        assert_eq!(parse_io_hold_ms(Some("invalid")), Duration::from_millis(500));
+        assert_eq!(parse_io_hold_ms(Some(" 1200 ")), Duration::from_millis(1200));
     }
 }

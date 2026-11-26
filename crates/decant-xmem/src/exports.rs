@@ -18,9 +18,6 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
-/// Calls of a page placing export that are traced, the rest stay silent.
-const TRACE_FIRST_CALLS: i64 = 64;
-
 use crate::engine::{Engine, EngineError};
 use crate::journal::GpuChange;
 use crate::{
@@ -491,11 +488,16 @@ pub unsafe extern "system" fn XMemAllocatePhysicalPages(flags: u64, number_of_pa
 ///
 /// # Safety
 /// Exported. `page_array` is null or readable for `number_of_pages` entries.
+fn should_trace_call(n: i64) -> bool {
+    let n = n as u64;
+    n < 32 || n.is_power_of_two() || n.is_multiple_of(1000)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn XMemMapPhysicalPages(virtual_address: *mut c_void, number_of_pages: usize, page_array: *const u64) -> *mut c_void {
-    // Only the first calls are traced, so a busy title cannot flood the log.
+    // Only the first calls, powers of two, and every 1000th call are traced so streaming cannot flood the log.
     static CALLS: AtomicI64 = AtomicI64::new(0);
-    let logged = CALLS.fetch_add(1, Ordering::Relaxed) < TRACE_FIRST_CALLS;
+    let logged = should_trace_call(CALLS.fetch_add(1, Ordering::Relaxed));
     if virtual_address.is_null() || !entries_fit(number_of_pages) {
         fail(ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
@@ -504,7 +506,6 @@ pub unsafe extern "system" fn XMemMapPhysicalPages(virtual_address: *mut c_void,
         return virtual_address;
     }
     let base = virtual_address as usize & !(crate::pages::PAGE_BYTES - 1);
-    let owned = Engine::started().is_some_and(|e| e.owns(base));
     let result = Engine::global().and_then(|engine| {
         if page_array.is_null() {
             engine.unmap_pages(base, number_of_pages)
@@ -512,6 +513,7 @@ pub unsafe extern "system" fn XMemMapPhysicalPages(virtual_address: *mut c_void,
             // SAFETY: the caller provides `number_of_pages` readable entries.
             let frames: Vec<u32> = unsafe { std::slice::from_raw_parts(page_array, number_of_pages) }.iter().map(|&f| frame32(f)).collect();
             if logged {
+                let owned = Engine::started().is_some_and(|e| e.owns(base));
                 let first = frames.first().copied().unwrap_or(0);
                 let last = frames.last().copied().unwrap_or(0);
                 decant_log::trace(&format!(
@@ -545,7 +547,7 @@ pub unsafe extern "system" fn XMemMapPhysicalPages(virtual_address: *mut c_void,
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(virtual_addresses: *const *mut c_void, number_of_pages: usize, page_array: *const u64) -> BOOL {
     static CALLS: AtomicI64 = AtomicI64::new(0);
-    let logged = CALLS.fetch_add(1, Ordering::Relaxed) < TRACE_FIRST_CALLS;
+    let logged = should_trace_call(CALLS.fetch_add(1, Ordering::Relaxed));
     if virtual_addresses.is_null() || !entries_fit(number_of_pages) {
         fail(ERROR_INVALID_PARAMETER);
         return FALSE;

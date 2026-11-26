@@ -1783,48 +1783,21 @@ impl Engine {
     /// A kernel write (a file read, a DirectStorage request) may land in `[address, address + len)`: the
     /// pages of it that views map are committed (a kernel write into a page that is not fails instead of
     /// faulting), and with the dirty tracking on they become dirty and writable, and stay so for
-    /// `track::IO_HOLD`.
+    /// `track::io_hold()`.
     pub fn prepare_write(&self, address: usize, len: usize) {
-        self.prepare_write_until(address, len, Instant::now() + track::IO_HOLD);
+        self.prepare_write_until(address, len, Instant::now() + track::io_hold());
     }
 
     /// As `prepare_write` for a write that ends when a call returns (a `ReadFile` without
-    /// `OVERLAPPED`): the pages stay open until [`Engine::end_write`], however long the call takes. A
-    /// read of hundreds of MB took longer than `track::IO_HOLD` in a retail title: its
-    /// pages were protected again under the kernel's write, it failed with `ERROR_NOACCESS` every time
-    /// and the title stopped at its boot.
+    /// `OVERLAPPED`): the pages stay pinned writable until [`Engine::end_write`].
     pub fn begin_write(&self, address: usize, len: usize) {
-        self.prepare_write_until(address, len, Instant::now() + track::CALL_HOLD);
+        self.begin_io_write(address, len);
     }
 
-    /// The write that [`Engine::begin_write`] opened is done: its pages are held for `track::IO_HOLD`
-    /// from now, as after any kernel write.
+    /// The write that [`Engine::begin_write`] opened is done: release the write pin so the next
+    /// `take_dirty` copies the page once and protects it again.
     pub fn end_write(&self, address: usize, len: usize) {
-        let Some(end) = address.checked_add(len).filter(|_| len != 0) else { return };
-        let st = self.lock();
-        let dirty_state = Arc::clone(&st.dirty);
-        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
-        let dirty = &mut *dirty_guard;
-        let now = Instant::now();
-        let mut page = address & !(PAGE_BYTES - 1);
-        while page < end {
-            let Some((base, region)) = st.regions.containing(page) else {
-                page += PAGE_BYTES;
-                continue;
-            };
-            let region_end = base + region.size;
-            if let Kind::View { first_frame } = region.kind
-                && let Some(first) = index_of(first_frame)
-                && let Some(track) = dirty.track.as_mut()
-            {
-                while page < end && page < region_end {
-                    track.hold_from((first + (page - base) / PAGE_BYTES) as u32, now);
-                    page += PAGE_BYTES;
-                }
-            } else {
-                page = region_end.max(page + PAGE_BYTES);
-            }
-        }
+        self.finish_io_write(address, len);
     }
 
     fn collect_rw_view_indices(st: &State, address: usize, len: usize, commit: bool) -> Vec<u32> {
