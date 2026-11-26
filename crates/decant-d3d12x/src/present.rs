@@ -50,6 +50,82 @@ fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("DECANT_D3D12X_PRESENT").is_none_or(|v| v != "0"))
 }
 
+const TIMESTAMP_RING_SLOTS: usize = 2;
+
+/// Converts a pair of D3D12 GPU timestamps `(start, end)` at tick frequency `freq` Hz to
+/// milliseconds. Returns `None` when `freq == 0` or `end < start`.
+fn timestamps_to_ms(start: u64, end: u64, freq: u64) -> Option<f64> {
+    if freq == 0 || end < start {
+        return None;
+    }
+    Some((end - start) as f64 * 1000.0 / freq as f64)
+}
+
+/// Ring slot index for `frame` across `slots` buffered slots.
+const fn ring_index(frame: u64, slots: usize) -> usize {
+    if slots == 0 { 0 } else { (frame as usize) % slots }
+}
+
+/// Start and end query indices inside the timestamp query heap for ring `slot`.
+const fn timestamp_pair(slot: usize) -> (u32, u32) {
+    let base = (slot * 2) as u32;
+    (base, base + 1)
+}
+
+/// Ring-buffered D3D12 timestamp query heap + readback buffer (2 slots per frame) for zero-stall
+/// `gpu_frame_ms` measurement when `decant_trace::enabled()` is true.
+struct GpuTimer {
+    heap: ID3D12QueryHeap,
+    readback: ID3D12Resource,
+    freq: u64,
+    has_sample: [bool; TIMESTAMP_RING_SLOTS],
+}
+
+impl GpuTimer {
+    unsafe fn new(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> windows::core::Result<Self> {
+        let freq = unsafe { queue.GetTimestampFrequency() }?;
+        let heap_desc = D3D12_QUERY_HEAP_DESC {
+            Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+            Count: (TIMESTAMP_RING_SLOTS * 2) as u32,
+            NodeMask: 0,
+        };
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        unsafe { dev.CreateQueryHeap(&heap_desc, &mut heap) }?;
+        let heap = heap.ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)))?;
+
+        let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        let buf_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: (TIMESTAMP_RING_SLOTS * 2 * std::mem::size_of::<u64>()) as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        unsafe { dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback) }?;
+        let readback = readback.ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)))?;
+        Ok(Self { heap, readback, freq, has_sample: [false; TIMESTAMP_RING_SLOTS] })
+    }
+
+    /// Reads the completed `(start, end)` timestamp pair for `slot` without stalling.
+    unsafe fn read_completed(&self, slot: usize) -> Option<f64> {
+        if !self.has_sample[slot] {
+            return None;
+        }
+        let byte_offset = slot * 16;
+        let read_range = D3D12_RANGE { Begin: byte_offset, End: byte_offset + 16 };
+        let mut mapped: *mut c_void = std::ptr::null_mut();
+        unsafe { self.readback.Map(0, Some(&read_range), Some(&mut mapped)) }.ok()?;
+        let words = unsafe { std::ptr::read_unaligned(mapped.cast::<u8>().add(byte_offset).cast::<[u64; 2]>()) };
+        let empty = D3D12_RANGE { Begin: 0, End: 0 };
+        unsafe { self.readback.Unmap(0, Some(&empty)) };
+        timestamps_to_ms(words[0], words[1], self.freq)
+    }
+}
+
 struct Presenter {
     dev: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -70,6 +146,8 @@ struct Presenter {
     /// `DECANT_D3D12X_PRESENT_PROBE=fill`: one render target view slot for the marker square.
     marker: Option<ID3D12DescriptorHeap>,
     marker_charge: Option<crate::mem_owners::Charge>,
+    gpu_timer: Option<GpuTimer>,
+    last_present: Option<std::time::Instant>,
     frames: u64,
 }
 
@@ -503,6 +581,7 @@ fn make(queue: &ID3D12CommandQueue, w: u32, h: u32, fmt: DXGI_FORMAT) -> windows
         list.Close()?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let wait_event = CreateEventW(None, false, false, None).ok();
+        let gpu_timer = if decant_trace::enabled() { GpuTimer::new(&dev, queue).ok() } else { None };
         xs_log!("present: swap chain {w}x{h} format {} on the title window {:?}", fmt.0, hwnd.0);
         Ok(Presenter {
             dev,
@@ -520,6 +599,8 @@ fn make(queue: &ID3D12CommandQueue, w: u32, h: u32, fmt: DXGI_FORMAT) -> windows
             target_probe: None,
             marker: None,
             marker_charge: None,
+            gpu_timer,
+            last_present: None,
             frames: 0,
         })
     }
@@ -564,13 +645,16 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
         }
     }
     let Some(p) = guard.as_mut() else { return false };
+    let trace_on = decant_trace::enabled();
     // SAFETY: COM calls on the presenter's live objects; each back buffer is reused only after its
     // last copy completed on the GPU.
-    let result: windows::core::Result<u64> = unsafe {
+    let result: windows::core::Result<(u64, Option<f64>, f64)> = unsafe {
         (|| {
-            let i = p.swap.GetCurrentBackBufferIndex() as usize % 2;
+            let i = ring_index(u64::from(p.swap.GetCurrentBackBufferIndex()), TIMESTAMP_RING_SLOTS);
+            let mut wait_ns = 0u128;
             if p.fence.GetCompletedValue() < p.marks[i] {
                 let _wait = decant_trace::span("present", "fence_wait");
+                let wait_began = trace_on.then(std::time::Instant::now);
                 if let Some(ev) = p.wait_event {
                     p.fence.SetEventOnCompletion(p.marks[i], ev)?;
                     WaitForSingleObject(ev, INFINITE);
@@ -578,9 +662,21 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
                     // A null event makes the call wait until the value is reached.
                     p.fence.SetEventOnCompletion(p.marks[i], HANDLE::default())?;
                 }
+                if let Some(b) = wait_began {
+                    wait_ns += b.elapsed().as_nanos();
+                }
             }
+            let gpu_frame_ms = if trace_on {
+                p.gpu_timer.as_ref().and_then(|t| t.read_completed(i))
+            } else {
+                None
+            };
             p.allocators[i].Reset()?;
             p.list.Reset(&p.allocators[i], None)?;
+            if trace_on && let Some(timer) = &p.gpu_timer {
+                let (q_start, _) = timestamp_pair(i);
+                p.list.EndQuery(&timer.heap, D3D12_QUERY_TYPE_TIMESTAMP, q_start);
+            }
             let back = &p.buffers[i];
             // A console title usually presents its back buffer in RENDER_TARGET, but it may also
             // leave it in COMMON or PRESENT. The tracked state avoids a mismatch with the barrier.
@@ -686,6 +782,12 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
             after[after_len] = transition(back, back_state, D3D12_RESOURCE_STATE_PRESENT);
             after_len += 1;
             p.list.ResourceBarrier(&after[..after_len]);
+            if trace_on && let Some(timer) = &mut p.gpu_timer {
+                let (q_start, q_end) = timestamp_pair(i);
+                p.list.EndQuery(&timer.heap, D3D12_QUERY_TYPE_TIMESTAMP, q_end);
+                p.list.ResolveQueryData(&timer.heap, D3D12_QUERY_TYPE_TIMESTAMP, q_start, 2, &timer.readback, (i * 16) as u64);
+                timer.has_sample[i] = true;
+            }
             p.list.Close()?;
             // the copy reads the title's target: a release of it waits for this submission too
             let list: ID3D12CommandList = p.list.cast()?;
@@ -696,8 +798,13 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
             }
             {
                 let _dxgi = decant_trace::span("present", "dxgi_present");
+                let dxgi_began = trace_on.then(std::time::Instant::now);
                 p.swap.Present(0, DXGI_PRESENT(0)).ok()?;
+                if let Some(b) = dxgi_began {
+                    wait_ns += b.elapsed().as_nanos();
+                }
             }
+            let wait_ms = wait_ns as f64 / 1_000_000.0;
             p.next += 1;
             p.queue.Signal(&p.fence, p.next)?;
             p.marks[i] = p.next;
@@ -762,17 +869,33 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
                     );
                 }
             }
-            Ok(p.frames)
+            Ok((p.frames, gpu_frame_ms, wait_ms))
         })()
+    };
+    let cpu_frame_ms = if trace_on {
+        let now = std::time::Instant::now();
+        let wait_ms = result.as_ref().map_or(0.0, |r| r.2);
+        let elapsed_ms = p.last_present.replace(now).map_or(0.0, |prev| now.duration_since(prev).as_secs_f64() * 1000.0);
+        Some((elapsed_ms - wait_ms).max(0.0))
+    } else {
+        None
     };
     drop(guard);
     match result {
-        Ok(frame_num) => {
+        Ok((frame_num, gpu_frame_ms, present_wait_ms)) => {
             static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 xs_log!("present: first frame shown ({w}x{h}, format {})", d.Format.0);
             }
-            if decant_trace::enabled() {
+            if trace_on {
+                if let Some(gpu_ms) = gpu_frame_ms {
+                    decant_trace::record_counter("gpu_frame_ms", gpu_ms);
+                }
+                if let Some(cpu_ms) = cpu_frame_ms {
+                    decant_trace::record_counter("cpu_frame_ms", cpu_ms);
+                }
+                decant_trace::record_counter("present_wait_ms", present_wait_ms);
+                decant_trace::record_counter("present_count", frame_num as f64);
                 decant_trace::frame_mark();
                 static TRACE_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 static LAST_FLUSH_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1106,5 +1229,19 @@ mod tests {
         note_list_transitions(list, &[(res, 1, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32), (0, 0, 1)]);
         let has_entry = with_states(|s| s.list_notes.contains_key(&list));
         assert!(!has_entry);
+    }
+
+    #[test]
+    fn timestamp_conversion_and_ring_indexing_handle_edges() {
+        assert_eq!(timestamps_to_ms(100, 100, 1_000_000), Some(0.0));
+        assert_eq!(timestamps_to_ms(1000, 2000, 1_000_000), Some(1.0));
+        assert_eq!(timestamps_to_ms(2000, 1000, 1_000_000), None);
+        assert_eq!(timestamps_to_ms(1000, 2000, 0), None);
+        assert_eq!(ring_index(0, TIMESTAMP_RING_SLOTS), 0);
+        assert_eq!(ring_index(1, TIMESTAMP_RING_SLOTS), 1);
+        assert_eq!(ring_index(2, TIMESTAMP_RING_SLOTS), 0);
+        assert_eq!(ring_index(5, 0), 0);
+        assert_eq!(timestamp_pair(0), (0, 1));
+        assert_eq!(timestamp_pair(1), (2, 3));
     }
 }
