@@ -37,3 +37,7 @@ tracy-client = { version = "0.19", default-features = false }
 [workspace.lints.rust]
 unsafe_code = "deny"
 
+[profile.release]
+debug = "line-tables-only"
+
+

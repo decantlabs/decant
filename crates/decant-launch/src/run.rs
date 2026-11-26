@@ -1079,6 +1079,17 @@ mod platform {
             prev != fresh
         }
 
+        #[cfg(test)]
+        pub(crate) fn probe_own_symbol(addr: usize, search_dir: Option<&Path>) -> Option<String> {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            // SAFETY: pseudo-handle to the current process, valid for the process lifetime.
+            let proc = unsafe { GetCurrentProcess() };
+            let mod_api = ModuleApi::load()?;
+            let mods = mod_api.snapshot(proc);
+            let mut dbg = DbgHelp::open(proc, search_dir)?;
+            dbg.resolve(&mods, addr)
+        }
+
         pub fn run_nodebug(process: HANDLE, pid: u32, every: Duration, out: PathBuf, stop: std::sync::Arc<AtomicBool>) {
             use windows_sys::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
             let _ = std::fs::write(&out, format!("thread samples every {} ms (no debugger)\n", every.as_millis()));
@@ -2094,5 +2105,17 @@ mod tests {
         assert!(!platform::sampling::modules_changed(&a, &a));
         assert!(platform::sampling::modules_changed(&a, &b));
         assert!(platform::sampling::modules_changed(&a, &[]));
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn dbghelp_resolves_own_symbol_with_pdb() {
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap();
+        let addr = dbghelp_resolves_own_symbol_with_pdb as *const () as usize;
+        let sym = platform::sampling::probe_own_symbol(addr, Some(dir));
+        assert!(sym.is_some(), "failed to resolve own symbol at {addr:#x} in {dir:?}");
+        let s = sym.unwrap();
+        assert!(s.contains("dbghelp_resolves_own_symbol_with_pdb"), "unexpected symbol: {s}");
     }
 }
