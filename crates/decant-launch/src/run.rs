@@ -798,6 +798,354 @@ mod platform {
                 }
             }
         }
+
+        const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+        const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+        const INVALID_HANDLE: HANDLE = (-1isize) as HANDLE;
+        const LIST_MODULES_ALL: u32 = 0x03;
+        const SYMOPT_UNDNAME: u32 = 0x0000_0002;
+        const SYMOPT_DEFERRED_LOADS: u32 = 0x0000_0004;
+
+        #[repr(C)]
+        struct ThreadEntry32 {
+            dw_size: u32,
+            cnt_usage: u32,
+            th32_thread_id: u32,
+            th32_owner_process_id: u32,
+            tp_base_pri: i32,
+            tp_delta_pri: i32,
+            dw_flags: u32,
+        }
+
+        #[repr(C)]
+        struct ModuleInfo {
+            lp_base_of_dll: *mut c_void,
+            size_of_image: u32,
+            entry_point: *mut c_void,
+        }
+
+        #[repr(C)]
+        struct SymbolInfo {
+            size_of_struct: u32,
+            type_index: u32,
+            reserved: [u64; 2],
+            index: u32,
+            size: u32,
+            mod_base: u64,
+            flags: u32,
+            value: u64,
+            address: u64,
+            register: u32,
+            scope: u32,
+            tag: u32,
+            name_len: u32,
+            max_name_len: u32,
+            name: [u8; 1],
+        }
+
+        #[repr(C)]
+        struct SymbolInfoBuf {
+            info: SymbolInfo,
+            rest: [u8; 255],
+        }
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> HANDLE;
+            fn Thread32First(hSnapshot: HANDLE, lpte: *mut ThreadEntry32) -> i32;
+            fn Thread32Next(hSnapshot: HANDLE, lpte: *mut ThreadEntry32) -> i32;
+        }
+
+        type EnumModulesFn = unsafe extern "system" fn(HANDLE, *mut usize, u32, *mut u32, u32) -> i32;
+        type GetModuleInfoFn = unsafe extern "system" fn(HANDLE, usize, *mut ModuleInfo, u32) -> i32;
+        type GetModuleBaseNameWFn = unsafe extern "system" fn(HANDLE, usize, *mut u16, u32) -> u32;
+
+        struct ModuleApi {
+            enum_modules: EnumModulesFn,
+            get_info: GetModuleInfoFn,
+            get_name: GetModuleBaseNameWFn,
+        }
+
+        impl ModuleApi {
+            fn load() -> Option<Self> {
+                use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+                let k32_name: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+                // SAFETY: `kernel32.dll` is always loaded in this process.
+                let k32 = unsafe { GetModuleHandleW(k32_name.as_ptr()) };
+                if k32.is_null() {
+                    return None;
+                }
+                // SAFETY: looking up documented K32* PSAPI exports in `kernel32.dll`.
+                unsafe {
+                    let e = GetProcAddress(k32, c"K32EnumProcessModulesEx".as_ptr().cast())?;
+                    let i = GetProcAddress(k32, c"K32GetModuleInformation".as_ptr().cast())?;
+                    let n = GetProcAddress(k32, c"K32GetModuleBaseNameW".as_ptr().cast())?;
+                    Some(Self {
+                        enum_modules: std::mem::transmute::<unsafe extern "system" fn() -> isize, EnumModulesFn>(e),
+                        get_info: std::mem::transmute::<unsafe extern "system" fn() -> isize, GetModuleInfoFn>(i),
+                        get_name: std::mem::transmute::<unsafe extern "system" fn() -> isize, GetModuleBaseNameWFn>(n),
+                    })
+                }
+            }
+
+            fn snapshot(&self, process: HANDLE) -> Vec<Module> {
+                let mut handles = vec![0usize; 256];
+                let mut needed = 0u32;
+                // SAFETY: `handles` is a valid writable buffer of `handles.len()` pointers.
+                if unsafe { (self.enum_modules)(process, handles.as_mut_ptr(), (handles.len() * std::mem::size_of::<usize>()) as u32, &mut needed, LIST_MODULES_ALL) } == 0 {
+                    return Vec::new();
+                }
+                let count = (needed as usize) / std::mem::size_of::<usize>();
+                if count > handles.len() {
+                    handles.resize(count, 0);
+                    // SAFETY: resized to `needed`.
+                    if unsafe { (self.enum_modules)(process, handles.as_mut_ptr(), needed, &mut needed, LIST_MODULES_ALL) } == 0 {
+                        return Vec::new();
+                    }
+                }
+                let count = ((needed as usize) / std::mem::size_of::<usize>()).min(handles.len());
+                let mut out = Vec::with_capacity(count);
+                let mut name_buf = [0u16; 260];
+                for &hmod in &handles[..count] {
+                    if hmod == 0 {
+                        continue;
+                    }
+                    // SAFETY: `info` and `name_buf` are valid writable buffers.
+                    unsafe {
+                        let mut info: ModuleInfo = std::mem::zeroed();
+                        if (self.get_info)(process, hmod, &mut info, std::mem::size_of::<ModuleInfo>() as u32) == 0 {
+                            continue;
+                        }
+                        let len = (self.get_name)(process, hmod, name_buf.as_mut_ptr(), name_buf.len() as u32) as usize;
+                        let name = if len > 0 {
+                            String::from_utf16_lossy(&name_buf[..len.min(name_buf.len())])
+                        } else {
+                            format!("{:#x}", info.lp_base_of_dll as usize)
+                        };
+                        out.push((info.lp_base_of_dll as usize, info.size_of_image as usize, name));
+                    }
+                }
+                out
+            }
+        }
+
+        type SymSetOptionsFn = unsafe extern "system" fn(u32) -> u32;
+        type SymInitializeFn = unsafe extern "system" fn(HANDLE, *const u8, i32) -> i32;
+        type SymCleanupFn = unsafe extern "system" fn(HANDLE) -> i32;
+        type SymRefreshModuleListFn = unsafe extern "system" fn(HANDLE) -> i32;
+        type SymFromAddrFn = unsafe extern "system" fn(HANDLE, u64, *mut u64, *mut SymbolInfo) -> i32;
+
+        struct DbgHelp {
+            dll: windows_sys::Win32::Foundation::HMODULE,
+            process: HANDLE,
+            sym_cleanup: SymCleanupFn,
+            sym_refresh: Option<SymRefreshModuleListFn>,
+            sym_from_addr: SymFromAddrFn,
+            cache: HashMap<usize, Option<String>>,
+        }
+
+        impl DbgHelp {
+            fn open(process: HANDLE) -> Option<Self> {
+                use windows_sys::Win32::Foundation::FreeLibrary;
+                use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+                let name: Vec<u16> = "dbghelp.dll\0".encode_utf16().collect();
+                // SAFETY: loading `dbghelp.dll` if present on the system.
+                let dll = unsafe { LoadLibraryW(name.as_ptr()) };
+                if dll.is_null() {
+                    return None;
+                }
+                // SAFETY: resolving `Sym*` exports from `dbghelp.dll`.
+                unsafe {
+                    let Some(set_opts) = GetProcAddress(dll, c"SymSetOptions".as_ptr().cast()) else {
+                        FreeLibrary(dll);
+                        return None;
+                    };
+                    let Some(init) = GetProcAddress(dll, c"SymInitialize".as_ptr().cast()) else {
+                        FreeLibrary(dll);
+                        return None;
+                    };
+                    let Some(cleanup) = GetProcAddress(dll, c"SymCleanup".as_ptr().cast()) else {
+                        FreeLibrary(dll);
+                        return None;
+                    };
+                    let Some(from_addr) = GetProcAddress(dll, c"SymFromAddr".as_ptr().cast()) else {
+                        FreeLibrary(dll);
+                        return None;
+                    };
+                    let sym_set_opts = std::mem::transmute::<unsafe extern "system" fn() -> isize, SymSetOptionsFn>(set_opts);
+                    let sym_init = std::mem::transmute::<unsafe extern "system" fn() -> isize, SymInitializeFn>(init);
+                    let sym_cleanup = std::mem::transmute::<unsafe extern "system" fn() -> isize, SymCleanupFn>(cleanup);
+                    let sym_from_addr = std::mem::transmute::<unsafe extern "system" fn() -> isize, SymFromAddrFn>(from_addr);
+                    let sym_refresh = GetProcAddress(dll, c"SymRefreshModuleList".as_ptr().cast())
+                        .map(|f| std::mem::transmute::<unsafe extern "system" fn() -> isize, SymRefreshModuleListFn>(f));
+                    sym_set_opts(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                    if sym_init(process, std::ptr::null(), 1) == 0 {
+                        FreeLibrary(dll);
+                        return None;
+                    }
+                    Some(Self { dll, process, sym_cleanup, sym_refresh, sym_from_addr, cache: HashMap::new() })
+                }
+            }
+
+            fn refresh(&mut self) {
+                if let Some(f) = self.sym_refresh {
+                    // SAFETY: `self.process` was initialized with `SymInitialize`.
+                    unsafe { f(self.process) };
+                }
+            }
+
+            fn resolve(&mut self, modules: &[Module], addr: usize) -> Option<String> {
+                if let Some(cached) = self.cache.get(&addr) {
+                    return cached.clone();
+                }
+                if self.cache.len() >= 65_536 {
+                    self.cache.clear();
+                }
+                let mod_name = modules
+                    .iter()
+                    .find(|(base, size, _)| (*base..base.saturating_add(*size)).contains(&addr))
+                    .map(|(_, _, n)| n.as_str())?;
+                let short_mod = mod_name.strip_suffix(".dll").or_else(|| mod_name.strip_suffix(".DLL")).or_else(|| mod_name.strip_suffix(".exe")).unwrap_or(mod_name);
+                // SAFETY: `SymbolInfoBuf` has `size_of::<SymbolInfo>()` header followed by 255 extra name bytes.
+                let resolved = unsafe {
+                    let mut buf: SymbolInfoBuf = std::mem::zeroed();
+                    buf.info.size_of_struct = std::mem::size_of::<SymbolInfo>() as u32;
+                    buf.info.max_name_len = 256;
+                    let mut disp = 0u64;
+                    if (self.sym_from_addr)(self.process, addr as u64, &mut disp, &mut buf.info) != 0 && buf.info.name_len > 0 {
+                        let ptr = buf.info.name.as_ptr();
+                        let len = (buf.info.name_len as usize).min(255);
+                        let bytes = std::slice::from_raw_parts(ptr, len);
+                        let sym = String::from_utf8_lossy(bytes);
+                        Some(if disp == 0 { format!("{short_mod}!{sym}") } else { format!("{short_mod}!{sym}+{disp:#x}") })
+                    } else {
+                        None
+                    }
+                };
+                self.cache.insert(addr, resolved.clone());
+                resolved
+            }
+        }
+
+        impl Drop for DbgHelp {
+            fn drop(&mut self) {
+                use windows_sys::Win32::Foundation::FreeLibrary;
+                // SAFETY: `self.process` was initialized with `SymInitialize` and `self.dll` loaded via `LoadLibraryW`.
+                unsafe {
+                    (self.sym_cleanup)(self.process);
+                    FreeLibrary(self.dll);
+                }
+            }
+        }
+
+        fn process_threads(pid: u32, tids: &mut Vec<u32>) {
+            tids.clear();
+            // SAFETY: Toolhelp32 snapshot handle is closed before returning.
+            unsafe {
+                let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if snap == INVALID_HANDLE || snap.is_null() {
+                    return;
+                }
+                let mut entry: ThreadEntry32 = std::mem::zeroed();
+                entry.dw_size = std::mem::size_of::<ThreadEntry32>() as u32;
+                if Thread32First(snap, &mut entry) != 0 {
+                    loop {
+                        if entry.th32_owner_process_id == pid {
+                            tids.push(entry.th32_thread_id);
+                        }
+                        if Thread32Next(snap, &mut entry) == 0 {
+                            break;
+                        }
+                    }
+                }
+                CloseHandle(snap);
+            }
+        }
+
+        fn flush_window(out: &Path, text: &str) {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(out) {
+                let _ = f.write_all(text.as_bytes());
+                let _ = f.flush();
+            }
+        }
+
+        pub fn run_nodebug(process: HANDLE, pid: u32, every: Duration, out: PathBuf, stop: std::sync::Arc<AtomicBool>) {
+            use windows_sys::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
+            let _ = std::fs::write(&out, format!("thread samples every {} ms (no debugger)\n", every.as_millis()));
+            let mod_api = ModuleApi::load();
+            let mut dbghelp = DbgHelp::open(process);
+            let mut modules = mod_api.as_ref().map(|api| api.snapshot(process)).unwrap_or_default();
+            let started = Instant::now();
+            let mut last_mod_refresh = started;
+            let mut win_start_s = 0.0f64;
+            let mut report_at = started + REPORT_EVERY;
+            let mut profile = Profile::default();
+            let mut tids = Vec::with_capacity(128);
+            let mut next_tick = started + every;
+
+            while !stop.load(Ordering::Acquire) {
+                let now = Instant::now();
+                if now >= last_mod_refresh + Duration::from_secs(1) {
+                    if let Some(api) = mod_api.as_ref() {
+                        let fresh = api.snapshot(process);
+                        if fresh.len() != modules.len() {
+                            modules = fresh;
+                            if let Some(d) = dbghelp.as_mut() {
+                                d.refresh();
+                            }
+                        }
+                    }
+                    last_mod_refresh = now;
+                }
+                process_threads(pid, &mut tids);
+                for &tid in &tids {
+                    // SAFETY: thread handle is opened with suspend/get_context, always resumed if suspended, and closed.
+                    unsafe {
+                        let handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, tid);
+                        if handle.is_null() {
+                            continue;
+                        }
+                        if SuspendThread(handle) == u32::MAX {
+                            CloseHandle(handle);
+                            continue;
+                        }
+                        let mut aligned: Aligned = std::mem::zeroed();
+                        aligned.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+                        let ok = GetThreadContext(handle, &mut aligned.0) != 0;
+                        let mut bytes = [0u8; 8 * 64];
+                        let got = if ok { read(process, aligned.0.Rsp as usize, &mut bytes) } else { 0 };
+                        ResumeThread(handle);
+                        CloseHandle(handle);
+                        if !ok {
+                            continue;
+                        }
+                        let words: Vec<usize> = bytes[..got].as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w) as usize).collect();
+                        let key = crate::sampler::key_with(&modules, aligned.0.Rip as usize, &words, |addr| {
+                            dbghelp.as_mut().and_then(|d| d.resolve(&modules, addr))
+                        });
+                        profile.add(tid, key);
+                    }
+                }
+                profile.tick();
+                let after = Instant::now();
+                if after >= report_at {
+                    let win_end_s = after.duration_since(started).as_secs_f64();
+                    let text = profile.take_window_report(win_start_s, win_end_s, 25, 10, 25);
+                    flush_window(&out, &text);
+                    win_start_s = win_end_s;
+                    report_at = after + REPORT_EVERY;
+                }
+                let sleep_for = next_tick.saturating_duration_since(Instant::now());
+                if !sleep_for.is_zero() {
+                    std::thread::sleep(sleep_for.min(Duration::from_millis(50)));
+                }
+                next_tick = Instant::now() + every;
+            }
+            let end_s = started.elapsed().as_secs_f64();
+            let tail = profile.take_window_report(win_start_s, end_s, 25, 10, 25);
+            flush_window(&out, &tail);
+        }
     }
 
     /// The first `take` of the `words` stack words of `thread` that fall inside the title image (the
@@ -957,6 +1305,21 @@ mod platform {
             log.line(&format!("{} no redirect of xgameruntime.dll ({why})", stamp(start)));
         }
         if use_no_debugger {
+            #[cfg(target_arch = "x86_64")]
+            let nodebug_sampler = {
+                let sample_every = crate::sampler::interval(env_lookup(crate::sampler::ENV).as_deref());
+                sample_every.map(|every| {
+                    let stop = std::sync::Arc::new(AtomicBool::new(false));
+                    let stop_thread = std::sync::Arc::clone(&stop);
+                    let proc_raw = info.hProcess as usize;
+                    let pid = info.dwProcessId;
+                    let out = folder.join("decant_sample.txt");
+                    let join = std::thread::spawn(move || {
+                        sampling::run_nodebug(proc_raw as HANDLE, pid, every, out, stop_thread);
+                    });
+                    (stop, join)
+                })
+            };
             loop {
                 if let Some(line) = gentle.as_mut().and_then(|g| g.poll(info.hProcess)) {
                     log.line(&format!("{} {line}", stamp(start)));
@@ -985,6 +1348,11 @@ mod platform {
                     }
                     break;
                 }
+            }
+            #[cfg(target_arch = "x86_64")]
+            if let Some((stop, join)) = nodebug_sampler {
+                stop.store(true, Ordering::Release);
+                let _ = join.join();
             }
             // SAFETY: handles the call gave us.
             unsafe {
@@ -1324,7 +1692,6 @@ pub fn no_debugger_eligible(no_debugger: Option<&str>, game_drive: Option<char>,
         && !active("DECANT_STACKS")
         && !active("DECANT_WAITS")
         && !active("DECANT_CALLS")
-        && !active("DECANT_SAMPLE_MS")
 }
 
 /// Like [`run`], and a title still running when another thread sets `cancel` is stopped (the
@@ -1638,10 +2005,11 @@ mod tests {
         assert!(no_debugger_eligible(Some(" 1 "), None, none));
         assert!(!no_debugger_eligible(Some("1"), Some('G'), none));
 
-        for tool in ["DECANT_DEBUGGER", "DECANT_WATCH", "DECANT_WATCH_READ", "DECANT_STACKS", "DECANT_WAITS", "DECANT_CALLS", "DECANT_SAMPLE_MS"] {
+        for tool in ["DECANT_DEBUGGER", "DECANT_WATCH", "DECANT_WATCH_READ", "DECANT_STACKS", "DECANT_WAITS", "DECANT_CALLS"] {
             assert!(!no_debugger_eligible(Some("1"), None, |k| (k == tool).then(|| "1".to_owned())));
             assert!(no_debugger_eligible(Some("1"), None, |k| (k == tool).then(|| "0".to_owned())));
         }
+        assert!(no_debugger_eligible(Some("1"), None, |k| (k == "DECANT_SAMPLE_MS").then(|| "20".to_owned())));
     }
 
     #[cfg(windows)]
@@ -1676,5 +2044,31 @@ mod tests {
                 "{p}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_debugger_with_sample_ms_writes_windowed_sample_file() {
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let cmd = Path::new(&system).join("System32").join("cmd.exe");
+        let dir = tempfile::tempdir().unwrap();
+        let mut log: Vec<String> = Vec::new();
+        let outcome = platform::run(
+            &cmd,
+            &["/C".into(), "ping -n 2 127.0.0.1 >nul".into()],
+            dir.path(),
+            &[(NO_DEBUGGER_ENV.into(), "1".into()), (crate::sampler::ENV.into(), "20".into())],
+            Some(Duration::from_secs(30)),
+            &AtomicBool::new(false),
+            false,
+            None,
+            &mut log,
+        )
+        .unwrap();
+        assert_eq!(outcome.exit_code, Some(0), "{log:#?}");
+        assert!(log.iter().any(|l| l.contains("no debugger")));
+        let sample = std::fs::read_to_string(dir.path().join("decant_sample.txt")).unwrap();
+        assert!(sample.contains("(no debugger)"), "{sample}");
+        assert!(sample.contains("--- window "), "{sample}");
     }
 }

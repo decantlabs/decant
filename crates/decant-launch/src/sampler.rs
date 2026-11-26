@@ -31,9 +31,30 @@ pub fn inside(modules: &[Module], address: usize) -> Option<String> {
 
 /// The key of one sample: the instruction pointer, then up to [`DEPTH`] stack words inside a module.
 pub fn key(modules: &[Module], rip: usize, stack: &[usize]) -> String {
-    let mut parts = vec![inside(modules, rip).unwrap_or_else(|| format!("{rip:#x}"))];
-    parts.extend(stack.iter().filter_map(|w| inside(modules, *w)).take(DEPTH));
+    key_with(modules, rip, stack, |_| None)
+}
+
+/// Like [`key`], using `resolve` to turn an address inside a module into a symbol name when available.
+pub fn key_with<F>(modules: &[Module], rip: usize, stack: &[usize], mut resolve: F) -> String
+where
+    F: FnMut(usize) -> Option<String>,
+{
+    let head = resolve(rip).or_else(|| inside(modules, rip)).unwrap_or_else(|| format!("{rip:#x}"));
+    let mut parts = Vec::with_capacity(1 + DEPTH);
+    parts.push(head);
+    for &w in stack {
+        if parts.len() > DEPTH {
+            break;
+        }
+        if let Some(fallback) = inside(modules, w) {
+            parts.push(resolve(w).unwrap_or(fallback));
+        }
+    }
     parts.join(" < ")
+}
+
+fn is_ntdll_top(key: &str) -> bool {
+    key.starts_with("ntdll.dll+") || key.starts_with("ntdll!")
 }
 
 /// Sample counts per thread and key.
@@ -57,17 +78,62 @@ impl Profile {
     /// The report: one block per thread (the busiest first, busy meaning samples outside
     /// `ntdll.dll`), each with its `top` most frequent keys and their share. Empties the profile.
     pub fn take_report(&mut self, top: usize) -> String {
+        use std::fmt::Write as _;
         let mut threads: Vec<(u32, HashMap<String, u64>)> = self.counts.drain().collect();
-        let busy = |m: &HashMap<String, u64>| m.iter().filter(|(k, _)| !k.starts_with("ntdll.dll+")).map(|(_, n)| *n).sum::<u64>();
+        let busy = |m: &HashMap<String, u64>| m.iter().filter(|(k, _)| !is_ntdll_top(k)).map(|(_, n)| *n).sum::<u64>();
         threads.sort_by_key(|(tid, m)| (std::cmp::Reverse(busy(m)), *tid));
         let mut out = format!("{} rounds\n", self.ticks);
         for (tid, m) in threads {
             let total: u64 = m.values().sum();
-            out += &format!("thread {tid}: {total} samples, {} outside ntdll\n", busy(&m));
+            let _ = writeln!(out, "thread {tid}: {total} samples, {} outside ntdll", busy(&m));
             let mut keys: Vec<(String, u64)> = m.into_iter().collect();
             keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             for (k, n) in keys.into_iter().take(top) {
-                out += &format!("  {:5.1}% {n:6} {k}\n", 100.0 * n as f64 / total as f64);
+                let _ = writeln!(out, "  {:5.1}% {n:6} {k}", 100.0 * n as f64 / total as f64);
+            }
+        }
+        self.ticks = 0;
+        out
+    }
+
+    /// Windowed report for `[from_s..to_s]`: aggregated callstacks across all threads followed by
+    /// per-thread top callstacks (busiest threads first). Empties the profile.
+    pub fn take_window_report(&mut self, from_s: f64, to_s: f64, top_threads: usize, top_per_thread: usize, top_agg: usize) -> String {
+        use std::fmt::Write as _;
+        let mut threads: Vec<(u32, HashMap<String, u64>)> = self.counts.drain().collect();
+        let busy = |m: &HashMap<String, u64>| m.iter().filter(|(k, _)| !is_ntdll_top(k)).map(|(_, n)| *n).sum::<u64>();
+        let mut agg: HashMap<String, u64> = HashMap::new();
+        let mut total_all = 0u64;
+        let mut busy_all = 0u64;
+        for (_, m) in &threads {
+            for (k, &n) in m {
+                total_all += n;
+                if !is_ntdll_top(k) {
+                    busy_all += n;
+                }
+                *agg.entry(k.clone()).or_default() += n;
+            }
+        }
+        let mut out = format!(
+            "--- window {from_s:.1}..{to_s:.1}s ({} rounds, {total_all} samples, {busy_all} outside ntdll) ---\n",
+            self.ticks
+        );
+        if total_all > 0 {
+            let mut agg_keys: Vec<(String, u64)> = agg.into_iter().collect();
+            agg_keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let _ = writeln!(out, "aggregated (all threads, top {top_agg}):");
+            for (k, n) in agg_keys.into_iter().take(top_agg) {
+                let _ = writeln!(out, "  {:5.1}% {n:6} {k}", 100.0 * n as f64 / total_all as f64);
+            }
+        }
+        threads.sort_by_key(|(tid, m)| (std::cmp::Reverse(busy(m)), *tid));
+        for (tid, m) in threads.into_iter().take(top_threads) {
+            let total: u64 = m.values().sum();
+            let _ = writeln!(out, "thread {tid}: {total} samples, {} outside ntdll", busy(&m));
+            let mut keys: Vec<(String, u64)> = m.into_iter().collect();
+            keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for (k, n) in keys.into_iter().take(top_per_thread) {
+                let _ = writeln!(out, "  {:5.1}% {n:6} {k}", 100.0 * n as f64 / total as f64);
             }
         }
         self.ticks = 0;
@@ -108,5 +174,32 @@ mod tests {
         assert!(r.contains(" 50.0%      1 t.exe+0x20"), "{r}");
         assert!(r.starts_with("1 rounds"), "{r}");
         assert!(p.take_report(5).starts_with("0 rounds\n"), "emptied");
+    }
+
+    #[test]
+    fn windowed_report_aggregates_across_threads_and_orders_busy_first() {
+        let mut p = Profile::default();
+        p.add(7, "ntdll!NtWaitForSingleObject+0x14".into());
+        p.add(7, "ntdll!NtWaitForSingleObject+0x14".into());
+        p.add(9, "t.exe!work+0x20 < ntdll!RtlUserThreadStart+0x21".into());
+        p.add(9, "ntdll!NtWaitForSingleObject+0x14".into());
+        p.tick();
+        p.tick();
+        let r = p.take_window_report(30.0, 60.0, 10, 5, 10);
+        assert!(r.starts_with("--- window 30.0..60.0s (2 rounds, 4 samples, 1 outside ntdll) ---"), "{r}");
+        assert!(r.contains("aggregated (all threads, top 10):"), "{r}");
+        assert!(r.contains(" 75.0%      3 ntdll!NtWaitForSingleObject+0x14"), "{r}");
+        assert!(r.contains(" 25.0%      1 t.exe!work+0x20 < ntdll!RtlUserThreadStart+0x21"), "{r}");
+        let (nine, seven) = (r.find("thread 9:").unwrap(), r.find("thread 7:").unwrap());
+        assert!(nine < seven, "{r}");
+    }
+
+    #[test]
+    fn key_with_prefers_resolved_symbol_when_inside_module() {
+        let modules = vec![(0x1000, 0x1000, "a.dll".to_owned()), (0x10_0000, 0x10_0000, "t.exe".to_owned())];
+        let k = key_with(&modules, 0x1010, &[0x10_0020, 0x1ff0], |addr| {
+            (addr == 0x1010).then(|| "a!foo+0x10".to_owned())
+        });
+        assert_eq!(k, "a!foo+0x10 < t.exe+0x20 < a.dll+0xff0");
     }
 }
