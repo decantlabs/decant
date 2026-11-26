@@ -548,15 +548,12 @@ fn dpp_add_refuses_unsupported_controls_precisely() {
 }
 
 #[test]
-fn native_dpp_add_refuses_scalarized_lane_reads() {
+fn native_dpp_add_allows_readfirstlane() {
     let p = compute([64, 1, 1], Vec::new(), |a| {
         a.push(dpp16(Op::v_add_u32, v(4), v(0), v(0), 0xff01_1100));
         a.push(vop1(Op::v_readfirstlane_b32, s(8), v(4)));
     });
-    assert_eq!(
-        decant_shader::lift_program(&p).unwrap_err().key(),
-        "exec:dpp-scalar-wave",
-    );
+    decant_shader::lift_program(&p).unwrap();
 }
 
 fn perm(op: Op, dst: Operand, opsel: u8) -> Insn {
@@ -680,10 +677,7 @@ fn permlane_refuses_unsupported_forms_and_scalar_wave_contexts() {
             a.push(perm(op, v(2), 0));
             a.push(vop1(Op::v_readfirstlane_b32, s(8), v(2)));
         });
-        assert_eq!(
-            decant_shader::lift_program(&p).unwrap_err().key(),
-            "exec:dpp-scalar-wave"
-        );
+        decant_shader::lift_program(&p).unwrap();
     }
 }
 

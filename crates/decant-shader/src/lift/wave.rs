@@ -776,8 +776,7 @@ pub(crate) fn check_dpp_context(
             )
             || matches!(
                 insn.op,
-                Op::v_readfirstlane_b32
-                    | Op::v_readlane_b32_e64
+                Op::v_readlane_b32_e64
                     | Op::v_writelane_b32_e64
                     | Op::v_mbcnt_lo_u32_b32
                     | Op::v_mbcnt_hi_u32_b32_e64

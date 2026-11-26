@@ -589,7 +589,7 @@ impl Collector<'_> {
     /// Vector instructions: the table says which slots are lane masks.
     fn vector(&mut self, insn: &Insn) {
         if insn.op == Op::v_writelane_b32_e64 {
-            self.uses(insn.src[0], 1, Role::Number);
+            self.uses(insn.src[0], 1, Role::MaskWord);
             self.uses(insn.src[1], 1, Role::Data);
             return;
         }
@@ -1919,11 +1919,12 @@ impl Typing<'_> {
             if !span.parked {
                 // A bitwise instruction works on whole masks: the low word in the low half,
                 // and in a 64 lane program the high word in the high half.
-                let high = self.groups[base as usize + 1].verdict().unwrap_or(NUMBER);
+                let high_group = &self.groups[base as usize + 1];
+                let high = high_group.verdict().unwrap_or(NUMBER);
                 let fits = match (low, span.wide) {
                     (NUMBER, false) | (LOW, false) => true,
                     (NUMBER, true) => high == NUMBER,
-                    (LOW, true) => high == HIGH,
+                    (LOW, true) => high == HIGH || !high_group.def_live,
                     _ => false,
                 };
                 if !fits {
@@ -2185,6 +2186,39 @@ mod tests {
         a.push(sop1(Op::s_mov_b64, s(62), s(32)));
         let (graph, masks) = analyse_asm(a);
         assert_eq!(masks.lanes(), 64);
+        for insn in graph.insns() {
+            masks.enter(insn.pc);
+            assert_eq!(masks.refusal(), None, "{insn}");
+        }
+    }
+
+    #[test]
+    fn writelane_with_mixed_provenance_does_not_refuse_mixed_pair() {
+        let mut a = Asm::new();
+        let numeric = a.label();
+        let join = a.label();
+        a.push(sopc(Op::s_cmp_eq_u32, s(0), int(0)));
+        a.branch(Op::s_cbranch_scc1, numeric);
+        a.push(sop1(Op::s_mov_b64, s(2), EXEC));
+        a.branch(Op::s_branch, join);
+        a.bind(numeric);
+        a.push(sop1(Op::s_mov_b32, s(2), int(7)));
+        a.bind(join);
+        a.push(vop3(Op::v_writelane_b32_e64, v(128), s(2), int(0), int(0)));
+        let (graph, masks) = analyse_asm(a);
+        for insn in graph.insns() {
+            masks.enter(insn.pc);
+            assert_eq!(masks.refusal(), None, "{insn}");
+        }
+    }
+
+    #[test]
+    fn move_b64_with_live_low_mask_and_dead_high_word_does_not_refuse_mixed_pair() {
+        let mut a = Asm::new();
+        a.push(sop1(Op::s_mov_b64, s(32), EXEC));
+        a.push(sop1(Op::s_mov_b64, s(62), s(32)));
+        a.push(sop1(Op::s_mov_b32, s(40), s(62)));
+        let (graph, masks) = analyse_asm(a);
         for insn in graph.insns() {
             masks.enter(insn.pc);
             assert_eq!(masks.refusal(), None, "{insn}");
