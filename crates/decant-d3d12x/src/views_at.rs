@@ -173,6 +173,10 @@ pub const DEFAULT_VIEW_TEX_MIB: u64 = 14 * 1024;
 pub const MIN_IDLE_PRESENTS: u64 = 180;
 /// ... and this many milliseconds (a present is slow while the world loads).
 pub const MIN_IDLE_MS: u64 = 15_000;
+/// When placed/held bytes exceed `budget`, evict views idle for at least this many presents.
+pub const OVER_BUDGET_IDLE_PRESENTS: u64 = 8;
+/// When `budget < held <= 2 * budget`, also require this many idle milliseconds.
+pub const OVER_BUDGET_IDLE_MS: u64 = 1_000;
 /// The most textures given back in one pass.
 pub const MAX_PER_PASS: usize = 4096;
 
@@ -330,8 +334,12 @@ impl ViewTextures {
         if cap == 0 || pass.held_before <= cap {
             return pass;
         }
+        let severely_over = pass.held_before > cap.saturating_mul(2);
+        let pass_limit = if severely_over { MAX_PER_PASS * 4 } else { MAX_PER_PASS };
         let free = |e: &ViewEntry| {
-            present.saturating_sub(e.last_present) >= MIN_IDLE_PRESENTS && ms.saturating_sub(e.last_ms) >= MIN_IDLE_MS && !referenced.contains(&e.res)
+            let idle_presents = present.saturating_sub(e.last_present) >= OVER_BUDGET_IDLE_PRESENTS;
+            let idle_ms = severely_over || ms.saturating_sub(e.last_ms) >= OVER_BUDGET_IDLE_MS;
+            idle_presents && idle_ms && !referenced.contains(&e.res)
         };
         // per heap: whether every texture of it may go, and when one of them was last used
         let mut heaps: std::collections::BTreeMap<usize, (bool, u64)> = std::collections::BTreeMap::new();
@@ -348,7 +356,7 @@ impl ViewTextures {
         let mut gone_heaps = Vec::new();
         let mut taken = 0usize;
         for (_, h) in order {
-            if pass.held_after <= target || taken >= MAX_PER_PASS {
+            if pass.held_after <= target || taken >= pass_limit {
                 break;
             }
             let n = self.made.values().chain(self.stale.iter()).filter(|e| e.heap == Some(h)).count();
@@ -820,6 +828,29 @@ mod tests {
         let none = std::collections::HashSet::new();
         let pass = t.collect(2000, 1000, 180, 15_000, &none);
         assert_eq!(pass.heaps_freed, 1, "oldest heap is reclaimed once 180 presents and 15s elapse");
+        assert_eq!(t.held_bytes(1000), 2000);
+    }
+
+    #[test]
+    fn over_budget_evicts_after_8_presents_and_1000_ms() {
+        let mut t = cache(3, 2, |h| (h as u64, h as u64 * 100));
+        let none = std::collections::HashSet::new();
+        // Held is 3000, budget is 2000 (not > 2 * budget): needs >= 8 presents AND >= 1000 ms.
+        assert!(t.collect(2000, 1000, 7, 1000, &none).freed.is_empty());
+        assert!(t.collect(2000, 1000, 8, 999, &none).freed.is_empty());
+        let pass = t.collect(2000, 1000, 8, 1000, &none);
+        assert_eq!(pass.heaps_freed, 1);
+        assert_eq!(t.held_bytes(1000), 2000);
+    }
+
+    #[test]
+    fn over_double_budget_evicts_after_8_presents_even_below_1000_ms() {
+        let mut t = cache(5, 2, |h| (h as u64, h as u64 * 10));
+        let none = std::collections::HashSet::new();
+        // Held is 5000, budget is 2000 (> 2 * budget): 8 presents alone suffices even at ms = 100.
+        assert!(t.collect(2000, 1000, 7, 100, &none).freed.is_empty());
+        let pass = t.collect(2000, 1000, 12, 100, &none);
+        assert_eq!(pass.heaps_freed, 3);
         assert_eq!(t.held_bytes(1000), 2000);
     }
 }

@@ -58,7 +58,7 @@ pub fn fit(used: u64, size: u64, align: u64) -> Option<u64> {
 }
 
 /// Presents a heap whose textures were all released waits before it is filled again.
-pub const REUSE_PRESENTS: u64 = 30;
+pub const REUSE_PRESENTS: u64 = 8;
 
 /// Whether a heap with `live` textures placed in it, all released at present `free_at`, may be filled
 /// again at present `now` (pure, for the tests).
