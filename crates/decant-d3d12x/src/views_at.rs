@@ -63,6 +63,13 @@ impl VaTable {
     pub fn forget(&mut self, host_res: usize) {
         self.by_start.retain(|_, e| e.host_res != host_res);
     }
+
+    /// Drops every entry whose resource is in `host_res` in a single pass.
+    pub fn forget_many(&mut self, host_res: &std::collections::HashSet<usize>) {
+        if !host_res.is_empty() {
+            self.by_start.retain(|_, e| !host_res.contains(&e.host_res));
+        }
+    }
 }
 
 /// Element byte size for typed DXGI buffer SRV/UAV formats (used when `StructureByteStride == 0`
@@ -424,9 +431,10 @@ impl ViewTextures {
             }
         }
         #[cfg(windows)]
-        for e in &pass.freed {
-            if e.heap.is_some() {
-                crate::view_heap::retire_resource(e.res, present);
+        {
+            let heap_res: Vec<usize> = pass.freed.iter().filter(|e| e.heap.is_some()).map(|e| e.res).collect();
+            if !heap_res.is_empty() {
+                crate::view_heap::retire_resources(&heap_res, present);
             }
         }
         pass.held_after = self.held_bytes(heap_bytes);
@@ -583,6 +591,14 @@ pub fn lookup_span(va: u64, len: u64) -> Option<(usize, u64)> {
 #[cfg(windows)]
 pub fn forget_resource(host_res: usize) {
     VA_TABLE.lock().unwrap_or_else(|e| e.into_inner()).forget(host_res);
+}
+
+/// Drops all address entries belonging to `host_res` in one lock acquisition.
+#[cfg(windows)]
+pub fn forget_resources(host_res: &std::collections::HashSet<usize>) {
+    if !host_res.is_empty() {
+        VA_TABLE.lock().unwrap_or_else(|e| e.into_inner()).forget_many(host_res);
+    }
 }
 
 #[cfg(windows)]
@@ -898,5 +914,20 @@ mod tests {
         assert_eq!(pass.heaps_freed, 0);
         assert_eq!(pass.freed.len(), 3);
         assert_eq!(t.live_bytes(), 100);
+    }
+
+    #[test]
+    fn va_table_forget_many_removes_selected_and_keeps_others() {
+        let mut table = VaTable::default();
+        table.record(VaResource { va: 0x1000, size: 0x100, host_res: 10, is_buffer: false });
+        table.record(VaResource { va: 0x2000, size: 0x100, host_res: 20, is_buffer: false });
+        table.record(VaResource { va: 0x3000, size: 0x100, host_res: 30, is_buffer: false });
+        table.record(VaResource { va: 0x4000, size: 0x100, host_res: 10, is_buffer: true });
+        let drop_set: std::collections::HashSet<usize> = [10, 30].into_iter().collect();
+        table.forget_many(&drop_set);
+        assert_eq!(table.lookup(0x1000, false), None);
+        assert_eq!(table.lookup(0x3000, false), None);
+        assert_eq!(table.lookup(0x4000, true), None);
+        assert_eq!(table.lookup(0x2000, false), Some((20, 0)));
     }
 }

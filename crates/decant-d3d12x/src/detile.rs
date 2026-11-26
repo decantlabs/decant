@@ -1401,6 +1401,18 @@ pub fn forget(res: usize) {
     });
 }
 
+/// Removes a batch of released resources under a single `REGISTRY` lock acquisition.
+pub fn forget_many(resources: &[usize]) {
+    if resources.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    with_registry(|r| {
+        for &res in resources {
+            r.remove(res);
+        }
+    });
+}
+
 /// Existing view and Unmap callers report possible writes. The placed memory is tracked by
 /// `note_tiles` and explicit writes arrive through `note_write`, so nothing is left to do here.
 pub fn mark_resource(_res: usize) {}
@@ -2203,5 +2215,37 @@ mod tests {
         assert!(r.pending.contains(&1));
         assert!(r.pending.contains(&2));
         assert!(r.textures[&2].dirty);
+    }
+
+    #[test]
+    fn forget_many_removes_listed_resources_and_preserves_remaining() {
+        let mut r = Registry::default();
+        r.insert(1, placed(0x1000, 0x1000));
+        r.insert(2, placed(0x2000, 0x1000));
+        r.insert(3, placed(0x3000, 0x1000));
+        for res in [1, 3] {
+            r.remove(res);
+        }
+        assert!(!r.textures.contains_key(&1));
+        assert!(r.textures.contains_key(&2));
+        assert!(!r.textures.contains_key(&3));
+
+        // Also exercise the public forget_many helper through REGISTRY.
+        with_registry(|reg| {
+            reg.insert(101, placed(0x1000, 0x1000));
+            reg.insert(102, placed(0x2000, 0x1000));
+            reg.insert(103, placed(0x3000, 0x1000));
+        });
+        forget_many(&[101, 103]);
+        let (has_101, has_102, has_103) = with_registry_read(|reg| {
+            (
+                reg.textures.contains_key(&101),
+                reg.textures.contains_key(&102),
+                reg.textures.contains_key(&103),
+            )
+        })
+        .unwrap();
+        assert!(!has_101 && has_102 && !has_103);
+        forget_many(&[102]);
     }
 }

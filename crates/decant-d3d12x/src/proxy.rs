@@ -2968,16 +2968,27 @@ fn trim_view_textures() {
         return;
     }
     mem_owners::note_view_heaps_evicted(pass.heaps_freed as u64);
+    let mut res_ids = Vec::with_capacity(pass.freed.len());
+    let mut res_set = std::collections::HashSet::with_capacity(pass.freed.len());
+    let mut heaps = Vec::new();
     let mut bytes = 0u64;
     for e in &pass.freed {
-        crate::detile::forget(e.res);
-        crate::views_at::forget_resource(e.res);
-        mem_owners::remove(
-            mem_owners::Kind::ViewTexture,
-            mem_owners::Segment::Local,
-            1,
-            e.bytes,
-        );
+        res_ids.push(e.res);
+        res_set.insert(e.res);
+        if let Some(h) = e.heap {
+            heaps.push(h);
+        }
+        bytes += e.bytes;
+    }
+    crate::detile::forget_many(&res_ids);
+    crate::views_at::forget_resources(&res_set);
+    mem_owners::remove(
+        mem_owners::Kind::ViewTexture,
+        mem_owners::Segment::Local,
+        pass.freed.len() as u64,
+        bytes,
+    );
+    for e in &pass.freed {
         // SAFETY: the layer's own reference of a texture it made, held by no table of the layer and by no slot of a view heap.
         if e.heap.is_none() {
             unsafe {
@@ -2995,11 +3006,8 @@ fn trim_view_textures() {
             // SAFETY: as above; the texture's bytes remain in its permanent view heap.
             unsafe { crate::retire::release(e.res as Object, "view texture") };
         }
-        if let Some(h) = e.heap {
-            crate::view_heap::released(h);
-        }
-        bytes += e.bytes;
     }
+    crate::view_heap::free_many(&heaps);
     if log_due(&WAVES) {
         let left = crate::views_at::with_view_textures(|t| t.len());
         xs_log!(

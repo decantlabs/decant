@@ -410,27 +410,42 @@ pub fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: u32) -> O
     Some((resource, index, size))
 }
 
-/// Schedules a placed texture's `(offset, size)` range for reuse after [`REUSE_PRESENTS`] presents.
-pub fn retire_resource(res: usize, present: u64) {
-    let Some((index, offset, size)) = ALLOCS.lock().unwrap_or_else(|e| e.into_inner()).remove(&res) else {
+/// Schedules a batch of placed textures for reuse under one `ALLOCS` lock and one `HEAPS` lock.
+pub fn retire_resources(resources: &[usize], present: u64) {
+    if resources.is_empty() {
         return;
+    }
+    let removed: Vec<(usize, u64, u64)> = {
+        let mut allocs = ALLOCS.lock().unwrap_or_else(|e| e.into_inner());
+        resources.iter().filter_map(|res| allocs.remove(res)).collect()
     };
+    if removed.is_empty() {
+        return;
+    }
+    let ready_at = present.saturating_add(REUSE_PRESENTS);
     let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(Some(h)) = pool.heaps.get_mut(index) {
-        h.meta.retire_block(offset, size, present.saturating_add(REUSE_PRESENTS));
+    for (index, offset, size) in removed {
+        if let Some(Some(h)) = pool.heaps.get_mut(index) {
+            h.meta.retire_block(offset, size, ready_at);
+        }
     }
 }
 
-/// A texture placed in heap `index` was released (its last reference is held back until the GPU is
-/// done, `retire`). Reclaims any excess empty heaps past [`REUSE_PRESENTS`] back to D3D12.
-pub fn released(index: usize) {
+/// Releases a batch of placed texture references across `heaps` under one `HEAPS` lock, dropping
+/// reclaimed D3D12 heaps outside the lock.
+pub fn free_many(heaps: &[usize]) {
+    if heaps.is_empty() {
+        return;
+    }
     let now = crate::title_heap::presents();
     let excess = {
         let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(Some(h)) = pool.heaps.get_mut(index) {
-            h.meta.live = h.meta.live.saturating_sub(1);
-            if h.meta.live == 0 {
-                h.meta.free_at = Some(now);
+        for &index in heaps {
+            if let Some(Some(h)) = pool.heaps.get_mut(index) {
+                h.meta.live = h.meta.live.saturating_sub(1);
+                if h.meta.live == 0 {
+                    h.meta.free_at = Some(now);
+                }
             }
         }
         reclaim_empty_in_pool(&mut pool, now)
