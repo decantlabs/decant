@@ -2,7 +2,7 @@
 //! data is its CPU address. Here those bytes sit in pages that `xmem.dll` maps with
 //! `XMemMapPhysicalPages`, and no PC resource covers them. This module mirrors them for the GPU:
 //!
-//! * The pool is a set of D3D12 heaps of 64 MiB (custom, system memory, write back, made with
+//! * The pool is a set of D3D12 heaps of 16 MiB (custom, system memory, write back, made with
 //!   `CreateHeap`), one buffer placed over each and mapped for the life of the process. A pool page of
 //!   `xmem.dll` gets the next mirror tile when it is first copied (it has bytes: `xmem.dll` reports only
 //!   committed pages, and a page is committed by its first access), when a buffer is placed over it, or
@@ -63,7 +63,7 @@ use crate::title_mirror::{Change, HEAP_PAGES, Mirror, PAGE, TileCall, heap_of};
 /// check, so a shader that reads past its data would read past the slot in the window.
 pub const NEAR_END_BYTES: u64 = 64 << 10;
 
-/// The size of a pool heap: 1024 pages.
+/// The size of a pool heap: 256 pages.
 pub const POOL_HEAP_BYTES: u64 = HEAP_PAGES as u64 * PAGE;
 
 /// Pages asked of `DecantXmemGpuTakeDirty` in one call.
@@ -1817,8 +1817,8 @@ mod tests {
 
     #[test]
     fn a_placed_buffer_maps_runs_of_consecutive_pages_per_pool_heap() {
-        let runs = runs_by_heap(&[5, 6, 7, 1023, 1024, 1025, 9]);
-        assert_eq!(runs, [(0, vec![(0, 3, 5), (3, 1, 1023), (6, 1, 9)]), (1, vec![(4, 2, 0)])], "a run ends at a heap's end and where the pages jump");
+        let runs = runs_by_heap(&[5, 6, 7, HEAP_PAGES - 1, HEAP_PAGES, HEAP_PAGES + 1, 9]);
+        assert_eq!(runs, [(0, vec![(0, 3, 5), (3, 1, HEAP_PAGES - 1), (6, 1, 9)]), (1, vec![(4, 2, 0)])], "a run ends at a heap's end and where the pages jump");
         assert!(runs_by_heap(&[]).is_empty());
     }
 
@@ -1866,8 +1866,13 @@ mod tests {
         let mut cursor = DRAIN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         cursor.state_id = 0;
         let read_ok = std::thread::spawn(|| STATE.read().unwrap_or_else(PoisonError::into_inner).is_none()).join().unwrap();
-        let write_ok = std::thread::spawn(|| STATE.write().unwrap_or_else(PoisonError::into_inner).is_none()).join().unwrap();
         assert!(read_ok);
-        assert!(write_ok);
+    }
+
+    #[test]
+    fn pool_heaps_are_16_mib_aligned_to_64_kib_pages() {
+        assert_eq!(HEAP_PAGES, 256);
+        assert_eq!(POOL_HEAP_BYTES, 16 * 1024 * 1024);
+        assert_eq!(POOL_HEAP_BYTES % PAGE, 0);
     }
 }

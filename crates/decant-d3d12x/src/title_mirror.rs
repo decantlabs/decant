@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, HashMap};
 
 /// The page of the title, the tile of a reserved buffer and the tile of a heap: 64 KiB.
 pub const PAGE: u64 = 0x1_0000;
-/// Pool pages in one pool heap: 64 MiB.
-pub const HEAP_PAGES: u32 = 1024;
+/// Pool pages in one pool heap: 16 MiB.
+pub const HEAP_PAGES: u32 = 256;
 /// The largest reservation a window buffer can hold, tiled resources tier 4: 40 bits of GPU address.
 pub const MAX_SLOT_BYTES: u64 = 1 << 40;
 
@@ -597,9 +597,9 @@ mod tests {
     #[test]
     fn a_mirror_tile_is_a_tile_of_its_heap() {
         assert_eq!(heap_of(0), (0, 0));
-        assert_eq!(heap_of(1023), (0, 1023));
-        assert_eq!(heap_of(1024), (1, 0));
-        assert_eq!(heap_of(99775), (97, 447));
+        assert_eq!(heap_of(255), (0, 255));
+        assert_eq!(heap_of(256), (1, 0));
+        assert_eq!(heap_of(99775), (389, 191));
     }
 
     #[test]
@@ -703,14 +703,14 @@ mod tests {
         let mut m = Mirror::new(GIB);
         reserve(&mut m, 0x1000_0000, 8);
         // A page mapped and unmapped again gives this reservation its slot at the start of buffer 0 and takes
-        // mirror tile 0. Then 1021 pages of a commit on demand (in window buffer 1) take tiles 1 to 1021.
+        // mirror tile 0. Then HEAP_PAGES - 3 pages of a commit on demand (in window buffer 1) take tiles 1 to HEAP_PAGES - 3.
         map(&mut m, 0x1000_0000 + 7 * PAGE, 1, 99_999);
         m.apply(Change::Unmap { va: 0x1000_0000 + 7 * PAGE, pages: 1 });
-        m.apply(Change::Reserve { va: 0x4000_0000, pages: 1021, on_demand: true });
-        map(&mut m, 0x4000_0000, 1021, 3000);
+        m.apply(Change::Reserve { va: 0x4000_0000, pages: HEAP_PAGES - 3, on_demand: true });
+        map(&mut m, 0x4000_0000, HEAP_PAGES - 3, 3000);
         m.drain_updates();
-        // Two runs: the next four pages take tiles 1022 and 1023 (heap 0, one range) and 1024 and 1025
-        // (heap 1), then a page mapped first long ago keeps its tile 41 (heap 0), one window tile on.
+        // Two runs: the next four pages take the last two tiles of heap 0 (one range) and the first two
+        // of heap 1, then a page mapped first long ago keeps its tile 41 (heap 0), one window tile on.
         map(&mut m, 0x1000_0000, 2, 100);
         map(&mut m, 0x1000_0000 + 2 * PAGE, 2, 102);
         map(&mut m, 0x1000_0000 + 5 * PAGE, 1, 3040);
@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(
             calls,
             [
-                TileCall { buffer: 0, heap: Some(0), ranges: vec![(0, 2), (5, 1)], heap_tiles: vec![1022, 41] },
+                TileCall { buffer: 0, heap: Some(0), ranges: vec![(0, 2), (5, 1)], heap_tiles: vec![HEAP_PAGES - 2, 41] },
                 TileCall { buffer: 0, heap: Some(1), ranges: vec![(2, 2)], heap_tiles: vec![0] },
             ]
         );
