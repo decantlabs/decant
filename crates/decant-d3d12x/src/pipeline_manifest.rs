@@ -460,14 +460,72 @@ pub struct Writer {
     pub pipelines: u64,
 }
 
+/// Maximum size of an existing manifest file before a new run truncates and rewrites it.
+pub const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+
 impl Writer {
-    /// A writer that appends to `path`, with the header when the file is new or empty.
+    /// A writer that appends to `path`, truncating if the existing file exceeds `MAX_MANIFEST_BYTES`.
     pub fn open(path: &Path) -> std::io::Result<Writer> {
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        Self::open_with_cap(path, MAX_MANIFEST_BYTES)
+    }
+
+    /// A writer that appends to `path`, truncating if the existing file exceeds `max_bytes`.
+    pub fn open_with_cap(path: &Path, max_bytes: u64) -> std::io::Result<Writer> {
+        let existing_len = std::fs::metadata(path).ok().map_or(0, |m| m.len());
+        let mut file = if existing_len > max_bytes {
+            std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(path)?
+        } else {
+            std::fs::OpenOptions::new().create(true).append(true).open(path)?
+        };
         if file.metadata()?.len() == 0 {
             file.write_all(format!("{HEADER}\n").as_bytes())?;
         }
         Ok(Writer { file, roots: HashSet::new(), lines: HashSet::new(), hashes: HashMap::new(), pipelines: 0 })
+    }
+
+    /// A writer that deduplicates against `path` (compacting existing duplicates if needed) and
+    /// truncates if the existing file exceeds `max_bytes`.
+    pub fn open_deduplicated(path: &Path, max_bytes: u64) -> std::io::Result<Writer> {
+        let existing_len = std::fs::metadata(path).ok().map_or(0, |m| m.len());
+        if existing_len == 0 || existing_len > max_bytes {
+            return Self::open_with_cap(path, max_bytes);
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self::open_with_cap(path, 0);
+        };
+        let mut roots = HashSet::new();
+        let mut lines = HashSet::new();
+        let mut kept: Vec<&str> = Vec::new();
+        let mut raw_p = 0usize;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("R ") {
+                if let Some(id_hex) = rest.split_whitespace().next()
+                    && let Ok(id) = u64::from_str_radix(id_hex, 16)
+                    && roots.insert(id)
+                {
+                    kept.push(line);
+                }
+            } else if line.starts_with("P ") {
+                raw_p += 1;
+                if lines.insert(Fnv128::default().bytes(line.as_bytes()).finish()) {
+                    kept.push(line);
+                }
+            }
+        }
+        if raw_p > lines.len() {
+            let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+            file.write_all(format!("{HEADER}\n").as_bytes())?;
+            for line in kept {
+                file.write_all(line.as_bytes())?;
+                file.write_all(b"\n")?;
+            }
+            drop(file);
+        }
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        if file.metadata()?.len() == 0 {
+            file.write_all(format!("{HEADER}\n").as_bytes())?;
+        }
+        Ok(Writer { file, roots, lines, hashes: HashMap::new(), pipelines: 0 })
     }
 
     /// Records one pipeline: its root signature (as the PC runtime got it, `None` when unknown),
@@ -522,7 +580,7 @@ pub(crate) fn created(owned: &crate::lazy_pso::Owned) {
     static WRITER: std::sync::OnceLock<Option<Mutex<Writer>>> = std::sync::OnceLock::new();
     static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let Some(path) = configured() else { return };
-    let writer = WRITER.get_or_init(|| match Writer::open(&path) {
+    let writer = WRITER.get_or_init(|| match Writer::open_deduplicated(&path, MAX_MANIFEST_BYTES) {
         Ok(w) => {
             xs_log!("pipeline manifest: recording every created pipeline to {}", path.display());
             Some(Mutex::new(w))
@@ -707,6 +765,54 @@ mod tests {
         let fnv = decant_shader::container::fnv1a64;
         assert_eq!(m.pipelines[0], Record { pc_state: None, root: Some(id), linkage: graphics(), stages: vec![(StageKind::Vertex, fnv(&vs)), (StageKind::Pixel, fnv(&ps))] });
         assert_eq!(m.pipelines[2].root, None);
+    }
+
+    #[test]
+    fn writer_truncates_when_existing_exceeds_cap() {
+        let tmp = TempDir::new("manifest-cap");
+        std::fs::create_dir_all(&tmp.0).expect("dir");
+        let path = tmp.0.join("pipelines.txt");
+        let cs = b"compute container".to_vec();
+        let compute = Linkage { stages: vec![StageKind::Compute], ..Linkage::default() };
+        {
+            let mut w = Writer::open_with_cap(&path, 1024).expect("open");
+            assert_eq!(w.record(Some(&layout()), &compute, &[&cs]).ok(), Some(true));
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > 32);
+        {
+            let mut w = Writer::open_with_cap(&path, 16).expect("reopen over cap");
+            assert_eq!(w.record(Some(&layout()), &compute, &[&cs]).ok(), Some(true));
+        }
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(text.matches(HEADER).count(), 1);
+        assert_eq!(text.lines().filter(|l| l.starts_with("P ")).count(), 1);
+    }
+
+    #[test]
+    fn writer_open_deduplicated_skips_existing_and_compacts_duplicates() {
+        let tmp = TempDir::new("manifest-dedup");
+        std::fs::create_dir_all(&tmp.0).expect("dir");
+        let path = tmp.0.join("pipelines.txt");
+        let (vs, ps, cs) = (b"vertex container".to_vec(), b"pixel container".to_vec(), b"compute container".to_vec());
+        let compute = Linkage { stages: vec![StageKind::Compute], ..Linkage::default() };
+
+        // Simulate two legacy runs that appended duplicate lines.
+        for _ in 0..2 {
+            let mut w = Writer::open(&path).expect("open");
+            assert_eq!(w.record(Some(&layout()), &compute, &[&cs]).ok(), Some(true));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().filter(|l| l.starts_with("P ")).count(), 2);
+
+        // open_deduplicated compacts the existing duplicates and skips re-recording existing pipelines.
+        {
+            let mut w = Writer::open_deduplicated(&path, MAX_MANIFEST_BYTES).expect("open dedup");
+            assert_eq!(w.record(Some(&layout()), &compute, &[&cs]).ok(), Some(false));
+            assert_eq!(w.record(Some(&layout()), &graphics(), &[&vs, &ps]).ok(), Some(true));
+        }
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(text.lines().filter(|l| l.starts_with("R ")).count(), 1);
+        assert_eq!(text.lines().filter(|l| l.starts_with("P ")).count(), 2);
+        assert_eq!(read(&path).expect("parse").pipelines.len(), 2);
     }
 
     /// What `created` records for a pipeline the title made: the copy of its description, its
