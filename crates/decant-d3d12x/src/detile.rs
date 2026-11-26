@@ -937,6 +937,57 @@ impl Drop for Registry {
 static HAS_PENDING_FILLS: AtomicBool = AtomicBool::new(false);
 /// Fast path counters to skip `REGISTRY_READ` when no textures or noted transitions exist.
 static TEXTURE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static INDEX_SETTLED_UNMAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const COARSE_TILE_WORDS: usize = 1024;
+static COARSE_TILE_BITS: [std::sync::atomic::AtomicU64; COARSE_TILE_WORDS] = [const { std::sync::atomic::AtomicU64::new(0) }; COARSE_TILE_WORDS];
+
+#[inline]
+fn coarse_tile_bit(tile: u32) -> (usize, u64) {
+    let bucket = ((tile >> 4) as usize) & ((COARSE_TILE_WORDS * 64) - 1);
+    (bucket >> 6, 1u64 << (bucket & 63))
+}
+
+#[inline]
+fn coarse_tile_set(tile: u32) {
+    let (word, mask) = coarse_tile_bit(tile);
+    COARSE_TILE_BITS[word].fetch_or(mask, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn may_overlap_tile(tile: u32) -> bool {
+    if TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let (word, mask) = coarse_tile_bit(tile);
+    (COARSE_TILE_BITS[word].load(Ordering::Relaxed) & mask) != 0
+}
+
+fn rebuild_coarse_tile_bits(tile_to_textures: &FastMap<u32, TileRefs>) {
+    for word in &COARSE_TILE_BITS {
+        word.store(0, Ordering::Relaxed);
+    }
+    for &tile in tile_to_textures.keys() {
+        coarse_tile_set(tile);
+    }
+}
+
+/// Filters `tiles` in place to those that may overlap a tracked placed texture.
+/// Returns `false` if no placed textures exist or no tiles can overlap (so the caller
+/// can skip sorting, deduplicating, and calling `note_tiles` completely).
+pub fn filter_overlapping_tiles(tiles: &mut Vec<u32>) -> bool {
+    if tiles.is_empty() || !enabled() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let settled = INDEX_SETTLED_UNMAP_GEN.load(Ordering::Acquire);
+    if settled == 0 || settled != crate::title_mem::unmap_generation() {
+        return true;
+    }
+    tiles.retain(|&t| {
+        let (word, mask) = coarse_tile_bit(t);
+        (COARSE_TILE_BITS[word].load(Ordering::Relaxed) & mask) != 0
+    });
+    !tiles.is_empty()
+}
 static NOTED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 const PLACED_SHARDS: usize = 16;
@@ -1114,6 +1165,7 @@ impl Registry {
         crate::mem_owners::add(crate::mem_owners::Kind::DetileTexture, crate::mem_owners::Segment::Local, 1, texture.bytes);
         self.textures.insert(res, texture);
         TEXTURE_COUNT.store(self.textures.len(), Ordering::Release);
+        INDEX_SETTLED_UNMAP_GEN.store(0, Ordering::Release);
         placed_insert(res);
     }
 
@@ -1121,6 +1173,9 @@ impl Registry {
     fn remove(&mut self, res: usize) -> bool {
         let Some(texture) = self.textures.remove(&res) else { return false };
         TEXTURE_COUNT.store(self.textures.len(), Ordering::Release);
+        if self.textures.is_empty() {
+            INDEX_SETTLED_UNMAP_GEN.store(0, Ordering::Release);
+        }
         placed_remove(res);
         self.pending.remove(&res);
         self.pending_index.remove(&res);
@@ -1242,6 +1297,13 @@ impl Registry {
         } else {
             self.layout_gen = 0;
         }
+        rebuild_coarse_tile_bits(&self.tile_to_textures);
+        let settled = if self.pending_index.is_empty() && self.unmapped_textures.is_empty() {
+            self.layout_gen
+        } else {
+            0
+        };
+        INDEX_SETTLED_UNMAP_GEN.store(settled, Ordering::Release);
         (new_tile_to_textures, new_unmapped)
     }
 
@@ -1287,6 +1349,7 @@ impl Registry {
             match maybe_tiles {
                 Some(tiles) => {
                     for &tile in tiles {
+                        coarse_tile_set(tile);
                         match self.tile_to_textures.entry(tile) {
                             std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(res),
                             std::collections::hash_map::Entry::Vacant(e) => {
@@ -1307,6 +1370,12 @@ impl Registry {
         if tile_current {
             self.last_tile_gen = tile_gen;
         }
+        let settled = if self.pending_index.is_empty() && self.unmapped_textures.is_empty() {
+            self.layout_gen
+        } else {
+            0
+        };
+        INDEX_SETTLED_UNMAP_GEN.store(settled, Ordering::Release);
     }
 
     /// Marks textures whose mirror tiles appear in `tiles` using the cached reverse index.
@@ -1529,6 +1598,13 @@ pub fn forget_many(resources: &[usize]) {
         for &res in resources {
             r.remove(res);
         }
+        rebuild_coarse_tile_bits(&r.tile_to_textures);
+        let settled = if !r.textures.is_empty() && r.pending_index.is_empty() && r.unmapped_textures.is_empty() {
+            r.layout_gen
+        } else {
+            0
+        };
+        INDEX_SETTLED_UNMAP_GEN.store(settled, Ordering::Release);
     });
 }
 
@@ -1929,7 +2005,7 @@ impl Drop for FlushScratchGuard {
 }
 
 pub unsafe fn flush(queue: *mut c_void) {
-    if !enabled() || !HAS_PENDING_FILLS.load(Ordering::Acquire) {
+    if !enabled() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 || !HAS_PENDING_FILLS.load(Ordering::Acquire) {
         return;
     }
     let _trace = decant_trace::span("detile", "flush");
@@ -2578,5 +2654,57 @@ mod tests {
 
         forget_many(&[0x2020, 0x2030]);
         assert!(!is_placed(0x2020) && !is_placed(0x2030));
+    }
+
+    #[test]
+    fn coarse_tile_filter_has_zero_false_negatives_and_rejects_unrelated_tiles() {
+        let unmap_gen = crate::title_mem::unmap_generation();
+        let map_gen = crate::title_mem::mapping_generation();
+        let tile_gen = crate::title_mem::tile_generation();
+
+        // Empty registry: filter rejects all tiles.
+        let mut empty_tiles = vec![0x10, 0x20];
+        assert!(!filter_overlapping_tiles(&mut empty_tiles));
+
+        // Register a pending texture: INDEX_SETTLED_UNMAP_GEN is 0, so filter keeps all tiles.
+        with_registry(|r| {
+            r.insert(0x3010, placed(0x1000, 0x1000));
+            r.insert(0x3020, placed(0x2000, 0x1000));
+        });
+        let mut pending_tiles = vec![0x10, 0x400];
+        assert!(filter_overlapping_tiles(&mut pending_tiles));
+        assert_eq!(pending_tiles, vec![0x10, 0x400]);
+
+        // Index both textures: 0x3010 -> tile 0x10, 0x3020 -> tile 0x200.
+        with_registry(|r| {
+            r.apply_full_index(
+                &[(0x3010, 0x1000, 0x1000), (0x3020, 0x2000, 0x1000)],
+                &[Some(vec![0x10]), Some(vec![0x200])],
+                unmap_gen,
+                map_gen,
+                tile_gen,
+                true,
+            );
+        });
+        assert!(may_overlap_tile(0x10));
+        assert!(may_overlap_tile(0x200));
+        assert!(!may_overlap_tile(0x400));
+
+        // Unrelated tiles are rejected; overlapping tiles are retained with zero false negatives.
+        let mut unrelated = vec![0x400, 0x800];
+        assert!(!filter_overlapping_tiles(&mut unrelated));
+        assert!(unrelated.is_empty());
+
+        let mut mixed = vec![0x400, 0x10, 0x800, 0x200];
+        assert!(filter_overlapping_tiles(&mut mixed));
+        assert_eq!(mixed, vec![0x10, 0x200]);
+
+        // forget_many rebuilds the coarse bitset cleanly.
+        forget_many(&[0x3010]);
+        assert!(!may_overlap_tile(0x10));
+        assert!(may_overlap_tile(0x200));
+
+        forget_many(&[0x3020]);
+        assert!(!may_overlap_tile(0x200));
     }
 }

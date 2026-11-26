@@ -2944,7 +2944,7 @@ pub unsafe fn sync(queue: *mut c_void) {
     note_streaming_work(page_units.max(range_units));
     // A placed texture whose memory the title wrote is filled again (after this lock is given back:
     // the detile table asks for tiles under its own lock).
-    if !written.is_empty() {
+    if crate::detile::filter_overlapping_tiles(&mut written) {
         written.sort_unstable();
         written.dedup();
         let _note_tiles = decant_trace::span("title_mem", "note_tiles");
