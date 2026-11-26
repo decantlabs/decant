@@ -175,6 +175,7 @@ const IID_IDXGI_OBJECT: GUID = GUID::from_u128(0xaec22fb8_76f3_4639_9be0_28eb43a
 const IID_IDXGI_DEVICE: GUID = GUID::from_u128(0x54ec77fa_1377_44e6_8c32_88fd5f44c84c);
 const IID_IDXGI_ADAPTER: GUID = GUID::from_u128(0x2411e7e1_12ac_4ccf_bd14_9798e8534dc0);
 const IID_IDXGI_FACTORY4: GUID = GUID::from_u128(0x1bc6ea02_ef36_464f_bf0c_21ca39e5168a);
+const IID_ID3D12_DEVICE: GUID = GUID::from_u128(0x189819f1_1db6_4b57_be54_1821339b85f7);
 const IID_COMMAND_QUEUE: GUID = GUID::from_u128(0x0ec870a6_5d7e_4c22_8cfc_5baae07616ed);
 const IID_COMMAND_ALLOCATOR: GUID = GUID::from_u128(0x6102dee4_af59_4b09_b999_b44d73f09b24);
 const IID_GRAPHICS_COMMAND_LIST: GUID = GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);
@@ -210,14 +211,39 @@ struct Proxy {
     kind: i32,
 }
 
-/// Memory accounting of a proxy, kept out of the proxy: the title reads and writes the bytes after
-/// +0x18 (the list cursor and limits, the placed address), so no field may be added to the structs.
+/// Creation parameters of a command list proxy, used to allocate or reuse an identical PC backing
+/// command list if the title calls `Reset` while the current backing list is still queued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ListSpec {
+    mask: u32,
+    list_type: u32,
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+impl ListSpec {
+    fn new(mask: u32, list_type: u32, riid: &GUID) -> Self {
+        Self { mask, list_type, data1: riid.data1, data2: riid.data2, data3: riid.data3, data4: riid.data4 }
+    }
+
+    fn guid(&self) -> GUID {
+        GUID { data1: self.data1, data2: self.data2, data3: self.data3, data4: self.data4 }
+    }
+}
+
+/// Memory accounting and auxiliary creation metadata of a proxy, kept out of the proxy: the title
+/// reads and writes the bytes after +0x18 (the list cursor and limits, the placed address), so no
+/// field may be added to the structs.
 #[derive(Clone, Copy, Default)]
 struct Side {
     /// The additive allocation released with this PC object, if any.
     charge: Option<Charge>,
     /// Informational placed-resource size and segment.
     placed: Option<(mem_owners::Segment, u64)>,
+    /// Creation parameters of a command list proxy, for non-blocking backing-list swaps on `Reset`.
+    list_spec: Option<ListSpec>,
 }
 
 #[derive(Default)]
@@ -257,6 +283,14 @@ fn side_set(proxy: *mut Proxy, f: impl FnOnce(&mut Side)) {
     if map.len() != len_before {
         SIDE_COUNT.store(map.len(), Ordering::Relaxed);
     }
+}
+
+fn side_list_spec(proxy: *mut Proxy) -> Option<ListSpec> {
+    if SIDE_COUNT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let g = SIDE.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref().and_then(|map| map.get(&(proxy as usize))).and_then(|s| s.list_spec)
 }
 
 fn side_take(proxy: *mut Proxy) -> Side {
@@ -491,11 +525,28 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
                 }
             }
         }
-        if proxy.kind == Kind::List as i32 {
+        let mut deferred_list_release = false;
+        if proxy.kind == Kind::List as i32 || proxy.kind == Kind::DmaList as i32 {
+            crate::list_sync::forget(this as usize);
             crate::title_heap::list_reset(this as usize);
             crate::cbv_copies::forget(this as usize);
             crate::flicker_probe::forget(this as usize);
-            crate::present::list_reset(proxy.pc as usize);
+            let pc_addr = proxy.pc as usize;
+            if crate::queue_fifo::is_list_held(pc_addr) {
+                let label = retired_label(proxy.kind);
+                deferred_list_release = true;
+                crate::queue_fifo::detach_or_recycle_list(pc_addr, move || {
+                    let pc = pc_addr as Object;
+                    let _ = take_unclosed(pc);
+                    crate::detile::list_reset(pc_addr);
+                    crate::present::list_reset(pc_addr);
+                    // SAFETY: the proxy transferred its sole remaining PC list reference here, and
+                    // all queued submissions holding this PC list have already released theirs.
+                    unsafe { crate::retire::release(pc, label) };
+                });
+            } else {
+                crate::present::list_reset(pc_addr);
+            }
         }
         if proxy.kind == Kind::Resource as i32 {
             crate::views_at::forget_resource(proxy.pc as usize);
@@ -515,8 +566,11 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
                 if !crate::queue_fifo::drain_all(crate::list_sync::wait_limits().hard * 2) {
                     xs_log!("device release: queued work of its queues did not finish in time");
                 }
+                flush_list_pool(proxy.pc as usize);
                 crate::retire::flush(proxy.pc);
                 method::<Release>(proxy.pc, 2)(proxy.pc);
+            } else if deferred_list_release {
+                // Ownership of `proxy.pc` was transferred to the detach callback above.
             } else if let Some(charge) = side.charge {
                 crate::retire::release_owned(proxy.pc, retired_label(proxy.kind), charge);
             } else {
@@ -876,15 +930,19 @@ unsafe fn create_list(this: *mut Proxy, mask: u32, kind: u32, alloc: Object, pso
         let alloc = unwrap(alloc);
         // A pipeline made on first bind is made here (null when the PC runtime refused it).
         let pso = unwrap(pso);
+        let list_type = kind;
         let mut l: Object = std::ptr::null_mut();
-        let mut hr = method::<CreateList>(pc, 12)(pc, mask, kind, alloc, pso, riid, &mut l);
+        let mut used_riid = if riid.is_null() { IID_GRAPHICS_COMMAND_LIST } else { *riid };
+        let mut hr = method::<CreateList>(pc, 12)(pc, mask, list_type, alloc, pso, riid, &mut l);
         if hr == E_NOINTERFACE && !is_iid(riid, &IID_GRAPHICS_COMMAND_LIST) {
             xs_log!("console device: command list IID {{{}}} unknown to the PC runtime, created as ID3D12GraphicsCommandList", guid_at(riid));
-            hr = method::<CreateList>(pc, 12)(pc, mask, kind, alloc, pso, &IID_GRAPHICS_COMMAND_LIST, &mut l);
+            used_riid = IID_GRAPHICS_COMMAND_LIST;
+            hr = method::<CreateList>(pc, 12)(pc, mask, list_type, alloc, pso, &IID_GRAPHICS_COMMAND_LIST, &mut l);
         }
         let kind = if is_iid(riid, &IID_DMA_COMMAND_LIST) { Kind::DmaList } else { Kind::List };
         let hr = give(hr, l, kind, out);
         if hr >= 0 && !(*out).is_null() {
+            side_set((*out).cast::<Proxy>(), |s| s.list_spec = Some(ListSpec::new(mask, list_type, &used_riid)));
             crate::upload_mem::with(|m| m.set_allocator(*out as usize, alloc as usize));
         }
         hr
@@ -3816,12 +3874,136 @@ unsafe fn bound_at_reset(this: *mut Proxy, pso: Object) -> Object {
     }
 }
 
+/// Maximum cached spare PC command lists per `(device, ListSpec)` bucket and across the process.
+const MAX_POOLED_LISTS_PER_SPEC: usize = 64;
+const MAX_POOLED_LISTS_TOTAL: usize = 256;
+
+/// Bounded LIFO pool of closed, idle PC command lists detached by `Reset` while queued.
+#[derive(Default)]
+struct SpareListPool {
+    buckets: std::collections::HashMap<(usize, ListSpec), Vec<usize>>,
+    total: usize,
+    closed_devices: Vec<usize>,
+}
+
+impl SpareListPool {
+    fn pop(&mut self, device: usize, spec: ListSpec) -> Option<usize> {
+        let list = self.buckets.get_mut(&(device, spec))?;
+        let pc = list.pop()?;
+        self.total = self.total.saturating_sub(1);
+        if list.is_empty() {
+            self.buckets.remove(&(device, spec));
+        }
+        Some(pc)
+    }
+
+    fn push(&mut self, device: usize, spec: ListSpec, pc: usize) -> bool {
+        if self.closed_devices.contains(&device) || self.total >= MAX_POOLED_LISTS_TOTAL {
+            return false;
+        }
+        let bucket = self.buckets.entry((device, spec)).or_default();
+        if bucket.len() >= MAX_POOLED_LISTS_PER_SPEC {
+            return false;
+        }
+        bucket.push(pc);
+        self.total += 1;
+        true
+    }
+
+    fn drain_device(&mut self, device: usize) -> Vec<usize> {
+        if !self.closed_devices.contains(&device) {
+            self.closed_devices.push(device);
+        }
+        let mut drained = Vec::new();
+        self.buckets.retain(|&(dev, _), lists| {
+            if dev == device {
+                self.total = self.total.saturating_sub(lists.len());
+                drained.append(lists);
+                false
+            } else {
+                true
+            }
+        });
+        drained
+    }
+
+    fn len(&self) -> usize {
+        self.total
+    }
+}
+
+static LIST_POOL: Mutex<Option<SpareListPool>> = Mutex::new(None);
+
+fn with_list_pool<R>(f: impl FnOnce(&mut SpareListPool) -> R) -> R {
+    let mut g = LIST_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(SpareListPool::default))
+}
+
+/// Releases all pooled spare PC command lists belonging to `device` during device teardown.
+///
+/// # Safety
+/// `device` is tearing down after all queue workers have been drained.
+unsafe fn flush_list_pool(device: usize) {
+    let drained = with_list_pool(|pool| pool.drain_device(device));
+    for pc in drained {
+        // SAFETY: each pooled list is owned by the pool and released once on teardown.
+        unsafe { method::<Release>(pc as Object, 2)(pc as Object) };
+    }
+}
+
+/// Acquires an open PC command list bound to `(allocator, pso)` with the same creation spec as
+/// `old_pc`, reusing a closed list from the spare pool when available or creating a fresh one.
+///
+/// # Safety
+/// `old_pc` is a live PC command list, `allocator` a live PC command allocator, `pso` null or a
+/// live PC pipeline state.
+unsafe fn acquire_spare_list(old_pc: Object, spec: ListSpec, allocator: Object, pso: Object) -> Option<(Object, usize, HRESULT)> {
+    type GetDevice = unsafe extern "system" fn(Object, *const GUID, *mut Object) -> HRESULT;
+    // SAFETY: by the contract above; PC slot 7 of ID3D12DeviceChild is GetDevice.
+    unsafe {
+        let mut device: Object = std::ptr::null_mut();
+        if method::<GetDevice>(old_pc, 7)(old_pc, &IID_ID3D12_DEVICE, &mut device) < 0 || device.is_null() {
+            return None;
+        }
+        let device_id = device as usize;
+        if let Some(pooled_addr) = with_list_pool(|pool| pool.pop(device_id, spec)) {
+            let pc2 = pooled_addr as Object;
+            let hr = method::<Reset>(pc2, 10)(pc2, allocator, pso);
+            if hr >= 0 {
+                method::<Release>(device, 2)(device);
+                return Some((pc2, device_id, hr));
+            }
+            crate::retire::release(pc2, "spare command list");
+        }
+        let mut pc2: Object = std::ptr::null_mut();
+        let guid = spec.guid();
+        let hr = method::<CreateList>(device, 12)(device, spec.mask, spec.list_type, allocator, pso, &guid, &mut pc2);
+        method::<Release>(device, 2)(device);
+        if hr >= 0 && !pc2.is_null() { Some((pc2, device_id, hr)) } else { None }
+    }
+}
+
+/// Returns a detached PC command list to the spare pool once every queued submission holding it has
+/// finished, or retires it when the pool is full or its last `Close` failed.
+fn recycle_detached_list(pc_addr: usize, device_id: usize, spec: ListSpec) {
+    let pc = pc_addr as Object;
+    let was_unclosed = take_unclosed(pc);
+    crate::detile::list_reset(pc_addr);
+    crate::present::list_reset(pc_addr);
+    if !was_unclosed && with_list_pool(|pool| pool.push(device_id, spec, pc_addr)) {
+        return;
+    }
+    // SAFETY: this callback owns the sole remaining reference to `pc`.
+    unsafe { crate::retire::release(pc, "title command list") };
+}
+
 /// Resets list `this` with `allocator` and `pso` (proxies or PC objects): every table of the layer
-/// that follows the recording of a list forgets it, then the PC list is reset. A queued submission
-/// of the list (`queue_fifo`) runs first, because the PC list is only read when it does.
+/// that follows the recording of a list forgets it, then the PC list is reset. When the list's
+/// current PC backing object is still held by a queued submission (`queue_fifo`), swaps in a spare
+/// PC backing list of the same type so `Reset` returns immediately without blocking a producer
+/// thread or forcing out-of-order execution.
 fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
     let key = this as usize;
-    crate::queue_fifo::wait_list_idle(key, crate::list_sync::wait_limits().idle);
     crate::list_sync::forget(key);
     crate::user_mirror::forget(key);
     crate::title_heap::list_reset(key);
@@ -3833,15 +4015,32 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
     crate::kind_check::reset(key);
     // SAFETY: `this` is a live proxy, `allocator` and `pso` are proxies or PC objects.
     unsafe {
-        let pc = (*this).pc;
-        forget_unclosed(pc);
-        crate::detile::list_reset(pc as usize);
-        crate::present::list_reset(pc as usize);
         let pso = bound_at_reset(this, pso);
         crate::rt_diag::list_reset(key, pso as usize);
         let allocator = unwrap(allocator);
         crate::upload_mem::with(|m| m.set_allocator(key, allocator as usize));
-        method::<Reset>(pc, 10)(pc, allocator, pso)
+        let old_pc = (*this).pc;
+        let old_addr = old_pc as usize;
+        if crate::queue_fifo::is_list_held(old_addr) {
+            if let Some(spec) = side_list_spec(this)
+                && let Some((new_pc, device_id, hr)) = acquire_spare_list(old_pc, spec, allocator, pso)
+            {
+                std::sync::atomic::AtomicPtr::from_ptr(&raw mut (*this).pc).store(new_pc, Ordering::Release);
+                crate::queue_fifo::detach_or_recycle_list(old_addr, move || recycle_detached_list(old_addr, device_id, spec));
+                static SWAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SWAPS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    let pooled = with_list_pool(|pool| pool.len());
+                    xs_log!("queue order: Reset of list {key:#x} swapped its backing PC list while queued ({n} swaps so far, {pooled} pooled)");
+                }
+                return hr;
+            }
+            crate::queue_fifo::wait_list_idle(old_addr, crate::list_sync::wait_limits().idle);
+        }
+        forget_unclosed(old_pc);
+        crate::detile::list_reset(old_addr);
+        crate::present::list_reset(old_addr);
+        method::<Reset>(old_pc, 10)(old_pc, allocator, pso)
     }
 }
 
@@ -3890,14 +4089,21 @@ extern "system" fn list_close(this: *mut Proxy) -> HRESULT {
     }
 }
 
-/// A list was reset: whatever its last Close did no longer matters.
-fn forget_unclosed(pc_list: Object) {
+/// Removes `pc_list` from `UNCLOSED` and returns whether its last `Close` had failed.
+fn take_unclosed(pc_list: Object) -> bool {
     if UNCLOSED_COUNT.load(Ordering::Relaxed) == 0 {
-        return;
+        return false;
     }
     let mut unclosed = UNCLOSED.lock().unwrap_or_else(|e| e.into_inner());
+    let before = unclosed.len();
     unclosed.retain(|&l| l != pc_list as usize);
     UNCLOSED_COUNT.store(unclosed.len(), Ordering::Relaxed);
+    unclosed.len() != before
+}
+
+/// A list was reset: whatever its last Close did no longer matters.
+fn forget_unclosed(pc_list: Object) {
+    let _ = take_unclosed(pc_list);
 }
 
 /// ExecuteCommandLists (PC 10) of the PC lists `lists` on PC queue `pc`, without the ones whose
@@ -3966,12 +4172,67 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
         let pc = (*this).pc;
         let ready = || keys.iter().all(|&key| crate::list_sync::all_waits(key, crate::cpu_writes::satisfied));
         if let Some(_gate) = crate::queue_fifo::inline_gate(pc as usize, ready) {
-            let _pc_call = crate::watchdog_hold::pc_call();
             // objects released from now on wait for this submission
             let tracked = crate::retire::begin(pc);
-            submit_lists(pc, mapped, keys, tracked);
+            submit_lists(pc, mapped, ListRecords::Live(keys), tracked);
         } else {
             QueuedLists::enqueue(pc, mapped, keys);
+        }
+    }
+}
+
+/// Per-list recording metadata used by [`submit_lists`]. Inline submissions read live tables
+/// directly without cloning; queued submissions carry an immutable snapshot taken at enqueue time
+/// so a subsequent `Reset` backing-list swap cannot disturb them.
+enum ListRecords<'a> {
+    Live(&'a [usize]),
+    Queued {
+        keys: &'a [usize],
+        waits: &'a [Vec<crate::list_sync::PendingWait>],
+        writes: &'a [Vec<crate::list_sync::CpuWrite>],
+        cbv_copies: &'a crate::cbv_copies::QueuedCopies,
+    },
+}
+
+impl<'a> ListRecords<'a> {
+    fn keys(&self) -> &'a [usize] {
+        match self {
+            Self::Live(keys) | Self::Queued { keys, .. } => keys,
+        }
+    }
+
+    fn all_waits_satisfied(&self, index: usize) -> bool {
+        match self {
+            Self::Live(keys) => crate::list_sync::all_waits(keys[index], crate::cpu_writes::satisfied),
+            Self::Queued { waits, .. } => waits[index].iter().all(crate::cpu_writes::satisfied),
+        }
+    }
+
+    fn waits_at(&self, index: usize) -> Vec<crate::list_sync::PendingWait> {
+        match self {
+            Self::Live(keys) => crate::list_sync::waits_of(keys[index]),
+            Self::Queued { waits, .. } => waits[index].clone(),
+        }
+    }
+
+    fn cpu_writes_range(&self, start: usize, end: usize) -> Vec<crate::list_sync::CpuWrite> {
+        match self {
+            Self::Live(keys) => crate::list_sync::cpu_writes_of(&keys[start..end]),
+            Self::Queued { writes, .. } => writes[start..end].iter().flat_map(|w| w.iter().cloned()).collect(),
+        }
+    }
+
+    fn total_waits(&self) -> usize {
+        match self {
+            Self::Live(keys) => keys.iter().map(|&k| crate::list_sync::waits_of(k).len()).sum(),
+            Self::Queued { waits, .. } => waits.iter().map(Vec::len).sum(),
+        }
+    }
+
+    fn refresh_cbv_copies(&self) -> crate::cbv_copies::Refresh {
+        match self {
+            Self::Live(keys) => crate::cbv_copies::submitted(keys),
+            Self::Queued { cbv_copies, .. } => crate::cbv_copies::refresh_snapshot(cbv_copies),
         }
     }
 }
@@ -3982,20 +4243,24 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
 /// `tracked` is the answer of `retire::begin` for this submission.
 ///
 /// # Safety
-/// `pc` is a live PC queue, `mapped` the live PC lists of the submission and `keys` the console
-/// lists behind them (empty when the title passed none).
-unsafe fn submit_lists(pc: Object, mapped: &[Object], keys: &[usize], tracked: bool) {
+/// `pc` is a live PC queue, `mapped` the live PC lists of the submission and `records` the matching
+/// recording metadata (empty keys when the title passed none).
+unsafe fn submit_lists(pc: Object, mapped: &[Object], records: ListRecords<'_>, tracked: bool) {
     // SAFETY: by the contract above.
     unsafe {
+        let keys = records.keys();
         // the title bytes that running submissions read and that this sync is about to copy (`flicker_probe`)
         let suspects = crate::flicker_probe::before_sync();
-        // the memory the title wrote since its last submission is in the GPU mirror before its lists run
-        crate::title_mem::sync(pc);
-        // the textures the title wrote since its last submission are readable by the GPU before its lists run
-        crate::detile::flush(pc);
+        {
+            let _pc_call = crate::watchdog_hold::pc_call();
+            // the memory the title wrote since its last submission is in the GPU mirror before its lists run
+            crate::title_mem::sync(pc);
+            // the textures the title wrote since its last submission are readable by the GPU before its lists run
+            crate::detile::flush(pc);
+        }
         crate::draw_diag::submitted(keys);
         // constant buffer copies of these lists take the bytes the title wrote since their recording
-        let refresh = crate::cbv_copies::submitted(keys);
+        let refresh = records.refresh_cbv_copies();
         if refresh.stale > 0 || refresh.kept > 0 {
             static STALE: AtomicI32 = AtomicI32::new(0);
             if log_due(&STALE) {
@@ -4009,25 +4274,29 @@ unsafe fn submit_lists(pc: Object, mapped: &[Object], keys: &[usize], tracked: b
         // wait on them); the wait holds it back within `list_sync::wait_limits`
         let mut total_writes = 0usize;
         if keys.is_empty() {
+            let _pc_call = crate::watchdog_hold::pc_call();
             execute_closed(pc, mapped);
         } else {
-            crate::list_sync::for_each_ready_slice(
-                keys,
-                |key| crate::list_sync::all_waits(key, crate::cpu_writes::satisfied),
+            crate::list_sync::for_each_ready_index(
+                keys.len(),
+                |i| records.all_waits_satisfied(i),
                 |start, end| {
-                    execute_closed(pc, &mapped[start..end]);
-                    let writes = crate::list_sync::cpu_writes_of(&keys[start..end]);
+                    {
+                        let _pc_call = crate::watchdog_hold::pc_call();
+                        execute_closed(pc, &mapped[start..end]);
+                    }
+                    let writes = records.cpu_writes_range(start, end);
                     total_writes += writes.len();
                     crate::cpu_writes::after(pc, writes);
                 },
-                |key| {
+                |i| {
                     let _trace = decant_trace::span("queue", "memory_wait");
                     let wait_scope = crate::queue_fifo::enter_wait();
-                    let waits = crate::list_sync::waits_of(key);
+                    let waits = records.waits_at(i);
                     let unmet = crate::cpu_writes::wait_all_until(
                         &waits,
                         crate::list_sync::wait_limits(),
-                        || crate::queue_fifo::busy_elsewhere(pc as usize),
+                        || crate::queue_fifo::busy_elsewhere(pc as usize) || crate::watchdog_hold::title_held(),
                         || wait_scope.interrupted(),
                     );
                     for w in unmet {
@@ -4057,7 +4326,7 @@ unsafe fn submit_lists(pc: Object, mapped: &[Object], keys: &[usize], tracked: b
         if !keys.is_empty() {
             static N: AtomicI32 = AtomicI32::new(0);
             if log_due(&N) {
-                let waits: usize = keys.iter().map(|&k| crate::list_sync::waits_of(k).len()).sum();
+                let waits = records.total_waits();
                 xs_log!("console queue: {} lists, {total_writes} CPU writes, {waits} waits recorded on them", keys.len());
             }
         }
@@ -4092,28 +4361,35 @@ unsafe fn com_release(object: Object) {
 }
 
 /// A submission queued behind the work of its queue (`queue_fifo`). Until it ran it holds a
-/// reference on the PC queue and on each console list, and holds the lists and their command
-/// allocators against a `Reset`.
+/// reference on the PC queue and on each PC command list, carries snapshots of the lists' memory
+/// sync and constant buffer copy metadata, and holds the PC lists and their command allocators
+/// against `Reset`.
 struct QueuedLists {
     queue: usize,
     lists: Vec<usize>,
     keys: Vec<usize>,
+    waits: Vec<Vec<crate::list_sync::PendingWait>>,
+    writes: Vec<Vec<crate::list_sync::CpuWrite>>,
+    cbv_copies: crate::cbv_copies::QueuedCopies,
     /// The submission is open in `retire` and not yet closed.
     tracked: bool,
     hold: Option<crate::queue_fifo::Hold>,
 }
 
-// SAFETY: the queue and the lists are free threaded COM objects that this value keeps alive.
+// SAFETY: the queue and the PC lists are free threaded COM objects that this value keeps alive.
 unsafe impl Send for QueuedLists {}
 
-/// Collects the deduplicated list and command allocator hold keys for a queued submission.
-fn collect_hold_keys(keys: &[usize]) -> Vec<crate::queue_fifo::HoldKey> {
+/// Collects the deduplicated PC command list and command allocator hold keys for a queued
+/// submission.
+fn collect_hold_keys(mapped: &[Object], keys: &[usize]) -> Vec<crate::queue_fifo::HoldKey> {
     use crate::queue_fifo::HoldKey;
-    let mut out = Vec::with_capacity(keys.len() * 2);
-    for &key in keys {
-        let hold = HoldKey::List(key);
-        if !out.contains(&hold) {
-            out.push(hold);
+    let mut out = Vec::with_capacity(mapped.len() + keys.len());
+    for &list_pc in mapped {
+        if !list_pc.is_null() {
+            let hold = HoldKey::List(list_pc as usize);
+            if !out.contains(&hold) {
+                out.push(hold);
+            }
         }
     }
     crate::upload_mem::with(|m| {
@@ -4131,30 +4407,38 @@ fn collect_hold_keys(keys: &[usize]) -> Vec<crate::queue_fifo::HoldKey> {
 }
 
 impl QueuedLists {
-    /// Takes the references, opens the submission in `retire` on the title's thread so objects
-    /// released afterwards wait for it, and queues it on its queue while holding every list and
-    /// command allocator against `Reset`.
+    /// Takes the references on the PC queue and PC command lists, snapshots per-list recording
+    /// metadata, opens the submission in `retire` on the title's thread so objects released
+    /// afterwards wait for it, and queues it on its queue while holding every PC list and command
+    /// allocator against `Reset`.
     ///
     /// # Safety
-    /// As for [`submit_lists`].
+    /// `pc` is a live PC queue, `mapped` the live PC lists of the submission, and `keys` the
+    /// console list proxies behind them.
     unsafe fn enqueue(pc: Object, mapped: &[Object], keys: &[usize]) {
         static N: AtomicI32 = AtomicI32::new(0);
+        let waits: Vec<Vec<crate::list_sync::PendingWait>> = keys.iter().map(|&k| crate::list_sync::waits_of(k)).collect();
+        let writes: Vec<Vec<crate::list_sync::CpuWrite>> = keys.iter().map(|&k| crate::list_sync::cpu_writes_of(&[k])).collect();
+        let cbv_copies = crate::cbv_copies::snapshot_for_submission(keys);
         // SAFETY: by the contract above.
         let mut queued = unsafe {
             com_add_ref(pc);
-            for &key in keys {
-                com_add_ref(key as Object);
+            for &list_pc in mapped {
+                com_add_ref(list_pc);
             }
             let tracked = crate::retire::begin(pc);
             Self {
                 queue: pc as usize,
                 lists: mapped.iter().map(|&l| l as usize).collect(),
                 keys: keys.to_vec(),
+                waits,
+                writes,
+                cbv_copies,
                 tracked,
                 hold: None,
             }
         };
-        let hold_keys = collect_hold_keys(keys);
+        let hold_keys = collect_hold_keys(mapped, keys);
         let (queue, lists) = (queued.queue, queued.lists.len());
         let count = crate::queue_fifo::defer_holding(queue, hold_keys, move |hold| {
             queued.hold = Some(hold);
@@ -4167,8 +4451,14 @@ impl QueuedLists {
 
     fn run(mut self) {
         let mapped: Vec<Object> = self.lists.iter().map(|&l| l as Object).collect();
-        // SAFETY: the references taken in `enqueue` keep the queue and the lists alive.
-        unsafe { submit_lists(self.queue as Object, &mapped, &self.keys, self.tracked) };
+        let records = ListRecords::Queued {
+            keys: &self.keys,
+            waits: &self.waits,
+            writes: &self.writes,
+            cbv_copies: &self.cbv_copies,
+        };
+        // SAFETY: the references taken in `enqueue` keep the queue and the PC lists alive.
+        unsafe { submit_lists(self.queue as Object, &mapped, records, self.tracked) };
         self.tracked = false;
     }
 }
@@ -4181,11 +4471,12 @@ impl Drop for QueuedLists {
             if self.tracked {
                 crate::retire::submitted(self.queue as Object);
             }
-            // Drop list and allocator holds only after `submit_lists` and `retire` are done.
-            self.hold = None;
-            for &key in &self.keys {
-                com_release(key as Object);
+            // Release our PC command list references before dropping `hold`, so any detached
+            // command list recycle callback sees our reference already gone.
+            for &pc in &self.lists {
+                com_release(pc as Object);
             }
+            self.hold = None;
             com_release(self.queue as Object);
         }
     }
@@ -5882,6 +6173,34 @@ mod tests {
         let empty = super::StackBarriers::empty();
         assert!(empty.is_empty());
         assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn spare_list_pool_reuses_lifo_respects_caps_and_drains_per_device() {
+        use super::{IID_GRAPHICS_COMMAND_LIST, ListSpec, MAX_POOLED_LISTS_PER_SPEC, SpareListPool};
+        let mut pool = SpareListPool::default();
+        let spec_direct = ListSpec::new(0, 0, &IID_GRAPHICS_COMMAND_LIST);
+        let spec_compute = ListSpec::new(0, 2, &IID_GRAPHICS_COMMAND_LIST);
+
+        assert!(pool.push(1, spec_direct, 0x101));
+        assert!(pool.push(1, spec_direct, 0x102));
+        assert!(pool.push(2, spec_compute, 0x201));
+        assert_eq!(pool.len(), 3);
+        assert_eq!(pool.pop(1, spec_direct), Some(0x102), "LIFO reuse");
+        assert_eq!(pool.pop(1, spec_compute), None, "spec mismatch does not cross buckets");
+        assert_eq!(pool.len(), 2);
+
+        for i in 0..(MAX_POOLED_LISTS_PER_SPEC - 1) {
+            assert!(pool.push(1, spec_direct, 0x1000 + i));
+        }
+        assert!(!pool.push(1, spec_direct, 0x9999), "per-spec cap rejects overflow");
+
+        let drained = pool.drain_device(1);
+        assert_eq!(drained.len(), MAX_POOLED_LISTS_PER_SPEC);
+        assert_eq!(pool.len(), 1, "other device stays pooled");
+        assert!(!pool.push(1, spec_direct, 0xAAAA), "closed device refuses late recycles");
+        assert_eq!(pool.pop(2, spec_compute), Some(0x201));
+        assert_eq!(pool.len(), 0);
     }
 
     #[test]

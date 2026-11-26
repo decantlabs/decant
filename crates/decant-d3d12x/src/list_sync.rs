@@ -205,6 +205,32 @@ pub fn all_waits(list: usize, met: impl Fn(&PendingWait) -> bool) -> bool {
     peek(list, |r| r.waits.iter().all(&met)).unwrap_or(true)
 }
 
+/// Walks indices `0..len` in order and splits the batch before each index whose memory waits are
+/// not yet met. Before waiting on index `i`, any earlier range `start..i` runs through
+/// `execute_slice(start, i)` so both the PC GPU work and its CPU bottom-of-pipe writes are
+/// dispatched before the wait begins. The trailing slice `start..len` runs once the loop finishes.
+pub fn for_each_ready_index(
+    len: usize,
+    mut ready: impl FnMut(usize) -> bool,
+    mut execute_slice: impl FnMut(usize, usize),
+    mut wait_index: impl FnMut(usize),
+) {
+    let mut start = 0usize;
+    for i in 0..len {
+        if ready(i) {
+            continue;
+        }
+        if i > start {
+            execute_slice(start, i);
+        }
+        wait_index(i);
+        start = i;
+    }
+    if start < len {
+        execute_slice(start, len);
+    }
+}
+
 /// Walks `keys` in order and splits the batch before each list whose memory waits are not yet met.
 /// Before waiting on list `i`, any earlier lists `start..i` run through `execute_slice(start, i)`
 /// so both the PC GPU work and its CPU bottom-of-pipe writes are dispatched before the wait begins.
@@ -212,23 +238,10 @@ pub fn all_waits(list: usize, met: impl Fn(&PendingWait) -> bool) -> bool {
 pub fn for_each_ready_slice(
     keys: &[usize],
     mut ready: impl FnMut(usize) -> bool,
-    mut execute_slice: impl FnMut(usize, usize),
+    execute_slice: impl FnMut(usize, usize),
     mut wait_list: impl FnMut(usize),
 ) {
-    let mut start = 0usize;
-    for (i, &key) in keys.iter().enumerate() {
-        if ready(key) {
-            continue;
-        }
-        if i > start {
-            execute_slice(start, i);
-        }
-        wait_list(key);
-        start = i;
-    }
-    if start < keys.len() {
-        execute_slice(start, keys.len());
-    }
+    for_each_ready_index(keys.len(), |i| ready(keys[i]), execute_slice, |i| wait_list(keys[i]));
 }
 
 /// Whether `list` holds a CPU write that overlaps `[va, va + bytes)`. Such a write only happens

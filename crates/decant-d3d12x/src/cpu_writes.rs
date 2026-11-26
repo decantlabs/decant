@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use windows_sys::core::{GUID, HRESULT};
@@ -65,6 +65,10 @@ const SLOT_GET_CLOCK_CALIBRATION: usize = 17;
 /// The longest the worker waits for a submission before it makes the writes anyway. That covers a
 /// removed device or a queue that never gets to the signal.
 const SUBMISSION_WAIT_MS: u32 = 10_000;
+/// Short grace period used for backlogged jobs on a queue whose GPU fence already timed out for
+/// [`SUBMISSION_WAIT_MS`] and still has not advanced a single tick. Avoids `N * 10s` cascading
+/// stalls while still allowing immediate recovery the moment the fence moves.
+const STALLED_FENCE_WAIT_MS: u32 = 200;
 
 /// The function in vtable slot `slot` of `object`.
 ///
@@ -110,7 +114,6 @@ impl Clock {
 }
 
 /// What the module keeps for one queue.
-#[derive(Default)]
 struct QueueSlot {
     /// The raw fence of the queue and the last value signalled on it. The fence lives as long as
     /// the process.
@@ -120,6 +123,14 @@ struct QueueSlot {
     /// The sender for this queue's dedicated worker thread, so a slow or blocked fence on one
     /// queue never stalls CPU writes for another queue.
     sender: Option<mpsc::Sender<Job>>,
+    /// Per-queue active-producer tracker shared with every job queued for this queue.
+    activity: Arc<QueueActivity>,
+}
+
+impl Default for QueueSlot {
+    fn default() -> Self {
+        Self { fence: None, clock: None, sender: None, activity: Arc::new(QueueActivity::default()) }
+    }
 }
 
 static QUEUES: Mutex<Option<HashMap<usize, QueueSlot>>> = Mutex::new(None);
@@ -155,28 +166,132 @@ fn counter_now() -> u64 {
     u64::try_from(ticks).unwrap_or(0)
 }
 
-/// One job's claim on [`PENDING_JOBS`]. Dropping or releasing it lowers the count once and wakes
-/// memory waits so idle waits can observe that no producer remains.
-struct ActiveJob(bool);
+/// State of one queue's pending bottom-of-pipe jobs for active-producer tracking.
+#[derive(Default)]
+struct ActivityState {
+    /// Jobs enqueued onto this queue whose writes have not yet been applied.
+    pending: usize,
+    /// Whether this queue currently holds a `+1` claim on [`ACTIVE_QUEUES`].
+    active: bool,
+    /// Whether this queue's head job passed [`ACTIVE_WAIT_MS`] without its fence advancing. While
+    /// set, backlogged jobs enqueued behind it do not re-claim [`ACTIVE_QUEUES`] until the fence
+    /// advances or the queue drains back to idle.
+    stalled: bool,
+}
 
-impl ActiveJob {
-    fn acquire() -> Self {
-        PENDING_JOBS.fetch_add(1, Ordering::AcqRel);
-        Self(true)
+/// Per-queue active-producer tracker. Each queue contributes at most `1` to [`ACTIVE_QUEUES`], so
+/// backlogged jobs sitting behind a stalled GPU fence never keep other queues pinned to the hard
+/// memory wait timeout.
+#[derive(Default)]
+struct QueueActivity {
+    state: Mutex<ActivityState>,
+}
+
+impl QueueActivity {
+    fn lock(&self) -> MutexGuard<'_, ActivityState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn release(&mut self) {
-        if self.0 {
-            self.0 = false;
-            PENDING_JOBS.fetch_sub(1, Ordering::AcqRel);
+    /// Registers one newly enqueued job on this queue.
+    fn enqueue(self: &Arc<Self>) -> JobActivityGuard {
+        let mut st = self.lock();
+        st.pending += 1;
+        if !st.active && !st.stalled {
+            st.active = true;
+            ACTIVE_QUEUES.fetch_add(1, Ordering::AcqRel);
+        }
+        drop(st);
+        JobActivityGuard { activity: Arc::clone(self), finished: false }
+    }
+
+    /// Marks this queue as stalled, releasing its single [`ACTIVE_QUEUES`] claim and waking waits.
+    fn mark_stalled(&self) {
+        let wake = {
+            let mut st = self.lock();
+            st.stalled = true;
+            if st.active {
+                st.active = false;
+                ACTIVE_QUEUES.fetch_sub(1, Ordering::AcqRel);
+                true
+            } else {
+                false
+            }
+        };
+        if wake {
             wake_waits();
+        }
+    }
+
+    /// Notes that this queue's GPU fence made progress again, restoring active tracking if further
+    /// jobs remain queued behind the current one.
+    fn mark_progressed(&self) {
+        let mut st = self.lock();
+        if st.stalled {
+            st.stalled = false;
+            if st.pending > 1 && !st.active {
+                st.active = true;
+                ACTIVE_QUEUES.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// Completes one job on this queue. Clears stalled state and releases [`ACTIVE_QUEUES`] once
+    /// the queue drains back to zero pending jobs.
+    fn finish_job(&self) {
+        let wake = {
+            let mut st = self.lock();
+            st.pending = st.pending.saturating_sub(1);
+            if st.pending == 0 {
+                st.stalled = false;
+                if st.active {
+                    st.active = false;
+                    ACTIVE_QUEUES.fetch_sub(1, Ordering::AcqRel);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if wake {
+            wake_waits();
+        }
+    }
+
+    fn is_stalled(&self) -> bool {
+        self.lock().stalled
+    }
+}
+
+/// Ensures every enqueued [`Job`] decrements its queue's pending count exactly once.
+struct JobActivityGuard {
+    activity: Arc<QueueActivity>,
+    finished: bool,
+}
+
+impl JobActivityGuard {
+    fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.activity.finish_job();
         }
     }
 }
 
-impl Drop for ActiveJob {
+impl Drop for JobActivityGuard {
     fn drop(&mut self) {
-        self.release();
+        self.finish();
+    }
+}
+
+/// Decides the total wait limit for a job whose fence currently reads `current` (`< target`),
+/// given the completed value where the previous job on the same queue timed out (`stalled_at`).
+fn fence_wait_limit_ms(current: u64, stalled_at: Option<u64>) -> (u32, bool) {
+    if stalled_at == Some(current) {
+        (STALLED_FENCE_WAIT_MS, true)
+    } else {
+        (SUBMISSION_WAIT_MS, false)
     }
 }
 
@@ -187,7 +302,7 @@ struct Job {
     writes: Vec<CpuWrite>,
     /// The clock of the queue, present when some write is a timestamp.
     clock: Option<Clock>,
-    active: ActiveJob,
+    guard: JobActivityGuard,
 }
 
 impl Job {
@@ -195,27 +310,39 @@ impl Job {
     ///
     /// # Safety
     /// The fence is live and `event` is an event handle that no other thread uses.
-    unsafe fn run(mut self, event: HANDLE) {
+    unsafe fn run(mut self, event: HANDLE, stalled_fence_at: &mut Option<u64>) {
         let fence = self.fence as Object;
         // SAFETY: by the contract above.
         unsafe {
             let completed: GetCompletedValue = vslot(fence, SLOT_GET_COMPLETED_VALUE);
-            if completed(fence) < self.value {
+            let before = completed(fence);
+            if before >= self.value {
+                *stalled_fence_at = None;
+                self.guard.activity.mark_progressed();
+            } else {
+                let (limit_ms, already_stalled) = fence_wait_limit_ms(before, *stalled_fence_at);
+                if already_stalled {
+                    self.guard.activity.mark_stalled();
+                } else {
+                    *stalled_fence_at = None;
+                }
                 let arm: SetEventOnCompletion = vslot(fence, SLOT_SET_EVENT_ON_COMPLETION);
                 if arm(fence, self.value, event) >= 0 {
                     let started = Instant::now();
                     let active_limit = Duration::from_millis(u64::from(ACTIVE_WAIT_MS));
-                    let total_limit = Duration::from_millis(u64::from(SUBMISSION_WAIT_MS));
+                    let total_limit = Duration::from_millis(u64::from(limit_ms));
+                    let mut marked_stalled = already_stalled || self.guard.activity.is_stalled();
                     while completed(fence) < self.value {
                         let elapsed = started.elapsed();
                         if elapsed >= total_limit {
                             break;
                         }
-                        if self.active.0 && elapsed >= active_limit {
-                            self.active.release();
+                        if !marked_stalled && elapsed >= active_limit {
+                            marked_stalled = true;
+                            self.guard.activity.mark_stalled();
                         }
-                        let remaining = if self.active.0 {
-                            active_limit.saturating_sub(elapsed)
+                        let remaining = if !marked_stalled {
+                            active_limit.saturating_sub(elapsed).min(total_limit.saturating_sub(elapsed))
                         } else {
                             total_limit.saturating_sub(elapsed)
                         };
@@ -226,10 +353,26 @@ impl Job {
                         }
                     }
                 }
+                let after = completed(fence);
+                if after >= self.value || after > before {
+                    *stalled_fence_at = None;
+                    self.guard.activity.mark_progressed();
+                } else {
+                    *stalled_fence_at = Some(after);
+                    self.guard.activity.mark_stalled();
+                    static STALL_LOGS: AtomicU32 = AtomicU32::new(0);
+                    let n = STALL_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 8 || n.is_power_of_two() {
+                        xs_log!(
+                            "bottom-of-pipe writes: queue fence stalled at {after} waiting for {}, applying writes after {limit_ms} ms ({n} so far)",
+                            self.value
+                        );
+                    }
+                }
             }
         }
         apply_writes(&self.writes, self.clock);
-        self.active.release();
+        self.guard.finish();
     }
 }
 
@@ -250,8 +393,8 @@ pub(crate) fn apply_writes(writes: &[CpuWrite], clock: Option<Clock>) {
     wake_waits();
 }
 
-/// Submissions whose writes are not made yet: sent to the worker, not yet run by it.
-static PENDING_JOBS: AtomicUsize = AtomicUsize::new(0);
+/// Queues that currently have active, non-stalled bottom-of-pipe write jobs in flight.
+static ACTIVE_QUEUES: AtomicUsize = AtomicUsize::new(0);
 
 /// A count of the times writes were made, and the waits that sleep until it moves.
 fn writes_made() -> &'static (Mutex<u64>, Condvar) {
@@ -286,7 +429,7 @@ fn sleep_until_written(seen: u64, timeout: Duration) {
 
 /// Spawns one dedicated worker thread for a single queue, running `run` on each queued item in
 /// order with its own fence event handle.
-fn spawn_queue_worker<T: Send + 'static>(run: impl Fn(T, HANDLE) + Send + 'static) -> Option<mpsc::Sender<T>> {
+fn spawn_queue_worker<T: Send + 'static>(mut run: impl FnMut(T, HANDLE) + Send + 'static) -> Option<mpsc::Sender<T>> {
     let (sender, jobs) = mpsc::channel::<T>();
     let started = std::thread::Builder::new().name("decant-cpu-writes".into()).spawn(move || {
         // SAFETY: the event is made here and only this thread uses it.
@@ -430,7 +573,7 @@ pub(crate) fn wait_all_until(
         if waited >= limits.hard {
             return waits.iter().copied().filter(|w| !satisfied(w)).collect();
         }
-        if waited >= limits.idle && PENDING_JOBS.load(Ordering::Acquire) == 0 && !elsewhere() {
+        if waited >= limits.idle && ACTIVE_QUEUES.load(Ordering::Acquire) == 0 && !elsewhere() {
             return waits.iter().copied().filter(|w| !satisfied(w)).collect();
         }
         let until_idle = if waited < limits.idle { limits.idle - waited } else { RECHECK };
@@ -538,9 +681,10 @@ pub(crate) unsafe fn after(queue: Object, writes: Vec<CpuWrite>) {
             slot.fence = Some((fence as usize, 0));
         }
         if slot.sender.is_none() {
-            slot.sender = spawn_queue_worker(|job: Job, event| {
+            let mut stalled_fence_at: Option<u64> = None;
+            slot.sender = spawn_queue_worker(move |job: Job, event| {
                 // SAFETY: `QUEUES` keeps the fences alive for the process.
-                unsafe { job.run(event) };
+                unsafe { job.run(event, &mut stalled_fence_at) };
             });
         }
         let Some(sender) = slot.sender.clone() else {
@@ -557,7 +701,8 @@ pub(crate) unsafe fn after(queue: Object, writes: Vec<CpuWrite>) {
             log_failure("Signal of the queue", hr);
             return;
         }
-        let job = Job { fence: *fence, value: *signalled, writes, clock, active: ActiveJob::acquire() };
+        let guard = slot.activity.enqueue();
+        let job = Job { fence: *fence, value: *signalled, writes, clock, guard };
         (sender, job)
     };
     if ANNOUNCED.fetch_add(1, Ordering::Relaxed) < 3 {
@@ -763,18 +908,45 @@ mod tests {
     }
 
     #[test]
-    fn active_job_release_drops_pending_count_so_idle_waits_finish() {
+    fn stalled_queue_with_backlogged_jobs_drops_active_producers_to_zero() {
+        let queue = Arc::new(QueueActivity::default());
         let cell = Box::new(AtomicU64::new(0));
         let wait = PendingWait { va: std::ptr::from_ref(&*cell) as u64, width: 8, comparison: 7, value: 1, mask: u64::MAX };
-        let mut active = ActiveJob::acquire();
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
-            active.release();
+
+        // Enqueue 20 backlogged jobs on one queue: ACTIVE_QUEUES only rises by 1, not 20.
+        let mut guards: Vec<JobActivityGuard> = (0..20).map(|_| queue.enqueue()).collect();
+        let baseline = ACTIVE_QUEUES.load(Ordering::Acquire);
+        assert!(baseline >= 1);
+
+        // Once the head job marks the queue stalled, ACTIVE_QUEUES drops cleanly even while 19
+        // backlogged jobs remain and even when more jobs are enqueued behind them.
+        let queue_bg = Arc::clone(&queue);
+        let staller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(35));
+            queue_bg.mark_stalled();
+            let extra = queue_bg.enqueue();
+            std::thread::sleep(Duration::from_millis(10));
+            drop(extra);
         });
         let begun = Instant::now();
         let unmet = wait_all_until(&[wait], WaitLimits { idle: Duration::from_millis(20), hard: Duration::from_secs(2) }, || false, || false);
-        releaser.join().unwrap();
+        staller.join().unwrap();
         assert_eq!(unmet.len(), 1);
-        assert!(begun.elapsed() < Duration::from_millis(400), "wait exited once stalled active job released ({:?})", begun.elapsed());
+        assert!(begun.elapsed() < Duration::from_millis(400), "backlogged stalled queue must not pin waits to hard limit ({:?})", begun.elapsed());
+
+        // Progress restores active tracking while remaining jobs exist, and draining releases it.
+        queue.mark_progressed();
+        assert_eq!(ACTIVE_QUEUES.load(Ordering::Acquire), baseline);
+        for g in &mut guards {
+            g.finish();
+        }
+        assert_eq!(ACTIVE_QUEUES.load(Ordering::Acquire), baseline - 1);
+    }
+
+    #[test]
+    fn stalled_fence_wait_limit_shortens_until_fence_advances() {
+        assert_eq!(fence_wait_limit_ms(10, None), (SUBMISSION_WAIT_MS, false));
+        assert_eq!(fence_wait_limit_ms(10, Some(10)), (STALLED_FENCE_WAIT_MS, true));
+        assert_eq!(fence_wait_limit_ms(11, Some(10)), (SUBMISSION_WAIT_MS, false));
     }
 }

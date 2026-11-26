@@ -319,15 +319,24 @@ pub(crate) fn busy_elsewhere(queue: usize) -> bool {
 /// One queued submission that holds an object: its queue and sequence number.
 type Holder = (Arc<Fifo>, u64);
 
-/// Objects held by queued submissions, mapped to each holding submission.
+/// Objects held by queued submissions, mapped to each holding submission, together with optional
+/// recycle callbacks for PC backing command lists detached by a concurrent `Reset`.
+#[derive(Default)]
+struct HeldState {
+    holders: HashMap<HoldKey, Vec<Holder>>,
+    /// Callbacks attached to a detached `HoldKey::List(pc)` key, run once the last queued
+    /// submission holding that PC backing list drops.
+    detached: HashMap<usize, Vec<Job>>,
+}
+
 struct Held {
-    holders: Mutex<HashMap<HoldKey, Vec<Holder>>>,
+    state: Mutex<HeldState>,
     changed: Condvar,
 }
 
 fn held() -> &'static Held {
     static HELD: OnceLock<Held> = OnceLock::new();
-    HELD.get_or_init(|| Held { holders: Mutex::new(HashMap::new()), changed: Condvar::new() })
+    HELD.get_or_init(|| Held { state: Mutex::new(HeldState::default()), changed: Condvar::new() })
 }
 
 /// How many holds there are in all, so a `Reset` without any queued work takes no lock.
@@ -343,9 +352,9 @@ pub(crate) struct Hold {
 impl Hold {
     fn acquire(fifo: Arc<Fifo>, seq: u64, keys: Vec<HoldKey>) -> Self {
         if !keys.is_empty() {
-            let mut holders = held().holders.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = held().state.lock().unwrap_or_else(|e| e.into_inner());
             for &key in &keys {
-                holders.entry(key).or_default().push((Arc::clone(&fifo), seq));
+                st.holders.entry(key).or_default().push((Arc::clone(&fifo), seq));
             }
             HELD_TOTAL.fetch_add(keys.len(), Ordering::AcqRel);
         }
@@ -359,20 +368,57 @@ impl Drop for Hold {
             return;
         }
         let h = held();
-        let mut holders = h.holders.lock().unwrap_or_else(|e| e.into_inner());
-        for &key in &self.keys {
-            if let Some(entries) = holders.get_mut(&key) {
-                if let Some(pos) = entries.iter().position(|(f, s)| *s == self.seq && Arc::ptr_eq(f, &self.fifo)) {
-                    entries.swap_remove(pos);
-                }
-                if entries.is_empty() {
-                    holders.remove(&key);
+        let mut to_recycle: Vec<Job> = Vec::new();
+        {
+            let mut st = h.state.lock().unwrap_or_else(|e| e.into_inner());
+            for &key in &self.keys {
+                if let Some(entries) = st.holders.get_mut(&key) {
+                    if let Some(pos) = entries.iter().position(|(f, s)| *s == self.seq && Arc::ptr_eq(f, &self.fifo)) {
+                        entries.swap_remove(pos);
+                    }
+                    if entries.is_empty() {
+                        st.holders.remove(&key);
+                        if let HoldKey::List(pc) = key
+                            && let Some(callbacks) = st.detached.remove(&pc)
+                        {
+                            to_recycle.extend(callbacks);
+                        }
+                    }
                 }
             }
+            HELD_TOTAL.fetch_sub(self.keys.len(), Ordering::AcqRel);
         }
-        HELD_TOTAL.fetch_sub(self.keys.len(), Ordering::AcqRel);
-        drop(holders);
         h.changed.notify_all();
+        for job in to_recycle {
+            if std::panic::catch_unwind(AssertUnwindSafe(job)).is_err() {
+                xs_log!("queue order: a detached command list recycle callback panicked");
+            }
+        }
+    }
+}
+
+/// Whether any queued submission currently holds PC command list `key`.
+pub(crate) fn is_list_held(key: usize) -> bool {
+    if HELD_TOTAL.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    held().state.lock().unwrap_or_else(|e| e.into_inner()).holders.contains_key(&HoldKey::List(key))
+}
+
+/// Attaches `recycle` to run once every queued submission holding PC command list `key` has
+/// finished and dropped its hold. If no submission holds `key` any longer, runs `recycle` at once.
+pub(crate) fn detach_or_recycle_list(key: usize, recycle: impl FnOnce() + Send + 'static) {
+    let run_now = {
+        let mut st = held().state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.holders.contains_key(&HoldKey::List(key)) {
+            st.detached.entry(key).or_default().push(Box::new(recycle));
+            None
+        } else {
+            Some(recycle)
+        }
+    };
+    if let Some(recycle) = run_now {
+        recycle();
     }
 }
 
@@ -384,14 +430,14 @@ fn wait_key_idle(key: HoldKey, grace: Duration) {
         return;
     }
     let h = held();
-    let mut holders = h.holders.lock().unwrap_or_else(|e| e.into_inner());
-    if !holders.contains_key(&key) {
+    let mut st = h.state.lock().unwrap_or_else(|e| e.into_inner());
+    if !st.holders.contains_key(&key) {
         return;
     }
     let urgent_at = Instant::now() + grace;
     let mut escalated = false;
     let mut warn_at = Instant::now() + Duration::from_secs(10);
-    while let Some(entries) = holders.get(&key) {
+    while let Some(entries) = st.holders.get(&key) {
         let now = Instant::now();
         if now >= urgent_at {
             let mut nudged = false;
@@ -415,9 +461,9 @@ fn wait_key_idle(key: HoldKey, grace: Duration) {
                 warn_at = now + Duration::from_secs(10);
                 xs_log!("queue order: Reset of {key:?} is still waiting for its queued submission to finish");
             }
-            holders = h.changed.wait_timeout(holders, Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
+            st = h.changed.wait_timeout(st, Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
         } else {
-            holders = h.changed.wait_timeout(holders, urgent_at - now).unwrap_or_else(|e| e.into_inner()).0;
+            st = h.changed.wait_timeout(st, urgent_at - now).unwrap_or_else(|e| e.into_inner()).0;
         }
     }
 }
@@ -764,5 +810,105 @@ mod tests {
         for k in [l0, l1, l2, c0] {
             forget(k);
         }
+    }
+
+    #[test]
+    fn detached_list_recycles_only_after_all_holding_submissions_finish() {
+        let (q_a, q_b, pc_list) = (0x7100_0010, 0x7100_0011, 0x7100_4001);
+        let recycled = Arc::new(AtomicUsize::new(0));
+        // Detaching an unheld list recycles immediately.
+        let r0 = Arc::clone(&recycled);
+        detach_or_recycle_list(pc_list, move || {
+            r0.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(recycled.load(Ordering::SeqCst), 1);
+
+        // Hold the same PC list in two submissions on two queues; recycle runs only when both end.
+        let (tx_a, rx_a) = std::sync::mpsc::channel::<()>();
+        let (tx_b, rx_b) = std::sync::mpsc::channel::<()>();
+        let (in_a_tx, in_a_rx) = std::sync::mpsc::channel::<()>();
+        let (in_b_tx, in_b_rx) = std::sync::mpsc::channel::<()>();
+        defer_holding(q_a, vec![HoldKey::List(pc_list)], move |hold| {
+            Box::new(move || {
+                let _hold = hold;
+                let _ = in_a_tx.send(());
+                let _ = rx_a.recv();
+            })
+        });
+        defer_holding(q_b, vec![HoldKey::List(pc_list)], move |hold| {
+            Box::new(move || {
+                let _hold = hold;
+                let _ = in_b_tx.send(());
+                let _ = rx_b.recv();
+            })
+        });
+        in_a_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        in_b_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(is_list_held(pc_list));
+
+        let r1 = Arc::clone(&recycled);
+        detach_or_recycle_list(pc_list, move || {
+            r1.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(recycled.load(Ordering::SeqCst), 1, "not recycled while two submissions hold it");
+
+        let _ = tx_a.send(());
+        assert!(drain(q_a, Duration::from_secs(5)));
+        assert_eq!(recycled.load(Ordering::SeqCst), 1, "still held by second submission");
+        assert!(is_list_held(pc_list));
+
+        let _ = tx_b.send(());
+        assert!(drain(q_b, Duration::from_secs(5)));
+        assert_eq!(recycled.load(Ordering::SeqCst), 2, "recycled once last hold dropped");
+        assert!(!is_list_held(pc_list));
+    }
+
+    #[test]
+    fn reset_swap_breaks_lifo_list_pool_producer_consumer_deadlock() {
+        // Reproduces a LIFO command-list pool: Queue A queues consumer PC_1 waiting on X >= 1;
+        // the caller immediately recycles the list proxy by detaching PC_1 and swapping in PC_2
+        // to record & submit the producer on Queue B. Queue A wakes up with X == 1 (zero timeout,
+        // zero out-of-order execution) and PC_1 recycles only after executing.
+        let (q_cons, q_prod, pc_1) = (0x7100_0012, 0x7100_0013, 0x7100_4002);
+        let label = Box::new(AtomicU64::new(0));
+        let va = std::ptr::from_ref(&*label) as usize;
+        let wait = greater_equal(&label, 1);
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+        let cons_met = Arc::new(AtomicBool::new(false));
+
+        let ev_cons = Arc::clone(&events);
+        let met_flag = Arc::clone(&cons_met);
+        let limits = WaitLimits { idle: Duration::from_secs(5), hard: Duration::from_secs(10) };
+        defer_holding(q_cons, vec![HoldKey::List(pc_1)], move |hold| {
+            Box::new(move || {
+                let _hold = hold;
+                let scope = enter_wait();
+                let unmet = wait_all_until(&[wait], limits, || true, || scope.interrupted());
+                met_flag.store(unmet.is_empty(), Ordering::SeqCst);
+                ev_cons.lock().unwrap().push("consumer_exec");
+            })
+        });
+
+        // Caller immediately recycles the list via detach-and-swap (zero blocking!).
+        let begun = Instant::now();
+        assert!(is_list_held(pc_1));
+        let ev_rec = Arc::clone(&events);
+        detach_or_recycle_list(pc_1, move || {
+            ev_rec.lock().unwrap().push("pc1_recycled");
+        });
+        assert!(begun.elapsed() < Duration::from_millis(50), "Reset swap did not block");
+
+        // Now the same caller records and submits the producer on Queue B using the swapped list.
+        {
+            let _gate = inline_gate(q_prod, || true).expect("producer queue is idle");
+            events.lock().unwrap().push("producer_write");
+            apply_writes(&[(va, vec![1, 0])], None);
+        }
+
+        assert!(drain(q_cons, Duration::from_secs(5)));
+        assert!(cons_met.load(Ordering::SeqCst), "consumer ran with wait satisfied, never accelerated");
+        assert_eq!(*events.lock().unwrap(), ["producer_write", "consumer_exec", "pc1_recycled"]);
+        assert!(begun.elapsed() < Duration::from_millis(200), "completed in {:?}", begun.elapsed());
+        drop(label);
     }
 }

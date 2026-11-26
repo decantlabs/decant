@@ -270,6 +270,45 @@ pub(crate) fn forget(list: usize) {
     });
 }
 
+/// Snapshot of constant buffer copies detached for a queued submission, so a later `Reset` of the
+/// console list proxy can clear its live table without losing refreshes for the queued backing list.
+pub(crate) struct QueuedCopies {
+    copies: Vec<(CbvCopy, u64)>,
+    kept: usize,
+}
+
+/// Captures the unsubmitted constant buffer copies of `lists` at enqueue time and marks those lists
+/// submitted, matching [`submitted`].
+pub(crate) fn snapshot_for_submission(lists: &[usize]) -> QueuedCopies {
+    let mut copies = Vec::new();
+    let mut kept = 0usize;
+    for &list in lists {
+        with_shard(list, |shard| {
+            let Some(l) = shard.get_mut(&list) else { return };
+            if l.submitted {
+                kept += l.copies.len();
+                return;
+            }
+            l.submitted = true;
+            copies.extend_from_slice(&l.copies);
+        });
+    }
+    QueuedCopies { copies, kept }
+}
+
+/// Brings the snapshotted copies of a queued submission up to date with the title's bytes right
+/// before its backing command lists execute on the PC queue.
+pub(crate) fn refresh_snapshot(snapshot: &QueuedCopies) -> Refresh {
+    let mut r = Refresh { copies: 0, stale: 0, kept: snapshot.kept };
+    for (c, hash) in &snapshot.copies {
+        r.copies += 1;
+        if refresh_copy(c, *hash) {
+            r.stale += 1;
+        }
+    }
+    r
+}
+
 /// The lists `lists` (console list proxies) are about to be submitted: their copies are brought up
 /// to date with the title's bytes.
 pub(crate) fn submitted(lists: &[usize]) -> Refresh {
@@ -454,5 +493,25 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn queued_snapshot_survives_reset_and_refreshes_stale_copy() {
+        let list = 0x5000_9999usize;
+        let mut title = [1u8; 32];
+        let mut upload = [1u8; 32];
+        let c = CbvCopy { dst: 0x200, va: title.as_ptr() as u64, size: 32, cpu: upload.as_mut_ptr() as usize };
+        assert!(!recorded(list, c));
+        let snap = snapshot_for_submission(&[list]);
+        // Simulating a second queued submission before Reset keeps the copies without duplicating.
+        let snap2 = snapshot_for_submission(&[list]);
+        assert_eq!(snap2.copies.len(), 0);
+        assert_eq!(snap2.kept, 1);
+        // Reset clears the proxy's live entry before the queued submission runs.
+        forget(list);
+        title[5] = 0x77;
+        let r = refresh_snapshot(&snap);
+        assert_eq!(r, Refresh { copies: 1, stale: 1, kept: 0 });
+        assert_eq!(upload, title);
     }
 }
