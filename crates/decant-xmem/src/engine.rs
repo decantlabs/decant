@@ -1116,6 +1116,7 @@ impl Engine {
             st.commits.remove(&address);
             let frames: Vec<u32> = (0..count as u32).map(|k| first + k * FRAMES_PER_PAGE).collect();
             st.pages.free(&frames)?;
+            Self::reset_unused_frames(&st, &frames);
             return Ok(size);
         }
         let size = st.regions.at(address).filter(|r| r.kind == Kind::Allocation).ok_or(RegionError::Unknown)?.size;
@@ -1219,7 +1220,10 @@ impl Engine {
     /// Frees pages. All or nothing. A page that a view still maps stays readable through it until
     /// the last view ends.
     pub fn free_pages(&self, frames: &[u32]) -> Result<(), EngineError> {
-        Ok(self.lock().pages.free(frames)?)
+        let mut st = self.lock();
+        st.pages.free(frames)?;
+        Self::reset_unused_frames(&st, frames);
+        Ok(())
     }
 
     /// Maps page `i` at `base + i * 64 KiB` for each entry. An entry of 0 unmaps that page, and a
@@ -1295,7 +1299,9 @@ impl Engine {
                     self.forget_view(&mut st, dirty, at)?;                    // The pages of a commit go back to the pool with the reservation.
                     if let Some((first, count)) = st.commits.remove(&at) {
                         let frames: Vec<u32> = (0..count as u32).map(|k| first + k * FRAMES_PER_PAGE).collect();
-                        let _ = st.pages.free(&frames);
+                        if st.pages.free(&frames).is_ok() {
+                            Self::reset_unused_frames(&st, &frames);
+                        }
                     }
                 }
             }
@@ -1819,6 +1825,51 @@ impl Engine {
         let mut indices = Vec::new();
         Self::collect_rw_view_indices_into(st, address, len, &mut indices);
         indices
+    }
+
+    /// Hints Windows to discard physical backing for freed, unmapped pool pages via `MEM_RESET`
+    /// while keeping section reservations intact. Pages still mapped by any view are skipped.
+    fn reset_unused_frames(st: &State, frames: &[u32]) {
+        const MEM_RESET: u32 = 0x8_0000;
+        if on_wine() || frames.is_empty() {
+            return;
+        }
+        let mut unused: Vec<usize> = frames
+            .iter()
+            .copied()
+            .filter(|&f| !st.pages.is_in_use(f))
+            .filter_map(index_of)
+            .collect();
+        if unused.is_empty() {
+            return;
+        }
+        unused.sort_unstable();
+        unused.dedup();
+        let mut i = 0;
+        while i < unused.len() {
+            let start_idx = unused[i];
+            let Some(sec) = st.sections.iter().find(|s| start_idx >= s.start && start_idx < s.start + s.pages) else {
+                i += 1;
+                continue;
+            };
+            let sec_end = sec.start + sec.pages;
+            let mut run_len = 1usize;
+            while i + run_len < unused.len() {
+                let next_idx = unused[i + run_len];
+                if next_idx == start_idx + run_len && next_idx < sec_end {
+                    run_len += 1;
+                } else {
+                    break;
+                }
+            }
+            let base_addr = sec.rw_view + (start_idx - sec.start) * PAGE_BYTES;
+            let run_bytes = run_len * PAGE_BYTES;
+            if page_committed(base_addr) {
+                // SAFETY: `base_addr..base_addr + run_bytes` is inside one section's private view and unmapped.
+                unsafe { VirtualAlloc(base_addr as *const c_void, run_bytes, MEM_RESET, PAGE_READWRITE) };
+            }
+            i += run_len;
+        }
     }
 
     /// Commits any uncommitted pool pages in `indices` in maximal contiguous section runs.
@@ -3388,5 +3439,28 @@ mod tests {
             drop(state_guard);
         });
         e.release(area).unwrap();
+    }
+
+    #[test]
+    fn free_pages_resets_unmapped_pages_and_preserves_still_mapped_pages() {
+        let Some(e) = held(|| Engine::load_limited(4, 4)) else { return };
+        let area = e.reserve(0, 2 * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(2).unwrap();
+        e.map_frames(area, &frames[..1]).unwrap();
+        write(area, 0, 0x7A);
+
+        // frames[0] is still mapped, frames[1] is unmapped.
+        e.free_pages(&frames).unwrap();
+        assert_eq!(read(area, 0), 0x7A, "still-mapped freed page keeps its bytes");
+
+        e.release(area).unwrap();
+        let reused = e.allocate_pages(2).unwrap();
+        let area2 = e.reserve(0, 2 * P, PAGE_READWRITE).unwrap();
+        e.map_frames(area2, &reused).unwrap();
+        write(area2, 0, 0x11);
+        write(area2 + P, 0, 0x22);
+        assert_eq!((read(area2, 0), read(area2 + P, 0)), (0x11, 0x22));
+        e.release(area2).unwrap();
+        e.free_pages(&reused).unwrap();
     }
 }
