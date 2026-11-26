@@ -498,12 +498,14 @@ fn make(queue: &ID3D12CommandQueue, w: u32, h: u32, fmt: DXGI_FORMAT) -> windows
 /// Flush recorded trace events periodically so long runs keep trace JSON on disk.
 const TRACE_FLUSH_INTERVAL: u64 = 300;
 
-/// Copies `resource` into the next back buffer and presents it. False when it cannot be shown
+/// Copies `plane0` into the next back buffer, optionally composes `plane1` over it with
+/// premultiplied alpha (`present_over`, `DECANT_D3D12X_PRESENT_OVER`), and presents. If `plane0` is
+/// null and `plane1` is non-null, `plane1` is shown directly. False when it cannot be shown
 /// (not enabled, no window, a format a swap chain does not take, a failed call), logged once.
 ///
 /// # Safety
-/// `queue` is a live PC `ID3D12CommandQueue`, `resource` null or a live PC `ID3D12Resource`.
-pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
+/// `queue` is a live PC `ID3D12CommandQueue`; each non-null plane is a live PC `ID3D12Resource`.
+pub unsafe fn show_planes(queue: *mut c_void, plane0: *mut c_void, plane1: *mut c_void) -> bool {
     static FAILED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     let fail = |why: String| {
         if FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -511,14 +513,18 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
         }
         false
     };
+    let (resource, overlay) = if plane0.is_null() { (plane1, std::ptr::null_mut()) } else { (plane0, plane1) };
     if !enabled() || queue.is_null() || resource.is_null() {
         return false;
     }
     let _trace = decant_trace::span("present", "show");
+    let overlay = if !overlay.is_null() && overlay != resource && crate::present_over::enabled() { overlay } else { std::ptr::null_mut() };
     // SAFETY: by the contract above.
     let (Some(queue), Some(source)) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }, unsafe { ID3D12Resource::from_raw_borrowed(&resource) }) else {
         return false;
     };
+    // SAFETY: by the contract above; null yields None.
+    let over_res = unsafe { ID3D12Resource::from_raw_borrowed(&overlay) };
     // SAFETY: a plain query on a live resource.
     let d = unsafe { source.GetDesc() };
     let Some(fmt) = swap_format(d.Format) else {
@@ -619,7 +625,29 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
                     }
                 }
             }
-            let back_state = if marker_enabled() {
+            let mut back_state = D3D12_RESOURCE_STATE_COPY_DEST;
+            if let Some(over) = over_res {
+                let od = over.GetDesc();
+                if let Some(ofmt) = swap_format(od.Format) {
+                    let mut dev: Option<ID3D12Device> = None;
+                    p.queue.GetDevice(&mut dev)?;
+                    if let Some(dev) = dev {
+                        p.list.ResourceBarrier(&[
+                            transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                            transition(over, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                        ]);
+                        if crate::present_over::record(&dev, &p.list, &back, fmt, (w, h), over, ofmt) {
+                            static COMPOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !COMPOSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                xs_log!("present: second plane composed over plane 0 ({}x{} format {} over {w}x{h} format {})", od.Width, od.Height, od.Format.0, d.Format.0);
+                            }
+                        }
+                        p.list.ResourceBarrier(&[transition(over, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                        back_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    }
+                }
+            }
+            if marker_enabled() {
                 if p.marker.is_none() {
                     let mut dev: Option<ID3D12Device> = None;
                     p.queue.GetDevice(&mut dev)?;
@@ -638,24 +666,21 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
                         }
                     }
                 }
-                match &p.marker {
-                    Some(heap) => {
-                        let mut dev: Option<ID3D12Device> = None;
-                        p.queue.GetDevice(&mut dev)?;
-                        let rtv = heap.GetCPUDescriptorHandleForHeapStart();
-                        if let Some(dev) = dev {
-                            dev.CreateRenderTargetView(&back, None, rtv);
-                        }
-                        p.list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
-                        let square = RECT { left: 64, top: 64, right: 576, bottom: 576 };
-                        p.list.ClearRenderTargetView(rtv, &[1.0, 0.0, 1.0, 1.0], Some(&[square]));
-                        D3D12_RESOURCE_STATE_RENDER_TARGET
+                if let Some(heap) = &p.marker {
+                    let mut dev: Option<ID3D12Device> = None;
+                    p.queue.GetDevice(&mut dev)?;
+                    let rtv = heap.GetCPUDescriptorHandleForHeapStart();
+                    if let Some(dev) = dev {
+                        dev.CreateRenderTargetView(&back, None, rtv);
                     }
-                    None => D3D12_RESOURCE_STATE_COPY_DEST,
+                    if back_state != D3D12_RESOURCE_STATE_RENDER_TARGET {
+                        p.list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                        back_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    }
+                    let square = RECT { left: 64, top: 64, right: 576, bottom: 576 };
+                    p.list.ClearRenderTargetView(rtv, &[1.0, 0.0, 1.0, 1.0], Some(&[square]));
                 }
-            } else {
-                D3D12_RESOURCE_STATE_COPY_DEST
-            };
+            }
             let mut after_len = 0usize;
             let mut after = [D3D12_RESOURCE_BARRIER::default(), D3D12_RESOURCE_BARRIER::default()];
             if src_state != D3D12_RESOURCE_STATE_COPY_SOURCE {

@@ -456,7 +456,16 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
             crate::title_heap::list_reset(this as usize);
             crate::cbv_copies::forget(this as usize);
             crate::flicker_probe::forget(this as usize);
+            crate::uav_barrier_merge::reset(this as usize);
+            crate::indirect_clamp::list_forget(this as usize);
             crate::present::list_reset(proxy.pc as usize);
+        }
+        if proxy.kind == Kind::List as i32 || proxy.kind == Kind::DmaList as i32 {
+            crate::alloc_pool::forget_list(proxy.pc as usize);
+        }
+        if proxy.kind == Kind::Allocator as i32 {
+            // SAFETY: final release of this title allocator proxy.
+            unsafe { crate::alloc_pool::forget(proxy.pc as usize) };
         }
         if proxy.kind == Kind::Resource as i32 {
             crate::views_at::forget_resource(proxy.pc as usize);
@@ -827,19 +836,22 @@ unsafe fn create_list(this: *mut Proxy, mask: u32, kind: u32, alloc: Object, pso
     // SAFETY: by the contract above.
     unsafe {
         let pc = (*this).pc;
-        let alloc = unwrap(alloc);
+        let title_alloc = unwrap(alloc);
+        let backing = crate::alloc_pool::current(title_alloc as usize) as Object;
         // A pipeline made on first bind is made here (null when the PC runtime refused it).
         let pso = unwrap(pso);
         let mut l: Object = std::ptr::null_mut();
-        let mut hr = method::<CreateList>(pc, 12)(pc, mask, kind, alloc, pso, riid, &mut l);
+        let mut hr = method::<CreateList>(pc, 12)(pc, mask, kind, backing, pso, riid, &mut l);
         if hr == E_NOINTERFACE && !is_iid(riid, &IID_GRAPHICS_COMMAND_LIST) {
             xs_log!("console device: command list IID {{{}}} unknown to the PC runtime, created as ID3D12GraphicsCommandList", guid_at(riid));
-            hr = method::<CreateList>(pc, 12)(pc, mask, kind, alloc, pso, &IID_GRAPHICS_COMMAND_LIST, &mut l);
+            hr = method::<CreateList>(pc, 12)(pc, mask, kind, backing, pso, &IID_GRAPHICS_COMMAND_LIST, &mut l);
         }
-        let kind = if is_iid(riid, &IID_DMA_COMMAND_LIST) { Kind::DmaList } else { Kind::List };
-        let hr = give(hr, l, kind, out);
+        let proxy_kind = if is_iid(riid, &IID_DMA_COMMAND_LIST) { Kind::DmaList } else { Kind::List };
+        let hr = give(hr, l, proxy_kind, out);
         if hr >= 0 && !(*out).is_null() {
-            crate::upload_mem::with(|m| m.set_allocator(*out as usize, alloc as usize));
+            crate::alloc_pool::created_on(l as usize, title_alloc as usize, backing as usize, kind as i32);
+            crate::upload_mem::with(|m| m.set_allocator(*out as usize, title_alloc as usize));
+            crate::indirect_clamp::list_reset(*out as usize, pso as usize);
         }
         hr
     }
@@ -868,6 +880,9 @@ extern "system" fn dev_create_allocator(this: *mut Proxy, kind: u32, riid: *cons
         if hr == E_NOINTERFACE && !is_iid(riid, &IID_COMMAND_ALLOCATOR) {
             xs_log!("console device: allocator IID {{{}}} unknown to the PC runtime, created as ID3D12CommandAllocator", guid_at(riid));
             hr = method::<CreateAllocator>(pc, 9)(pc, kind, &IID_COMMAND_ALLOCATOR, &mut a);
+        }
+        if hr >= 0 && !a.is_null() {
+            crate::alloc_pool::note_allocator_type(a as usize, kind as i32);
         }
         give(hr, a, Kind::Allocator, out)
     }
@@ -3077,36 +3092,28 @@ extern "system" fn dev_create_placed_resource(this: *mut Proxy, heap: Object, of
     }
 }
 
-/// The `D3D12_INDIRECT_ARGUMENT_TYPE` of the console only `DispatchX` argument, which has no PC
-/// equivalent.
-const INDIRECT_ARGUMENT_DISPATCH_X: u32 = 105;
-
-/// The PC `D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH` that a `DispatchX` argument is made.
-const PC_INDIRECT_ARGUMENT_DISPATCH: u32 = 2;
-
-/// Console slot 41: CreateCommandSignature. The console only `DispatchX` indirect argument type
-/// (105) is rewritten in the title's description to the PC `Dispatch` type (2), then the PC call
-/// is made with the root signature unwrapped.
+/// Console slot 41: CreateCommandSignature, translating console `DispatchX` (105) to PC
+/// `Dispatch` (2), forwarding `root_sig` only when root-modifying args exist, and registering
+/// single-action signatures for `indirect_clamp`.
 extern "system" fn dev_create_command_signature(this: *mut Proxy, desc: *const u8, root_sig: Object, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
-    if out.is_null() {
+    if out.is_null() || desc.is_null() {
         return E_POINTER;
     }
-    // SAFETY: `this` is a live proxy; `desc` is {NumArgumentDescs: u32, ArgumentDescs: *const
-    // ArgDesc, ByteStride: u32} by the console calling convention, each ArgDesc at least 4 bytes.
+    // SAFETY: `this` is a live proxy; `desc` is a readable 24-byte D3D12_COMMAND_SIGNATURE_DESC.
     unsafe {
         let pc = (*this).pc;
-        let count = std::ptr::read_unaligned::<u32>(desc.cast()) as usize;
-        let first: *mut u8 = std::ptr::read_unaligned(desc.add(8).cast());
-        let step = std::ptr::read_unaligned::<u32>(desc.add(16).cast()) as usize;
-        for index in 0..count {
-            let type_field = first.add(index * step).cast::<u32>();
-            if std::ptr::read_unaligned(type_field) == INDIRECT_ARGUMENT_DISPATCH_X {
-                std::ptr::write_unaligned(type_field, PC_INDIRECT_ARGUMENT_DISPATCH);
+        let translated = crate::indirect_clamp::translate_command_signature_desc(desc);
+        let root_sig = if translated.needs_root { unwrap(root_sig) } else { std::ptr::null_mut() };
+        let mut r: Object = std::ptr::null_mut();
+        let hr = method::<CreateCommandSignature>(pc, 41)(pc, translated.desc.as_ptr().cast(), root_sig, riid, &mut r);
+        if hr >= 0 {
+            if let Some(spec) = translated.spec {
+                crate::indirect_clamp::register_signature(r as usize, spec);
             }
+            *out = r;
+        } else {
+            *out = std::ptr::null_mut();
         }
-        let mut made: Object = std::ptr::null_mut();
-        let hr = method::<CreateCommandSignature>(pc, 41)(pc, desc.cast(), unwrap(root_sig), riid, &mut made);
-        *out = if hr >= 0 { made } else { std::ptr::null_mut() };
         hr
     }
 }
@@ -3520,6 +3527,12 @@ extern "system" fn list_uav_barrier(this: *mut Proxy, n: u32, barriers: *const c
     if !crate::abi::newer_layout() {
         return unknown_slot(this.cast(), Kind::List, 146);
     }
+    if !crate::uav_barrier_merge::take_global(this as usize) {
+        if log_due(&N) {
+            xs_log!("console list slot 146 (UAV barrier, n {n}, barriers {barriers:?}): dropped, a global UAV barrier is already pending on this list");
+        }
+        return;
+    }
     let global = crate::list_sync::global_uav_barrier();
     // SAFETY: `this` is a live proxy; PC slot 26 of ID3D12GraphicsCommandList is ResourceBarrier.
     unsafe {
@@ -3686,6 +3699,7 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
     crate::draw_diag::forget(key);
     crate::flicker_probe::forget(key);
     crate::kind_check::reset(key);
+    crate::uav_barrier_merge::reset(key);
     // SAFETY: `this` is a live proxy, `allocator` and `pso` are proxies or PC objects.
     unsafe {
         let pc = (*this).pc;
@@ -3693,10 +3707,11 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
         crate::detile::list_reset(pc as usize);
         crate::present::list_reset(pc as usize);
         let pso = bound_at_reset(this, pso);
+        crate::indirect_clamp::list_reset(key, pso as usize);
         crate::rt_diag::list_reset(key, pso as usize);
         let allocator = unwrap(allocator);
         crate::upload_mem::with(|m| m.set_allocator(key, allocator as usize));
-        method::<Reset>(pc, 10)(pc, allocator, pso)
+        crate::alloc_pool::reset_list(pc as usize, allocator as usize, |backing| method::<Reset>(pc, 10)(pc, backing as Object, pso))
     }
 }
 
@@ -3765,7 +3780,15 @@ unsafe fn execute_closed(pc: Object, lists: &[Object]) {
         xs_log!("console queue: {} unclosed command lists left out of a submission of {}", lists.len() - kept.len(), lists.len());
     }
     // SAFETY: by the contract above.
-    unsafe { method::<Execute>(pc, 10)(pc, kept.len() as u32, kept.as_ptr()) };
+    unsafe {
+        if !kept.is_empty() {
+            crate::alloc_pool::note_resubmits(pc, &kept);
+        }
+        method::<Execute>(pc, 10)(pc, kept.len() as u32, kept.as_ptr());
+        if !kept.is_empty() {
+            crate::alloc_pool::executed(pc, &kept);
+        }
+    };
     crate::diagnose::removed_after(|| format!("a title submission of {} lists on queue {pc:p}", kept.len()));
 }
 
@@ -3804,15 +3827,17 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
             }
             if i > start {
                 execute_closed(pc, &mapped[start..i]);
-            }
-            for w in &waits {
-                if !crate::cpu_writes::wait_until(w, crate::list_sync::WAIT_TIMEOUT) {
-                    static N: AtomicI32 = AtomicI32::new(0);
-                    if log_due(&N) {
-                        xs_log!("console list: a memory wait at {:#x} ({} bytes, comparison {}, value {:#x}, mask {:#x}) timed out, the list runs anyway", w.va, w.width, w.comparison, w.value, w.mask);
-                    }
+                // flush the writes already submitted now, not held back behind this list's own
+                // unmet waits (the submission thread must stay free to submit other queues)
+                let done = crate::list_sync::cpu_writes_of(&keys[start..i]);
+                if !done.is_empty() {
+                    crate::cpu_writes::after(pc, done);
                 }
             }
+            // the GPU queue itself waits for these (via its own fence); a synchronous CPU wait
+            // here would block the one thread that submits every queue, including the producing
+            // queue's own list this wait is waiting on
+            crate::cpu_writes::defer_waits(pc, &waits);
             start = i;
         }
         if start < mapped.len() || mapped.is_empty() {
@@ -3824,13 +3849,15 @@ extern "system" fn queue_execute(this: *mut Proxy, n: u32, lists: *const Object)
         crate::rt_diag::executed(&keys);
         // the lists' bottom-of-pipe writes into title memory: done once the GPU has finished this
         if !keys.is_empty() {
-            let writes = crate::list_sync::cpu_writes_of(&keys);
+            let writes = crate::list_sync::cpu_writes_of(&keys[start..]);
             static N: AtomicI32 = AtomicI32::new(0);
             if log_due(&N) {
                 let waits: usize = keys.iter().map(|&k| crate::list_sync::waits_of(k).len()).sum();
                 xs_log!("console queue: {} lists, {} CPU writes, {waits} waits recorded on them", keys.len(), writes.len());
             }
-            crate::cpu_writes::after(pc, writes);
+            if !writes.is_empty() {
+                crate::cpu_writes::after(pc, writes);
+            }
         }
         if tracked {
             crate::retire::submitted(pc);
@@ -4116,6 +4143,8 @@ extern "system" fn queue_present_x(this: *mut Proxy, plane_count: u32, planes: *
     heap_pages::present();
     crate::flicker_probe::present();
     crate::retire::present();
+    // a deferred memory wait a writer never answered must not hang the GPU past its frame
+    crate::cpu_writes::release_all_waits();
     let hook = PRESENT_HOOK.load(Ordering::SeqCst);
     if hook != 0 {
         // SAFETY: the hook was installed through `DecantD3D12X_SetPresentHook` with this signature.
@@ -4124,32 +4153,30 @@ extern "system" fn queue_present_x(this: *mut Proxy, plane_count: u32, planes: *
             return hook((*this).pc, plane_count, planes, parameters);
         }
     }
-    // Plane 0 is readable for its 0x18 bytes when there is a plane at all, and its array holds
-    // `count` resource pointers.
+    // Plane entries are 0x48 bytes each: {token u64 @0, resource count u32 @8, resource array @0x10}.
+    // Plane 0 goes to the swap chain, and plane 1 (when present and DECANT_D3D12X_PRESENT_OVER != 0) is
+    // composed over it with premultiplied alpha (`present_over`).
     let plane_zero = (plane_count > 0 && !planes.is_null()).then_some(planes.cast::<u8>());
     // SAFETY: by the line above, `plane` points to a plane 0.
     let token = plane_zero.map_or(0, |plane| unsafe { plane.cast::<u64>().read_unaligned() });
-    // SAFETY: as above, the resource array is read only when the plane has one.
-    let shown = plane_zero.is_some_and(|plane| unsafe {
-        let count = plane.add(8).cast::<u32>().read_unaligned();
-        let array = plane.add(0x10).cast::<*const Object>().read_unaligned();
-        if count == 0 || array.is_null() {
-            return false;
+    // SAFETY: `planes` holds `plane_count` plane entries of 0x48 bytes each.
+    let shown = plane_zero.is_some_and(|_plane| unsafe {
+        let p0 = unwrap(crate::present_over::plane_resource(plane_count, planes, 0));
+        let p1 = unwrap(crate::present_over::plane_resource(plane_count, planes, 1));
+        if !p0.is_null() {
+            crate::capture::presented((*this).pc, p0);
         }
-        let frame = unwrap(array.read_unaligned());
-        crate::capture::presented((*this).pc, frame);
-        crate::present::show((*this).pc, frame)
+        crate::present::show_planes((*this).pc, p0, p1)
     });
     crate::pso_diag::present();
     crate::direct_pso::note_present();
     crate::watchdog_hold::note_present();
     crate::frame::mark_flipped(token);
-    // Only plane 0 is shown. A change of the plane count is logged every time (a few dozen at
-    // most): a screen the title composes from two planes shows without its second one.
     static PLANES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
     static PLANE_LINES: AtomicI32 = AtomicI32::new(0);
     if PLANES.swap(plane_count, Ordering::Relaxed) != plane_count && PLANE_LINES.fetch_add(1, Ordering::Relaxed) < 64 {
-        xs_log!("console queue slot 30 (PresentX): the plane count is now {plane_count} (token {token:016X}), only plane 0 is shown");
+        let mode = if plane_count >= 2 && crate::present_over::enabled() { "planes 0 and 1 composed" } else { "only plane 0 is shown" };
+        xs_log!("console queue slot 30 (PresentX): the plane count is now {plane_count} (token {token:016X}), {mode}");
     }
     if log_due(&N) {
         xs_log!(
@@ -4385,7 +4412,11 @@ extern "system" fn list_resource_barrier(this: *mut Proxy, n: u32, barriers: *co
             .collect();
         crate::detile::note_transitions(pc as usize, &noted);
         crate::present::note_list_transitions(pc as usize, &noted);
-        method::<Barriers>(pc, 26)(pc, n, copy.as_ptr().cast());
+        crate::uav_barrier_merge::filter_barriers(this as usize, &mut copy);
+        if copy.is_empty() {
+            return;
+        }
+        method::<Barriers>(pc, 26)(pc, copy.len() as u32, copy.as_ptr().cast());
     }
 }
 
@@ -4511,8 +4542,12 @@ fn clear_uav(this: *mut Proxy, gpu: u64, cpu: u64, res: Object, values: *const c
         let pc = (*this).pc;
         let gpu = heap_pages::host_handle(this as usize, gpu, || 1);
         match clear {
-            crate::view_raw::Clear::AsIs => method::<ClearUavView>(pc, if float { 50 } else { 49 })(pc, gpu, cpu as u64, unwrap(res), values, n, rects),
+            crate::view_raw::Clear::AsIs => {
+                crate::uav_barrier_merge::mark_pending(this as usize);
+                method::<ClearUavView>(pc, if float { 50 } else { 49 })(pc, gpu, cpu as u64, unwrap(res), values, n, rects);
+            }
             crate::view_raw::Clear::Words(w) => {
+                crate::uav_barrier_merge::mark_pending(this as usize);
                 let words = [w; 4];
                 method::<ClearUavView>(pc, 49)(pc, gpu, cpu as u64, unwrap(res), words.as_ptr().cast(), n, rects);
             }
@@ -4559,6 +4594,7 @@ extern "system" fn list_set_pipeline_state(this: *mut Proxy, pso: Object) {
         };
         crate::rt_diag::pipeline_set(this as usize, pso as usize);
         crate::kind_check::bound(this as usize, pso as usize);
+        crate::indirect_clamp::note_pso(this as usize, pso as usize);
         method::<unsafe extern "system" fn(Object, Object)>(pc, 25)(pc, pso);
     }
 }
@@ -4621,25 +4657,49 @@ extern "system" fn list_execute_indirect(this: *mut Proxy, sig: Object, max: u32
         if crate::pso_diag::skip(this as usize) {
             return;
         }
+        let pc_sig = unwrap(sig);
+        let pc_arg = unwrap(arg);
+        let pc_count = unwrap(count);
+        // Clamp BEFORE `list_mirror::prepare` so restoring the title's compute state does not
+        // clobber mirror/window-service root bindings prepared for this call.
+        let clamped = crate::indirect_clamp::try_clamp(this as usize, pc, pc_sig, max, pc_arg, arg_off, pc_count, count_off);
         list_mirror::prepare(this, crate::user_mirror::Bind::Graphics);
         list_mirror::prepare(this, crate::user_mirror::Bind::Compute);
         crate::rt_diag::count(&crate::rt_diag::INDIRECT);
-        let pc_arg = unwrap(arg);
-        let pc_count = unwrap(count);
+        crate::uav_barrier_merge::mark_pending(this as usize);
         type GetListType = unsafe extern "system" fn(Object) -> u32;
         const D3D12_COMMAND_LIST_TYPE_BUNDLE: u32 = 1;
         let record_barriers = method::<GetListType>(pc, 8)(pc) != D3D12_COMMAND_LIST_TYPE_BUNDLE;
-        let (before, after) = if record_barriers {
-            indirect_argument_barriers(pc_arg as u64, needs_indirect_barrier(pc_arg), pc_count as u64, needs_indirect_barrier(pc_count))
+        if let Some(call) = clamped {
+            // The clamp shader already left the scratch buffer in INDIRECT_ARGUMENT state, so
+            // only the count buffer (passed through unclamped) may still need its barrier.
+            let (before, after) = if record_barriers {
+                indirect_argument_barriers(0, false, pc_count as u64, needs_indirect_barrier(pc_count))
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            if !before.is_empty() {
+                method::<Barriers>(pc, 26)(pc, before.len() as u32, before.as_ptr().cast());
+            }
+            let scratch_raw = windows::core::Interface::as_raw(&call.scratch);
+            method::<ExecuteIndirect>(pc, 59)(pc, pc_sig, max, scratch_raw, 0, pc_count, count_off);
+            if !after.is_empty() {
+                method::<Barriers>(pc, 26)(pc, after.len() as u32, after.as_ptr().cast());
+            }
+            crate::indirect_clamp::finish_clamp(pc, call);
         } else {
-            (Vec::new(), Vec::new())
-        };
-        if !before.is_empty() {
-            method::<Barriers>(pc, 26)(pc, before.len() as u32, before.as_ptr().cast());
-        }
-        method::<ExecuteIndirect>(pc, 59)(pc, unwrap(sig), max, pc_arg, arg_off, pc_count, count_off);
-        if !after.is_empty() {
-            method::<Barriers>(pc, 26)(pc, after.len() as u32, after.as_ptr().cast());
+            let (before, after) = if record_barriers {
+                indirect_argument_barriers(pc_arg as u64, needs_indirect_barrier(pc_arg), pc_count as u64, needs_indirect_barrier(pc_count))
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            if !before.is_empty() {
+                method::<Barriers>(pc, 26)(pc, before.len() as u32, before.as_ptr().cast());
+            }
+            method::<ExecuteIndirect>(pc, 59)(pc, pc_sig, max, pc_arg, arg_off, pc_count, count_off);
+            if !after.is_empty() {
+                method::<Barriers>(pc, 26)(pc, after.len() as u32, after.as_ptr().cast());
+            }
         }
     }
 }

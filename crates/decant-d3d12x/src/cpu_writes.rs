@@ -74,6 +74,11 @@ type SetEventOnCompletion = unsafe extern "system" fn(Object, u64, HANDLE) -> HR
 type Release = unsafe extern "system" fn(Object) -> u32;
 type GetTimestampFrequency = unsafe extern "system" fn(Object, *mut u64) -> HRESULT;
 type GetClockCalibration = unsafe extern "system" fn(Object, *mut u64, *mut u64) -> HRESULT;
+/// `ID3D12CommandQueue::Wait` (PC queue vtable slot 15): the queue's own GPU timeline waits for
+/// `fence` to reach `value` before running anything submitted to it after this call.
+type QueueWait = unsafe extern "system" fn(Object, Object, u64) -> HRESULT;
+/// `ID3D12Fence::Signal` (PC fence vtable slot 10), called from the CPU.
+type FenceSignalCpu = unsafe extern "system" fn(Object, u64) -> HRESULT;
 
 /// A GPU tick and the performance counter value read together with it, plus both frequencies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,6 +285,178 @@ pub(crate) fn wait_until(wait: &PendingWait, timeout: Duration) -> bool {
     }
 }
 
+// ---- non-blocking deferral of unmet waits to a GPU fence (the one thread that submits every
+// queue must never block synchronously on a wait the GPU itself would answer) ----
+
+/// One queue's outstanding deferrals: its own wait fence, the next ticket to use, and the waits
+/// still pending in submission order (a queue only ever grows its ticket from one thread, the
+/// one that calls `queue_execute`, so FIFO order here matches submission order).
+struct Deferred {
+    fence: usize,
+    ticket: u64,
+    pending: std::collections::VecDeque<(u64, Vec<PendingWait>, Instant)>,
+}
+
+static WAIT_FENCES: Mutex<Option<HashMap<usize, Deferred>>> = Mutex::new(None);
+
+/// Creates a fresh, zero-valued fence on `queue`'s device for deferred waits. `None` on any COM
+/// failure (the caller falls back to the old synchronous wait).
+///
+/// # Safety
+/// `queue` is a live PC command queue.
+unsafe fn new_wait_fence(queue: Object) -> Option<usize> {
+    static FAILS: AtomicU32 = AtomicU32::new(0);
+    // SAFETY: `queue` is live by the contract above, and the slots are the ones named in the
+    // module header (`GetDevice` 7, `CreateFence` 36).
+    unsafe {
+        let mut dev: Object = std::ptr::null_mut();
+        let get: GetDevice = vslot(queue, SLOT_GET_DEVICE);
+        let hr = get(queue, &IID_ID3D12_DEVICE, &mut dev);
+        if hr < 0 || dev.is_null() {
+            if FAILS.fetch_add(1, Ordering::Relaxed) < 5 {
+                xs_log!("memory waits: GetDevice of the queue failed, hr {hr:#x}");
+            }
+            return None;
+        }
+        let mut fence: Object = std::ptr::null_mut();
+        let create: CreateFence = vslot(dev, SLOT_CREATE_FENCE);
+        let hr = create(dev, 0, 0, &IID_ID3D12_FENCE, &mut fence);
+        let release: Release = vslot(dev, SLOT_RELEASE);
+        release(dev);
+        if hr < 0 || fence.is_null() {
+            if FAILS.fetch_add(1, Ordering::Relaxed) < 5 {
+                xs_log!("memory waits: CreateFence for a deferred wait failed, hr {hr:#x}");
+            }
+            return None;
+        }
+        Some(fence as usize)
+    }
+}
+
+/// Pops every front entry of `pending` that is already met or past its deadline, in FIFO order,
+/// and returns each popped ticket with whether it timed out rather than being met. An entry still
+/// unmet and inside its deadline stops the scan, since later entries queued after it cannot be
+/// due first. Pure logic, kept apart from the fence signalling so it can be unit tested on
+/// synthetic input.
+fn due_tickets<T>(pending: &mut std::collections::VecDeque<(u64, T, Instant)>, now: Instant, met: impl Fn(&T) -> bool) -> Vec<(u64, bool)> {
+    let mut due = Vec::new();
+    while let Some((_, waits, deadline)) = pending.front() {
+        let is_met = met(waits);
+        let expired = !is_met && now >= *deadline;
+        if !is_met && !expired {
+            break;
+        }
+        let (ticket, ..) = pending.pop_front().expect("front checked above");
+        due.push((ticket, expired));
+    }
+    due
+}
+
+/// A watcher thread that advances every queue's deferred waits: the front one still unmet and
+/// inside its deadline is left alone; a met or expired front one is cleared by signalling the
+/// queue's own fence to its ticket, which releases the matching `ID3D12CommandQueue::Wait` on the
+/// GPU without any CPU thread blocking on it. Checked every millisecond, same granularity as the
+/// old synchronous poll (`wait_until`).
+fn watcher() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new().name("decant-memwait-watch".into()).spawn(|| loop {
+            std::thread::sleep(Duration::from_millis(1));
+            let mut g = WAIT_FENCES.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(m) = g.as_mut() else { continue };
+            for state in m.values_mut() {
+                let fence = state.fence as Object;
+                for (ticket, expired) in due_tickets(&mut state.pending, Instant::now(), |waits| waits.iter().all(satisfied)) {
+                    if expired {
+                        static TIMED_OUT: AtomicU32 = AtomicU32::new(0);
+                        if TIMED_OUT.fetch_add(1, Ordering::Relaxed) < 20 {
+                            xs_log!("console list: a deferred memory wait timed out, the list runs anyway");
+                        }
+                    }
+                    // SAFETY: the fence is kept alive by `WAIT_FENCES` for the life of the process.
+                    unsafe {
+                        let signal: FenceSignalCpu = vslot(fence, 10);
+                        signal(fence, ticket);
+                    }
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            xs_log!("console proxies: no thread to watch deferred memory waits: {e}");
+        }
+    });
+}
+
+/// Defers `waits` not already met on `queue`: an `ID3D12CommandQueue::Wait` is issued on `queue`
+/// for a ticket on the queue's own wait fence, and a background thread signals that ticket once
+/// the waits are met or `list_sync::WAIT_TIMEOUT` has passed, same timeout as the old synchronous
+/// `wait_until` loop. Returns without blocking the calling thread (`queue_execute`'s one
+/// submission thread, which must stay free to submit the producing queue's own list).
+///
+/// # Safety
+/// `queue` is a live PC command queue.
+pub(crate) unsafe fn defer_waits(queue: Object, waits: &[PendingWait]) {
+    let unmet: Vec<PendingWait> = waits.iter().copied().filter(|w| !satisfied(w)).collect();
+    if unmet.is_empty() {
+        return;
+    }
+    watcher();
+    let mut g = WAIT_FENCES.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    let state = match m.entry(queue as usize) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(v) => {
+            // SAFETY: `queue` is live by the contract above.
+            let Some(fence) = (unsafe { new_wait_fence(queue) }) else {
+                // no fence for this queue: fall back to the old synchronous wait so the title's
+                // data is still correct even though this queue stalls the submission thread.
+                drop(g);
+                for w in &unmet {
+                    wait_until(w, crate::list_sync::WAIT_TIMEOUT);
+                }
+                return;
+            };
+            v.insert(Deferred { fence, ticket: 0, pending: std::collections::VecDeque::new() })
+        }
+    };
+    state.ticket += 1;
+    let ticket = state.ticket;
+    state.pending.push_back((ticket, unmet, Instant::now() + crate::list_sync::WAIT_TIMEOUT));
+    let fence = state.fence as Object;
+    drop(g);
+    // SAFETY: `queue` is live by the contract above, `fence` is kept alive by `WAIT_FENCES`.
+    unsafe {
+        let wait: QueueWait = vslot(queue, 15);
+        let hr = wait(queue, fence, ticket);
+        if hr < 0 {
+            static FAILS: AtomicU32 = AtomicU32::new(0);
+            if FAILS.fetch_add(1, Ordering::Relaxed) < 5 {
+                xs_log!("memory waits: ID3D12CommandQueue::Wait for a deferred wait failed, hr {hr:#x}");
+            }
+        }
+    }
+}
+
+/// Releases every queue's still-pending deferred waits right away (called at present): a missing
+/// or cross-frame-cyclic writer must never hang the GPU past the frame it was due in.
+pub(crate) fn release_all_waits() {
+    let mut g = WAIT_FENCES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_mut() else { return };
+    for state in m.values_mut() {
+        if state.pending.is_empty() {
+            continue;
+        }
+        let ticket = state.ticket;
+        let fence = state.fence as Object;
+        // SAFETY: the fence is kept alive by `WAIT_FENCES` for the life of the process.
+        unsafe {
+            let signal: FenceSignalCpu = vslot(fence, 10);
+            signal(fence, ticket);
+        }
+        state.pending.clear();
+    }
+}
+
 /// Stores `words` at `va` if that memory is still there and the CPU can write it.
 ///
 /// # Safety
@@ -456,5 +633,35 @@ mod tests {
         assert_eq!(clock.gpu_at(80_000), 5_000 + 25_000, "one millisecond on");
         assert_eq!(clock.gpu_at(0), 0, "no value below zero");
         assert_eq!(Clock { cpu_freq: 0, ..clock }.gpu_at(123), 5_000, "no counter frequency, no movement");
+    }
+
+    #[test]
+    fn due_tickets_stops_at_the_first_unmet_unexpired_entry() {
+        let now = Instant::now();
+        let far_future = now + Duration::from_secs(60);
+        let mut pending = std::collections::VecDeque::from([(1u64, false, far_future), (2u64, true, far_future)]);
+        // The front ticket is neither met nor expired: nothing is due yet, even though a later
+        // one queued after it is already met (FIFO order, same as submission order).
+        assert_eq!(due_tickets(&mut pending, now, |met| *met), Vec::new());
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn due_tickets_pops_met_and_expired_fronts_in_order() {
+        let now = Instant::now();
+        let past = now - Duration::from_millis(1);
+        let far_future = now + Duration::from_secs(60);
+        // Ticket 1 is met, ticket 2 is unmet but past its deadline, ticket 3 is still pending.
+        let mut pending = std::collections::VecDeque::from([(1u64, true, far_future), (2u64, false, past), (3u64, false, far_future)]);
+        let due = due_tickets(&mut pending, now, |met| *met);
+        assert_eq!(due, vec![(1, false), (2, true)], "ticket 1 met, ticket 2 timed out, ticket 3 left pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.front().unwrap().0, 3);
+    }
+
+    #[test]
+    fn due_tickets_on_an_empty_queue_is_a_no_op() {
+        let mut pending: std::collections::VecDeque<(u64, bool, Instant)> = std::collections::VecDeque::new();
+        assert_eq!(due_tickets(&mut pending, Instant::now(), |met| *met), Vec::new());
     }
 }

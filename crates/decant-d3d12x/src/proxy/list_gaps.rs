@@ -125,25 +125,29 @@ unsafe fn root_address(list: Object, va: u64) -> u64 {
 }
 
 macro_rules! root_va_method {
-    ($name:ident, $pc:literal, $bind:expr) => {
+    ($name:ident, $pc:literal, $bind:expr, $va_kind:expr) => {
         pub(super) extern "system" fn $name(this: *mut Proxy, index: u32, va: u64) {
             // The user data mirror gets the console address, as the shader sees it.
             super::list_mirror::note_address(this, $bind, index, va);
             // SAFETY: `this` is a live list proxy; the PC slot takes (root index, address).
             unsafe {
                 let pc = (*this).pc;
-                method::<RootVa>(pc, $pc)(pc, index, super::root_views::bind_address(pc, $pc, va));
+                let gpu = super::root_views::bind_address(pc, $pc, va);
+                if $bind == crate::user_mirror::Bind::Compute {
+                    crate::indirect_clamp::note_compute_va(this as usize, $va_kind, index, gpu);
+                }
+                method::<RootVa>(pc, $pc)(pc, index, gpu);
             }
         }
     };
 }
 
-root_va_method!(list_set_compute_root_cbv, 37, crate::user_mirror::Bind::Compute);
-root_va_method!(list_set_graphics_root_cbv, 38, crate::user_mirror::Bind::Graphics);
-root_va_method!(list_set_compute_root_srv, 39, crate::user_mirror::Bind::Compute);
-root_va_method!(list_set_graphics_root_srv, 40, crate::user_mirror::Bind::Graphics);
-root_va_method!(list_set_compute_root_uav, 41, crate::user_mirror::Bind::Compute);
-root_va_method!(list_set_graphics_root_uav, 42, crate::user_mirror::Bind::Graphics);
+root_va_method!(list_set_compute_root_cbv, 37, crate::user_mirror::Bind::Compute, crate::indirect_clamp::RootVaKind::Cbv);
+root_va_method!(list_set_graphics_root_cbv, 38, crate::user_mirror::Bind::Graphics, crate::indirect_clamp::RootVaKind::Cbv);
+root_va_method!(list_set_compute_root_srv, 39, crate::user_mirror::Bind::Compute, crate::indirect_clamp::RootVaKind::Srv);
+root_va_method!(list_set_graphics_root_srv, 40, crate::user_mirror::Bind::Graphics, crate::indirect_clamp::RootVaKind::Srv);
+root_va_method!(list_set_compute_root_uav, 41, crate::user_mirror::Bind::Compute, crate::indirect_clamp::RootVaKind::Uav);
+root_va_method!(list_set_graphics_root_uav, 42, crate::user_mirror::Bind::Graphics, crate::indirect_clamp::RootVaKind::Uav);
 
 /// The bytes of a `D3D12_INDEX_BUFFER_VIEW` with its address translated: upload memory, title
 /// memory in xmem pages or a placed buffer. An address no PC resource holds stays as it was.
@@ -287,7 +291,8 @@ pub(super) extern "system" fn allocator_reset(this: *mut Proxy) -> HRESULT {
     // SAFETY: `this` is a live allocator proxy.
     unsafe {
         let pc = (*this).pc;
-        let hr = method::<AllocReset>(pc, 8)(pc);
+        let hr = crate::alloc_pool::title_reset(pc, |raw| method::<AllocReset>(raw, 8)(raw))
+            .unwrap_or_else(|| method::<AllocReset>(pc, 8)(pc));
         if hr >= 0 {
             for (res, bytes) in crate::upload_mem::with(|m| m.free_owner(pc as usize)) {
                 // SAFETY: the chunk was charged when it was added and is released once.

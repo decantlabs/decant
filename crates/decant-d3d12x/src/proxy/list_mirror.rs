@@ -764,6 +764,9 @@ macro_rules! root_signature_method {
             if window_service::active() {
                 window_service::note_signature(this as usize, $bind, signature as usize);
             }
+            if $bind == Bind::Compute {
+                crate::indirect_clamp::note_compute_rs(this as usize, signature as usize);
+            }
             // SAFETY: `this` is a live list proxy; the PC slot takes the root signature.
             unsafe {
                 let pc = (*this).pc;
@@ -786,6 +789,9 @@ macro_rules! root_table_method {
             if user_mirror::active() {
                 user_mirror::with_shadow(this as usize, |s| s.set_table($bind, index, handle));
             }
+            if $bind == Bind::Compute {
+                crate::indirect_clamp::note_compute_table(this as usize, index, handle);
+            }
             // SAFETY: `this` is a live list proxy; the PC slot takes (index, handle).
             unsafe {
                 let pc = (*this).pc;
@@ -804,6 +810,9 @@ macro_rules! root_constant_method {
         pub(super) extern "system" fn $name(this: *mut Proxy, index: u32, value: u32, offset: u32) {
             if user_mirror::active() {
                 user_mirror::with_shadow(this as usize, |s| s.set_constants($bind, index, offset, &[value]));
+            }
+            if $bind == Bind::Compute {
+                crate::indirect_clamp::note_compute_constants(this as usize, index, offset, &[value]);
             }
             // SAFETY: `this` is a live list proxy; the PC slot takes (index, value, offset).
             unsafe {
@@ -825,10 +834,15 @@ const MAX_CONSTANTS: u32 = 64;
 macro_rules! root_constants_method {
     ($name:ident, $pc:literal, $bind:expr) => {
         pub(super) extern "system" fn $name(this: *mut Proxy, index: u32, count: u32, data: *const u32, offset: u32) {
-            if user_mirror::active() && !data.is_null() && count <= MAX_CONSTANTS {
+            if (user_mirror::active() || ($bind == Bind::Compute && crate::indirect_clamp::enabled())) && !data.is_null() && count <= MAX_CONSTANTS {
                 // SAFETY: the caller passes `count` readable dwords.
                 let values: Vec<u32> = (0..count as usize).map(|i| unsafe { data.add(i).read_unaligned() }).collect();
-                user_mirror::with_shadow(this as usize, |s| s.set_constants($bind, index, offset, &values));
+                if user_mirror::active() {
+                    user_mirror::with_shadow(this as usize, |s| s.set_constants($bind, index, offset, &values));
+                }
+                if $bind == Bind::Compute {
+                    crate::indirect_clamp::note_compute_constants(this as usize, index, offset, &values);
+                }
             }
             // SAFETY: `this` is a live list proxy; the PC slot takes (index, count, data, offset).
             unsafe {
@@ -852,6 +866,7 @@ pub(super) extern "system" fn list_draw_instanced(this: *mut Proxy, vertices: u3
     describe_draw(this, n);
     crate::draw_diag::describe(this as usize, n, "DrawInstanced", None, start_vertex, instances);
     crate::flicker_probe::draw(this as usize, crate::flicker_probe::Draw::Plain { vertices, first: start_vertex });
+    crate::uav_barrier_merge::mark_pending(this as usize);
     if vertices > 0
         && vertices.is_multiple_of(3)
         && let Some(vb) = crate::rect_list::rect_vb0(this as usize)
@@ -876,6 +891,7 @@ pub(super) extern "system" fn list_draw_indexed_instanced(this: *mut Proxy, indi
     describe_draw(this, n);
     crate::draw_diag::describe(this as usize, n, "DrawIndexedInstanced", Some((indices, start_index, base_vertex)), 0, instances);
     crate::flicker_probe::draw(this as usize, crate::flicker_probe::Draw::Indexed { count: indices, first: start_index, base: base_vertex });
+    crate::uav_barrier_merge::mark_pending(this as usize);
     // SAFETY: `this` is a live list proxy.
     unsafe {
         let pc = (*this).pc;
@@ -891,6 +907,7 @@ pub(super) extern "system" fn list_dispatch(this: *mut Proxy, x: u32, y: u32, z:
     prepare(this, Bind::Compute);
     crate::rt_diag::count(&crate::rt_diag::DISPATCHES);
     describe_dispatch(this, crate::draw_diag::dispatch(this as usize, x, y, z));
+    crate::uav_barrier_merge::mark_pending(this as usize);
     // SAFETY: `this` is a live list proxy.
     unsafe {
         let pc = (*this).pc;
