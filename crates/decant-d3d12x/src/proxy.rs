@@ -2820,9 +2820,11 @@ unsafe fn view_texture(this: *mut Proxy, va: u64, rdesc: *const c_void) -> Optio
     {
         let (height, format) = (u32::from_le_bytes(raw[0x18..0x1C].try_into().unwrap_or([0; 4])), u32::from_le_bytes(raw[0x20..0x24].try_into().unwrap_or([0; 4])));
         let width = u64::from_le_bytes(raw[0x10..0x18].try_into().unwrap_or([0; 8]));
-        // SAFETY: a live PC resource, named for DRED.
-        if let Some(o) = unsafe { <windows::Win32::Graphics::Direct3D12::ID3D12Object as windows::core::Interface>::from_raw_borrowed(&out) } {
-            let _ = unsafe { o.SetName(&windows::core::HSTRING::from(format!("decant view texture {width}x{height} format {format} at {va:#x}"))) };
+        if name_view_textures() {
+            // SAFETY: a live PC resource, named for DRED when requested.
+            if let Some(o) = unsafe { <windows::Win32::Graphics::Direct3D12::ID3D12Object as windows::core::Interface>::from_raw_borrowed(&out) } {
+                let _ = unsafe { o.SetName(&windows::core::HSTRING::from(format!("decant view texture {width}x{height} format {format} at {va:#x}"))) };
+            }
         }
         crate::diagnose::removed_after(|| format!("the texture {width}x{height} format {format} for the view at {va:#x}"));
     }
@@ -2859,6 +2861,12 @@ unsafe fn view_texture(this: *mut Proxy, va: u64, rdesc: *const c_void) -> Optio
         );
     }
     Some(res)
+}
+
+/// Whether individual view textures are named for DRED (`DECANT_D3D12X_NAME_VIEWS=1`, default off).
+fn name_view_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DECANT_D3D12X_NAME_VIEWS").is_some_and(|v| v == "1"))
 }
 
 /// Milliseconds since the first call (a monotonic clock for the age of the view textures).
