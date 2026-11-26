@@ -43,7 +43,7 @@
 //! that position with [`Masks::enter`] before any rule runs.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::cfg::{Cfg, Cond, Term};
 use crate::decode::{DppCtrl, Ext, Form, Insn, Operand, Reg};
@@ -224,6 +224,9 @@ enum Role {
     Same,
     /// Read as a number when it is a number, as a whole mask when it is a mask. No evidence.
     Number,
+    /// A data read whose every reaching write is an exact copy of EXEC (see [`ballot_reads`]): it
+    /// takes any kind, so the write keeps its mask kind; a mask it reads is answered by the ballot.
+    Ballot,
 }
 
 /// One location an instruction reads or writes: a followed register or a parked scalar.
@@ -411,6 +414,9 @@ struct Collector<'a> {
     lanes: u8,
     parking: &'a Parking,
     out: &'a mut Vec<Touch>,
+    /// The instruction being collected, and the (instruction, register) reads that are exact.
+    pc: u32,
+    exact: &'a HashSet<(u32, u8)>,
 }
 
 impl Collector<'_> {
@@ -419,6 +425,8 @@ impl Collector<'_> {
     }
 
     fn at(&mut self, loc: u16, half: u8, role: Role, def: bool) {
+        let exact = usize::from(loc) < usize::from(VCC) && self.exact.contains(&(self.pc, loc as u8));
+        let role = if role == Role::Data && !def && half == 0 && exact { Role::Ballot } else { role };
         self.out.push(Touch {
             loc,
             half,
@@ -855,7 +863,7 @@ impl Group {
 fn written(t: &Touch, groups: &[Group]) -> u8 {
     match t.role {
         Role::Mask => word_kind(t.half) | SURE,
-        Role::Data | Role::Number => NUMBER | SURE,
+        Role::Data | Role::Number | Role::Ballot => NUMBER | SURE,
         Role::Same => {
             let g = groups[t.group as usize];
             g.kinds | if g.sure { SURE } else { 0 }
@@ -867,6 +875,7 @@ fn written(t: &Touch, groups: &[Group]) -> u8 {
 fn wanted(t: &Touch, groups: &[Group]) -> u8 {
     match t.role {
         Role::Number => 0,
+        Role::Ballot => ANY,
         _ => written(t, groups),
     }
 }
@@ -896,6 +905,13 @@ struct Site {
     parked: u8,
     /// The part the instruction has in a reduction over the wave.
     reduction: Option<Reduction>,
+    /// The scalar registers (low word) that the instruction reads as data, a whole mask as a number.
+    data_reads: Set,
+    /// Another refusal reason than the first one was found here too.
+    more_refusals: bool,
+    /// A mask operation inside EXEC whose mask is read as data later in its block: it also stores the
+    /// wave ballot of its bits, which is the number the read takes (see `ballot_reads`).
+    ballot_def: bool,
 }
 
 /// Where the scalar registers of a program hold lane masks.
@@ -912,6 +928,11 @@ pub struct Masks {
 impl Masks {
     pub fn converged(&self) -> bool {
         self.converged
+    }
+
+    /// Whether the instruction being lifted stores the wave ballot of the mask it writes.
+    pub fn ballot_def(&self) -> bool {
+        self.at.get().ballot_def
     }
 
     pub fn reads_high_mask(&self, first: u8) -> bool {
@@ -1828,6 +1849,9 @@ impl Typing<'_> {
         let mut site = Site::default();
         // The first reason found stays: it is the one closest to the cause.
         fn refuse(site: &mut Site, what: &'static str) {
+            if site.refusal.is_some_and(|first| first != what) {
+                site.more_refusals = true;
+            }
             site.refusal.get_or_insert(what);
         }
         let group_kind = |site: &mut Site, t: &Touch| match self.groups[t.group as usize].verdict()
@@ -1850,9 +1874,12 @@ impl Typing<'_> {
                     }
                     word_kind(t.half)
                 }
-                Role::Data => {
+                Role::Data | Role::Ballot => {
                     if set != 0 && set & NUMBER == 0 {
                         refuse(&mut site, "mask-as-data");
+                        if t.half == 0 && usize::from(t.loc) < usize::from(VCC) {
+                            site.data_reads |= bit(t.loc as u8);
+                        }
                     }
                     NUMBER
                 }
@@ -1890,7 +1917,7 @@ impl Typing<'_> {
         for t in self.own(span).iter().filter(|t| t.def) {
             let kind = match t.role {
                 Role::Mask => word_kind(t.half),
-                Role::Data | Role::Number => NUMBER,
+                Role::Data | Role::Number | Role::Ballot => NUMBER,
                 Role::Same => group_kind(&mut site, t),
             };
             if usize::from(t.loc) >= REGS {
@@ -1926,6 +1953,7 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
     let mut touches = Vec::new();
     let mut groups = Vec::new();
     let mut spans: Vec<Vec<Span>> = Vec::with_capacity(cfg.blocks.len());
+    let exact = exact_reads(cfg);
     let mut close = |touches: &mut Vec<Touch>, pc: u32, start: usize, parked: bool| {
         let own = &mut touches[start..];
         let shared = own.iter().any(|t| t.role == Role::Same);
@@ -1962,6 +1990,8 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
                 lanes,
                 parking,
                 out: &mut touches,
+                pc: insn.pc,
+                exact: &exact,
             }
             .insn(insn);
             let parked = parking.slot(insn).is_some();
@@ -1978,6 +2008,8 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
                 lanes,
                 parking,
                 out: &mut touches,
+                pc: NO_PC,
+                exact: &exact,
             }
             .uses(Operand::Reg(Reg::VccLo), lanes / 32, Role::Mask);
             list.push(close(&mut touches, NO_PC, start, false));
@@ -2042,26 +2074,24 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
         converged: cfg.blocks.len() == 1,
         ..Masks::default()
     };
-    let mut refused = 0;
     for (b, list) in typing.spans.iter().enumerate() {
         let mut cur = ins[b];
         for span in list {
             let site = typing.site(span, &mut cur, &later);
-            if site.refusal.is_some() {
-                refused += 1;
-                if span.pc == NO_PC {
-                    return Err(Refusal::new(
-                        RefusalKind::Exec("data-as-mask"),
-                        "a branch on VCC that holds a number",
-                    )
-                    .at(cfg.blocks[b].start));
-                }
+            if site.refusal.is_some() && span.pc == NO_PC {
+                return Err(Refusal::new(
+                    RefusalKind::Exec("data-as-mask"),
+                    "a branch on VCC that holds a number",
+                )
+                .at(cfg.blocks[b].start));
             }
             if span.pc != NO_PC && site != Site::default() {
                 masks.sites.insert(span.pc, site);
             }
         }
     }
+    ballot_reads(cfg, &mut masks);
+    let refused = masks.sites.values().filter(|s| s.refusal.is_some()).count();
     for (pc, part) in reductions(cfg, lanes) {
         masks.sites.entry(pc).or_default().reduction = Some(part);
     }
@@ -2069,6 +2099,175 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
         masks.sites.entry(pc).or_default().reduction = Some(part);
     }
     Ok((masks, refused))
+}
+
+/// The reads of a whole mask as data that stay exact. The register holds, as a number, the bits its
+/// mask had when it was written: when every write that can reach the read is a mask operation whose
+/// result lies inside EXEC (a move of EXEC, or an AND with it), the wave ballot of those bits taken at
+/// that write is the number the read takes. Such a write stores the ballot (`Site::ballot_def`), and the
+/// read is no longer refused. A compare result, a write that reaches from before the program, or a
+/// write of another kind keeps the refusal.
+fn ballot_reads(cfg: &Cfg, masks: &mut Masks) {
+    let preds = cfg.predecessors();
+    for (b, block) in cfg.blocks.iter().enumerate() {
+        for (i, insn) in block.insns.iter().enumerate() {
+            let Some(site) = masks.sites.get(&insn.pc).copied() else { continue };
+            if site.refusal != Some("mask-as-data") || site.more_refusals || site.data_reads == 0 {
+                continue;
+            }
+            let mut defs = Vec::new();
+            let mut exact = true;
+            for reg in 0..VCC {
+                if site.data_reads & bit(reg) == 0 {
+                    continue;
+                }
+                match reaching_exact_writes(cfg, &preds, b, i, reg) {
+                    Some(found) => defs.extend(found),
+                    None => {
+                        exact = false;
+                        break;
+                    }
+                }
+            }
+            if !exact || defs.is_empty() {
+                continue;
+            }
+            for (blk, j) in defs {
+                masks.sites.entry(cfg.blocks[blk].insns[j].pc).or_default().ballot_def = true;
+            }
+            if let Some(s) = masks.sites.get_mut(&insn.pc) {
+                s.refusal = None;
+                s.data_reads = 0;
+            }
+        }
+    }
+}
+
+/// The scalar reads (instruction pc, register) whose every reaching write is an exact copy of EXEC.
+fn exact_reads(cfg: &Cfg) -> HashSet<(u32, u8)> {
+    let preds = cfg.predecessors();
+    let mut out = HashSet::new();
+    for (b, block) in cfg.blocks.iter().enumerate() {
+        for (i, insn) in block.insns.iter().enumerate() {
+            for op in insn.src {
+                if let Operand::Reg(Reg::S(r)) = op
+                    && r < VCC
+                    && reaching_exact_writes(cfg, &preds, b, i, r).is_some()
+                {
+                    out.insert((insn.pc, r));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The writes of the low word of `reg` that can reach the instruction `end` of block `block`, as
+/// (block, index), when every one is an exact mask write (see [`exact_write`]). `None` when one of them
+/// is not, when a path reaches the start of the program without a write (the value then comes from
+/// before the program), or when a 64 bit write of the register below covers it.
+fn reaching_exact_writes(
+    cfg: &Cfg,
+    preds: &[Vec<usize>],
+    block: usize,
+    end: usize,
+    reg: u8,
+) -> Option<Vec<(usize, usize)>> {
+    let defs = reaching_writes(cfg, preds, block, end, reg)?;
+    defs.iter()
+        .all(|&(blk, j)| exact_write(cfg, preds, blk, j, 0))
+        .then_some(defs)
+}
+
+/// The last writes of the low word of `reg` on every path into `end` of `block`. `None` when a
+/// path reaches the start of the program without a write, or a write covers the register with its
+/// high word.
+fn reaching_writes(
+    cfg: &Cfg,
+    preds: &[Vec<usize>],
+    block: usize,
+    end: usize,
+    reg: u8,
+) -> Option<Vec<(usize, usize)>> {
+    let mut found = Vec::new();
+    let mut seen = vec![false; cfg.blocks.len()];
+    let mut work = vec![(block, end)];
+    while let Some((blk, upto)) = work.pop() {
+        let insns = &cfg.blocks[blk].insns;
+        // A write of this register or of the register below it (a 64 bit write covering it).
+        let write = (0..upto).rev().find(|&j| {
+            insns[j].dst == Operand::Reg(Reg::S(reg)) || insns[j].dst == Operand::Reg(Reg::S(reg.wrapping_sub(1)))
+        });
+        if let Some(j) = write {
+            if insns[j].dst != Operand::Reg(Reg::S(reg)) {
+                return None;
+            }
+            found.push((blk, j));
+            continue;
+        }
+        if preds[blk].is_empty() {
+            return None;
+        }
+        for &p in &preds[blk] {
+            if !seen[p] {
+                seen[p] = true;
+                work.push((p, cfg.blocks[p].insns.len()));
+            }
+        }
+    }
+    (!found.is_empty()).then_some(found)
+}
+
+/// Whether instruction `j` of `block` writes a mask that is a subset of EXEC at that point: a move of
+/// EXEC, an AND with one operand inside EXEC, or a select of EXEC and zero. An operand inside EXEC is
+/// EXEC itself or a scalar whose every reaching write in the same block is such a write with no write
+/// of EXEC between them (so the lanes of the result were active when it was made). The depth bounds the
+/// chain.
+fn exact_write(cfg: &Cfg, preds: &[Vec<usize>], block: usize, j: usize, depth: u32) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let insns = &cfg.blocks[block].insns;
+    let ins = &insns[j];
+    let on_exec = |op: Operand| op == Operand::Reg(Reg::ExecLo);
+    let zero = |op: Operand| matches!(op, Operand::Int(0) | Operand::Lit(0));
+    let inside = |op: Operand| {
+        if on_exec(op) {
+            return true;
+        }
+        let Operand::Reg(Reg::S(r)) = op else {
+            return false;
+        };
+        if r >= VCC {
+            return false;
+        }
+        let Some(defs) = reaching_writes(cfg, preds, block, j, r) else {
+            return false;
+        };
+        defs.iter().all(|&(blk, k)| {
+            // A definition after the read (a loop back to it) is no straight-line chain.
+            blk == block
+                && k < j
+                && !insns[k + 1..j].iter().any(writes_exec)
+                && exact_write(cfg, preds, block, k, depth + 1)
+        })
+    };
+    match mask_op(ins.op) {
+        Some((MaskOp::Logic(Logic::Mov), _)) => inside(ins.src[0]),
+        Some((MaskOp::Logic(Logic::And), _)) => inside(ins.src[0]) || inside(ins.src[1]),
+        Some((MaskOp::Select, _)) => {
+            (on_exec(ins.src[0]) && zero(ins.src[1])) || (on_exec(ins.src[1]) && zero(ins.src[0]))
+        }
+        _ => false,
+    }
+}
+
+/// Whether the instruction writes EXEC: a destination of EXEC, a save or a write of it, or a compare
+/// that writes it.
+fn writes_exec(ins: &Insn) -> bool {
+    matches!(ins.dst, Operand::Reg(Reg::ExecLo | Reg::ExecHi))
+        || matches!(mask_op(ins.op), Some((MaskOp::SaveExec(_) | MaskOp::WrExec(_), _)))
+        || ins.op.name().starts_with("v_cmpx")
 }
 
 /// How many rounds the typing runs at most. A program that needs more keeps what it has: the
@@ -2105,19 +2304,19 @@ mod tests {
         (graph, masks)
     }
 
-    /// In a 64 lane program, `s_mov_b32` reads a 32 bit scalar as numeric data. When the source
-    /// only ever holds a live 64 lane mask word, refusing `mask-as-data` keeps the scalar lifter
-    /// from reading an unwritten `Var::S` instead of `Var::Mask`. Supporting that pattern needs
-    /// explicit mask word lifting in `lift::wave`.
+    /// In a 64 lane program, `s_mov_b32` reads a 32 bit scalar as numeric data. This was refused
+    /// (`mask-as-data`) so that the scalar lifter did not read an unwritten `Var::S` instead of
+    /// `Var::Mask`. A saved EXEC read as data now takes its wave ballot (`ballot_reads`), so the
+    /// program is translated (tests/ballot_saved.rs covers the lifting).
     #[test]
-    fn move_b32_of_live_64_lane_mask_word_is_refused_as_mask_as_data() {
+    fn move_b32_of_live_64_lane_mask_word_takes_its_ballot() {
         let mut a = Asm::new();
         a.push(sop1(Op::s_mov_b64, s(26), EXEC));
         a.push(sop1(Op::s_mov_b32, s(40), s(26)));
         let (graph, masks) = analyse_asm(a);
         let mov = graph.insns().find(|i| i.op == Op::s_mov_b32).unwrap();
         masks.enter(mov.pc);
-        assert_eq!(masks.refusal(), Some("mask-as-data"));
+        assert_eq!(masks.refusal(), None);
     }
 
     #[test]

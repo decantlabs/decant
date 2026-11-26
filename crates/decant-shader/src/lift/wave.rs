@@ -275,6 +275,7 @@ fn mask_instruction(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
                 MaskOp::Logic(Logic::Mov) => {
                     let dst = target(cx, insn)?;
                     cx.set(dst, a);
+                    ballot_copy(cx, dst);
                 }
                 MaskOp::Logic(op) => {
                     let value = if op == Logic::Not {
@@ -286,6 +287,7 @@ fn mask_instruction(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
                     cx.set(t, value);
                     let dst = target(cx, insn)?;
                     cx.set(dst, Expr::Var(t));
+                    ballot_copy(cx, dst);
                     cx.set(Var::Scc, Expr::Var(t));
                 }
                 _ => unreachable!("the outer match selected these two kinds"),
@@ -465,6 +467,16 @@ fn park(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
         }
     }
     Ok(true)
+}
+
+/// A mask that an instruction wrote and that a later one reads as data: its wave ballot goes where the
+/// read takes it, the scalar register (see `exec::ballot_reads`).
+fn ballot_copy(cx: &mut Lifter, dst: Var) {
+    if let Var::Mask(n) = dst
+        && cx.masks.ballot_def()
+    {
+        cx.set(Var::S(n), Expr::Call(&MASK_WORD, vec![Expr::Var(Var::Mask(n)), Expr::U32(0)]));
+    }
 }
 
 static MASK_WORD: Helper = Helper {
