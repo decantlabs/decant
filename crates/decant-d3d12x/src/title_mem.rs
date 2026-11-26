@@ -25,8 +25,8 @@
 //!   written since the last time (page protection, see its `track` module). `sync` runs before every
 //!   submission of the title: it applies the changes, copies the dirty pages from the read only view of
 //!   their section into the heap, and makes the submitting queue wait for the tile mappings.
-//!   Batches of at least 16 MiB use scoped copying threads sized to host parallelism and batch size.
-//!   Each job covers at most 4 MiB within one section and heap. Threads join before tile mappings.
+//!   Batches of at least 2 MiB use scoped copying threads sized to host parallelism and batch size.
+//!   Each job covers at most 512 KiB within one section and heap. Threads join before tile mappings.
 //!
 //! Nothing here keeps a section committed: no heap is opened on memory of the title, so the commit
 //! comes back when the process ends, killed or not. The two DLLs only meet through exports of
@@ -68,8 +68,9 @@ pub const POOL_HEAP_BYTES: u64 = HEAP_PAGES as u64 * PAGE;
 
 /// Pages asked of `DecantXmemGpuTakeDirty` in one call.
 const TAKE_PAGES: usize = 65536;
-/// Bound each copy job to 1 MiB and assign at least 1 MiB per copying thread.
-const COPY_CHUNK_PAGES: usize = 16;
+/// Bound each copy job to 512 KiB, parallelize batches of at least 2 MiB, and assign at least 1 MiB per copying thread.
+const COPY_CHUNK_PAGES: usize = 8;
+const PARALLEL_THRESHOLD_PAGES: usize = 32;
 const COPY_THREAD_PAGES: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
@@ -90,7 +91,10 @@ fn plan_copy(jobs: &mut Vec<CopyJob>, source: usize, destination: usize, pages: 
 }
 
 fn copy_threads(pages: usize, cores: usize) -> usize {
-    (pages / COPY_THREAD_PAGES).max(1).min(cores.max(1))
+    if pages < PARALLEL_THRESHOLD_PAGES {
+        return 1;
+    }
+    (pages / COPY_THREAD_PAGES).max(2).min(cores.max(1))
 }
 
 struct PoolState {
@@ -816,9 +820,14 @@ impl State {
 
     /// The address of pool page `page` in the read only view of its section.
     fn source(&mut self, api: &Api, page: u32) -> Option<usize> {
+        self.source_section(api, page).map(|(src, _)| src)
+    }
+
+    /// The address of pool page `page` and how many pages remain in its section from `page`.
+    fn source_section(&mut self, api: &Api, page: u32) -> Option<(usize, usize)> {
         loop {
-            if let Some(&(base, first, _)) = self.sections.iter().find(|&&(_, first, pages)| page >= first && page - first < pages) {
-                return Some(base + (page - first) as usize * PAGE as usize);
+            if let Some(&(base, first, pages)) = self.sections.iter().find(|&&(_, first, pages)| page >= first && page - first < pages) {
+                return Some((base + (page - first) as usize * PAGE as usize, (first + pages - page) as usize));
             }
             let (mut base, mut first, mut pages) = (0usize, 0u32, 0u32);
             let index = self.sections.len() as u32;
@@ -977,25 +986,31 @@ impl State {
         let mut total = 0;
         let mut new_tile = false;
         loop {
-            self.dirty.resize(TAKE_PAGES, 0);
-            // SAFETY: `dirty` has room for `TAKE_PAGES` entries.
+            self.dirty.clear();
+            self.dirty.reserve(TAKE_PAGES);
+            // SAFETY: `dirty` has spare capacity for `TAKE_PAGES` entries.
             let asked = Instant::now();
             let n = {
                 let _take = decant_trace::span("title_mem", "take_dirty");
                 unsafe { (api.take_dirty)(self.dirty.as_mut_ptr(), TAKE_PAGES as u32) }
             } as usize;
             self.stats.take_micros += asked.elapsed().as_micros() as u64;
+            let n = n.min(TAKE_PAGES);
+            // SAFETY: `take_dirty` wrote `n` initialized page indices into `self.dirty`.
+            unsafe { self.dirty.set_len(n) };
+            if n == 0 {
+                break;
+            }
             let mut pages = std::mem::take(&mut self.dirty);
-            pages.truncate(n);
             pages.sort_unstable();
             pages.dedup();
             // A page copied for the first time has bytes now: it gets its mirror tile here (in page order,
             // so consecutive pages get consecutive tiles), and the window shows it from this sync on.
             for &page in &pages {
                 if self.mirror.tile_of(page).is_none() {
+                    self.mirror.give_tile(page);
                     new_tile = true;
                 }
-                self.mirror.give_tile(page);
             }
             self.plan_runs(api, &pages, jobs, &mut total);
             self.dirty = pages;
@@ -1027,9 +1042,8 @@ impl State {
                 n += 1;
             }
             i += n;
-            let (Some(dst), Some(src)) = (self.heap(heap), self.source(api, first)) else { continue };
+            let (Some(dst), Some((src, in_section))) = (self.heap(heap), self.source_section(api, first)) else { continue };
             // One run never leaves its section: the tail of a section is cut off and copied by page.
-            let in_section = self.sections.iter().find(|&&(_, f, p)| first >= f && first - f < p).map_or(1, |&(_, f, p)| (f + p - first) as usize);
             let (head, rest) = (n.min(in_section), n.saturating_sub(in_section));
             plan_copy(jobs, src, dst + tile as usize * PAGE as usize, head);
             *copied += head as u64;
@@ -1565,16 +1579,19 @@ mod tests {
     fn copy_planning_bounds_chunks_and_thread_counts() {
         assert_eq!(copy_threads(0, 8), 1);
         assert_eq!(copy_threads(15, 8), 1);
+        assert_eq!(copy_threads(31, 8), 1);
         assert_eq!(copy_threads(32, 8), 2);
+        assert_eq!(copy_threads(48, 8), 3);
         assert_eq!(copy_threads(4096, 3), 3);
+        assert_eq!(copy_threads(4096, 1), 1);
         assert_eq!(copy_threads(4096, 0), 1);
         let mut jobs = Vec::new();
         plan_copy(&mut jobs, 0, 1024, 0);
         assert!(jobs.is_empty());
         plan_copy(&mut jobs, 0, 1024, 35);
-        assert_eq!(jobs.iter().map(|job| job.pages).collect::<Vec<_>>(), [16, 16, 3]);
+        assert_eq!(jobs.iter().map(|job| job.pages).collect::<Vec<_>>(), [8, 8, 8, 8, 3]);
         for (i, job) in jobs.iter().enumerate() {
-            assert_eq!(job.source, i * 16 * PAGE as usize);
+            assert_eq!(job.source, i * COPY_CHUNK_PAGES * PAGE as usize);
             assert_eq!(job.destination, 1024 + job.source);
         }
     }
