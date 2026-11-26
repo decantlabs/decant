@@ -1687,6 +1687,12 @@ pub fn lift(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
                 return Ok(true);
             }
             if cx.stage == Stage::Compute {
+                if insn.op == Op::v_readlane_b32_e64 && cx.masks.self_lane_read() {
+                    let value = bits(insn, 0)?;
+                    let dst = var(insn, insn.dst)?;
+                    cx.set(dst, value);
+                    return Ok(true);
+                }
                 return compute_lane(cx, insn);
             }
             // A lane read with a computed lane: the lane a search of a mask found. In a wave of

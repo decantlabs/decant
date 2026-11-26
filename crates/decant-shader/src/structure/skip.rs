@@ -19,10 +19,10 @@
 //!
 //! * the code is entered through the skip only, and leaves to the target of the skip only (or to
 //!   an empty end block when the target itself is an empty end block, for a barrier region),
-//! * each of its statements is under the lane test, is a barrier (for a barrier region), or is an
-//!   assignment whose variable nothing reads once the code is left (a saved mask, a condition
-//!   code, a scalar the code uses itself). Exports, messages and effects that are not under the
-//!   lane test keep the skip,
+//! * each of its statements is under the lane test, is a barrier or lane masked swizzle (for a
+//!   barrier region), or is an assignment whose variable nothing reads once the code is left (a
+//!   saved mask, a condition code, a scalar the code uses itself). Exports, messages and other
+//!   effects that are not under the lane test keep the skip,
 //! * the code never sets EXEC to something that can be true in a lane that came in inactive.
 //!   Saving EXEC, narrowing it and restoring the saved value are all false in such a lane,
 //! * for a barrier region that contains loops, every cycle reachable by an inactive lane exits
@@ -382,6 +382,18 @@ fn always_written(g: &Graph, nodes: &[usize], allow_barrier: bool) -> Option<Vec
                 Stmt::Effect {
                     guard: Guard::Exec, ..
                 } => {}
+                Stmt::Effect {
+                    dst,
+                    call: Expr::Call(h, _),
+                    guard: Guard::Always,
+                } if allow_barrier
+                    && (h.name == crate::lift::wave::SWIZZLE.name
+                        || h.name == crate::lift::wave::SWIZZLE_WAVE.name) =>
+                {
+                    if let Some(dst) = dst {
+                        out.push(*dst);
+                    }
+                }
                 Stmt::Barrier { .. } if allow_barrier => {}
                 Stmt::Image(..)
                 | Stmt::Buffer(..)

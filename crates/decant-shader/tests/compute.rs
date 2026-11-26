@@ -1329,3 +1329,144 @@ fn barrier_skip_respects_mid_shader_joins_and_rejects_unsafe_regions() {
     unsafe_vloop.lds_bytes = 2048;
     assert_eq!(lifted_barrier_depths(&unsafe_vloop), [1]);
 }
+
+#[test]
+fn early_exec_exit_around_swizzle_and_barrier_is_dropped_and_compiles() {
+    // 1. Early s_cbranch_execz wrapping ds_swizzle_b32 and s_barrier is dropped to top level.
+    let mut p = compute([256, 1, 1], Vec::new(), |a| {
+        let end = a.label();
+        a.push(vopc(Op::v_cmp_gt_u32, s(4), v(0)));
+        a.push(sop1(Op::s_and_saveexec_b64, s(10), VCC));
+        a.branch(Op::s_cbranch_execz, end);
+        a.push(ds(Op::ds_swizzle_b32, v(4), [v(0), NONE, NONE], 31, 16));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(4), NONE], 0, 0));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_read_b32, v(5), [v(0), NONE, NONE], 0, 0));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(5), NONE], 4, 0));
+        a.bind(end);
+    });
+    p.lds_bytes = 256;
+    assert_eq!(lifted_barrier_depths(&p), [0]);
+    let text = hlsl(&p);
+    assert!(text.contains("GroupMemoryBarrierWithGroupSync()"), "{text}");
+    assert_eq!(text.matches("return;").count(), 1, "{text}");
+    compiles(&p);
+
+    // 2. Nested EXEC branch holding a swizzle inside a dropped barrier skip lowers swizzles
+    //    via wave intrinsics while keeping the workgroup barrier at depth 0.
+    let mut nested = compute([256, 1, 1], Vec::new(), |a| {
+        let inner = a.label();
+        let end = a.label();
+        a.push(vopc(Op::v_cmpx_gt_u32, s(4), v(0)));
+        a.branch(Op::s_cbranch_execz, end);
+        a.push(vopc(Op::v_cmp_lt_u32, v(0), int(64)));
+        a.push(sop1(Op::s_and_saveexec_b64, s(12), VCC));
+        a.branch(Op::s_cbranch_execz, inner);
+        a.push(ds(Op::ds_swizzle_b32, v(4), [v(0), NONE, NONE], 31, 16));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(4), NONE], 0, 0));
+        a.bind(inner);
+        a.push(sop1(Op::s_mov_b64, EXEC, s(12)));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_read_b32, v(5), [v(0), NONE, NONE], 0, 0));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(5), NONE], 4, 0));
+        a.bind(end);
+    });
+    nested.lds_bytes = 256;
+    assert_eq!(lifted_barrier_depths(&nested), [0]);
+    let nested_text = hlsl(&nested);
+    assert!(nested_text.contains("decant_swizzle_wave("), "{nested_text}");
+    assert!(nested_text.contains("decant_barrier();"), "{nested_text}");
+    assert_eq!(nested_text.matches("return;").count(), 1, "{nested_text}");
+    compiles(&nested);
+
+    // 3. Restoring outer EXEC inside a swizzle plus barrier region still keeps the skip.
+    let mut unsafe_swizzle = compute([256, 1, 1], Vec::new(), |a| {
+        let end = a.label();
+        a.push(sop1(Op::s_mov_b64, s(20), EXEC));
+        a.push(vopc(Op::v_cmpx_gt_u32, s(4), v(0)));
+        a.branch(Op::s_cbranch_execz, end);
+        a.push(ds(Op::ds_swizzle_b32, v(4), [v(0), NONE, NONE], 31, 16));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(sop1(Op::s_mov_b64, EXEC, s(20)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(4), NONE], 0, 0));
+        a.bind(end);
+    });
+    unsafe_swizzle.lds_bytes = 256;
+    assert_eq!(lifted_barrier_depths(&unsafe_swizzle), [1]);
+}
+
+#[test]
+fn single_lane_mask_ff1_readlane_avoids_wave_read_lane_and_spurious_wave_size() {
+    // 1. Wave32 mask search followed by v_readlane_b32 emits no WaveReadLaneAt or WaveSize.
+    let mut w32 = compute([64, 1, 1], Vec::new(), |a| {
+        a.push(vopc(Op::v_cmp_lg_u32, int(0), v(0)));
+        a.push(sop2(Op::s_and_b32, s(2), VCC, EXEC));
+        a.push(sop1(Op::s_ff1_i32_b32, s(2), s(2)));
+        a.push(vop3(Op::v_readlane_b32_e64, s(2), v(0), s(2), NONE));
+        a.push(vop1(Op::v_mov_b32, v(4), s(2)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(4), NONE], 0, 0));
+    });
+    w32.lds_bytes = 256;
+    let text32 = hlsl(&w32);
+    assert!(!text32.contains("decant_read_lane("), "{text32}");
+    assert!(!text32.contains("WaveReadLaneAt"), "{text32}");
+    assert!(!text32.contains("[WaveSize("), "{text32}");
+    compiles(&w32);
+
+    // 2. Wave64 mask search with divergent quad swizzle drops from WaveSize(64) to WaveSize(32).
+    let mut w64_swizzle = compute([64, 1, 1], Vec::new(), |a| {
+        let done = a.label();
+        a.push(sop1(Op::s_mov_b64, s(20), EXEC));
+        a.push(vopc(Op::v_cmpx_lt_u32, v(0), int(48)));
+        a.branch(Op::s_cbranch_execz, done);
+        a.push(sop2(Op::s_and_b64, s(4), s(20), EXEC));
+        a.push(sop1(Op::s_ff1_i32_b64, s(4), s(4)));
+        a.push(vop3(Op::v_readlane_b32_e64, s(4), v(0), s(4), NONE));
+        a.push(vop2(Op::v_add_u32, v(5), s(4), v(0)));
+        a.push(ds(Op::ds_swizzle_b32, v(6), [v(5), NONE, NONE], 0, 128));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(6), NONE], 0, 0));
+        a.bind(done);
+        a.push(sop1(Op::s_mov_b64, EXEC, s(20)));
+    });
+    w64_swizzle.lds_bytes = 256;
+    let text64 = hlsl(&w64_swizzle);
+    assert!(!text64.contains("decant_read_lane("), "{text64}");
+    assert!(text64.contains("[WaveSize(32)]"), "{text64}");
+    assert!(!text64.contains("[WaveSize(64)]"), "{text64}");
+    compiles(&w64_swizzle);
+
+    // 3. Numeric s_ff1 (not a lane mask) followed by v_readlane_b32 keeps decant_read_lane.
+    let mut numeric = compute([32, 1, 1], Vec::new(), |a| {
+        a.push(sop1(Op::s_and_saveexec_b32, s(10), int(-1)));
+        a.push(sop1(Op::s_mov_b32, s(2), int(7)));
+        a.push(sop1(Op::s_ff1_i32_b32, s(2), s(2)));
+        a.push(vop3(Op::v_readlane_b32_e64, s(3), v(0), s(2), NONE));
+        a.push(vop1(Op::v_mov_b32, v(4), s(3)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(4), NONE], 0, 0));
+    });
+    numeric.lds_bytes = 256;
+    let text_num = hlsl(&numeric);
+    assert!(text_num.contains("decant_read_lane("), "{text_num}");
+    assert!(text_num.contains("[WaveSize(32)]"), "{text_num}");
+    compiles(&numeric);
+
+    // 4. Real wave mode (matched exclusive scan plus constant cross lane read) keeps
+    //    WaveReadLaneAt for a mask s_ff1 readlane because s_ff1 uses WaveActiveBallot.
+    let mut real_wave = compute([64, 1, 1], Vec::new(), |a| {
+        for i in exclusive_scan() {
+            a.push(i);
+        }
+        a.push(vop3(Op::v_readlane_b32_e64, s(30), v(7), int(63), NONE));
+        a.push(sop1(Op::s_ff1_i32_b64, s(28), EXEC));
+        a.push(vop3(Op::v_readlane_b32_e64, s(29), v(7), s(28), NONE));
+        a.push(vop1(Op::v_mov_b32, v(5), s(29)));
+        a.push(vop2(Op::v_add_u32, v(4), s(30), v(5)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(4), NONE], 0, 0));
+    });
+    real_wave.lds_bytes = 256;
+    let text_rw = hlsl(&real_wave);
+    assert!(text_rw.contains("[WaveSize(64)]"), "{text_rw}");
+    assert!(text_rw.contains("decant_wave_ff1_b64("), "{text_rw}");
+    assert_eq!(text_rw.matches("decant_read_lane(").count(), 3, "{text_rw}");
+    compiles(&real_wave);
+}

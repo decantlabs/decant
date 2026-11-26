@@ -948,6 +948,10 @@ struct Site {
     /// Whether this `s_mov_b32` or `s_cselect_b32` reads mask words already materialised
     /// into scalar registers at their defining `v_cmp`.
     ballot_ready: bool,
+    /// Whether this `v_readlane_b32_e64` reads a lane index produced by a single lane mask search
+    /// (`s_ff1_i32_b32` or `s_ff1_i32_b64` on a lane mask), so in single lane mode it yields this
+    /// lane's own value without `WaveReadLaneAt`.
+    self_lane_read: bool,
 }
 
 /// Where the scalar registers of a program hold lane masks.
@@ -1060,6 +1064,12 @@ impl Masks {
     /// into scalar registers at their defining `v_cmp`.
     pub fn ballot_ready(&self) -> bool {
         self.at.get().ballot_ready
+    }
+
+    /// Whether this `v_readlane_b32_e64` reads a lane index from a single lane mask search and
+    /// yields this lane's own value.
+    pub fn self_lane_read(&self) -> bool {
+        self.at.get().self_lane_read
     }
 }
 
@@ -2876,7 +2886,176 @@ fn analyse_for(cfg: &Cfg, lanes: u8, parking: &Parking) -> Result<(Masks, usize)
     if lanes == 64 && !masks.converged {
         mark_vcmp_ballots(cfg, &typing, &mut masks);
     }
+    if !masks.real_wave {
+        mark_self_lane_reads(cfg, &typing, parking, &mut masks);
+    }
     Ok((masks, refused))
+}
+
+/// Marks non parked `v_readlane_b32_e64` instructions whose dynamic lane index is proven on every
+/// path to come from a single lane mask search (`s_ff1_i32_b32` or `s_ff1_i32_b64` on a lane mask
+/// of the program's wave width).
+///
+/// When [`Masks::real_wave`] is false, `s_ff1` on a lane mask lowers to the single lane projection
+/// (`mask ? lane : 0xffffffffu`), which differs per invocation and yields an out of range index on
+/// inactive lanes. Passing that register to `WaveReadLaneAt` is invalid in SM 6.0 and adds a
+/// spurious `[WaveSize]` attribute. In the single lane model, the first lane of a one lane wave is
+/// this lane itself.
+fn mark_self_lane_reads(
+    cfg: &Cfg,
+    typing: &Typing<'_>,
+    parking: &Parking,
+    masks: &mut Masks,
+) {
+    let lanes = masks.lanes();
+    let has_dynamic_read = cfg.insns().any(|insn| {
+        insn.op == Op::v_readlane_b32_e64
+            && followed(insn.src[1]).is_some()
+            && parking.slot(insn).is_none()
+            && masks
+                .sites
+                .get(&insn.pc)
+                .is_none_or(|s| s.reduction.is_none() && s.scan.is_none())
+    });
+    if !has_dynamic_read {
+        return;
+    }
+    let is_mask_ff1 = |insn: &Insn, masks: &Masks| -> Option<u16> {
+        if !matches!(insn.op, Op::s_ff1_i32_b32 | Op::s_ff1_i32_b64)
+            || mask_number(insn.op) != Some(lanes)
+        {
+            return None;
+        }
+        let reads_mask = match insn.src[0] {
+            Operand::Reg(Reg::ExecLo) => true,
+            Operand::Reg(Reg::VccLo) => masks
+                .sites
+                .get(&insn.pc)
+                .is_some_and(|s| s.reads & bit(VCC) != 0),
+            Operand::Reg(Reg::VccHi) => masks
+                .sites
+                .get(&insn.pc)
+                .is_some_and(|s| s.reads & bit(VCC + 1) != 0),
+            Operand::Reg(Reg::S(n)) => masks
+                .sites
+                .get(&insn.pc)
+                .is_some_and(|s| s.reads & bit(n) != 0),
+            _ => false,
+        };
+        if !reads_mask {
+            return None;
+        }
+        followed(insn.dst).map(u16::from)
+    };
+    let step = |insn: &Insn, span: &Span, cur: &mut Bits, masks: &Masks| {
+        if let Some(dst) = is_mask_ff1(insn, masks) {
+            cur.put(dst, true);
+            return;
+        }
+        if insn.op == Op::s_mov_b32
+            && !names(insn, Reg::ExecLo)
+            && !masks
+                .sites
+                .get(&insn.pc)
+                .is_some_and(|s| s.reads != 0 || s.writes != 0)
+            && let (Some(dst), Some(src)) = (followed(insn.dst), followed(insn.src[0]))
+        {
+            let v = cur.has(u16::from(src));
+            cur.put(u16::from(dst), v);
+            return;
+        }
+        if let Some(slot) = parking.slot(insn)
+            && masks
+                .sites
+                .get(&insn.pc)
+                .is_some_and(|s| s.parked == NUMBER)
+        {
+            if insn.op == Op::v_writelane_b32_e64 {
+                let v = followed(insn.src[0]).is_some_and(|r| cur.has(u16::from(r)));
+                cur.put(slot, v);
+                return;
+            }
+            if insn.op == Op::v_readlane_b32_e64
+                && let Some(dst) = followed(insn.dst)
+            {
+                cur.put(u16::from(dst), cur.has(slot));
+                return;
+            }
+        }
+        for t in typing.own(span).iter().filter(|t| t.def) {
+            cur.put(t.loc, false);
+        }
+    };
+    let n = cfg.blocks.len();
+    let mut ins = vec![Bits::NONE; n];
+    let mut outs = vec![Bits::NONE; n];
+    let mut seen = vec![false; n];
+    let transfer = |b: usize, mut cur: Bits| -> Bits {
+        for (idx, insn) in cfg.blocks[b].insns.iter().enumerate() {
+            step(insn, &typing.spans[b][idx], &mut cur, masks);
+        }
+        cur
+    };
+    seen[0] = true;
+    outs[0] = transfer(0, Bits::NONE);
+    loop {
+        let mut changed = false;
+        for b in 0..n {
+            let incoming = if b == 0 {
+                Bits::NONE
+            } else {
+                let mut acc: Option<Bits> = None;
+                for &p in &typing.preds[b] {
+                    if seen[p] {
+                        acc = Some(match acc {
+                            None => outs[p],
+                            Some(mut old) => {
+                                for (x, y) in old.0.iter_mut().zip(&outs[p].0) {
+                                    *x &= y;
+                                }
+                                old
+                            }
+                        });
+                    }
+                }
+                let Some(v) = acc else { continue };
+                v
+            };
+            if !seen[b] || incoming != ins[b] {
+                let was_seen = seen[b];
+                seen[b] = true;
+                ins[b] = incoming;
+                let out = transfer(b, incoming);
+                if !was_seen || out != outs[b] {
+                    outs[b] = out;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for b in 0..n {
+        if !seen[b] {
+            continue;
+        }
+        let mut cur = ins[b];
+        for (idx, insn) in cfg.blocks[b].insns.iter().enumerate() {
+            if insn.op == Op::v_readlane_b32_e64
+                && let Some(lane_reg) = followed(insn.src[1])
+                && cur.has(u16::from(lane_reg))
+                && parking.slot(insn).is_none()
+                && masks
+                    .sites
+                    .get(&insn.pc)
+                    .is_none_or(|s| s.reduction.is_none() && s.scan.is_none())
+            {
+                masks.sites.entry(insn.pc).or_default().self_lane_read = true;
+            }
+            step(insn, &typing.spans[b][idx], &mut cur, masks);
+        }
+    }
 }
 
 /// Marks 64 lane `v_cmp_*` definitions whose scalar destination words are read directly as
@@ -3296,5 +3475,74 @@ mod tests {
             masks.enter(insn.pc);
             assert_eq!(masks.refusal(), None, "{insn}");
         }
+    }
+
+    #[test]
+    fn mask_ff1_readlane_marks_self_lane_read_only_when_proven_on_all_paths() {
+        // Wave32 in place overwrite: first readlane is self lane, second reads loaded data.
+        let mut a = Asm::new();
+        a.push(vopc(Op::v_cmp_lg_u32, int(0), v(1)));
+        a.push(sop2(Op::s_and_b32, s(2), crate::asm::VCC, EXEC));
+        a.push(sop1(Op::s_ff1_i32_b32, s(2), s(2)));
+        a.push(vop3(Op::v_readlane_b32_e64, s(2), v(4), s(2), Operand::None));
+        a.push(vop3(Op::v_readlane_b32_e64, s(3), v(5), s(2), Operand::None));
+        let (graph, masks) = analyse_asm(a);
+        let reads: Vec<_> = graph
+            .insns()
+            .filter(|i| i.op == Op::v_readlane_b32_e64)
+            .collect();
+        assert_eq!(reads.len(), 2);
+        masks.enter(reads[0].pc);
+        assert!(masks.self_lane_read());
+        masks.enter(reads[1].pc);
+        assert!(!masks.self_lane_read());
+
+        // Wave64 copy through s_mov_b32 preserves mask search provenance.
+        let mut b = Asm::new();
+        b.push(sop1(Op::s_mov_b64, s(8), EXEC));
+        b.push(sop2(Op::s_and_b64, s(4), s(8), EXEC));
+        b.push(sop1(Op::s_ff1_i32_b64, s(4), s(4)));
+        b.push(sop1(Op::s_mov_b32, s(6), s(4)));
+        b.push(vop3(Op::v_readlane_b32_e64, s(7), v(4), s(6), Operand::None));
+        let (graph, masks) = analyse_asm(b);
+        let read = graph
+            .insns()
+            .find(|i| i.op == Op::v_readlane_b32_e64)
+            .unwrap();
+        masks.enter(read.pc);
+        assert!(masks.self_lane_read());
+
+        // Mixed path where one branch sets a constant lane does not mark self_lane_read.
+        let mut c = Asm::new();
+        let other = c.label();
+        let join = c.label();
+        c.push(sopc(Op::s_cmp_eq_u32, s(0), int(0)));
+        c.branch(Op::s_cbranch_scc1, other);
+        c.push(sop1(Op::s_ff1_i32_b32, s(2), EXEC));
+        c.branch(Op::s_branch, join);
+        c.bind(other);
+        c.push(sop1(Op::s_mov_b32, s(2), int(3)));
+        c.bind(join);
+        c.push(vop3(Op::v_readlane_b32_e64, s(3), v(4), s(2), Operand::None));
+        let (graph, masks) = analyse_asm(c);
+        let read = graph
+            .insns()
+            .find(|i| i.op == Op::v_readlane_b32_e64)
+            .unwrap();
+        masks.enter(read.pc);
+        assert!(!masks.self_lane_read());
+
+        // Numeric s_ff1 on a non mask scalar does not mark self_lane_read.
+        let mut d = Asm::new();
+        d.push(sop1(Op::s_mov_b32, s(2), int(7)));
+        d.push(sop1(Op::s_ff1_i32_b32, s(2), s(2)));
+        d.push(vop3(Op::v_readlane_b32_e64, s(3), v(4), s(2), Operand::None));
+        let (graph, masks) = analyse_asm(d);
+        let read = graph
+            .insns()
+            .find(|i| i.op == Op::v_readlane_b32_e64)
+            .unwrap();
+        masks.enter(read.pc);
+        assert!(!masks.self_lane_read());
     }
 }
