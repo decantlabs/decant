@@ -32,6 +32,7 @@ const T2D_MS_ARRAY: u32 = 15;
 /// "All that are left" in a mip count, array size or 3D slice count of a view.
 const ALL: u32 = u32::MAX;
 
+#[inline]
 fn get32(d: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([d[at], d[at + 1], d[at + 2], d[at + 3]])
 }
@@ -48,15 +49,17 @@ struct Resource {
 }
 
 impl Resource {
-    fn read(d: &[u8; RESOURCE_BYTES]) -> Resource {
-        let width = u32::try_from(u64::from_le_bytes(d[0x10..0x18].try_into().unwrap_or_default())).unwrap_or(u32::MAX);
+    #[inline]
+    fn read(dimension: u32, d: &[u8; RESOURCE_BYTES]) -> Resource {
+        let width64 = u64::from_le_bytes([d[0x10], d[0x11], d[0x12], d[0x13], d[0x14], d[0x15], d[0x16], d[0x17]]);
+        let width = u32::try_from(width64).unwrap_or(u32::MAX);
         let height = get32(d, 0x18).max(1);
         let depth_or_array = u32::from(u16::from_le_bytes([d[0x1C], d[0x1D]])).max(1);
-        let depth = if get32(d, 0) == 4 { depth_or_array } else { 1 };
+        let depth = if dimension == 4 { depth_or_array } else { 1 };
         let declared = u32::from(u16::from_le_bytes([d[0x1E], d[0x1F]]));
         // 0 mip levels: the whole chain
         let mips = if declared == 0 { 32 - width.max(height).max(depth).max(1).leading_zeros() } else { declared };
-        Resource { dimension: get32(d, 0), width: width.max(1), height, depth_or_array, mips, samples: get32(d, 0x24).max(1) }
+        Resource { dimension, width: width.max(1), height, depth_or_array, mips, samples: get32(d, 0x24).max(1) }
     }
 
     fn array(&self) -> u32 {
@@ -80,11 +83,13 @@ struct Shape {
 /// The two image words of the texture view `view` (`None`: the resource's own view) of `kind` on the
 /// resource described by `resource`. `None` for a buffer, a view of another kind or an unknown
 /// dimension.
+#[inline]
 pub fn image_words(view: Option<&[u8; DESC_BYTES]>, kind: ViewKind, resource: &[u8; RESOURCE_BYTES]) -> Option<[u32; 2]> {
-    let r = Resource::read(resource);
-    if !(2..=4).contains(&r.dimension) {
+    let dimension = get32(resource, 0);
+    if !(2..=4).contains(&dimension) {
         return None;
     }
+    let r = Resource::read(dimension, resource);
     let shape = match view {
         Some(v) => view_shape(v, kind, &r)?,
         None => own_shape(kind, &r),
@@ -112,9 +117,9 @@ fn own_shape(kind: ViewKind, r: &Resource) -> Shape {
     Shape { image, mip: 0, levels_field, last }
 }
 
+#[inline]
 fn view_shape(v: &[u8; DESC_BYTES], kind: ViewKind, r: &Resource) -> Option<Shape> {
     let dim = get32(v, 4);
-    let samples = r.samples.trailing_zeros();
     // array slices of a view from its first slice and size
     let slices = |first: u32, size: u32| if size == ALL { r.array().saturating_sub(first) } else { size };
     let last = |count: u32| count.max(1) - 1;
@@ -131,8 +136,8 @@ fn view_shape(v: &[u8; DESC_BYTES], kind: ViewKind, r: &Resource) -> Option<Shap
                 3 => shape(T1D_ARRAY, mip, levels, last(slices(get32(v, 0x18), get32(v, 0x1C)))),
                 4 => shape(T2D, mip, levels, 0),
                 5 => shape(T2D_ARRAY, mip, levels, last(slices(get32(v, 0x18), get32(v, 0x1C)))),
-                6 => Shape { image: T2D_MS, mip: 0, levels_field: samples, last: 0 },
-                7 => Shape { image: T2D_MS_ARRAY, mip: 0, levels_field: samples, last: last(slices(get32(v, 0x10), get32(v, 0x14))) },
+                6 => Shape { image: T2D_MS, mip: 0, levels_field: r.samples.trailing_zeros(), last: 0 },
+                7 => Shape { image: T2D_MS_ARRAY, mip: 0, levels_field: r.samples.trailing_zeros(), last: last(slices(get32(v, 0x10), get32(v, 0x14))) },
                 8 => shape(T3D, mip, levels, last(r.depth_at(mip))),
                 9 => shape(CUBE, mip, levels, 5),
                 10 => shape(CUBE, mip, levels, last(6 * get32(v, 0x1C))),
@@ -146,8 +151,8 @@ fn view_shape(v: &[u8; DESC_BYTES], kind: ViewKind, r: &Resource) -> Option<Shap
                 3 => shape(T1D_ARRAY, mip, 1, last(slices(get32(v, 0x0C), get32(v, 0x10)))),
                 4 => shape(T2D, mip, 1, 0),
                 5 => shape(T2D_ARRAY, mip, 1, last(slices(get32(v, 0x0C), get32(v, 0x10)))),
-                6 => Shape { image: T2D_MS, mip: 0, levels_field: samples, last: 0 },
-                7 => Shape { image: T2D_MS_ARRAY, mip: 0, levels_field: samples, last: last(slices(get32(v, 0x08), get32(v, 0x0C))) },
+                6 => Shape { image: T2D_MS, mip: 0, levels_field: r.samples.trailing_zeros(), last: 0 },
+                7 => Shape { image: T2D_MS_ARRAY, mip: 0, levels_field: r.samples.trailing_zeros(), last: last(slices(get32(v, 0x08), get32(v, 0x0C))) },
                 8 => {
                     let depth = match get32(v, 0x10) {
                         ALL => r.depth_at(mip).saturating_sub(get32(v, 0x0C)),
@@ -222,5 +227,6 @@ mod tests {
         assert_eq!(image_words(None, ViewKind::UnorderedAccess, &resource(3, 64, 32, 1, 5, 1)), Some(words(64, 32, 0, 0, 9)));
         assert_eq!(image_words(None, ViewKind::ShaderResource, &resource(1, 256, 1, 1, 1, 1)), None);
         assert_eq!(image_words(Some(&view(1, &[])), ViewKind::ShaderResource, &resource(3, 8, 8, 1, 1, 1)), None, "a buffer view");
+        assert_eq!(image_words(None, ViewKind::ShaderResource, &resource(0, 256, 1, 1, 1, 1)), None, "unknown dimension");
     }
 }

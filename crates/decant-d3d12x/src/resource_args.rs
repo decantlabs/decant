@@ -22,21 +22,31 @@ const BARRIER_TYPE_UAV: u32 = 2;
 const BARRIER_UNION: usize = 8;
 
 /// Replaces the pointer stored at `at` with `unwrap(pointer)`.
+#[inline]
 fn rewrite(bytes: &mut [u8], at: usize, unwrap: &impl Fn(u64) -> u64) {
-    let mut raw = [0u8; 8];
-    raw.copy_from_slice(&bytes[at..at + 8]);
-    let mapped = unwrap(u64::from_le_bytes(raw));
-    bytes[at..at + 8].copy_from_slice(&mapped.to_le_bytes());
+    let orig = u64::from_le_bytes([
+        bytes[at],
+        bytes[at + 1],
+        bytes[at + 2],
+        bytes[at + 3],
+        bytes[at + 4],
+        bytes[at + 5],
+        bytes[at + 6],
+        bytes[at + 7],
+    ]);
+    let mapped = unwrap(orig);
+    if mapped != orig {
+        bytes[at..at + 8].copy_from_slice(&mapped.to_le_bytes());
+    }
 }
 
 /// Unwraps the resource pointers of one `D3D12_RESOURCE_BARRIER` in place. A transition and a UAV
 /// barrier hold one resource (`Transition.pResource`, `UAV.pResource`, both at the start of the
 /// union), an aliasing barrier holds two (`pResourceBefore`, `pResourceAfter`). Any other type has
 /// no resource and is left as it is.
+#[inline]
 pub fn unwrap_barrier(barrier: &mut [u8; BARRIER_BYTES], unwrap: impl Fn(u64) -> u64) {
-    let mut raw = [0u8; 4];
-    raw.copy_from_slice(&barrier[0..4]);
-    match u32::from_le_bytes(raw) {
+    match u32::from_le_bytes([barrier[0], barrier[1], barrier[2], barrier[3]]) {
         BARRIER_TYPE_TRANSITION | BARRIER_TYPE_UAV => rewrite(barrier, BARRIER_UNION, &unwrap),
         BARRIER_TYPE_ALIASING => {
             rewrite(barrier, BARRIER_UNION, &unwrap);
@@ -47,6 +57,7 @@ pub fn unwrap_barrier(barrier: &mut [u8; BARRIER_BYTES], unwrap: impl Fn(u64) ->
 }
 
 /// Unwraps the resource of one `D3D12_TEXTURE_COPY_LOCATION` in place (`pResource` at 0).
+#[inline]
 pub fn unwrap_copy_location(location: &mut [u8; COPY_LOCATION_BYTES], unwrap: impl Fn(u64) -> u64) {
     rewrite(location, 0, &unwrap);
 }

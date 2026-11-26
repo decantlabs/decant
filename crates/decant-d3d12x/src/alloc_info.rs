@@ -17,6 +17,35 @@
 //! Buffers and descriptions XG refuses keep the PC answer.
 
 use crate::detile_plan::console_footprint;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[derive(Default)]
+struct FastBytesHasher(u64);
+
+impl Hasher for FastBytesHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0 ^ 0xCBF2_9CE4_8422_2325;
+        let (chunks, rem) = bytes.as_chunks::<8>();
+        for &c in chunks {
+            let word = u64::from_le_bytes(c);
+            h = (h ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        for &b in rem {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3);
+        }
+        self.0 = h;
+    }
+}
+
+type FastDescSet = HashSet<[u8; 0x38], BuildHasherDefault<FastBytesHasher>>;
+type FastAllocMap = HashMap<([u8; 0x38], bool), Option<(u64, u64)>, BuildHasherDefault<FastBytesHasher>>;
 
 /// `D3D12_RESOURCE_DIMENSION_BUFFER`.
 const BUFFER: u32 = 1;
@@ -24,14 +53,33 @@ const BUFFER: u32 = 1;
 /// How many distinct descriptions are logged with both answers.
 pub const LOGGED_DESCRIPTIONS: usize = 256;
 
+/// Maximum cached `console_allocation` entries.
+const ALLOC_CACHE_CAP: usize = 4096;
+
 /// Whether `raw` is a description not logged yet, while fewer than `LOGGED_DESCRIPTIONS` were.
 pub fn first_sight(raw: &[u8; 0x38]) -> bool {
-    static SEEN: std::sync::Mutex<Vec<[u8; 0x38]>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if seen.len() >= LOGGED_DESCRIPTIONS || seen.contains(raw) {
+    static SEEN_FULL: AtomicBool = AtomicBool::new(false);
+    static SEEN: RwLock<Option<FastDescSet>> = RwLock::new(None);
+    if SEEN_FULL.load(Ordering::Relaxed) {
         return false;
     }
-    seen.push(*raw);
+    if let Some(seen) = SEEN.read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()
+        && (seen.len() >= LOGGED_DESCRIPTIONS || seen.contains(raw))
+    {
+        return false;
+    }
+    let mut guard = SEEN.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let seen = guard.get_or_insert_with(FastDescSet::default);
+    if seen.len() >= LOGGED_DESCRIPTIONS {
+        SEEN_FULL.store(true, Ordering::Relaxed);
+        return false;
+    }
+    if !seen.insert(*raw) {
+        return false;
+    }
+    if seen.len() >= LOGGED_DESCRIPTIONS {
+        SEEN_FULL.store(true, Ordering::Relaxed);
+    }
     true
 }
 
@@ -39,10 +87,25 @@ pub fn first_sight(raw: &[u8; 0x38]) -> bool {
 /// hardware version `v4`. `None` for a buffer, for a description XG refuses and for a requested
 /// alignment that is not a power of two: the caller keeps the PC answer.
 pub fn console_allocation(raw: &[u8; 0x38], v4: bool) -> Option<(u64, u64)> {
-    if u32::from_le_bytes(raw[0..4].try_into().ok()?) == BUFFER {
+    static CACHE: RwLock<Option<FastAllocMap>> = RwLock::new(None);
+    if u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) == BUFFER {
         return None;
     }
-    let requested = u64::from_le_bytes(raw[8..16].try_into().ok()?);
+    let key = (*raw, v4);
+    if let Some(&cached) = CACHE.read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|m| m.get(&key)) {
+        return cached;
+    }
+    let computed = compute_console_allocation(raw, v4);
+    let mut guard = CACHE.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = guard.get_or_insert_with(FastAllocMap::default);
+    if map.len() < ALLOC_CACHE_CAP {
+        map.insert(key, computed);
+    }
+    computed
+}
+
+fn compute_console_allocation(raw: &[u8; 0x38], v4: bool) -> Option<(u64, u64)> {
+    let requested = u64::from_le_bytes([raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]]);
     let (size, layout_alignment) = console_footprint(raw, v4)?;
     let alignment = requested.max(layout_alignment);
     if !alignment.is_power_of_two() {
@@ -160,5 +223,14 @@ mod tests {
         assert!(line.contains("dimension 3, 128x128x1, mips 8, format 98, layout 0x105"), "{line}");
         assert!(line.contains("asked alignment 0x1000: PC 0x4000 align 0x1000, XG 0x8000 align 0x1000"), "{line}");
         assert!(describe(25, &raw, (1, 2), None).ends_with("XG none, the PC answer stands"));
+    }
+
+    #[test]
+    fn repeated_console_allocation_hits_cache_consistently() {
+        let raw = desc(3, 0x1000, 256, 256, 9, 98, 0x105);
+        let first = console_allocation(&raw, false);
+        let second = console_allocation(&raw, false);
+        assert_eq!(first, second);
+        assert!(first.is_some());
     }
 }
