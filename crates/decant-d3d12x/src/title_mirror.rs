@@ -497,6 +497,49 @@ impl Mirror {
         self.tile_pages.get(tile as usize).copied()
     }
 
+    /// Pool pages whose mirror tile falls in pool heap `heap`, in mirror tile order.
+    pub fn pages_in_heap(&self, heap: u32) -> Vec<u32> {
+        let Some(first_tile) = heap.checked_mul(HEAP_PAGES) else {
+            return Vec::new();
+        };
+        let start = (first_tile as usize).min(self.tile_pages.len());
+        let end = (first_tile.saturating_add(HEAP_PAGES) as usize).min(self.tile_pages.len());
+        self.tile_pages[start..end].to_vec()
+    }
+
+    /// Re-queues pending tile updates for every live window tile showing a pool page of `heap`.
+    /// Used when a transiently deferred pool heap is materialized later. Returns how many window
+    /// tile mappings were queued.
+    pub fn remap_heap_tiles(&mut self, heap: u32) -> usize {
+        let Some(first_tile) = heap.checked_mul(HEAP_PAGES) else {
+            return 0;
+        };
+        let start = (first_tile as usize).min(self.tile_pages.len());
+        let end = (first_tile.saturating_add(HEAP_PAGES) as usize).min(self.tile_pages.len());
+        let mut queued = 0usize;
+        for tile_idx in start..end {
+            let page = self.tile_pages[tile_idx];
+            let target = Target::Heap(tile_idx as u32);
+            let p_idx = page as usize;
+            if p_idx < self.owners_dense.len() {
+                let pending = &mut self.pending;
+                self.owners_dense[p_idx].for_each(|(b, t)| {
+                    pending_set(pending, b, t, 1, target);
+                    queued += 1;
+                });
+            } else if p_idx >= DENSE_OWNER_LIMIT
+                && let Some(owners) = self.owners_sparse.get(&page)
+            {
+                let pending = &mut self.pending;
+                owners.for_each(|(b, t)| {
+                    pending_set(pending, b, t, 1, target);
+                    queued += 1;
+                });
+            }
+        }
+        queued
+    }
+
     /// Changes whenever a slot is given or freed. A mapping inside a slot does not change any address.
     pub fn generation(&self) -> u32 {
         self.generation
@@ -1142,5 +1185,45 @@ mod tests {
         assert_eq!(m.translate(0x2_0000_0000 + 199 * PAGE, 4).map(|p| p.offset), Some(199 * PAGE));
         assert!(m.translate(0x2_0000_0000 + 210 * PAGE, 4).is_none());
         assert_eq!(m.translate(0x2_0000_0000 + 260 * PAGE, 4).map(|p| p.offset), Some(260 * PAGE));
+    }
+
+    #[test]
+    fn pages_in_heap_and_remap_heap_tiles_cover_dense_aliased_and_sparse_owners() {
+        let mut m = Mirror::new(GIB);
+        reserve(&mut m, 0x1000_0000, 300);
+        reserve(&mut m, 0x2000_0000, 4);
+        assert_eq!(m.apply(Change::Map { va: 0x1000_0000, pages: 260, first_page: 0 }), None);
+        // Alias pool page 257 into the second reservation, plus a sparse page index in heap 1.
+        assert_eq!(m.apply(Change::Map { va: 0x2000_0000, pages: 1, first_page: 257 }), None);
+        let sparse_page = DENSE_OWNER_LIMIT as u32 + 17;
+        assert_eq!(m.apply(Change::Map { va: 0x2000_0000 + PAGE, pages: 1, first_page: sparse_page }), None);
+        for p in 0..260u32 {
+            m.give_tile(p);
+        }
+        let sparse_tile = m.give_tile(sparse_page);
+        assert_eq!(heap_of(sparse_tile), (1, 4));
+        // Unmap page 256 so it is no longer owned by any window tile.
+        assert_eq!(m.apply(Change::Unmap { va: 0x1000_0000 + 256 * PAGE, pages: 1 }), None);
+        let _ = m.drain_updates();
+
+        assert_eq!(m.pages_in_heap(0).len(), HEAP_PAGES as usize);
+        assert_eq!(m.pages_in_heap(1), vec![256, 257, 258, 259, sparse_page]);
+        assert!(m.pages_in_heap(99).is_empty());
+        assert!(m.pages_in_heap(u32::MAX).is_empty());
+
+        // Remapping heap 1 must re-queue 257..=259 in slot 0, the alias of 257 at tile 300,
+        // and the sparse page at tile 301, while omitting unmapped page 256.
+        assert_eq!(m.remap_heap_tiles(1), 5);
+        assert_eq!(m.remap_heap_tiles(99), 0);
+        assert_eq!(m.remap_heap_tiles(u32::MAX), 0);
+        assert_eq!(
+            m.drain_updates(),
+            [TileCall {
+                buffer: 0,
+                heap: Some(1),
+                ranges: vec![(257, 3), (300, 1), (301, 1)],
+                heap_tiles: vec![1, 1, 4],
+            }]
+        );
     }
 }

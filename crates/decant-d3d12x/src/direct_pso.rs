@@ -26,6 +26,10 @@
 //! * `DECANT_D3D12X_DIRECT_DUMP=<dir>` gets the HLSL of each translated stage with its instruction
 //!   listing, the reason of each refused pipeline, and the HLSL and the DXC message of each stage
 //!   DXC refused.
+//! * `DECANT_D3D12X_DUMP_HLSL_HASHES=<hex,...>` dumps translated HLSL (with ISA listing), compiled
+//!   DXIL, and raw console container bytes for matching shader content hashes even on warm cache
+//!   hits into `DECANT_D3D12X_DUMP_HLSL_DIR` (or `DECANT_D3D12X_DIRECT_DUMP`, or
+//!   `%LOCALAPPDATA%\Decant\shader-dump`).
 //! * `DECANT_D3D12X_COMPUTE_WAIT_MS=<ms>` is how long a compute pipeline waits for its shaders and
 //!   driver pipeline before being marked late (default 5000, `0` does not wait).
 //! * `DECANT_D3D12X_FRAME_WAIT_MS=<ms>` is the total per-frame wait budget across cold graphics and
@@ -57,8 +61,9 @@
 
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -159,6 +164,7 @@ fn start() -> Option<Service> {
     let settings = Settings { threads: threads(), cache, dump, log: log_line };
     let live_limit = parse_live_limit(std::env::var("DECANT_D3D12X_MAX_LIVE_HLSL_BYTES").ok().as_deref());
     let o0_bytes = o0_hlsl_bytes();
+    let _ = dump_hlsl_hashes();
     xs_log!(
         "direct shaders on: {}, translator {}, translator_hash={TRANSLATOR_HASH}, {} workers, cache {}, dump {}, -O0 from {o0_bytes} HLSL bytes, live limit {}",
         dxc.describe(),
@@ -631,11 +637,207 @@ pub(crate) fn choose_with_budget(object: usize, owned: &Owned, key: Option<u128>
     choice_from(owned, verdict)
 }
 
+/// Stack size for targeted shader dumps so recursive translation cannot overflow a title thread.
+const DUMP_TRANSLATE_STACK: usize = 32 << 20;
+
+/// Configured shader hashes to dump on demand (`DECANT_D3D12X_DUMP_HLSL_HASHES`, default off).
+fn dump_hlsl_hashes() -> &'static [u64] {
+    static HASHES: OnceLock<Vec<u64>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        let hashes = crate::pso_diag::parse_hex_hash_list(std::env::var("DECANT_D3D12X_DUMP_HLSL_HASHES").ok().as_deref());
+        if !hashes.is_empty() {
+            let formatted = hashes.iter().map(|h| format!("{h:016x}")).collect::<Vec<_>>().join(", ");
+            xs_log!(
+                "direct shaders: DECANT_D3D12X_DUMP_HLSL_HASHES active for {} hash(es) -> {} ({formatted})",
+                hashes.len(),
+                dump_hlsl_dir().display()
+            );
+        }
+        hashes
+    })
+}
+
+/// Output directory for `DECANT_D3D12X_DUMP_HLSL_HASHES`: prefers `DECANT_D3D12X_DUMP_HLSL_DIR`,
+/// then `DECANT_D3D12X_DIRECT_DUMP`, then `%LOCALAPPDATA%\Decant\shader-dump`.
+fn dump_hlsl_dir() -> PathBuf {
+    dump_hlsl_dir_from(
+        std::env::var_os("DECANT_D3D12X_DUMP_HLSL_DIR").filter(|v| !v.is_empty()).map(PathBuf::from),
+        std::env::var_os("DECANT_D3D12X_DIRECT_DUMP").filter(|v| !v.is_empty()).map(PathBuf::from),
+        std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()).map(PathBuf::from),
+    )
+}
+
+fn dump_hlsl_dir_from(explicit: Option<PathBuf>, direct_dump: Option<PathBuf>, local_app_data: Option<PathBuf>) -> PathBuf {
+    explicit
+        .or(direct_dump)
+        .or_else(|| local_app_data.map(|p| p.join("Decant").join("shader-dump")))
+        .unwrap_or_else(|| std::env::temp_dir().join("decant-shader-dump"))
+}
+
+fn shader_stage_of(kind: StageKind) -> decant_shader::api::Stage {
+    use decant_shader::api::Stage;
+    match kind {
+        StageKind::Vertex => Stage::Vertex,
+        StageKind::Pixel => Stage::Pixel,
+        StageKind::Domain => Stage::Domain,
+        StageKind::Hull => Stage::Hull,
+        StageKind::Geometry => Stage::Geometry,
+        StageKind::Compute => Stage::Compute,
+        StageKind::Amplification => Stage::Amplification,
+        StageKind::Mesh => Stage::Mesh,
+    }
+}
+
+/// Dumps raw container bytes, compiled DXIL (when available), and translated HLSL with ISA listing
+/// for every stage of `pipeline` whose content hash appears in `targets`. Returns how many target
+/// stages were dumped.
+fn dump_matching_pipeline_to(dir: &Path, pipeline: &Pipeline, dxil: Option<&[Arc<[u8]>]>, targets: &[u64]) -> usize {
+    let hashes: Vec<u64> = pipeline.stages.iter().map(|s| crate::dxil_override::content_hash(&s.bytes)).collect();
+    if !hashes.iter().any(|h| targets.contains(h)) {
+        return 0;
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        xs_log!("direct shaders: cannot create shader dump dir {} ({e})", dir.display());
+        return 0;
+    }
+    let mut dumped = 0usize;
+    for ((i, stage), &h) in pipeline.stages.iter().enumerate().zip(&hashes) {
+        if !targets.contains(&h) {
+            continue;
+        }
+        dumped += 1;
+        let _ = std::fs::write(dir.join(format!("{h:016x}.bin")), &stage.bytes);
+        if let Some(blob) = dxil.and_then(|blobs| blobs.get(i)) {
+            let _ = std::fs::write(dir.join(format!("{h:016x}.dxil")), blob.as_ref());
+        }
+    }
+    let mut programs = Vec::with_capacity(pipeline.stages.len());
+    let mut parse_err: Option<String> = None;
+    for (stage, &h) in pipeline.stages.iter().zip(&hashes) {
+        let name = format!("{h:016x}");
+        let expected = shader_stage_of(stage.kind);
+        match std::panic::catch_unwind(|| decant_shader::container::program(&stage.bytes, &name)) {
+            Ok(Ok(prog)) if prog.stage == expected => programs.push(prog),
+            Ok(Ok(prog)) => {
+                parse_err = Some(format!("stage mismatch: expected {expected:?}, got {:?}", prog.stage));
+                break;
+            }
+            Ok(Err(r)) => {
+                parse_err = Some(format!("{}: {}", r.key(), r.detail));
+                break;
+            }
+            Err(_) => {
+                parse_err = Some(String::from("container parser panicked"));
+                break;
+            }
+        }
+    }
+    if let Some(err) = parse_err {
+        for &h in &hashes {
+            if targets.contains(&h) {
+                let _ = std::fs::write(dir.join(format!("{h:016x}.refused.txt")), format!("{err}\n"));
+            }
+        }
+        return dumped;
+    }
+    let root = crate::direct_source::root_signature(&pipeline.root);
+    let mut opts = crate::direct_source::options(&pipeline.root);
+    opts.listing = true;
+    let translated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decant_shader::translate(&programs, &root, &opts, &crate::direct_source::RegistryHost)
+    }));
+    match translated {
+        Ok(Ok(tr)) => {
+            for ((i, stage), &h) in tr.stages.iter().enumerate().zip(&hashes) {
+                if !targets.contains(&h) {
+                    continue;
+                }
+                let path = dir.join(format!("{h:016x}.{}.hlsl", stage.profile));
+                let _ = std::fs::write(&path, &stage.hlsl);
+                let dxil_len = dxil.and_then(|blobs| blobs.get(i)).map_or(0, |b| b.len());
+                xs_log!(
+                    "direct shaders: dumped targeted shader {h:016x} (hlsl {} bytes, dxil {} bytes) to {}",
+                    stage.hlsl.len(),
+                    dxil_len,
+                    path.display()
+                );
+            }
+        }
+        Ok(Err(r)) => {
+            let text = format!("{}\n{}\n", r.key(), r.detail);
+            for &h in &hashes {
+                if targets.contains(&h) {
+                    let _ = std::fs::write(dir.join(format!("{h:016x}.refused.txt")), &text);
+                }
+            }
+        }
+        Err(_) => {
+            for &h in &hashes {
+                if targets.contains(&h) {
+                    let _ = std::fs::write(dir.join(format!("{h:016x}.refused.txt")), "translator panicked\n");
+                }
+            }
+        }
+    }
+    dumped
+}
+
+/// Checks whether `owned` contains any stage hash requested by `DECANT_D3D12X_DUMP_HLSL_HASHES`
+/// that has not been dumped yet, and dumps it on a dedicated high-stack thread so warm cache hits
+/// still produce full HLSL listings and DXIL blobs without blocking the binding thread.
+fn maybe_dump_matching_hlsl(owned: &Owned, dxil: Option<&[Arc<[u8]>]>) {
+    let targets = dump_hlsl_hashes();
+    if targets.is_empty() {
+        return;
+    }
+    let desc = owned.desc();
+    let mut matched = Vec::new();
+    for &(_, at) in stage_offsets(desc).iter() {
+        let (ptr, len) = (read_u64(desc, at), read_u64(desc, at + 8) as usize);
+        let Some(bytes) = owned.shaders().iter().find(|s| s.as_ptr() as u64 == ptr && s.len() == len) else {
+            continue;
+        };
+        let hash = crate::dxil_override::content_hash(bytes);
+        if targets.contains(&hash) && !matched.contains(&hash) {
+            matched.push(hash);
+        }
+    }
+    if matched.is_empty() {
+        return;
+    }
+    static DUMPED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+    let fresh: Vec<u64> = {
+        let mut guard = DUMPED.lock().unwrap_or_else(|e| e.into_inner());
+        let set = guard.get_or_insert_with(HashSet::new);
+        matched.into_iter().filter(|&h| set.insert(h)).collect()
+    };
+    if fresh.is_empty() {
+        return;
+    }
+    let Ok(pipeline) = pipeline_of(owned) else {
+        return;
+    };
+    let dxil_owned = dxil.map(<[Arc<[u8]>]>::to_vec);
+    let dir = dump_hlsl_dir();
+    let _ = std::thread::Builder::new()
+        .name("decant-hlsl-dump".into())
+        .stack_size(DUMP_TRANSLATE_STACK)
+        .spawn(move || {
+            let _ = dump_matching_pipeline_to(&dir, &pipeline, dxil_owned.as_deref(), &fresh);
+        });
+}
+
 /// The choice that follows a poll answer.
-fn choice_from(_owned: &Owned, verdict: Poll) -> Choice {
+fn choice_from(owned: &Owned, verdict: Poll) -> Choice {
     match verdict {
-        Poll::Ready(dxil) => Choice::Direct(patch(_owned.desc(), &dxil)),
-        Poll::Refused(_) => Choice::Original,
+        Poll::Ready(dxil) => {
+            maybe_dump_matching_hlsl(owned, Some(&dxil));
+            Choice::Direct(patch(owned.desc(), &dxil))
+        }
+        Poll::Refused(_) => {
+            maybe_dump_matching_hlsl(owned, None);
+            Choice::Original
+        }
         Poll::Pending => Choice::Pending,
     }
 }
@@ -1274,5 +1476,48 @@ mod tests {
         // Calling `prepare_patched` again is a no-op.
         prepare_patched(&owned, &mut patched);
         assert!(patched.blob_checked);
+    }
+
+    #[test]
+    fn dump_hlsl_dir_prefers_explicit_then_direct_dump_then_local_app_data() {
+        let explicit = PathBuf::from("D:\\custom_dump");
+        let direct = PathBuf::from("D:\\direct_dump");
+        let local = PathBuf::from("C:\\Users\\test\\AppData\\Local");
+        assert_eq!(dump_hlsl_dir_from(Some(explicit.clone()), Some(direct.clone()), Some(local.clone())), explicit);
+        assert_eq!(dump_hlsl_dir_from(None, Some(direct.clone()), Some(local.clone())), direct);
+        assert_eq!(
+            dump_hlsl_dir_from(None, None, Some(local)),
+            PathBuf::from("C:\\Users\\test\\AppData\\Local\\Decant\\shader-dump")
+        );
+    }
+
+    #[test]
+    fn dump_matching_pipeline_writes_bin_dxil_and_refusal_only_for_target_hashes() {
+        let dir = std::env::temp_dir().join(format!("decant-d3d12x-hlsl-dump-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let stage_bytes = Arc::<[u8]>::from(&b"synthetic-non-container-compute-shader"[..]);
+        let hash = crate::dxil_override::content_hash(&stage_bytes);
+        let pipeline = Pipeline {
+            stages: vec![StageInput { kind: StageKind::Compute, bytes: stage_bytes.clone() }],
+            root: crate::rts0::RootLayout {
+                version: 2,
+                flags: 0,
+                params: Vec::new(),
+                static_samplers: Vec::new(),
+            },
+            linkage: Linkage::default(),
+        };
+        let dxil = vec![Arc::<[u8]>::from(&b"DXBCfake"[..])];
+
+        // Non-matching target hash writes nothing.
+        assert_eq!(dump_matching_pipeline_to(&dir, &pipeline, Some(&dxil), &[hash ^ 1]), 0);
+        assert!(!dir.exists());
+
+        // Matching target hash writes `.bin`, `.dxil`, and `.refused.txt` (since bytes are synthetic).
+        assert_eq!(dump_matching_pipeline_to(&dir, &pipeline, Some(&dxil), &[hash]), 1);
+        assert_eq!(std::fs::read(dir.join(format!("{hash:016x}.bin"))).unwrap(), stage_bytes.as_ref());
+        assert_eq!(std::fs::read(dir.join(format!("{hash:016x}.dxil"))).unwrap(), b"DXBCfake");
+        assert!(dir.join(format!("{hash:016x}.refused.txt")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

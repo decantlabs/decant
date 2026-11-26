@@ -728,7 +728,7 @@ impl VramBudget {
         } else if budget_mib < 20_480 {
             2_048 << 20
         } else {
-            4_096 << 20
+            8_192 << 20
         };
         Self { r_drv, hwm_total, lwm_total, m_cap }
     }
@@ -769,17 +769,20 @@ fn host_ram_l0_cap(
         return cap;
     }
     if total_phys <= HOST_RAM_32G_THRESHOLD {
-        let base = if total_phys <= (16_384 << 20) {
+        if total_phys <= (16_384 << 20) {
+            if avail_phys < (2_560 << 20) || avail_pagefile < (2_048 << 20) {
+                512 << 20
+            } else {
+                1_024 << 20
+            }
+        } else if avail_phys < (2_560 << 20) || avail_pagefile < (2_048 << 20) {
+            512 << 20
+        } else if avail_phys < (4_096 << 20) || avail_pagefile < (4_096 << 20) {
             1_024 << 20
+        } else if avail_phys >= (6_144 << 20) && avail_pagefile >= (10_240 << 20) {
+            4_096 << 20
         } else {
             2_048 << 20
-        };
-        if avail_phys < (2_560 << 20) || avail_pagefile < (2_048 << 20) {
-            base.min(512 << 20)
-        } else if avail_phys < (4_096 << 20) || avail_pagefile < (4_096 << 20) {
-            base.min(1_024 << 20)
-        } else {
-            base
         }
     } else {
         let twenty_pct = ((total_phys >> 20) * 20 / 100) << 20;
@@ -1772,6 +1775,79 @@ struct TileScratch {
     flags: Vec<D3D12_TILE_RANGE_FLAGS>,
 }
 
+/// Cooldown between retries of pool heaps skipped due to transient VRAM or host RAM caps.
+const DEFERRED_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// Maximum number of deferred pool heaps retried per sync tick.
+const DEFERRED_RETRY_BURST: usize = 8;
+
+#[derive(Default)]
+struct DeferredHeaps {
+    /// Pool heap indices transiently skipped due to L1 or L0 caps or transient OOM.
+    heaps: HashSet<u32>,
+    /// Earliest instant when deferred pool heaps may be retried.
+    retry_after: Option<Instant>,
+    /// Pool pages belonging to recovered heaps that must be uploaded before GPU execution.
+    backfill_pages: Vec<u32>,
+}
+
+impl DeferredHeaps {
+    fn defer(&mut self, index: u32, now: Instant) {
+        self.heaps.insert(index);
+        if self.retry_after.is_none_or(|until| until <= now) {
+            self.retry_after = Some(now + DEFERRED_RETRY_INTERVAL);
+        }
+    }
+
+    fn remove(&mut self, index: u32) -> bool {
+        let removed = self.heaps.remove(&index);
+        if self.heaps.is_empty() {
+            self.retry_after = None;
+        }
+        removed
+    }
+
+    fn is_suppressed(&self, index: u32, now: Instant) -> bool {
+        self.heaps.contains(&index) && self.retry_after.is_some_and(|until| now < until)
+    }
+
+    fn should_retry(&self, now: Instant) -> bool {
+        !self.heaps.is_empty() && self.retry_after.is_none_or(|until| now >= until)
+    }
+
+    fn retry_batch(&self, now: Instant, max_count: usize) -> Vec<u32> {
+        if !self.should_retry(now) || max_count == 0 {
+            return Vec::new();
+        }
+        let mut out: Vec<u32> = self.heaps.iter().copied().collect();
+        out.sort_unstable();
+        out.truncate(max_count);
+        out
+    }
+
+    /// Marks `index` materialized. When it was previously deferred, re-queues its window tile
+    /// mappings and records its live pool pages for backfill upload.
+    fn mark_recovered(&mut self, index: u32, mirror: &mut Mirror) -> bool {
+        if !self.remove(index) {
+            return false;
+        }
+        let _ = mirror.remap_heap_tiles(index);
+        self.backfill_pages.extend(mirror.pages_in_heap(index));
+        true
+    }
+
+    fn take_backfill(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.backfill_pages)
+    }
+
+    fn has_deferred(&self) -> bool {
+        !self.heaps.is_empty()
+    }
+
+    fn has_backfill(&self) -> bool {
+        !self.backfill_pages.is_empty()
+    }
+}
+
 struct State {
     /// Distinguishes a replacement device while the sampler reads outside the lock.
     id: u64,
@@ -1785,7 +1861,7 @@ struct State {
     seq: u64,
     /// Last `DecantXmemJournalSeq` observed before draining `xmem.dll`.
     last_journal_seq: Option<u64>,
-    /// Pool heaps by index. A heap that cannot be made is `None` and is not tried again.
+    /// Pool heaps by index. Permanently failed heaps stay `None`, transiently deferred heaps retry.
     heaps: Vec<Option<Heap>>,
     adapter: Option<IDXGIAdapter3>,
     pool_mode: MirrorPoolMode,
@@ -1795,8 +1871,10 @@ struct State {
     l1_heaps: u64,
     l0_heaps: u64,
     has_staging: bool,
-    /// The heaps that could not be made.
+    /// Pool heaps that hit a non-transient D3D12 creation error and are not retried.
     failed: HashSet<u32>,
+    /// Pool heaps transiently skipped due to cap or memory pressure, retried once headroom returns.
+    deferred: DeferredHeaps,
     windows: Vec<Option<Window>>,
     /// The read only section views of `xmem.dll`: address, first pool page, pages.
     sections: Vec<(usize, u32, u32)>,
@@ -1948,6 +2026,10 @@ static DRAINED_JOURNAL_SEQ: AtomicU64 = AtomicU64::new(u64::MAX);
 static DRAINED_STATE_ID: AtomicU64 = AtomicU64::new(0);
 /// True while `PENDING_JOURNAL` is non-empty or a drained batch is being applied under `APPLY_LOCK`.
 static HAS_PENDING_JOURNAL: AtomicBool = AtomicBool::new(false);
+/// True while `State::deferred` holds pool heaps awaiting retry after cap or pressure skips.
+static HAS_DEFERRED_HEAPS: AtomicBool = AtomicBool::new(false);
+/// True while `State::deferred` holds pages from recovered pool heaps waiting for backfill copy.
+static HAS_BACKFILL_PAGES: AtomicBool = AtomicBool::new(false);
 /// True when `Mirror` may have un-drained `TileCall` updates for `sync()`.
 static MIRROR_MAY_HAVE_PENDING: AtomicBool = AtomicBool::new(false);
 /// True once `DecantXmemGpuTrack(1)` has been enabled, so `with_state` can skip `DRAIN_LOCK`.
@@ -2636,7 +2718,14 @@ impl State {
     /// Applies the pending tile mappings on the private queue and signals the fence. Returns the ranges.
     /// Collects copy jobs for sorted unique pool pages written since the last sync, ensuring heaps
     /// are either ready or returned in `Err(missing_heaps)` to be created outside `STATE`.
-    fn plan_upload(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, runs: &mut Vec<UploadRun>) -> Result<u64, Vec<u32>> {
+    fn plan_upload(
+        &mut self,
+        api: &Api,
+        pages: &[u32],
+        tried_heaps: &HashSet<u32>,
+        jobs: &mut Vec<CopyJob>,
+        runs: &mut Vec<UploadRun>,
+    ) -> Result<u64, Vec<u32>> {
         if pages.is_empty() {
             return Ok(0);
         }
@@ -2655,7 +2744,7 @@ impl State {
                 new_tile = true;
             }
         }
-        let res = self.plan_runs(api, pages, jobs, runs, &mut total);
+        let res = self.plan_runs(api, pages, tried_heaps, jobs, runs, &mut total);
         if new_tile {
             bump_tile_gen();
             MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
@@ -2663,8 +2752,17 @@ impl State {
         res.map(|()| total)
     }
 
-    fn plan_runs(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, runs: &mut Vec<UploadRun>, copied: &mut u64) -> Result<(), Vec<u32>> {
+    fn plan_runs(
+        &mut self,
+        api: &Api,
+        pages: &[u32],
+        tried_heaps: &HashSet<u32>,
+        jobs: &mut Vec<CopyJob>,
+        runs: &mut Vec<UploadRun>,
+        copied: &mut u64,
+    ) -> Result<(), Vec<u32>> {
         let mut missing_heaps = Vec::new();
+        let now = self.deferred.has_deferred().then(Instant::now);
         let mut i = 0;
         while i < pages.len() {
             let first = pages[i];
@@ -2682,7 +2780,10 @@ impl State {
                 n += 1;
             }
             let heap_info = self.heaps.get(heap as usize).and_then(Option::as_ref).map(|h| (h.ptr, h.is_l1));
-            if heap_info.is_none() && !self.failed.contains(&heap) {
+            let suppressed = self.failed.contains(&heap)
+                || tried_heaps.contains(&heap)
+                || now.is_some_and(|t| self.deferred.is_suppressed(heap, t));
+            if heap_info.is_none() && !suppressed {
                 if !missing_heaps.contains(&heap) {
                     missing_heaps.push(heap);
                 }
@@ -2840,6 +2941,8 @@ pub unsafe fn device_created(device: *mut c_void) {
     bump_unmap_gen();
     PENDING_JOURNAL.lock().unwrap_or_else(PoisonError::into_inner).clear();
     HAS_PENDING_JOURNAL.store(false, Ordering::Release);
+    HAS_DEFERRED_HEAPS.store(false, Ordering::Release);
+    HAS_BACKFILL_PAGES.store(false, Ordering::Release);
     MIRROR_MAY_HAVE_PENDING.store(false, Ordering::Release);
     DRAINED_STATE_ID.store(0, Ordering::Release);
     DRAINED_JOURNAL_SEQ.store(u64::MAX, Ordering::Release);
@@ -2866,6 +2969,7 @@ pub unsafe fn device_created(device: *mut c_void) {
         l0_heaps: 0,
         has_staging,
         failed: HashSet::new(),
+        deferred: DeferredHeaps::default(),
         windows: Vec::new(),
         sections: Vec::new(),
         last_section: 0,
@@ -2904,6 +3008,58 @@ fn ensure_windows_outside_state(state_id: u64, device: &ID3D12Device, start_idx:
     }
 }
 
+enum HeapMakeOutcome {
+    Created(Heap),
+    Deferred,
+    Failed(windows::core::Error),
+}
+
+fn is_transient_oom(err: &windows::core::Error) -> bool {
+    err.code().0 == 0x8007_000E_u32 as i32
+}
+
+fn allow_l0_growth(l0_heaps: u64, l0_cap_override: Option<u64>) -> bool {
+    let Some((total_phys, avail_phys, avail_pagefile)) = host_ram_status() else {
+        return true;
+    };
+    let l0_cap = host_ram_l0_cap(total_phys, avail_phys, avail_pagefile, l0_cap_override);
+    let l0_bytes = l0_heaps * POOL_HEAP_BYTES;
+    let ok = can_grow_l0(l0_bytes, l0_cap, avail_phys, avail_pagefile);
+    if !ok {
+        static L0_PRESSURE_SKIPS: AtomicU64 = AtomicU64::new(0);
+        let n = L0_PRESSURE_SKIPS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n == 16 || n == 64 || n.is_multiple_of(256) {
+            xs_log!(
+                "title memory: L0 host RAM cap reached ({} MiB / {} MiB, avail phys {} MiB, avail pagefile {} MiB, skip #{}), deferring pool heap growth for retry",
+                l0_bytes >> 20,
+                l0_cap >> 20,
+                avail_phys >> 20,
+                avail_pagefile >> 20,
+                n
+            );
+        }
+    }
+    ok
+}
+
+fn make_l0_checked(device: &ID3D12Device, index: u32, l0_heaps: u64, l0_cap_override: Option<u64>) -> HeapMakeOutcome {
+    if !allow_l0_growth(l0_heaps, l0_cap_override) {
+        return HeapMakeOutcome::Deferred;
+    }
+    match make_heap(device, index, MirrorPool::L0) {
+        Ok(h) => HeapMakeOutcome::Created(h),
+        Err(e) if is_transient_oom(&e) => {
+            static L0_OOM_DEFERS: AtomicU64 = AtomicU64::new(0);
+            let n = L0_OOM_DEFERS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 4 || n.is_power_of_two() {
+                xs_log!("title memory: pool heap {index} hit transient OOM ({e}, defer #{n}), retrying when headroom returns");
+            }
+            HeapMakeOutcome::Deferred
+        }
+        Err(e) => HeapMakeOutcome::Failed(e),
+    }
+}
+
 /// Creates any missing pool heaps in `indices` outside `STATE`, holding `HEAP_MAKE_LOCK` across
 /// `CreateHeap`/`CreatePlacedResource`/`Map` and taking `STATE.write()` only to insert the handle.
 fn ensure_heaps_outside_state(state_id: u64, indices: &[u32]) {
@@ -2911,7 +3067,9 @@ fn ensure_heaps_outside_state(state_id: u64, indices: &[u32]) {
         return;
     }
     let _make_guard = HEAP_MAKE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    for &index in indices {
+    let mut recovered = 0usize;
+    let mut last_counts = (0u64, 0u64, 0usize);
+    for (pos, &index) in indices.iter().enumerate() {
         let snap = {
             let guard = STATE.read().unwrap_or_else(PoisonError::into_inner);
             let Some(st) = guard.as_ref().filter(|st| st.id == state_id) else {
@@ -2938,34 +3096,14 @@ fn ensure_heaps_outside_state(state_id: u64, indices: &[u32]) {
         let want_l1 = has_staging && should_use_l1(pool_mode, budget, current_usage, l1_heaps * POOL_HEAP_BYTES, m_cap_override);
         let made = if want_l1 {
             match make_heap(&device, index, MirrorPool::L1) {
-                Ok(h) => Ok(Some(h)),
+                Ok(h) => HeapMakeOutcome::Created(h),
                 Err(e) => {
                     xs_log!("title memory: L1 pool heap {index} failed ({e}), spilling to L0");
-                    make_heap(&device, index, MirrorPool::L0).map(Some)
+                    make_l0_checked(&device, index, l0_heaps, l0_cap_override)
                 }
             }
         } else {
-            let allow_l0 = if let Some((total_phys, avail_phys, avail_pagefile)) = host_ram_status() {
-                let l0_cap = host_ram_l0_cap(total_phys, avail_phys, avail_pagefile, l0_cap_override);
-                let l0_bytes = l0_heaps * POOL_HEAP_BYTES;
-                let ok = can_grow_l0(l0_bytes, l0_cap, avail_phys, avail_pagefile);
-                if !ok {
-                    static L0_PRESSURE_LOGGED: std::sync::Once = std::sync::Once::new();
-                    L0_PRESSURE_LOGGED.call_once(|| {
-                        xs_log!(
-                            "title memory: L0 host RAM cap reached ({} MiB / {} MiB, avail phys {} MiB, avail pagefile {} MiB), skipping further L0 heap growth",
-                            l0_bytes >> 20,
-                            l0_cap >> 20,
-                            avail_phys >> 20,
-                            avail_pagefile >> 20
-                        );
-                    });
-                }
-                ok
-            } else {
-                true
-            };
-            if !allow_l0 { Ok(None) } else { make_heap(&device, index, MirrorPool::L0).map(Some) }
+            make_l0_checked(&device, index, l0_heaps, l0_cap_override)
         };
         let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
         let Some(st) = guard.as_mut().filter(|st| st.id == state_id) else {
@@ -2979,23 +3117,104 @@ fn ensure_heaps_outside_state(state_id: u64, indices: &[u32]) {
             continue;
         }
         match made {
-            Ok(Some(heap)) => {
+            HeapMakeOutcome::Created(heap) => {
                 if heap.is_l1 {
                     st.l1_heaps += 1;
                 } else {
                     st.l0_heaps += 1;
                 }
                 st.heaps[i] = Some(heap);
+                if st.deferred.mark_recovered(index, &mut st.mirror) {
+                    recovered += 1;
+                    MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
+                }
+                last_counts = (st.l1_heaps, st.l0_heaps, st.deferred.heaps.len());
+                HAS_DEFERRED_HEAPS.store(st.deferred.has_deferred(), Ordering::Release);
+                HAS_BACKFILL_PAGES.store(st.deferred.has_backfill(), Ordering::Release);
             }
-            Ok(None) => {
-                st.failed.insert(index);
+            HeapMakeOutcome::Deferred => {
+                let now = Instant::now();
+                for &rem in &indices[pos..] {
+                    let ri = rem as usize;
+                    if st.heaps.get(ri).and_then(Option::as_ref).is_none() && !st.failed.contains(&rem) {
+                        st.deferred.defer(rem, now);
+                    }
+                }
+                HAS_DEFERRED_HEAPS.store(st.deferred.has_deferred(), Ordering::Release);
+                HAS_BACKFILL_PAGES.store(st.deferred.has_backfill(), Ordering::Release);
+                break;
             }
-            Err(e) => {
+            HeapMakeOutcome::Failed(e) => {
+                st.deferred.remove(index);
                 st.failed.insert(index);
+                HAS_DEFERRED_HEAPS.store(st.deferred.has_deferred(), Ordering::Release);
+                HAS_BACKFILL_PAGES.store(st.deferred.has_backfill(), Ordering::Release);
                 xs_log!("title memory: pool heap {index} cannot be made ({e}), its pages stay invisible to the GPU");
             }
         }
     }
+    if recovered > 0 {
+        xs_log!(
+            "title memory: recovered {recovered} deferred pool heap(s) (l1 {} MiB, l0 {} MiB, {} still deferred)",
+            (last_counts.0 * POOL_HEAP_BYTES) >> 20,
+            (last_counts.1 * POOL_HEAP_BYTES) >> 20,
+            last_counts.2
+        );
+    }
+}
+
+/// Retries up to [`DEFERRED_RETRY_BURST`] transiently deferred pool heaps once the retry cooldown
+/// elapses, outside `STATE`.
+fn retry_deferred_heaps_outside_state() {
+    if !HAS_DEFERRED_HEAPS.load(Ordering::Acquire) {
+        return;
+    }
+    let retry = {
+        let guard = STATE.read().unwrap_or_else(PoisonError::into_inner);
+        let Some(st) = guard.as_ref() else {
+            return;
+        };
+        let batch = st.deferred.retry_batch(Instant::now(), DEFERRED_RETRY_BURST);
+        (!batch.is_empty()).then_some((st.id, batch))
+    };
+    if let Some((state_id, batch)) = retry {
+        ensure_heaps_outside_state(state_id, &batch);
+    }
+}
+
+/// Merges sorted backfill pool pages into `dirty[tail_start..]` without disturbing `dirty[..tail_start]`.
+fn merge_backfill_tail(dirty: &mut Vec<u32>, tail_start: usize, mut backfill: Vec<u32>) {
+    if backfill.is_empty() {
+        return;
+    }
+    if tail_start >= dirty.len() {
+        backfill.sort_unstable();
+        backfill.dedup();
+        dirty.extend_from_slice(&backfill);
+    } else {
+        let mut tail = dirty.split_off(tail_start);
+        tail.extend(backfill);
+        tail.sort_unstable();
+        tail.dedup();
+        dirty.append(&mut tail);
+    }
+}
+
+fn drain_backfill_into_dirty(dirty: &mut Vec<u32>, tail_start: usize) {
+    if !HAS_BACKFILL_PAGES.load(Ordering::Acquire) {
+        return;
+    }
+    let backfill = {
+        let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
+        let Some(st) = guard.as_mut() else {
+            HAS_BACKFILL_PAGES.store(false, Ordering::Release);
+            return;
+        };
+        let pages = st.deferred.take_backfill();
+        HAS_BACKFILL_PAGES.store(st.deferred.has_backfill(), Ordering::Release);
+        pages
+    };
+    merge_backfill_tail(dirty, tail_start, backfill);
 }
 
 fn ensure_missing_windows() {
@@ -3720,6 +3939,12 @@ pub unsafe fn sync(queue: *mut c_void) {
     let started = Instant::now();
     let take_micros = take_dirty_outside_state(api_ref, dirty);
     stats.take_micros += take_micros;
+    if HAS_DEFERRED_HEAPS.load(Ordering::Acquire) {
+        retry_deferred_heaps_outside_state();
+    }
+    if HAS_BACKFILL_PAGES.load(Ordering::Acquire) {
+        drain_backfill_into_dirty(dirty, 0);
+    }
     static CORES: OnceLock<usize> = OnceLock::new();
     let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from));
 
@@ -3796,6 +4021,7 @@ pub unsafe fn sync(queue: *mut c_void) {
                     .map(|c| (c.state_id, 0u64, c.map_queue.clone(), c.map_fence.clone(), c.fence_value.clone(), Vec::new()))
             }
         } else {
+            let mut tried_heaps: HashSet<u32> = HashSet::new();
             loop {
                 jobs.clear();
                 runs.clear();
@@ -3808,7 +4034,7 @@ pub unsafe fn sync(queue: *mut c_void) {
                             fence_value: st.fence_value.clone(),
                         });
                     }
-                    match st.plan_upload(api, batch_pages, jobs, runs) {
+                    match st.plan_upload(api, batch_pages, &tried_heaps, jobs, runs) {
                         Ok(pages) => {
                             let mut batch_written = std::mem::take(&mut st.written);
                             written.append(&mut batch_written);
@@ -3835,6 +4061,7 @@ pub unsafe fn sync(queue: *mut c_void) {
                     None => break None,
                     Some(Ok(ok)) => break Some(ok),
                     Some(Err((state_id, missing_heaps))) => {
+                        tried_heaps.extend(missing_heaps.iter().copied());
                         ensure_heaps_outside_state(state_id, &missing_heaps);
                     }
                 }
@@ -3895,11 +4122,15 @@ pub unsafe fn sync(queue: *mut c_void) {
                 let mut missing_heaps = Vec::new();
                 let mut window_resources: Vec<Option<ID3D12Resource>> = Vec::new();
                 let mut heap_objs: HashMap<u32, ID3D12Heap> = HashMap::new();
+                let tile_now = st.deferred.has_deferred().then(Instant::now);
                 for call in &calls {
                     if let Some(h) = call.heap {
                         if let Some(Some(pool)) = st.heaps.get(h as usize) {
                             heap_objs.entry(h).or_insert_with(|| pool._heap.clone());
-                        } else if !st.failed.contains(&h) && !missing_heaps.contains(&h) {
+                        } else if !st.failed.contains(&h)
+                            && !tile_now.is_some_and(|t| st.deferred.is_suppressed(h, t))
+                            && !missing_heaps.contains(&h)
+                        {
                             missing_heaps.push(h);
                         }
                     }
@@ -3954,6 +4185,9 @@ pub unsafe fn sync(queue: *mut c_void) {
         total_copy_micros += copy_micros;
         total_tile_micros += tile_started.elapsed().as_micros() as u64;
         last_fence = Some((map_fence, fence_value));
+        if HAS_BACKFILL_PAGES.load(Ordering::Acquire) {
+            drain_backfill_into_dirty(dirty, chunk_start);
+        }
     }
     if let Some((map_fence, fence_value)) = last_fence {
         // SAFETY: `queue_ref` and `map_fence` are live objects of the active device.
@@ -4363,7 +4597,7 @@ mod tests {
         assert_eq!(b24.r_drv, 3_769 << 20);
         assert_eq!(b24.hwm_total, 19_789 << 20);
         assert_eq!(b24.lwm_total, 17_434 << 20);
-        assert_eq!(b24.m_cap, 4_096 << 20);
+        assert_eq!(b24.m_cap, 8_192 << 20);
     }
 
     #[test]
@@ -4371,14 +4605,14 @@ mod tests {
         let budget_24 = 23_558 << 20;
         // Under both HWM_total and M_cap: Auto places heap in L1.
         assert!(should_use_l1(MirrorPoolMode::Auto, budget_24, 10_000 << 20, 0, None));
-        assert!(should_use_l1(MirrorPoolMode::Auto, budget_24, 10_000 << 20, 4_080 << 20, None));
-        // At M_cap (4096 MiB): Auto spills cleanly to L0.
-        assert!(!should_use_l1(MirrorPoolMode::Auto, budget_24, 10_000 << 20, 4_096 << 20, None));
+        assert!(should_use_l1(MirrorPoolMode::Auto, budget_24, 10_000 << 20, 8_176 << 20, None));
+        // At M_cap (8192 MiB): Auto spills cleanly to L0.
+        assert!(!should_use_l1(MirrorPoolMode::Auto, budget_24, 10_000 << 20, 8_192 << 20, None));
         // Near HWM_total (19789 MiB): Auto and PreferL1 both spill to L0 before OOM.
         assert!(!should_use_l1(MirrorPoolMode::Auto, budget_24, 19_780 << 20, 1_024 << 20, None));
-        assert!(!should_use_l1(MirrorPoolMode::PreferL1, budget_24, 19_780 << 20, 4_096 << 20, None));
+        assert!(!should_use_l1(MirrorPoolMode::PreferL1, budget_24, 19_780 << 20, 8_192 << 20, None));
         // PreferL1 allows beyond M_cap while below HWM_total.
-        assert!(should_use_l1(MirrorPoolMode::PreferL1, budget_24, 10_000 << 20, 5_000 << 20, None));
+        assert!(should_use_l1(MirrorPoolMode::PreferL1, budget_24, 10_000 << 20, 9_000 << 20, None));
         // StrictL0 always stays on L0.
         assert!(!should_use_l1(MirrorPoolMode::StrictL0, budget_24, 0, 0, None));
         // 8 GiB class has M_cap = 0 so Auto stays on L0.
@@ -4672,7 +4906,11 @@ mod tests {
         let g32 = 32_768 << 20;
         let g64 = 65_536 << 20;
         assert_eq!(host_ram_l0_cap(g16, 8_000 << 20, 8_000 << 20, None), 1_024 << 20);
-        assert_eq!(host_ram_l0_cap(g32, 12_000 << 20, 12_000 << 20, None), 2_048 << 20);
+        assert_eq!(host_ram_l0_cap(g16, 2_000 << 20, 8_000 << 20, None), 512 << 20);
+        assert_eq!(host_ram_l0_cap(g32, 12_000 << 20, 12_000 << 20, None), 4_096 << 20);
+        assert_eq!(host_ram_l0_cap(g32, 6_144 << 20, 10_240 << 20, None), 4_096 << 20);
+        assert_eq!(host_ram_l0_cap(g32, 5_000 << 20, 12_000 << 20, None), 2_048 << 20);
+        assert_eq!(host_ram_l0_cap(g32, 12_000 << 20, 8_000 << 20, None), 2_048 << 20);
         assert_eq!(host_ram_l0_cap(g32, 3_500 << 20, 12_000 << 20, None), 1_024 << 20);
         assert_eq!(host_ram_l0_cap(g32, 12_000 << 20, 3_500 << 20, None), 1_024 << 20);
         assert_eq!(host_ram_l0_cap(g32, 2_000 << 20, 12_000 << 20, None), 512 << 20);
@@ -4680,10 +4918,64 @@ mod tests {
         assert_eq!(host_ram_l0_cap(g64, 30_000 << 20, 30_000 << 20, None), 6_144 << 20);
         assert_eq!(host_ram_l0_cap(g32, 2_000 << 20, 1_500 << 20, Some(768 << 20)), 768 << 20);
         assert_eq!(parse_mirror_l0_mib(Some("1536")), Some(1536 << 20));
-        assert!(can_grow_l0(1_024 << 20, 2_048 << 20, 6_000 << 20, 6_000 << 20));
-        assert!(!can_grow_l0(2_048 << 20, 2_048 << 20, 6_000 << 20, 6_000 << 20));
+        assert!(can_grow_l0(1_024 << 20, 4_096 << 20, 6_000 << 20, 12_000 << 20));
+        assert!(!can_grow_l0(4_096 << 20, 4_096 << 20, 6_000 << 20, 12_000 << 20));
         assert!(!can_grow_l0(512 << 20, 2_048 << 20, 3_900 << 20, 6_000 << 20));
         assert!(!can_grow_l0(512 << 20, 2_048 << 20, 6_000 << 20, 1_900 << 20));
+    }
+
+    #[test]
+    fn deferred_heaps_respect_cooldown_and_recover_with_remap_and_backfill() {
+        let mut mirror = Mirror::new(1 << 30);
+        assert_eq!(mirror.apply(Change::Reserve { va: 0x1000_0000, pages: 300, on_demand: false }), None);
+        assert_eq!(mirror.apply(Change::Map { va: 0x1000_0000, pages: 260, first_page: 100 }), None);
+        for p in 100..360u32 {
+            mirror.give_tile(p);
+        }
+        let _ = mirror.drain_updates();
+
+        let t0 = Instant::now();
+        let mut deferred = DeferredHeaps::default();
+        assert!(!deferred.has_deferred());
+        assert!(!deferred.should_retry(t0));
+
+        // Deferring heap 1 suppresses immediate re-attempts and avoids starvation when another
+        // heap defers during the same cooldown window.
+        deferred.defer(1, t0);
+        assert!(deferred.has_deferred());
+        assert!(deferred.is_suppressed(1, t0 + Duration::from_millis(100)));
+        assert!(!deferred.should_retry(t0 + Duration::from_millis(100)));
+        assert!(deferred.retry_batch(t0 + Duration::from_millis(100), 8).is_empty());
+
+        deferred.defer(2, t0 + Duration::from_millis(200));
+        assert_eq!(deferred.retry_batch(t0 + DEFERRED_RETRY_INTERVAL, 1), vec![1]);
+        assert_eq!(deferred.retry_batch(t0 + DEFERRED_RETRY_INTERVAL, 8), vec![1, 2]);
+        assert!(!deferred.is_suppressed(1, t0 + DEFERRED_RETRY_INTERVAL));
+
+        // Recovering heap 1 re-queues its window tile mappings and schedules its pool pages for backfill.
+        assert!(deferred.mark_recovered(1, &mut mirror));
+        assert!(!deferred.mark_recovered(1, &mut mirror));
+        assert!(deferred.has_backfill());
+        assert!(deferred.has_deferred());
+        let calls = mirror.drain_updates();
+        assert_eq!(
+            calls,
+            [TileCall {
+                buffer: 0,
+                heap: Some(1),
+                ranges: vec![(HEAP_PAGES, 4)],
+                heap_tiles: vec![0],
+            }]
+        );
+
+        let mut dirty = vec![10, 20, 358, 400];
+        merge_backfill_tail(&mut dirty, 2, deferred.take_backfill());
+        assert!(!deferred.has_backfill());
+        assert_eq!(dirty, vec![10, 20, 356, 357, 358, 359, 400]);
+
+        assert!(deferred.remove(2));
+        assert!(!deferred.has_deferred());
+        assert!(deferred.retry_after.is_none());
     }
 
     #[test]

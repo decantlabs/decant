@@ -13,10 +13,10 @@
 
 #![allow(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::dxil_override::Outcome;
 use crate::log::xs_log;
@@ -144,6 +144,18 @@ pub struct RecordedOp {
     pub pso: ActivePso,
 }
 
+/// Per-pipeline dispatch and indirect-execution counts recorded on a PC command list even when
+/// `DECANT_D3D12X_FORCE_GPU_TIMEOUT` is off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComputeOpSummary {
+    pub pso: ActivePso,
+    pub dispatches: u32,
+    pub indirects: u32,
+    /// Distinct sample argument details (such as `(64, 1, 1)` or `indirect (max=4, arg_off=0x0)`),
+    /// capped at [`MAX_COMPUTE_SAMPLES`].
+    pub samples: Vec<String>,
+}
+
 /// Pipelines bound on one queue submission, retained for stalled-queue diagnostics when the GPU
 /// hangs without reporting device removal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,12 +164,15 @@ pub struct QueueSubmission {
     pub psos: Vec<ActivePso>,
     pub overflow_psos: usize,
     pub ops: Vec<RecordedOp>,
+    pub compute_ops: Vec<ComputeOpSummary>,
 }
 
 const MAX_BOUND_PSOS_PER_LIST: usize = 16;
 const MAX_PENDING_SUBMISSIONS_PER_QUEUE: usize = 16;
 const MAX_SUBMISSION_PSOS: usize = 16;
 const MAX_SUBMISSION_OPS: usize = 16;
+const MAX_COMPUTE_SUMMARIES_PER_LIST: usize = 16;
+const MAX_COMPUTE_SAMPLES: usize = 4;
 
 #[derive(Default)]
 struct State {
@@ -180,8 +195,116 @@ struct State {
     pipelines: HashMap<usize, ActivePso>,
     /// Per PC command list recorded draws and dispatches for exact DRED breadcrumb matching.
     recorded_ops: HashMap<usize, Vec<RecordedOp>>,
+    /// Per PC command list lightweight dispatch and indirect counts for stalled-queue attribution.
+    compute_ops: HashMap<usize, Vec<ComputeOpSummary>>,
     /// Recent submissions on each PC command queue since the last bottom-of-pipe fence signal.
     pending_submissions: HashMap<usize, VecDeque<QueueSubmission>>,
+    /// Command list key (`pc_list` or proxy) currently bound to a hash listed in
+    /// `DECANT_D3D12X_SKIP_SHADERS`.
+    skip_lists: HashMap<usize, u64>,
+    /// Total skipped calls per shader hash under `DECANT_D3D12X_SKIP_SHADERS`.
+    shader_skips: BTreeMap<u64, u64>,
+    /// Shader hashes already logged on first skip-bind.
+    logged_skip_binds: HashSet<u64>,
+}
+
+/// Parses a comma, semicolon, or whitespace separated list of 64 bit hex shader hashes.
+pub(crate) fn parse_hex_hash_list(raw: Option<&str>) -> Vec<u64> {
+    let Some(raw) = raw else { return Vec::new() };
+    let mut out = Vec::new();
+    for token in raw.split(|c: char| c == ',' || c == ';' || c.is_ascii_whitespace()) {
+        let trimmed = token.trim();
+        let hex = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")).unwrap_or(trimmed);
+        if hex.is_empty() || hex.len() > 16 {
+            continue;
+        }
+        if let Ok(hash) = u64::from_str_radix(hex, 16)
+            && !out.contains(&hash)
+        {
+            out.push(hash);
+        }
+    }
+    out
+}
+
+/// Configured shader hashes whose draws and dispatches are skipped (`DECANT_D3D12X_SKIP_SHADERS`,
+/// default off). Read once.
+fn skip_shader_hashes() -> &'static [u64] {
+    static HASHES: OnceLock<Vec<u64>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        let hashes = parse_hex_hash_list(std::env::var("DECANT_D3D12X_SKIP_SHADERS").ok().as_deref());
+        if !hashes.is_empty() {
+            let formatted = hashes.iter().map(|h| format!("{h:016x}")).collect::<Vec<_>>().join(", ");
+            xs_log!("pso_diag: DECANT_D3D12X_SKIP_SHADERS active for {} hash(es): {formatted}", hashes.len());
+        }
+        hashes
+    })
+}
+
+/// Returns the first shader hash in `targets` that appears as a 16-hex-digit token in `shaders`.
+fn match_shader_hash(shaders: &str, targets: &[u64]) -> Option<u64> {
+    if shaders.is_empty() || targets.is_empty() {
+        return None;
+    }
+    for token in shaders.split(|c: char| !c.is_ascii_hexdigit()) {
+        if token.len() == 16
+            && let Ok(hash) = u64::from_str_radix(token, 16)
+            && targets.contains(&hash)
+        {
+            return Some(hash);
+        }
+    }
+    None
+}
+
+fn update_skip_list(state: &mut State, track_key: usize, entry: Option<&ActivePso>, targets: &[u64]) {
+    if track_key == 0 || targets.is_empty() {
+        return;
+    }
+    let matched = entry.and_then(|e| match_shader_hash(&e.shaders, targets));
+    match matched {
+        Some(hash) => {
+            state.skip_lists.insert(track_key, hash);
+            if state.logged_skip_binds.insert(hash) {
+                let summary = entry.map_or_else(String::new, ActivePso::format_summary);
+                xs_log!("pso_diag: skipping work for shader {hash:016x} ({summary})");
+            }
+        }
+        None => {
+            state.skip_lists.remove(&track_key);
+        }
+    }
+}
+
+fn merge_compute_op_summary(out: &mut Vec<ComputeOpSummary>, cap: usize, incoming: &ComputeOpSummary) {
+    if incoming.dispatches == 0 && incoming.indirects == 0 {
+        return;
+    }
+    if let Some(existing) = out.iter_mut().find(|e| pso_matches(&e.pso, &incoming.pso)) {
+        if existing.pso.number.is_none() {
+            existing.pso.number = incoming.pso.number;
+        }
+        if existing.pso.shaders.is_empty() && !incoming.pso.shaders.is_empty() {
+            existing.pso.shaders = incoming.pso.shaders.clone();
+        }
+        if incoming.pso.pso != 0 && existing.pso.pso == 0 {
+            existing.pso.pso = incoming.pso.pso;
+        }
+        existing.dispatches = existing.dispatches.saturating_add(incoming.dispatches);
+        existing.indirects = existing.indirects.saturating_add(incoming.indirects);
+        for sample in &incoming.samples {
+            if existing.samples.len() >= MAX_COMPUTE_SAMPLES {
+                break;
+            }
+            if !existing.samples.contains(sample) {
+                existing.samples.push(sample.clone());
+            }
+        }
+        return;
+    }
+    if out.len() < cap {
+        out.push(incoming.clone());
+    }
 }
 
 fn pso_matches(a: &ActivePso, b: &ActivePso) -> bool {
@@ -296,6 +419,7 @@ pub unsafe fn bind(list: usize, pso: *mut c_void) -> bool {
         None
     };
 
+    let skip_targets = skip_shader_hashes();
     with(|s| {
         if pc_list != 0 && list != 0 {
             s.proxy_to_pc.insert(list, pc_list);
@@ -303,17 +427,20 @@ pub unsafe fn bind(list: usize, pso: *mut c_void) -> bool {
         if track_key != 0 {
             if pso.is_null() {
                 s.active.remove(&track_key);
+                update_skip_list(s, track_key, None, skip_targets);
             } else if let Some(id) = id {
                 let shaders = s.refused.get(id as usize).cloned().unwrap_or_default();
                 s.active.insert(
                     track_key,
                     ActivePso { number: Some(id), pso: pso as usize, shaders, missing: true },
                 );
+                update_skip_list(s, track_key, None, skip_targets);
             } else {
                 let mut entry = s.pipelines.get(&(pso as usize)).cloned().unwrap_or_default();
                 entry.pso = pso as usize;
                 entry.number = entry.number.or(lazy_number);
                 record_bound_pso(s, track_key, &entry, 0);
+                update_skip_list(s, track_key, Some(&entry), skip_targets);
                 s.active.insert(track_key, entry);
             }
         }
@@ -388,6 +515,10 @@ pub fn register_pipeline_summary(lazy_pso: usize, pc_pso: usize, number: Option<
 /// Refreshes the active pipeline entry for `list` after a lazy pipeline resolves on its first bind,
 /// when shader metadata was registered during `lazy_pso::resolve`.
 pub fn bind_resolved(list: usize, pc_list: usize, title_pso: usize, pc_pso: usize) {
+    bind_resolved_with_targets(list, pc_list, title_pso, pc_pso, skip_shader_hashes());
+}
+
+fn bind_resolved_with_targets(list: usize, pc_list: usize, title_pso: usize, pc_pso: usize, skip_targets: &[u64]) {
     let track_key = if pc_list != 0 { pc_list } else { list };
     if track_key == 0 || (title_pso == 0 && pc_pso == 0) {
         return;
@@ -398,6 +529,7 @@ pub fn bind_resolved(list: usize, pc_list: usize, title_pso: usize, pc_pso: usiz
         }
         if let Some(entry) = s.pipelines.get(&title_pso).or_else(|| s.pipelines.get(&pc_pso)).cloned() {
             record_bound_pso(s, track_key, &entry, title_pso);
+            update_skip_list(s, track_key, Some(&entry), skip_targets);
             s.active.insert(track_key, entry);
         } else if pc_pso != 0 {
             let fallback = s.active.get(&track_key).cloned().unwrap_or(ActivePso {
@@ -407,6 +539,7 @@ pub fn bind_resolved(list: usize, pc_list: usize, title_pso: usize, pc_pso: usiz
                 missing: false,
             });
             record_bound_pso(s, track_key, &fallback, title_pso);
+            update_skip_list(s, track_key, Some(&fallback), skip_targets);
         }
     });
 }
@@ -422,6 +555,8 @@ pub fn rebind_pc_list(list: usize, new_pc_list: usize) {
         s.active.remove(&new_pc_list);
         s.bound_psos.remove(&new_pc_list);
         s.recorded_ops.remove(&new_pc_list);
+        s.compute_ops.remove(&new_pc_list);
+        s.skip_lists.remove(&new_pc_list);
     });
 }
 
@@ -435,6 +570,8 @@ pub fn reset_pc_list(pc_list: usize) {
         s.active.remove(&pc_list);
         s.bound_psos.remove(&pc_list);
         s.recorded_ops.remove(&pc_list);
+        s.compute_ops.remove(&pc_list);
+        s.skip_lists.remove(&pc_list);
     });
 }
 
@@ -449,6 +586,7 @@ pub fn record_submission(queue: usize, pc_lists: &[usize]) {
         let mut psos = Vec::new();
         let mut overflow_psos = 0usize;
         let mut ops = Vec::new();
+        let mut compute_ops = Vec::new();
         for &pc_list in pc_lists {
             if pc_list == 0 {
                 continue;
@@ -467,12 +605,17 @@ pub fn record_submission(queue: usize, pc_lists: &[usize]) {
                 let take = (MAX_SUBMISSION_OPS - ops.len()).min(recorded.len());
                 ops.extend(recorded[..take].iter().cloned());
             }
+            if let Some(recorded_compute) = s.compute_ops.get(&pc_list) {
+                for summary in recorded_compute {
+                    merge_compute_op_summary(&mut compute_ops, MAX_COMPUTE_SUMMARIES_PER_LIST, summary);
+                }
+            }
         }
         let ring = s.pending_submissions.entry(queue).or_default();
         if ring.len() >= MAX_PENDING_SUBMISSIONS_PER_QUEUE {
             ring.pop_front();
         }
-        ring.push_back(QueueSubmission { list_count: pc_lists.len(), psos, overflow_psos, ops });
+        ring.push_back(QueueSubmission { list_count: pc_lists.len(), psos, overflow_psos, ops, compute_ops });
     });
 }
 
@@ -502,6 +645,7 @@ pub fn format_submissions(submissions: &[QueueSubmission]) -> String {
     let mut psos = Vec::new();
     let mut overflow = 0usize;
     let mut ops = Vec::new();
+    let mut compute_ops = Vec::new();
     for sub in submissions {
         overflow += sub.overflow_psos;
         for p in &sub.psos {
@@ -510,6 +654,9 @@ pub fn format_submissions(submissions: &[QueueSubmission]) -> String {
         if ops.len() < MAX_SUBMISSION_OPS {
             let take = (MAX_SUBMISSION_OPS - ops.len()).min(sub.ops.len());
             ops.extend(sub.ops[..take].iter().cloned());
+        }
+        for summary in &sub.compute_ops {
+            merge_compute_op_summary(&mut compute_ops, MAX_COMPUTE_SUMMARIES_PER_LIST, summary);
         }
     }
     let mut out = format!("{} submission(s), {} list(s)", submissions.len(), total_lists);
@@ -522,6 +669,28 @@ pub fn format_submissions(submissions: &[QueueSubmission]) -> String {
         if overflow > 0 {
             out.push_str(&format!(" (+{overflow} more)"));
         }
+    }
+    if !compute_ops.is_empty() {
+        let formatted = compute_ops
+            .iter()
+            .map(|c| {
+                let mut counts = Vec::new();
+                if c.dispatches > 0 {
+                    counts.push(format!("dispatch={}", c.dispatches));
+                }
+                if c.indirects > 0 {
+                    counts.push(format!("indirect={}", c.indirects));
+                }
+                if c.samples.is_empty() {
+                    format!("{} ({})", c.pso.format_summary(), counts.join(", "))
+                } else {
+                    format!("{} ({}, dims=[{}])", c.pso.format_summary(), counts.join(", "), c.samples.join(", "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(", compute ops: ");
+        out.push_str(&formatted);
     }
     if !ops.is_empty() {
         let formatted_ops = ops
@@ -542,21 +711,30 @@ pub fn format_submissions(submissions: &[QueueSubmission]) -> String {
 }
 
 /// Records one draw or dispatch on `pc_list` alongside the currently active pipeline.
-/// Only stores entries when `DECANT_D3D12X_FORCE_GPU_TIMEOUT=1` is enabled, keeping default runs
-/// free of per draw locking.
+/// Default runs record lightweight per-pipeline counts and sample dimensions for `Dispatch` and
+/// `ExecuteIndirect` with zero locking on graphics draws, while `DECANT_D3D12X_FORCE_GPU_TIMEOUT=1`
+/// records every op for exact DRED breadcrumb matching.
 #[inline]
 pub fn record_op(list: usize, pc_list: usize, kind: RecordedOpKind, detail: impl FnOnce() -> String) {
-    if !crate::proxy::force_gpu_timeout() {
+    let full = crate::proxy::force_gpu_timeout();
+    if !full && !matches!(kind, RecordedOpKind::Dispatch | RecordedOpKind::ExecuteIndirect) {
         return;
     }
-    record_op_unconditional(list, pc_list, kind, detail());
+    record_op_inner(list, pc_list, kind, detail, full);
 }
 
+#[cfg(test)]
 fn record_op_unconditional(list: usize, pc_list: usize, kind: RecordedOpKind, detail: String) {
+    record_op_inner(list, pc_list, kind, || detail, true);
+}
+
+fn record_op_inner(list: usize, pc_list: usize, kind: RecordedOpKind, detail: impl FnOnce() -> String, full: bool) {
     let key = if pc_list != 0 { pc_list } else { list };
     if key == 0 {
         return;
     }
+    let is_compute = matches!(kind, RecordedOpKind::Dispatch | RecordedOpKind::ExecuteIndirect);
+    let mut detail_fn = Some(detail);
     with(|s| {
         let pso = s
             .active
@@ -564,7 +742,49 @@ fn record_op_unconditional(list: usize, pc_list: usize, kind: RecordedOpKind, de
             .cloned()
             .or_else(|| s.proxy_to_pc.get(&list).and_then(|pc| s.active.get(pc)).cloned())
             .unwrap_or_default();
-        s.recorded_ops.entry(key).or_default().push(RecordedOp { kind, detail, pso });
+        let mut detail_opt: Option<String> = None;
+        if is_compute && !pso.missing && (pso.number.is_some() || pso.pso != 0) {
+            let summaries = s.compute_ops.entry(key).or_default();
+            let pos = summaries.iter().position(|c| pso_matches(&c.pso, &pso));
+            let entry = if let Some(idx) = pos {
+                Some(&mut summaries[idx])
+            } else if summaries.len() < MAX_COMPUTE_SUMMARIES_PER_LIST {
+                summaries.push(ComputeOpSummary {
+                    pso: pso.clone(),
+                    dispatches: 0,
+                    indirects: 0,
+                    samples: Vec::new(),
+                });
+                summaries.last_mut()
+            } else {
+                None
+            };
+            if let Some(summary) = entry {
+                if kind == RecordedOpKind::Dispatch {
+                    summary.dispatches = summary.dispatches.saturating_add(1);
+                } else {
+                    summary.indirects = summary.indirects.saturating_add(1);
+                }
+                if summary.samples.len() < MAX_COMPUTE_SAMPLES
+                    && let Some(f) = detail_fn.take()
+                {
+                    let raw = f();
+                    let sample = if kind == RecordedOpKind::ExecuteIndirect {
+                        format!("indirect {raw}")
+                    } else {
+                        raw.clone()
+                    };
+                    if !sample.is_empty() && !summary.samples.contains(&sample) {
+                        summary.samples.push(sample);
+                    }
+                    detail_opt = Some(raw);
+                }
+            }
+        }
+        if full {
+            let text = detail_opt.unwrap_or_else(|| detail_fn.take().map_or_else(String::new, |f| f()));
+            s.recorded_ops.entry(key).or_default().push(RecordedOp { kind, detail: text, pso });
+        }
     });
 }
 
@@ -612,10 +832,14 @@ fn forget_list(list: usize) {
         s.active.remove(&list);
         s.bound_psos.remove(&list);
         s.recorded_ops.remove(&list);
+        s.compute_ops.remove(&list);
+        s.skip_lists.remove(&list);
         if let Some(pc) = s.proxy_to_pc.get(&list).copied() {
             s.active.remove(&pc);
             s.bound_psos.remove(&pc);
             s.recorded_ops.remove(&pc);
+            s.compute_ops.remove(&pc);
+            s.skip_lists.remove(&pc);
         }
     });
 }
@@ -633,17 +857,34 @@ pub fn active_pso(list: usize) -> Option<ActivePso> {
     })
 }
 
-/// Whether a draw, dispatch or indirect execution on `list` is left out because a stand in is bound.
+/// Whether a draw, dispatch or indirect execution on `list` is left out because a stand in or
+/// skipped shader hash is bound.
 pub fn skip(list: usize) -> bool {
-    if !standin_enabled() && !MISSING.load(Ordering::Relaxed) {
+    skip_with_targets(list, skip_shader_hashes())
+}
+
+fn skip_with_targets(list: usize, targets: &[u64]) -> bool {
+    let skip_shaders = !targets.is_empty();
+    if !standin_enabled() && !MISSING.load(Ordering::Relaxed) && !skip_shaders {
         return false;
     }
-    with(|s| match s.bound.get(&list).copied() {
-        Some(id) => {
+    with(|s| {
+        if let Some(id) = s.bound.get(&list).copied() {
             *s.frame_skips.entry(id).or_default() += 1;
-            true
+            return true;
         }
-        None => false,
+        if skip_shaders {
+            let key = s.proxy_to_pc.get(&list).copied().unwrap_or(list);
+            if let Some(&hash) = s.skip_lists.get(&key) {
+                let count = s.shader_skips.entry(hash).or_default();
+                *count += 1;
+                if *count == 1 || (*count >= 64 && count.is_power_of_two()) {
+                    xs_log!("pso_diag: skipped work #{} for shader {hash:016x}", *count);
+                }
+                return true;
+            }
+        }
+        false
     })
 }
 
@@ -981,5 +1222,99 @@ mod tests {
 
         reset_pc_list(pc_a);
         reset_pc_list(pc_b);
+    }
+
+    #[test]
+    fn default_mode_tracks_compute_dispatch_counts_and_dims_without_force_timeout() {
+        let queue = 0x6001_0000usize;
+        let pc_a = 0x6001_0010usize;
+        let proxy_a: [usize; 2] = [0x9000, pc_a];
+        let pso_vtbl: usize = 0x8000;
+        let pso1_stub: [usize; 2] = [&raw const pso_vtbl as usize, 0];
+        let pso1 = pso1_stub.as_ptr() as *mut c_void;
+
+        let _ = take_queue_submissions(queue);
+        reset_pc_list(pc_a);
+        register_pipeline_summary(pso1 as usize, 0x6101, Some(51137), "CS b0c0fed0cdf7fd9c direct".to_owned());
+
+        // SAFETY: `proxy_a` stores `pc_a` in word 1 and `pso1_stub` starts with a vtable pointer.
+        unsafe {
+            assert!(!bind(proxy_a.as_ptr() as usize, pso1));
+            bind_resolved(proxy_a.as_ptr() as usize, pc_a, pso1 as usize, 0x6101);
+        }
+
+        // Graphics draws are ignored when `force_gpu_timeout` is false (closure not even evaluated).
+        let mut draw_eval = false;
+        record_op(proxy_a.as_ptr() as usize, pc_a, RecordedOpKind::Draw, || {
+            draw_eval = true;
+            String::from("(verts=3, inst=1)")
+        });
+        assert!(!draw_eval, "Draw detail closure must not run in default mode");
+
+        // Compute dispatches and indirect executions record counts and bounded sample dims.
+        for _ in 0..3 {
+            record_op(proxy_a.as_ptr() as usize, pc_a, RecordedOpKind::Dispatch, || String::from("(64, 1, 1)"));
+        }
+        record_op(proxy_a.as_ptr() as usize, pc_a, RecordedOpKind::Dispatch, || String::from("(128, 2, 1)"));
+        record_op(proxy_a.as_ptr() as usize, pc_a, RecordedOpKind::ExecuteIndirect, || String::from("(max=8, arg_off=0x40)"));
+        record_op(proxy_a.as_ptr() as usize, pc_a, RecordedOpKind::Dispatch, || String::from("(1, 1, 1)"));
+        // Fifth distinct sample is capped at MAX_COMPUTE_SAMPLES so the closure is skipped.
+        let mut extra_eval = false;
+        record_op(proxy_a.as_ptr() as usize, pc_a, RecordedOpKind::Dispatch, || {
+            extra_eval = true;
+            String::from("(999, 1, 1)")
+        });
+        assert!(!extra_eval, "extra sample beyond cap should not format detail");
+
+        record_submission(queue, &[pc_a]);
+        let drained = take_queue_submissions(queue);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].compute_ops.len(), 1);
+        assert_eq!(drained[0].compute_ops[0].dispatches, 6);
+        assert_eq!(drained[0].compute_ops[0].indirects, 1);
+        assert_eq!(drained[0].compute_ops[0].samples.len(), MAX_COMPUTE_SAMPLES);
+
+        let text = format_submissions(&drained);
+        assert!(text.contains("compute ops:"), "{text}");
+        assert!(text.contains("pipeline 51137 [CS b0c0fed0cdf7fd9c direct]"), "{text}");
+        assert!(text.contains("dispatch=6, indirect=1"), "{text}");
+        assert!(text.contains("(64, 1, 1)"), "{text}");
+        assert!(text.contains("indirect (max=8, arg_off=0x40)"), "{text}");
+
+        reset_pc_list(pc_a);
+    }
+
+    #[test]
+    fn skip_shader_hashes_parses_matches_and_toggles_per_bind() {
+        let targets = parse_hex_hash_list(Some("0xb0c0fed0cdf7fd9c, a51350876cf12f94; invalid 0X2E0055C25F49848A"));
+        assert_eq!(targets, vec![0xb0c0_fed0_cdf7_fd9c, 0xa513_5087_6cf1_2f94, 0x2e00_55c2_5f49_848a]);
+        assert!(parse_hex_hash_list(None).is_empty());
+        assert_eq!(match_shader_hash("CS b0c0fed0cdf7fd9c direct", &targets), Some(0xb0c0_fed0_cdf7_fd9c));
+        assert_eq!(match_shader_hash("CS 1111222233334444 direct", &targets), None);
+
+        let pc_a = 0x7001_0010usize;
+        let proxy_a: [usize; 2] = [0x9000, pc_a];
+        let proxy_ptr = proxy_a.as_ptr() as usize;
+        let pso_vtbl: usize = 0x8000;
+        let pso_skip_stub: [usize; 2] = [&raw const pso_vtbl as usize, 0];
+        let pso_keep_stub: [usize; 2] = [&raw const pso_vtbl as usize, 0];
+        let pso_skip = pso_skip_stub.as_ptr() as usize;
+        let pso_keep = pso_keep_stub.as_ptr() as usize;
+
+        reset_pc_list(pc_a);
+        register_pipeline_summary(pso_skip, 0x7101, Some(51137), "CS b0c0fed0cdf7fd9c direct".to_owned());
+        register_pipeline_summary(pso_keep, 0x7102, Some(51138), "CS 0123456789abcdef direct".to_owned());
+
+        bind_resolved_with_targets(proxy_ptr, pc_a, pso_skip, 0x7101, &targets);
+        assert!(skip_with_targets(proxy_ptr, &targets), "matching hash must be skipped");
+        assert!(!skip_with_targets(proxy_ptr, &[]), "empty target list must never skip");
+
+        bind_resolved_with_targets(proxy_ptr, pc_a, pso_keep, 0x7102, &targets);
+        assert!(!skip_with_targets(proxy_ptr, &targets), "switching to non-matching pipeline must resume execution");
+
+        bind_resolved_with_targets(proxy_ptr, pc_a, pso_skip, 0x7101, &targets);
+        assert!(skip_with_targets(proxy_ptr, &targets));
+        reset_pc_list(pc_a);
+        assert!(!skip_with_targets(proxy_ptr, &targets), "reset_pc_list must clear skipped binding");
     }
 }
