@@ -21,13 +21,13 @@ pub const IO_HOLD: Duration = Duration::from_secs(2);
 pub const CALL_HOLD: Duration = Duration::from_secs(600);
 
 /// A write fault this soon after the page was made clean counts as a quick one.
-pub const HOT_WINDOW: Duration = Duration::from_millis(250);
+pub const HOT_WINDOW: Duration = Duration::from_millis(500);
 /// Quick faults in a row that make a page hot.
 pub const HOT_FAULTS: u8 = 3;
 /// How long a hot page stays unprotected and is copied at every sync by default.
-pub const HOT_HOLD: Duration = Duration::from_millis(250);
+pub const HOT_HOLD: Duration = Duration::from_millis(1000);
 /// Minimum writable rest after a CPU write fault before `take` re-protects the page by default.
-pub const GUARD_REST: Duration = Duration::from_millis(8);
+pub const GUARD_REST: Duration = Duration::from_millis(32);
 
 /// Parses a hold duration in milliseconds from an optional string, falling back to `default`.
 fn parse_hold_ms(raw: Option<&str>, default: Duration) -> Duration {
@@ -695,11 +695,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_hot_hold_ms_parses_override_and_defaults_to_250_ms() {
-        assert_eq!(HOT_HOLD, Duration::from_millis(250));
-        assert_eq!(parse_hot_hold_ms(None), Duration::from_millis(250));
-        assert_eq!(parse_hot_hold_ms(Some("")), Duration::from_millis(250));
-        assert_eq!(parse_hot_hold_ms(Some("invalid")), Duration::from_millis(250));
+    fn parse_hot_hold_ms_parses_override_and_defaults_to_1000_ms() {
+        assert_eq!(HOT_WINDOW, Duration::from_millis(500));
+        assert_eq!(HOT_HOLD, Duration::from_millis(1000));
+        assert_eq!(parse_hot_hold_ms(None), Duration::from_millis(1000));
+        assert_eq!(parse_hot_hold_ms(Some("")), Duration::from_millis(1000));
+        assert_eq!(parse_hot_hold_ms(Some("invalid")), Duration::from_millis(1000));
         assert_eq!(parse_hot_hold_ms(Some(" 750 ")), Duration::from_millis(750));
     }
 
@@ -764,7 +765,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_guard_rest_ms_parses_override_and_defaults_to_8_ms() {
+    fn parse_guard_rest_ms_parses_override_and_defaults_to_32_ms() {
+        assert_eq!(GUARD_REST, Duration::from_millis(32));
         assert_eq!(parse_guard_rest_ms(None), GUARD_REST);
         assert_eq!(parse_guard_rest_ms(Some("0")), Duration::ZERO);
         assert_eq!(parse_guard_rest_ms(Some(" 16 ")), Duration::from_millis(16));
