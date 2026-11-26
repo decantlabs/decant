@@ -250,6 +250,24 @@ pub fn tile_generation() -> u64 {
     TILE_GEN.load(Ordering::Acquire)
 }
 
+static STREAMING_WORK: AtomicU64 = AtomicU64::new(0);
+
+/// Records bulk streaming work (`detile` textures/bytes or `title_mem` pages/tile ranges) so
+/// frame pacing can skip waits during heavy loading bursts.
+pub(crate) fn note_streaming_work(units: u64) {
+    if units > 0 {
+        STREAMING_WORK.fetch_add(units, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn take_streaming_work() -> u64 {
+    STREAMING_WORK.swap(0, Ordering::Relaxed)
+}
+
+pub(crate) fn peek_streaming_work() -> u64 {
+    STREAMING_WORK.load(Ordering::Relaxed)
+}
+
 /// One complete rotating pass over the mirror tiles.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ZeroSweep {
@@ -1368,12 +1386,14 @@ pub unsafe fn sync(queue: *mut c_void) {
         0
     };
 
+    let mut ranges_updated = 0u64;
     if let Some(api) = api() {
         let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.lock().unwrap_or_else(|e| e.into_inner()));
         if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
             st.stats.copy_micros += copy_micros;
             let tiles = Instant::now();
             let ranges = st.update_tiles();
+            ranges_updated = ranges;
             st.stats.tile_micros += tiles.elapsed().as_micros() as u64;
             if st.fence_value > 0 && st.waited.get(&(queue as usize)).is_none_or(|&v| v < st.fence_value) {
                 // SAFETY: both objects are live. The queue waits on the GPU, the CPU does not.
@@ -1416,6 +1436,9 @@ pub unsafe fn sync(queue: *mut c_void) {
         }
     }
     drop(jobs);
+    let page_units = pages / 16;
+    let range_units = ranges_updated / 4;
+    note_streaming_work(page_units.max(range_units));
     // A placed texture whose memory the title wrote is filled again (after this lock is given back:
     // the detile table asks for tiles under its own lock).
     if !written.is_empty() {

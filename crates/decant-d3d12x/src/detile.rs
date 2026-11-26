@@ -1701,7 +1701,7 @@ pub unsafe fn flush(queue: *mut c_void) {
         return;
     };
 
-    with_registry(|r| {
+    let streaming_units = with_registry(|r| {
         let mut filled_bytes = 0u64;
         for (&res, &ok) in job_res.iter().zip(&outcome) {
             if let Some(texture) = r.textures.get_mut(&res) {
@@ -1735,7 +1735,9 @@ pub unsafe fn flush(queue: *mut c_void) {
         }
         r.scratch.job_res = job_res;
         r.scratch.outcome = outcome;
+        (ready_count as u64).max(filled_bytes >> 20)
     });
+    crate::title_mem::note_streaming_work(streaming_units);
 }
 
 #[cfg(test)]

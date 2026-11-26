@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use windows_sys::Win32::Foundation::{CloseHandle, E_INVALIDARG, HANDLE, S_FALSE, S_OK};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -36,6 +36,37 @@ const SIXTIETH_US: u32 = 16_667;
 
 /// How many issued type 0 tokens are remembered.
 const TOKEN_MEMORY: usize = 64;
+/// Streaming work units in one frame needed to trigger loading uncap in `Auto` mode.
+const BURST_THRESHOLD: u64 = 16;
+/// Frames to stay uncapped after streaming work drops below `BURST_THRESHOLD`.
+const UNCAPPED_HOLD_FRAMES: u32 = 20;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UncapMode {
+    Off,
+    Auto,
+    Always,
+}
+
+fn parse_uncap_mode(value: Option<&str>) -> UncapMode {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("0" | "off" | "false") => UncapMode::Off,
+        Some("always") => UncapMode::Always,
+        _ => UncapMode::Auto,
+    }
+}
+
+fn uncap_mode() -> UncapMode {
+    static MODE: OnceLock<UncapMode> = OnceLock::new();
+    *MODE.get_or_init(|| parse_uncap_mode(std::env::var("DECANT_D3D12X_LOAD_UNCAP").ok().as_deref()))
+}
+
+/// Records bulk streaming work (`detile` textures/bytes or `title_mem` pages/tile ranges) so
+/// `wait_event` can skip frame pacing during heavy loading bursts.
+#[allow(dead_code)]
+pub(crate) fn note_streaming_work(units: u64) {
+    crate::title_mem::note_streaming_work(units);
+}
 /// The last tokens handed out, oldest first. A caller may pass one back in, and only a token from
 /// this window counts as genuine.
 static TOKEN_WINDOW: Mutex<VecDeque<u64>> = Mutex::new(VecDeque::new());
@@ -102,10 +133,23 @@ struct Clock {
     offset: [i64; EVENT_TYPES],
     /// The first frame index not handed out yet, per event type.
     next: [u64; EVENT_TYPES],
+    /// Remaining frames to stay uncapped after a streaming burst.
+    uncap_hold: u32,
+    /// Whether the clock was uncapped on the previous frame check.
+    uncapped: bool,
 }
 
-static CLOCK: Mutex<Clock> =
-    Mutex::new(Clock { started: false, active: false, freq: 0, origin: 0, period: 0.0, offset: [0; EVENT_TYPES], next: [0; EVENT_TYPES] });
+static CLOCK: Mutex<Clock> = Mutex::new(Clock {
+    started: false,
+    active: false,
+    freq: 0,
+    origin: 0,
+    period: 0.0,
+    offset: [0; EVENT_TYPES],
+    next: [0; EVENT_TYPES],
+    uncap_hold: 0,
+    uncapped: false,
+});
 
 fn lock() -> MutexGuard<'static, Clock> {
     CLOCK.lock().unwrap_or_else(PoisonError::into_inner)
@@ -147,6 +191,32 @@ impl Clock {
     /// Records that `frame` was handed out for `kind`.
     fn consume(&mut self, kind: usize, frame: u64) {
         self.next[kind] = self.next[kind].max(frame + 1);
+    }
+
+    /// Updates streaming burst uncap state and resets the clock origin when leaving uncap so
+    /// steady-state pacing resumes smoothly without catch-up stutter.
+    fn update_uncap(&mut self, mode: UncapMode, burst_units: u64, decay: bool, at: i64) -> bool {
+        let active = match mode {
+            UncapMode::Off => {
+                self.uncap_hold = 0;
+                false
+            }
+            UncapMode::Always => true,
+            UncapMode::Auto => {
+                if burst_units >= BURST_THRESHOLD {
+                    self.uncap_hold = UNCAPPED_HOLD_FRAMES;
+                } else if decay && self.uncap_hold > 0 {
+                    self.uncap_hold -= 1;
+                }
+                self.uncap_hold > 0
+            }
+        };
+        if self.uncapped && !active {
+            self.origin = at;
+            self.next = [1; EVENT_TYPES];
+        }
+        self.uncapped = active;
+        active
     }
 }
 
@@ -261,13 +331,22 @@ pub(crate) fn wait_event(kind: u32, timeout_ms: u32, aux: usize, flags: u32, tok
         xs_log!("WaitFrameEventX(type 0, token {token_in:016X}, flags 0x{flags:X}): not a recently issued token, or passed together with 0x2, E_INVALIDARG");
         return (E_INVALIDARG, None);
     }
-    let (frame, deadline, arrival, freq) = {
+    let burst_units = if t == 0 { crate::title_mem::take_streaming_work() } else { crate::title_mem::peek_streaming_work() };
+    let mode = uncap_mode();
+    let (frame, deadline, arrival, freq, uncapped) = {
         let mut clock = lock();
         clock.start();
         let arrival = now();
+        let uncapped = clock.update_uncap(mode, burst_units, t == 0, arrival);
         let (frame, deadline) = clock.next_event(t, arrival);
-        (frame, deadline, arrival, clock.freq)
+        if uncapped {
+            clock.consume(t, frame);
+        }
+        (frame, deadline, arrival, clock.freq, uncapped)
     };
+    if uncapped {
+        return (S_OK, Some(if t == 0 { issue_token() } else { frame + 1 }));
+    }
 
     let timeout_ticks = i64::from(timeout_ms) * freq / 1000;
     if timeout_ms != INFINITE && deadline - arrival > timeout_ticks {
@@ -301,7 +380,7 @@ mod tests {
 
     /// A started clock at 1 MHz so tick values read as microseconds.
     fn micro_clock(period: f64) -> Clock {
-        Clock { started: true, active: true, freq: 1_000_000, origin: 0, period, offset: [0; EVENT_TYPES], next: [1; EVENT_TYPES] }
+        Clock { started: true, active: true, freq: 1_000_000, origin: 0, period, offset: [0; EVENT_TYPES], next: [1; EVENT_TYPES], uncap_hold: 0, uncapped: false }
     }
 
     #[test]
@@ -387,6 +466,54 @@ mod tests {
         assert_eq!(statistics(1, 0, &mut count, std::ptr::null_mut()), S_OK);
         assert_eq!(count, 0);
         assert_eq!(statistics(1, 0, std::ptr::null_mut(), std::ptr::null_mut()), E_INVALIDARG);
+    }
+
+    #[test]
+    fn uncap_mode_parses_auto_off_and_always() {
+        assert_eq!(parse_uncap_mode(None), UncapMode::Auto);
+        assert_eq!(parse_uncap_mode(Some("")), UncapMode::Auto);
+        assert_eq!(parse_uncap_mode(Some("1")), UncapMode::Auto);
+        assert_eq!(parse_uncap_mode(Some("auto")), UncapMode::Auto);
+        assert_eq!(parse_uncap_mode(Some("0")), UncapMode::Off);
+        assert_eq!(parse_uncap_mode(Some("off")), UncapMode::Off);
+        assert_eq!(parse_uncap_mode(Some("FALSE")), UncapMode::Off);
+        assert_eq!(parse_uncap_mode(Some("always")), UncapMode::Always);
+    }
+
+    #[test]
+    fn streaming_burst_uncaps_decays_and_resets_clock_origin_on_exit() {
+        let mut clock = micro_clock(33_333.0);
+        clock.origin = 1_000;
+        clock.next[0] = 5;
+
+        // Below threshold keeps normal pacing.
+        assert!(!clock.update_uncap(UncapMode::Auto, BURST_THRESHOLD - 1, true, 10_000));
+        assert_eq!(clock.origin, 1_000);
+
+        // Burst activates uncap for UNCAPPED_HOLD_FRAMES.
+        assert!(clock.update_uncap(UncapMode::Auto, BURST_THRESHOLD, true, 20_000));
+        assert_eq!(clock.uncap_hold, UNCAPPED_HOLD_FRAMES);
+
+        // Secondary event check does not decay hold.
+        assert!(clock.update_uncap(UncapMode::Auto, 0, false, 25_000));
+        assert_eq!(clock.uncap_hold, UNCAPPED_HOLD_FRAMES);
+
+        // Decay for UNCAPPED_HOLD_FRAMES - 1 primary frames stays uncapped.
+        for i in 1..UNCAPPED_HOLD_FRAMES {
+            assert!(clock.update_uncap(UncapMode::Auto, 0, true, 30_000 + i64::from(i) * 1_000));
+        }
+        assert_eq!(clock.uncap_hold, 1);
+
+        // Final decay exits uncap and resets origin and next counters cleanly.
+        let exit_at = 500_000;
+        assert!(!clock.update_uncap(UncapMode::Auto, 0, true, exit_at));
+        assert_eq!(clock.origin, exit_at);
+        assert_eq!(clock.next, [1; EVENT_TYPES]);
+        assert_eq!(clock.next_event(0, exit_at), (1, exit_at + 33_333));
+
+        // Off and Always modes behave as configured.
+        assert!(!clock.update_uncap(UncapMode::Off, BURST_THRESHOLD * 4, true, 600_000));
+        assert!(clock.update_uncap(UncapMode::Always, 0, true, 610_000));
     }
 }
 
