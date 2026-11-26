@@ -749,6 +749,31 @@ impl Tracer<'_> {
             }
             Expr::Var(_) => upper(e, 0, out).unwrap_or(true),
             Expr::Un(_, a) => self.data_reads(state, a, out),
+            Expr::Bin(Bin::And, a, b) => {
+                let const_val = |e: &Expr| match e {
+                    Expr::U32(v) => Some(*v),
+                    Expr::Var(v) => match state.get(v) {
+                        Some(Sym::Const(v)) => Some(*v),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let ca = const_val(a);
+                let cb = const_val(b);
+                if matches!(ca, Some(0)) || matches!(cb, Some(0)) {
+                    true
+                } else if let Some(mask) = cb
+                    && let Some(ok) = upper(a, mask.trailing_zeros(), out)
+                {
+                    ok
+                } else if let Some(mask) = ca
+                    && let Some(ok) = upper(b, mask.trailing_zeros(), out)
+                {
+                    ok
+                } else {
+                    self.data_reads(state, a, out) & self.data_reads(state, b, out)
+                }
+            }
             Expr::Bin(_, a, b) => self.data_reads(state, a, out) & self.data_reads(state, b, out),
             Expr::Select(c, a, b) => {
                 self.data_reads(state, c, out)

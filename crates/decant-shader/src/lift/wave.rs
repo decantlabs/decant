@@ -768,8 +768,7 @@ pub(crate) fn check_dpp_context(
             || zero_test(insn).is_some_and(|(at, ..)| reads_mask_operand(masks, insn.src[at]))
             || matches!(
                 mask_op(insn.op),
-                Some((MaskOp::SaveExec(_) | MaskOp::WrExec(_) | MaskOp::Wqm
-                    | MaskOp::Logic(_) | MaskOp::Select, _))
+                Some((MaskOp::Wqm, _))
                     if masks.touches_mask()
                         || insn.dst == Operand::Reg(Reg::ExecLo)
                         || insn.src.contains(&Operand::Reg(Reg::ExecLo))

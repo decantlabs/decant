@@ -252,6 +252,25 @@ fn mesh_registers_map_to_mirror_dwords() {
 }
 
 #[test]
+fn descriptor_words_masked_safely_in_and_are_accepted() {
+    let mut a = Asm::new();
+    a.push(sop1(Op::s_mov_b32, s(9), int(0)));
+    a.push(smem(Op::s_load_dwordx4, s(4), s(8), 0));
+    a.push(sop2(Op::s_and_b32, s(0), s(4), int(0)));
+    a.push(sop2(Op::s_and_b32, s(1), s(5), lit(0x3fff_0000)));
+    a.push(sopp(Op::s_endpgm, 0));
+    placed(&program(Stage::Compute, a)).unwrap();
+
+    let mut b = Asm::new();
+    b.push(sop1(Op::s_mov_b32, s(9), int(0)));
+    b.push(smem(Op::s_load_dwordx4, s(4), s(8), 0));
+    b.push(sop2(Op::s_and_b32, s(0), s(4), lit(0xff)));
+    b.push(sopp(Op::s_endpgm, 0));
+    let refusal = placed(&program(Stage::Compute, b)).unwrap_err();
+    assert_eq!(refusal.key(), "resource:descriptor-as-data");
+}
+
+#[test]
 fn descriptor_words_used_as_numbers_are_refused() {
     let mut a = Asm::new();
     a.push(sop1(Op::s_mov_b32, s(9), int(0)));

@@ -166,6 +166,26 @@ fn scalar_high_words_without_mask_identity_remain_refused() {
 }
 
 #[test]
+fn compute_dpp_accepts_saveexec_control_flow() {
+    for (cmp, save_exec, restore) in [
+        (Op::v_cmp_gt_u32, Op::s_and_saveexec_b64, Op::s_mov_b64),
+        (Op::v_cmp_gt_u32, Op::s_and_saveexec_b32, Op::s_mov_b32),
+    ] {
+        let mut a = Asm::new();
+        let skip = a.label();
+        a.push(vopc(cmp, v(0), int(0)));
+        a.push(sop1(save_exec, s(0), VCC));
+        a.branch(Op::s_cbranch_execz, skip);
+        a.push(dpp16(Op::v_add_u32, v(2), v(0), v(1), 0xff08_b100));
+        a.bind(skip);
+        a.push(sop1(restore, EXEC, s(0)));
+        let p = finish(a, Stage::Compute);
+        lift_program(&p).unwrap();
+        compile(&p);
+    }
+}
+
+#[test]
 fn incompatible_mask_and_numeric_sources_remain_refused() {
     let mut a = Asm::new();
     a.push(sop1(Op::s_mov_b32, s(0), EXEC));
