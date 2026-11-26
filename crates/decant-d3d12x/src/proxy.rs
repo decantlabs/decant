@@ -2840,9 +2840,8 @@ unsafe fn view_texture(this: *mut Proxy, va: u64, rdesc: *const c_void) -> Optio
         S_OK
     };
     if bytes == 0 && hr >= 0 && !out.is_null() {
-        // a committed texture: its size on the PC
-        // SAFETY: one valid description.
-        bytes = device.as_ref().map_or(0, |d| unsafe { d.GetResourceAllocationInfo(0, &[pc_desc]) }.SizeInBytes);
+        // a committed texture: its size on the PC (cached by resource descriptor)
+        bytes = device.as_ref().map_or(0, |d| cached_resource_alloc_size(d, &pc_desc));
     }
     if hr < 0 || out.is_null() {
         if log_due(&MADE) {
@@ -2881,9 +2880,9 @@ unsafe fn view_texture(this: *mut Proxy, va: u64, rdesc: *const c_void) -> Optio
         crate::detile::forget(old);
         crate::views_at::forget_resource(old);
     }
-    let count = crate::views_at::with_view_textures(|t| {
+    let (count, held_bytes) = crate::views_at::with_view_textures(|t| {
         t.note(va, crate::views_at::ViewEntry::new(raw, res, heap_index, bytes, crate::title_heap::presents(), view_clock_ms()));
-        t.len()
+        (t.len(), t.held_bytes(crate::view_heap::HEAP_BYTES))
     });
     mem_owners::add(
         mem_owners::Kind::ViewTexture,
@@ -2891,7 +2890,7 @@ unsafe fn view_texture(this: *mut Proxy, va: u64, rdesc: *const c_void) -> Optio
         1,
         bytes,
     );
-    trim_view_textures();
+    trim_view_textures_with(device.as_ref(), Some(held_bytes));
     let width = u64::from_le_bytes(raw[0x10..0x18].try_into().unwrap_or([0; 8]));
     crate::views_at::record_resource(va, width, res, false);
     crate::detile::register(res, va, &raw, state, bytes);
@@ -2923,11 +2922,67 @@ fn next_trim_present(present: u64, freed_empty: bool) -> u64 {
     present.saturating_add(if freed_empty { 300 } else { 60 })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct AllocInfoCacheKey {
+    dimension: i32,
+    alignment: u64,
+    width: u64,
+    height: u32,
+    depth_or_array_size: u16,
+    mip_levels: u16,
+    format: i32,
+    sample_count: u32,
+    sample_quality: u32,
+    layout: i32,
+    flags: i32,
+}
+
+impl AllocInfoCacheKey {
+    fn from_desc(desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC) -> Self {
+        Self {
+            dimension: desc.Dimension.0,
+            alignment: desc.Alignment,
+            width: desc.Width,
+            height: desc.Height,
+            depth_or_array_size: desc.DepthOrArraySize,
+            mip_levels: desc.MipLevels,
+            format: desc.Format.0,
+            sample_count: desc.SampleDesc.Count,
+            sample_quality: desc.SampleDesc.Quality,
+            layout: desc.Layout.0,
+            flags: desc.Flags.0,
+        }
+    }
+}
+
+fn cached_resource_alloc_size(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+) -> u64 {
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<AllocInfoCacheKey, u64>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    let key = AllocInfoCacheKey::from_desc(desc);
+    if let Some(&bytes) = cache.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
+        return bytes;
+    }
+    // SAFETY: one valid description.
+    let bytes = unsafe { device.GetResourceAllocationInfo(0, std::slice::from_ref(desc)) }.SizeInBytes;
+    let mut map = cache.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if map.len() >= 4096 {
+        map.clear();
+    }
+    map.insert(key, bytes);
+    bytes
+}
+
 /// Gives back the view textures that no view of their address asked for lately when the cache is past
 /// its memory cap (`views_at::view_texture_cap_bytes`, `DECANT_D3D12X_VIEW_TEX_MIB`). Each goes through
 /// `retire`, so the GPU finishes the submissions that may read it first; its heap is used again once
 /// every texture placed in it is gone (`view_heap`). A line says how much went.
-fn trim_view_textures() {
+fn trim_view_textures_with(
+    known_device: Option<&windows::Win32::Graphics::Direct3D12::ID3D12Device>,
+    known_held_bytes: Option<u64>,
+) {
     static NEXT_TRIM_PRESENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let present = crate::title_heap::presents();
     if present < NEXT_TRIM_PRESENT.load(Ordering::Relaxed) {
@@ -2936,8 +2991,16 @@ fn trim_view_textures() {
     let _trace = decant_trace::span("views_at", "trim");
     static WAVES: AtomicI32 = AtomicI32::new(0);
     static STUCK: std::sync::Once = std::sync::Once::new();
-    let Some(device) = crate::title_mem::device() else { return };
-    let (cap, dedicated, budget) = crate::views_at::view_texture_cap(&device);
+    let owned_device;
+    let device = match known_device {
+        Some(d) => d,
+        None => {
+            let Some(d) = crate::title_mem::device() else { return };
+            owned_device = d;
+            &owned_device
+        }
+    };
+    let (cap, dedicated, budget) = crate::views_at::view_texture_cap(device);
     let lru_budget = crate::views_at::view_texture_budget();
     let effective_cap = if lru_budget > 0 && (cap == 0 || lru_budget < cap) { lru_budget } else { cap };
     static CAP_LOGGED: std::sync::Once = std::sync::Once::new();
@@ -2951,7 +3014,8 @@ fn trim_view_textures() {
             lru_budget >> 20
         );
     });
-    if effective_cap == 0 || crate::views_at::with_view_textures(|t| t.held_bytes(crate::view_heap::HEAP_BYTES)) <= effective_cap {
+    let held_bytes = known_held_bytes.unwrap_or_else(|| crate::views_at::with_view_textures(|t| t.held_bytes(crate::view_heap::HEAP_BYTES)));
+    if effective_cap == 0 || held_bytes <= effective_cap {
         NEXT_TRIM_PRESENT.store(next_trim_present(present, false), Ordering::Relaxed);
         return;
     }

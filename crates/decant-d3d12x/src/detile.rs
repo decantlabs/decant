@@ -1879,6 +1879,55 @@ fn collect_pending_items(r: &mut Registry, pending_items: &mut Vec<(usize, u64, 
     }
 }
 
+#[derive(Default)]
+struct FlushScratch {
+    pending_items: Vec<(usize, u64, u64)>,
+    pending_spans: Vec<(u64, u64)>,
+    exhausted: Vec<usize>,
+    translated: Vec<Option<(crate::title_mem::Span, bool)>>,
+    ready: Vec<(usize, u64)>,
+    owned_jobs: Vec<OwnedJob>,
+    job_res: Vec<usize>,
+    outcome: Vec<bool>,
+}
+
+impl FlushScratch {
+    fn clear_all(&mut self) {
+        self.pending_items.clear();
+        self.pending_spans.clear();
+        self.exhausted.clear();
+        self.translated.clear();
+        self.ready.clear();
+        self.owned_jobs.clear();
+        self.job_res.clear();
+        self.outcome.clear();
+    }
+}
+
+std::thread_local! {
+    static FLUSH_SCRATCH: std::cell::RefCell<FlushScratch> = std::cell::RefCell::new(FlushScratch::default());
+}
+
+struct FlushScratchGuard(FlushScratch);
+
+impl FlushScratchGuard {
+    fn take() -> Self {
+        let mut s = FLUSH_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        s.clear_all();
+        Self(s)
+    }
+}
+
+impl Drop for FlushScratchGuard {
+    fn drop(&mut self) {
+        self.0.clear_all();
+        let returned = std::mem::take(&mut self.0);
+        let _ = FLUSH_SCRATCH.try_with(|cell| {
+            *cell.borrow_mut() = returned;
+        });
+    }
+}
+
 pub unsafe fn flush(queue: *mut c_void) {
     if !enabled() || !HAS_PENDING_FILLS.load(Ordering::Acquire) {
         return;
@@ -1921,140 +1970,113 @@ pub unsafe fn flush(queue: *mut c_void) {
         return;
     }
 
-    let collected = with_registry_read(|r| {
+    let mut scratch_guard = FlushScratchGuard::take();
+    let s = &mut scratch_guard.0;
+
+    let Some(has_exhausted) = with_registry_read(|r| {
         if r.pending.is_empty() {
             HAS_PENDING_FILLS.store(false, Ordering::Release);
-            return None;
+            return false;
         }
-        let mut pending_items = Vec::with_capacity(r.pending.len());
-        let mut pending_spans = Vec::with_capacity(r.pending.len());
         let mut has_exhausted = false;
         for &res in &r.pending {
             if let Some(texture) = r.textures.get(&res).filter(|t| t.wants_fill()) {
-                pending_items.push((res, texture.va, texture.plan.size));
-                pending_spans.push((texture.va, texture.plan.size));
+                s.pending_items.push((res, texture.va, texture.plan.size));
+                s.pending_spans.push((texture.va, texture.plan.size));
             } else {
                 has_exhausted = true;
             }
         }
-        Some((pending_items, pending_spans, has_exhausted))
-    })
-    .flatten();
-    let Some((mut pending_items, mut pending_spans, has_exhausted)) = collected else {
+        has_exhausted
+    }) else {
         return;
     };
-    let mut exhausted = Vec::new();
-    if pending_items.is_empty() {
+    if s.pending_items.is_empty() {
         if has_exhausted {
-            with_registry(|r| collect_pending_items(r, &mut pending_items, &mut pending_spans, &mut exhausted));
+            with_registry(|r| collect_pending_items(r, &mut s.pending_items, &mut s.pending_spans, &mut s.exhausted));
         }
         return;
     }
-    let mut translated = Vec::with_capacity(pending_spans.len());
 
     // Translate outside REGISTRY so title_mem::STATE never nests under REGISTRY.
-    crate::title_mem::translate_fresh_batch(&pending_spans, &mut translated);
-    if needs_fresh_sync(tuning.defer_fresh_spans, &translated) {
+    crate::title_mem::translate_fresh_batch(&s.pending_spans, &mut s.translated);
+    if needs_fresh_sync(tuning.defer_fresh_spans, &s.translated) {
         // SAFETY: `queue_raw` is a live direct queue and REGISTRY is not held.
         unsafe { crate::title_mem::sync(queue_raw) };
-        with_registry(|r| collect_pending_items(r, &mut pending_items, &mut pending_spans, &mut exhausted));
-        crate::title_mem::translate_fresh_batch(&pending_spans, &mut translated);
+        with_registry(|r| collect_pending_items(r, &mut s.pending_items, &mut s.pending_spans, &mut s.exhausted));
+        crate::title_mem::translate_fresh_batch(&s.pending_spans, &mut s.translated);
     }
 
-    let prepared = with_registry(|r| {
-        let mut ready = std::mem::take(&mut r.scratch.ready);
-        ready.clear();
-        let mut owned_jobs = std::mem::take(&mut r.scratch.owned_jobs);
-        owned_jobs.clear();
-        let mut job_res = std::mem::take(&mut r.scratch.job_res);
-        job_res.clear();
-        let mut outcome = std::mem::take(&mut r.scratch.outcome);
-        outcome.clear();
-
+    let ready_count = with_registry(|r| {
         let mut unreachable = 0u32;
-        exhausted.clear();
-        for (&(res, _, _), mapped) in pending_items.iter().zip(&translated) {
+        s.exhausted.clear();
+        for (&(res, _, _), mapped) in s.pending_items.iter().zip(&s.translated) {
             if !r.textures.get(&res).is_some_and(Placed::wants_fill) {
                 continue;
             }
             match mapped {
                 // Fresh mappings go out with the next sync, before the next submission.
                 Some((_, true)) if tuning.defer_fresh_spans => r.deferred += 1,
-                Some((span, _)) => ready.push((res, span.gpu)),
+                Some((span, _)) => s.ready.push((res, span.gpu)),
                 None => {
                     unreachable += 1;
                     if let Some(texture) = r.textures.get_mut(&res) {
                         texture.attempts += 1;
                         if !texture.wants_fill() {
-                            exhausted.push(res);
+                            s.exhausted.push(res);
                         }
                     }
                 }
             }
         }
-        r.scratch.pending_items = pending_items;
-        r.scratch.pending_spans = pending_spans;
-        r.scratch.translated = translated;
-        for &res in &exhausted {
+        for &res in &s.exhausted {
             r.pending.remove(&res);
         }
-        r.scratch.exhausted = exhausted;
         if r.pending.is_empty() {
             HAS_PENDING_FILLS.store(false, Ordering::Release);
         }
         if unreachable > 0 && r.flushes < 4 {
             xs_log!("detile: {unreachable} textures have no GPU address for their memory yet");
         }
-        if ready.is_empty() {
-            r.scratch.ready = ready;
-            r.scratch.owned_jobs = owned_jobs;
-            r.scratch.job_res = job_res;
-            r.scratch.outcome = outcome;
-            return None;
+        if s.ready.is_empty() {
+            return 0;
         }
-        ready.sort_unstable_by_key(|&(res, _)| res);
-        for &(res, gpu) in &ready {
+        s.ready.sort_unstable_by_key(|&(res, _)| res);
+        for &(res, gpu) in &s.ready {
             let raw = res as *mut c_void;
             // SAFETY: the registry holds the entry, so the title still owns the resource (it is forgotten before it is released).
             if let (Some(texture), Some(placed)) = (unsafe { ID3D12Resource::from_raw_borrowed(&raw) }.cloned(), r.textures.get(&res)) {
-                owned_jobs.push(OwnedJob { texture, src_gpu: gpu, plan: Arc::clone(&placed.plan), states: Arc::clone(&placed.states) });
-                job_res.push(res);
+                s.owned_jobs.push(OwnedJob { texture, src_gpu: gpu, plan: Arc::clone(&placed.plan), states: Arc::clone(&placed.states) });
+                s.job_res.push(res);
             }
         }
-        let ready_count = ready.len();
-        r.scratch.ready = ready;
-        Some((owned_jobs, job_res, outcome, ready_count))
+        s.ready.len()
     });
-    let Some((mut owned_jobs, job_res, mut outcome, ready_count)) = prepared else {
+    if ready_count == 0 {
         return;
-    };
+    }
 
     // Execute GPU detile work under DETILER without holding REGISTRY so note_tiles,
     // note_write, and register never contend with command list recording.
-    let jobs: Vec<Job<'_>> = owned_jobs
+    let jobs: Vec<Job<'_>> = s
+        .owned_jobs
         .iter()
         .map(|j| Job { texture: j.texture.clone(), src_gpu: j.src_gpu, plan: &j.plan, states: &j.states })
         .collect();
     let footprint = with_detiler(|d| {
         let detiler = d.detiler.as_mut()?;
-        detiler.run_into(queue, &jobs, tuning.wait_each_flush, &mut outcome);
+        detiler.run_into(queue, &jobs, tuning.wait_each_flush, &mut s.outcome);
         Some(detiler.footprint())
     });
     drop(jobs);
-    owned_jobs.clear();
+    s.owned_jobs.clear();
     let Some((frames, queues, staging)) = footprint else {
-        with_registry(|r| {
-            r.scratch.owned_jobs = owned_jobs;
-            r.scratch.job_res = job_res;
-            r.scratch.outcome = outcome;
-        });
         return;
     };
 
     let streaming_units = with_registry(|r| {
-        r.scratch.owned_jobs = owned_jobs;
         let mut filled_bytes = 0u64;
-        for (&res, &ok) in job_res.iter().zip(&outcome) {
+        for (&res, &ok) in s.job_res.iter().zip(&s.outcome) {
             if let Some(texture) = r.textures.get_mut(&res) {
                 texture.settle(ok);
                 if !texture.wants_fill() {
@@ -2084,8 +2106,6 @@ pub unsafe fn flush(queue: *mut c_void) {
                 staging >> 20
             );
         }
-        r.scratch.job_res = job_res;
-        r.scratch.outcome = outcome;
         (ready_count as u64).max(filled_bytes >> 20)
     });
     crate::title_mem::note_streaming_work(streaming_units);
