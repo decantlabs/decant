@@ -77,23 +77,84 @@ const COPY_CHUNK_PAGES: usize = 4;
 const PARALLEL_THRESHOLD_PAGES: usize = 8;
 const COPY_THREAD_PAGES: usize = 8;
 
+const SUBPAGE_BYTES: usize = 4096;
+const SUBPAGES_PER_PAGE: usize = PAGE as usize / SUBPAGE_BYTES;
+
+fn parse_subpage_diff(raw: Option<&str>) -> bool {
+    !matches!(raw.map(str::trim), Some(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false"))
+}
+
+fn subpage_diff_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| parse_subpage_diff(std::env::var("DECANT_D3D12X_SUBPAGE_DIFF").ok().as_deref()))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CopyJob {
     source: usize,
     destination: usize,
-    pages: usize,
+    bytes: usize,
     staged: bool,
 }
 
 fn plan_copy(jobs: &mut Vec<CopyJob>, source: usize, destination: usize, pages: usize, staged: bool) {
     for start in (0..pages).step_by(COPY_CHUNK_PAGES) {
+        let count = (pages - start).min(COPY_CHUNK_PAGES);
         jobs.push(CopyJob {
             source: source + start * PAGE as usize,
             destination: destination + start * PAGE as usize,
-            pages: (pages - start).min(COPY_CHUNK_PAGES),
+            bytes: count * PAGE as usize,
             staged,
         });
     }
+}
+
+/// Executes one copy job, returning `(copied_bytes, skipped_bytes)`.
+/// For direct L0 destinations when `diff_enabled` is true, compares 4 KiB sub-pages and copies
+/// only contiguous changed runs.
+///
+/// # Safety
+/// `job.source` must be readable and `job.destination` writable for `job.bytes` bytes, and the
+/// two ranges must not overlap.
+unsafe fn run_copy_job(job: CopyJob, diff_enabled: bool) -> (u64, u64) {
+    if job.staged || !diff_enabled {
+        // SAFETY: caller guarantees live disjoint ranges for `job.bytes`.
+        unsafe { std::ptr::copy_nonoverlapping(job.source as *const u8, job.destination as *mut u8, job.bytes) };
+        return (job.bytes as u64, 0);
+    }
+    let total_subpages = job.bytes / SUBPAGE_BYTES;
+    let mut copied = 0u64;
+    let mut skipped = 0u64;
+    let mut run_start: Option<usize> = None;
+    for sp in 0..total_subpages {
+        let off = sp * SUBPAGE_BYTES;
+        // SAFETY: `off + SUBPAGE_BYTES <= job.bytes`, both slices are live and disjoint.
+        let same = unsafe {
+            let s = std::slice::from_raw_parts((job.source + off) as *const u8, SUBPAGE_BYTES);
+            let d = std::slice::from_raw_parts((job.destination + off) as *const u8, SUBPAGE_BYTES);
+            s == d
+        };
+        if same {
+            if let Some(start_sp) = run_start.take() {
+                let run_off = start_sp * SUBPAGE_BYTES;
+                let run_bytes = (sp - start_sp) * SUBPAGE_BYTES;
+                // SAFETY: contiguous changed sub-pages within `job.bytes`.
+                unsafe { std::ptr::copy_nonoverlapping((job.source + run_off) as *const u8, (job.destination + run_off) as *mut u8, run_bytes) };
+                copied += run_bytes as u64;
+            }
+            skipped += SUBPAGE_BYTES as u64;
+        } else if run_start.is_none() {
+            run_start = Some(sp);
+        }
+    }
+    if let Some(start_sp) = run_start {
+        let run_off = start_sp * SUBPAGE_BYTES;
+        let run_bytes = (total_subpages - start_sp) * SUBPAGE_BYTES;
+        // SAFETY: contiguous changed tail sub-pages within `job.bytes`.
+        unsafe { std::ptr::copy_nonoverlapping((job.source + run_off) as *const u8, (job.destination + run_off) as *mut u8, run_bytes) };
+        copied += run_bytes as u64;
+    }
+    (copied, skipped)
 }
 
 /// Rebases staged L1 copy destinations by `dst_base` while leaving direct L0 pointers untouched.
@@ -117,6 +178,7 @@ fn copy_threads(pages: usize, cores: usize) -> usize {
 struct PoolState {
     jobs_ptr: usize,
     jobs_len: usize,
+    diff_enabled: bool,
     workers_to_take: usize,
     active_workers: usize,
     epoch: u64,
@@ -125,6 +187,8 @@ struct PoolState {
 struct PoolShared {
     state: Mutex<PoolState>,
     next: std::sync::atomic::AtomicUsize,
+    copied_bytes: AtomicU64,
+    skipped_bytes: AtomicU64,
     cv_work: Condvar,
     cv_done: Condvar,
 }
@@ -138,8 +202,10 @@ struct CopyPool {
 impl CopyPool {
     fn new(workers: usize) -> Self {
         let shared = Arc::new(PoolShared {
-            state: Mutex::new(PoolState { jobs_ptr: 0, jobs_len: 0, workers_to_take: 0, active_workers: 0, epoch: 0 }),
+            state: Mutex::new(PoolState { jobs_ptr: 0, jobs_len: 0, diff_enabled: true, workers_to_take: 0, active_workers: 0, epoch: 0 }),
             next: std::sync::atomic::AtomicUsize::new(0),
+            copied_bytes: AtomicU64::new(0),
+            skipped_bytes: AtomicU64::new(0),
             cv_work: Condvar::new(),
             cv_done: Condvar::new(),
         });
@@ -148,15 +214,17 @@ impl CopyPool {
             let _ = std::thread::Builder::new().name(format!("title-mem-copy-{i}")).spawn(move || {
                 let mut seen_gen = 0u64;
                 loop {
-                    let (ptr, len) = {
+                    let (ptr, len, diff_enabled) = {
                         let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
                         while st.epoch == seen_gen || st.workers_to_take == 0 {
                             st = shared.cv_work.wait(st).unwrap_or_else(|e| e.into_inner());
                         }
                         seen_gen = st.epoch;
                         st.workers_to_take -= 1;
-                        (st.jobs_ptr as *const CopyJob, st.jobs_len)
+                        (st.jobs_ptr as *const CopyJob, st.jobs_len, st.diff_enabled)
                     };
+                    let mut local_copied = 0u64;
+                    let mut local_skipped = 0u64;
                     loop {
                         let idx = shared.next.fetch_add(1, Ordering::Relaxed);
                         if idx >= len {
@@ -165,8 +233,12 @@ impl CopyPool {
                         // SAFETY: `run` keeps the `jobs` slice alive until `active_workers` reaches 0.
                         let job = unsafe { *ptr.add(idx) };
                         // SAFETY: caller guarantees live disjoint source and destination ranges.
-                        unsafe { std::ptr::copy_nonoverlapping(job.source as *const u8, job.destination as *mut u8, job.pages * PAGE as usize) };
+                        let (c, s) = unsafe { run_copy_job(job, diff_enabled) };
+                        local_copied += c;
+                        local_skipped += s;
                     }
+                    shared.copied_bytes.fetch_add(local_copied, Ordering::Relaxed);
+                    shared.skipped_bytes.fetch_add(local_skipped, Ordering::Relaxed);
                     let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
                     st.active_workers -= 1;
                     if st.active_workers == 0 {
@@ -180,39 +252,53 @@ impl CopyPool {
 
     /// # Safety
     /// Same safety contract as `execute_copies`.
-    unsafe fn run(&self, jobs: &[CopyJob], threads: usize) {
+    unsafe fn run(&self, jobs: &[CopyJob], threads: usize, diff_enabled: bool) -> (u64, u64) {
         let _run_guard = self.run_lock.lock().unwrap_or_else(|e| e.into_inner());
         let worker_count = threads.saturating_sub(1).min(self.workers);
         if worker_count == 0 || jobs.len() <= 1 {
-            for job in jobs {
+            let mut copied = 0u64;
+            let mut skipped = 0u64;
+            for &job in jobs {
                 // SAFETY: caller guarantees live disjoint ranges for every job.
-                unsafe { std::ptr::copy_nonoverlapping(job.source as *const u8, job.destination as *mut u8, job.pages * PAGE as usize) };
+                let (c, s) = unsafe { run_copy_job(job, diff_enabled) };
+                copied += c;
+                skipped += s;
             }
-            return;
+            return (copied, skipped);
         }
+        self.shared.copied_bytes.store(0, Ordering::Relaxed);
+        self.shared.skipped_bytes.store(0, Ordering::Relaxed);
         {
             let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.jobs_ptr = jobs.as_ptr() as usize;
             st.jobs_len = jobs.len();
+            st.diff_enabled = diff_enabled;
             self.shared.next.store(0, Ordering::Relaxed);
             st.workers_to_take = worker_count;
             st.active_workers = worker_count;
             st.epoch += 1;
             self.shared.cv_work.notify_all();
         }
+        let mut main_copied = 0u64;
+        let mut main_skipped = 0u64;
         loop {
             let idx = self.shared.next.fetch_add(1, Ordering::Relaxed);
             if idx >= jobs.len() {
                 break;
             }
-            let job = jobs[idx];
             // SAFETY: caller guarantees live disjoint ranges for every job.
-            unsafe { std::ptr::copy_nonoverlapping(job.source as *const u8, job.destination as *mut u8, job.pages * PAGE as usize) };
+            let (c, s) = unsafe { run_copy_job(jobs[idx], diff_enabled) };
+            main_copied += c;
+            main_skipped += s;
         }
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         while st.active_workers > 0 {
             st = self.shared.cv_done.wait(st).unwrap_or_else(|e| e.into_inner());
         }
+        (
+            main_copied + self.shared.copied_bytes.load(Ordering::Relaxed),
+            main_skipped + self.shared.skipped_bytes.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -224,18 +310,22 @@ fn copy_pool(cores: usize) -> &'static CopyPool {
 /// # Safety
 /// Sources must be readable and destinations writable until this function returns.
 /// All destination ranges must be disjoint and must not overlap any source.
-unsafe fn execute_copies(jobs: &[CopyJob], cores: usize) {
-    let pages = jobs.iter().map(|job| job.pages).sum();
+unsafe fn execute_copies(jobs: &[CopyJob], cores: usize, diff_enabled: bool) -> (u64, u64) {
+    let pages = jobs.iter().map(|job| job.bytes.div_ceil(PAGE as usize)).sum();
     let threads = copy_threads(pages, cores).min(jobs.len());
     if threads <= 1 {
-        for job in jobs {
+        let mut copied = 0u64;
+        let mut skipped = 0u64;
+        for &job in jobs {
             // SAFETY: the caller guarantees live disjoint ranges for every job.
-            unsafe { std::ptr::copy_nonoverlapping(job.source as *const u8, job.destination as *mut u8, job.pages * PAGE as usize) };
+            let (c, s) = unsafe { run_copy_job(job, diff_enabled) };
+            copied += c;
+            skipped += s;
         }
-        return;
+        return (copied, skipped);
     }
     // SAFETY: caller guarantees live disjoint ranges for every job.
-    unsafe { copy_pool(cores).run(jobs, threads) };
+    unsafe { copy_pool(cores).run(jobs, threads, diff_enabled) }
 }
 
 /// Journal records read in one call.
@@ -665,10 +755,163 @@ fn dedicated_vram(adapter: Option<&IDXGIAdapter3>) -> u64 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct UploadRun {
+    source: usize,
     heap: u32,
     heap_offset: u64,
     staging_offset: u64,
     bytes: u64,
+}
+
+/// Deterministic 128-bit fingerprint of a 4 KiB sub-page (`SUBPAGE_BYTES`).
+///
+/// # Safety
+/// `src` must be readable for `SUBPAGE_BYTES` bytes.
+unsafe fn hash_subpage(src: *const u8) -> u128 {
+    const WORDS: usize = SUBPAGE_BYTES / 8;
+    let mut h1 = 0x243F_6A88_85A3_08D3u64;
+    let mut h2 = 0x1319_8A2E_0370_7344u64;
+    for i in 0..WORDS {
+        // SAFETY: `i * 8 < SUBPAGE_BYTES`.
+        let w = unsafe { src.cast::<u64>().add(i).read_unaligned() };
+        h1 = h1.wrapping_add(w).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h1 ^= h1 >> 30;
+        h2 = (h2 ^ w).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h2 = h2.rotate_left(27);
+    }
+    h1 ^= h1 >> 27;
+    h1 = h1.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h2 ^= h2 >> 31;
+    h2 = h2.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    (u128::from(h2) << 64) | u128::from(h1)
+}
+
+#[derive(Default)]
+struct L1HeapPrints {
+    valid: [u64; 4],
+    hashes: Vec<[u128; SUBPAGES_PER_PAGE]>,
+}
+
+impl L1HeapPrints {
+    fn is_valid(&self, tile: usize) -> bool {
+        (self.valid[tile >> 6] & (1u64 << (tile & 63))) != 0
+    }
+
+    fn set_valid(&mut self, tile: usize) {
+        self.valid[tile >> 6] |= 1u64 << (tile & 63);
+    }
+
+    fn ensure_hashes(&mut self) -> &mut [[u128; SUBPAGES_PER_PAGE]] {
+        if self.hashes.is_empty() {
+            self.hashes.resize(HEAP_PAGES as usize, [0u128; SUBPAGES_PER_PAGE]);
+        }
+        &mut self.hashes
+    }
+}
+
+#[derive(Default)]
+struct L1Fingerprints {
+    heaps: Vec<Option<Box<L1HeapPrints>>>,
+}
+
+impl L1Fingerprints {
+    fn clear(&mut self) {
+        self.heaps.clear();
+    }
+
+    fn heap_mut(&mut self, heap: usize) -> &mut L1HeapPrints {
+        if self.heaps.len() <= heap {
+            self.heaps.resize_with(heap + 1, || None);
+        }
+        self.heaps[heap].get_or_insert_with(|| Box::new(L1HeapPrints::default()))
+    }
+}
+
+/// Filters staged L1 `runs` to contiguous changed 4 KiB sub-page runs using `prints` when
+/// `diff_enabled` is true, appending staged `CopyJob`s to `jobs` and returning
+/// `(staged_bytes, skipped_bytes)`.
+///
+/// # Safety
+/// Every `UploadRun` in `runs` must have a live readable `source` for `bytes` bytes.
+unsafe fn filter_staged_runs(
+    runs: &mut Vec<UploadRun>,
+    prints: &mut L1Fingerprints,
+    jobs: &mut Vec<CopyJob>,
+    diff_enabled: bool,
+) -> (usize, u64) {
+    if runs.is_empty() {
+        return (0, 0);
+    }
+    if !diff_enabled {
+        let mut staged_bytes = 0usize;
+        for run in runs.iter_mut() {
+            run.staging_offset = staged_bytes as u64;
+            let pages = (run.bytes / PAGE) as usize;
+            plan_copy(jobs, run.source, staged_bytes, pages, true);
+            staged_bytes += run.bytes as usize;
+        }
+        return (staged_bytes, 0);
+    }
+    let raw = std::mem::take(runs);
+    let mut staged_bytes = 0usize;
+    let mut skipped_bytes = 0u64;
+    for run in raw {
+        let hp = prints.heap_mut(run.heap as usize);
+        let first_tile = (run.heap_offset / PAGE) as usize;
+        let tile_count = (run.bytes / PAGE) as usize;
+        let mut run_src = 0usize;
+        let mut run_heap_off = 0u64;
+        let mut run_bytes = 0usize;
+        let flush_run = |runs: &mut Vec<UploadRun>, jobs: &mut Vec<CopyJob>, staged_bytes: &mut usize, r_src: usize, r_hoff: u64, r_bytes: usize| {
+            if r_bytes == 0 {
+                return;
+            }
+            let st_off = *staged_bytes;
+            jobs.push(CopyJob { source: r_src, destination: st_off, bytes: r_bytes, staged: true });
+            runs.push(UploadRun {
+                source: 0,
+                heap: run.heap,
+                heap_offset: r_hoff,
+                staging_offset: st_off as u64,
+                bytes: r_bytes as u64,
+            });
+            *staged_bytes += r_bytes;
+        };
+        for t in 0..tile_count {
+            let tile = first_tile + t;
+            let tile_src = run.source + t * PAGE as usize;
+            let tile_hoff = run.heap_offset + t as u64 * PAGE;
+            let was_valid = hp.is_valid(tile);
+            let hashes = hp.ensure_hashes();
+            let tile_hashes = &mut hashes[tile];
+            for (sp, slot) in tile_hashes.iter_mut().enumerate() {
+                let sp_src = tile_src + sp * SUBPAGE_BYTES;
+                // SAFETY: caller guarantees `run.source..run.source + run.bytes` is readable.
+                let h = unsafe { hash_subpage(sp_src as *const u8) };
+                let changed = !was_valid || *slot != h;
+                if changed {
+                    *slot = h;
+                    let sp_hoff = tile_hoff + sp as u64 * SUBPAGE_BYTES as u64;
+                    if run_bytes > 0 && run_src + run_bytes == sp_src {
+                        run_bytes += SUBPAGE_BYTES;
+                    } else {
+                        flush_run(runs, jobs, &mut staged_bytes, run_src, run_heap_off, run_bytes);
+                        run_src = sp_src;
+                        run_heap_off = sp_hoff;
+                        run_bytes = SUBPAGE_BYTES;
+                    }
+                } else {
+                    flush_run(runs, jobs, &mut staged_bytes, run_src, run_heap_off, run_bytes);
+                    run_bytes = 0;
+                    skipped_bytes += SUBPAGE_BYTES as u64;
+                }
+            }
+            if !was_valid {
+                hp.set_valid(tile);
+            }
+        }
+        flush_run(runs, jobs, &mut staged_bytes, run_src, run_heap_off, run_bytes);
+    }
+    (staged_bytes, skipped_bytes)
 }
 
 struct StagingRing {
@@ -843,6 +1086,8 @@ struct Window {
 struct Stats {
     syncs: u64,
     pages: u64,
+    copied_bytes: u64,
+    skipped_bytes: u64,
     ranges: u64,
     micros: u64,
     worst_micros: u64,
@@ -1047,6 +1292,7 @@ struct SyncScratch {
     dirty: Vec<u32>,
     runs: Vec<UploadRun>,
     staging: Option<StagingRing>,
+    l1_prints: L1Fingerprints,
     /// The map fence value each submitting queue has waited for.
     waited: Option<HashMap<usize, u64>>,
 }
@@ -1058,6 +1304,7 @@ static SYNC_LOCK: Mutex<SyncScratch> = Mutex::new(SyncScratch {
     dirty: Vec::new(),
     runs: Vec::new(),
     staging: None,
+    l1_prints: L1Fingerprints { heaps: Vec::new() },
     waited: None,
 });
 
@@ -1488,7 +1735,6 @@ impl State {
 
     fn plan_runs(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, runs: &mut Vec<UploadRun>, copied: &mut u64) {
         let mut i = 0;
-        let mut staged_pages = runs.iter().map(|r| (r.bytes / PAGE) as usize).sum::<usize>();
         while i < pages.len() {
             let first = pages[i];
             let Some(first_tile) = self.mirror.tile_of(first) else {
@@ -1512,15 +1758,13 @@ impl State {
             let head = n.min(in_section);
             i += head;
             if use_staging {
-                let staging_offset = staged_pages * PAGE as usize;
-                plan_copy(jobs, src, staging_offset, head, true);
                 runs.push(UploadRun {
+                    source: src,
                     heap,
                     heap_offset: tile as u64 * PAGE,
-                    staging_offset: staging_offset as u64,
+                    staging_offset: 0,
                     bytes: head as u64 * PAGE,
                 });
-                staged_pages += head;
             } else {
                 plan_copy(jobs, src, dst + tile as usize * PAGE as usize, head, false);
             }
@@ -1602,6 +1846,7 @@ pub unsafe fn device_created(device: *mut c_void) {
     let has_staging = staging.is_some();
     let mut sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     sync_guard.staging = staging;
+    sync_guard.l1_prints.clear();
     sync_guard.waited = Some(HashMap::new());
     let mut st = STATE.write().unwrap_or_else(PoisonError::into_inner);
     if st.is_some() {
@@ -2059,7 +2304,7 @@ pub unsafe fn sync(queue: *mut c_void) {
     let Some(queue_ref) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
     let Some(api_ref) = api() else { return };
     let mut sync_scratch = decant_trace::timed_lock("title_mem::SYNC_LOCK", || SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-    let SyncScratch { jobs, dirty, runs, staging, waited } = &mut *sync_scratch;
+    let SyncScratch { jobs, dirty, runs, staging, l1_prints, waited } = &mut *sync_scratch;
     let waited = waited.get_or_insert_with(HashMap::new);
     thread_local! {
         static SYNC_WRITTEN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
@@ -2109,7 +2354,13 @@ pub unsafe fn sync(queue: *mut c_void) {
             return;
         };
 
-        let staged_bytes: usize = runs.iter().map(|r| r.bytes as usize).sum();
+        let diff_enabled = subpage_diff_enabled();
+        let (staged_bytes, l1_skipped_bytes) = if !runs.is_empty() && staging.is_some() {
+            // SAFETY: every staged `UploadRun` points to a live section view for this sync.
+            unsafe { filter_staged_runs(runs, l1_prints, jobs, diff_enabled) }
+        } else {
+            (0, 0)
+        };
         let staging_span = if let (true, Some(ring)) = (staged_bytes > 0, staging.as_mut()) {
             let Some(base) = ring.reserve(staged_bytes, &map_fence) else {
                 SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
@@ -2122,19 +2373,20 @@ pub unsafe fn sync(queue: *mut c_void) {
             None
         };
 
-        let copy_micros = if !jobs.is_empty() {
+        let (copy_micros, copied_bytes, l0_skipped_bytes) = if !jobs.is_empty() {
             let copying = Instant::now();
             let _copy = decant_trace::span("title_mem", "copy_runs");
             // SAFETY: sorted unique pool pages have unique mirror tiles. Planning keeps each job
             // inside a live section and heap (or reserved staging span), and SYNC_LOCK keeps `device_created` from replacing heaps.
-            unsafe { execute_copies(jobs, cores) };
+            let (copied_bytes, l0_skipped_bytes) = unsafe { execute_copies(jobs, cores, diff_enabled) };
             if let (Some((base, staged_bytes)), Some(ring)) = (staging_span, staging.as_mut()) {
                 ring.copy_to_heaps(&map_queue, &map_fence, &target_heaps, (base, staged_bytes), runs, &fence_value);
             }
-            copying.elapsed().as_micros() as u64
+            (copying.elapsed().as_micros() as u64, copied_bytes, l0_skipped_bytes)
         } else {
-            0
+            (0, 0, 0)
         };
+        let skipped_bytes = l1_skipped_bytes + l0_skipped_bytes;
 
         let mut wait_target = None;
         {
@@ -2158,15 +2410,18 @@ pub unsafe fn sync(queue: *mut c_void) {
                 let s = &mut st.stats;
                 s.syncs += 1;
                 s.pages += pages;
+                s.copied_bytes += copied_bytes;
+                s.skipped_bytes += skipped_bytes;
                 s.ranges += ranges;
                 s.micros += micros;
                 s.worst_micros = s.worst_micros.max(micros);
                 if s.syncs.is_multiple_of(STATS_EVERY) {
                     xs_log!(
-                        "title memory: {} syncs, {} pages copied ({} MiB), {} tile ranges updated, {} us in total ({} us asking for written pages, {} us copying, {} us mapping tiles), {} us at worst, {} slots",
+                        "title memory: {} syncs, {} pages ({} MiB copied, {} MiB skipped by subpage diff), {} tile ranges updated, {} us in total ({} us asking for written pages, {} us copying, {} us mapping tiles), {} us at worst, {} slots",
                         s.syncs,
                         s.pages,
-                        (s.pages * PAGE) >> 20,
+                        s.copied_bytes >> 20,
+                        s.skipped_bytes >> 20,
                         s.ranges,
                         s.micros,
                         s.take_micros,
@@ -2292,7 +2547,7 @@ mod tests {
         plan_copy(&mut jobs, 0, 1024, 0, false);
         assert!(jobs.is_empty());
         plan_copy(&mut jobs, 0, 1024, 15, false);
-        assert_eq!(jobs.iter().map(|job| job.pages).collect::<Vec<_>>(), [4, 4, 4, 3]);
+        assert_eq!(jobs.iter().map(|job| job.bytes / PAGE as usize).collect::<Vec<_>>(), [4, 4, 4, 3]);
         for (i, job) in jobs.iter().enumerate() {
             assert_eq!(job.source, i * COPY_CHUNK_PAGES * PAGE as usize);
             assert_eq!(job.destination, 1024 + job.source);
@@ -2313,7 +2568,7 @@ mod tests {
             }
             for _ in 0..3 {
                 // SAFETY: vectors live until the workers join and the destination spans are disjoint.
-                unsafe { execute_copies(&jobs, cores) };
+                unsafe { execute_copies(&jobs, cores, false) };
             }
         }
         assert_eq!(parallel, inline);
@@ -2578,6 +2833,7 @@ mod tests {
         // Two staged L1 pages (offset 0) and three direct L0 pages (absolute host pointer).
         plan_copy(&mut jobs, 0x1000_0000, 0, 2, true);
         runs.push(UploadRun {
+            source: 0x1000_0000,
             heap: 0,
             heap_offset: 0,
             staging_offset: 0,
@@ -2617,5 +2873,108 @@ mod tests {
         assert!(read_guard.is_ok(), "STATE.read() must not block while SYNC_LOCK / staging is held");
         drop(read_guard);
         sync_guard.waited = None;
+    }
+
+    #[test]
+    fn l0_subpage_diff_skips_unchanged_subpages_and_copies_changed_ones() {
+        let mut src = vec![0xAAu8; PAGE as usize];
+        let mut dst = vec![0xAAu8; PAGE as usize];
+        // Mutate sub-pages 2, 3 (contiguous) and 11.
+        src[2 * SUBPAGE_BYTES + 7] = 0x55;
+        src[3 * SUBPAGE_BYTES + 19] = 0x66;
+        src[11 * SUBPAGE_BYTES + 1] = 0x77;
+        let jobs = [CopyJob {
+            source: src.as_ptr() as usize,
+            destination: dst.as_mut_ptr() as usize,
+            bytes: PAGE as usize,
+            staged: false,
+        }];
+        let (copied, skipped) = unsafe { execute_copies(&jobs, 1, true) };
+        assert_eq!(copied, 3 * SUBPAGE_BYTES as u64);
+        assert_eq!(skipped, (SUBPAGES_PER_PAGE - 3) as u64 * SUBPAGE_BYTES as u64);
+        assert_eq!(src, dst);
+    }
+
+    #[test]
+    fn l1_subpage_diff_hashes_coalesces_changed_runs_and_skips_clean_pages() {
+        let mut src = vec![0x11u8; PAGE as usize];
+        let mut prints = L1Fingerprints::default();
+        let mut runs = vec![UploadRun {
+            source: src.as_ptr() as usize,
+            heap: 0,
+            heap_offset: 2 * PAGE,
+            staging_offset: 0,
+            bytes: PAGE,
+        }];
+        let mut jobs = Vec::new();
+        // First copy populates fingerprints and uploads the full 64 KiB page.
+        let (staged1, skipped1) = unsafe { filter_staged_runs(&mut runs, &mut prints, &mut jobs, true) };
+        assert_eq!((staged1, skipped1), (PAGE as usize, 0));
+        assert_eq!(runs.len(), 1);
+        assert_eq!(jobs.len(), 1);
+
+        // Unchanged second copy skips 100% (0 staged bytes).
+        runs = vec![UploadRun {
+            source: src.as_ptr() as usize,
+            heap: 0,
+            heap_offset: 2 * PAGE,
+            staging_offset: 0,
+            bytes: PAGE,
+        }];
+        jobs.clear();
+        let (staged2, skipped2) = unsafe { filter_staged_runs(&mut runs, &mut prints, &mut jobs, true) };
+        assert_eq!((staged2, skipped2), (0, PAGE));
+        assert!(runs.is_empty());
+        assert!(jobs.is_empty());
+
+        // Mutate sub-pages 4, 5 (coalesced) and 14 -> 2 UploadRuns totaling 12 KiB.
+        src[4 * SUBPAGE_BYTES] = 0x99;
+        src[5 * SUBPAGE_BYTES + 100] = 0x88;
+        src[14 * SUBPAGE_BYTES + 42] = 0x77;
+        runs = vec![UploadRun {
+            source: src.as_ptr() as usize,
+            heap: 0,
+            heap_offset: 2 * PAGE,
+            staging_offset: 0,
+            bytes: PAGE,
+        }];
+        jobs.clear();
+        let (staged3, skipped3) = unsafe { filter_staged_runs(&mut runs, &mut prints, &mut jobs, true) };
+        assert_eq!((staged3, skipped3), (3 * SUBPAGE_BYTES, (SUBPAGES_PER_PAGE - 3) as u64 * SUBPAGE_BYTES as u64));
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[0].heap_offset, runs[0].bytes), (2 * PAGE + 4 * SUBPAGE_BYTES as u64, 2 * SUBPAGE_BYTES as u64));
+        assert_eq!((runs[1].heap_offset, runs[1].bytes), (2 * PAGE + 14 * SUBPAGE_BYTES as u64, SUBPAGE_BYTES as u64));
+        assert_eq!(jobs.len(), 2);
+    }
+
+    #[test]
+    fn subpage_diff_disabled_copies_full_64k_pages() {
+        assert!(parse_subpage_diff(None));
+        assert!(!parse_subpage_diff(Some("0")));
+        assert!(!parse_subpage_diff(Some("OFF")));
+        assert!(!parse_subpage_diff(Some(" false ")));
+
+        let src = vec![0x33u8; PAGE as usize];
+        let mut dst = vec![0x33u8; PAGE as usize];
+        let jobs = [CopyJob {
+            source: src.as_ptr() as usize,
+            destination: dst.as_mut_ptr() as usize,
+            bytes: PAGE as usize,
+            staged: false,
+        }];
+        let (copied, skipped) = unsafe { execute_copies(&jobs, 1, false) };
+        assert_eq!((copied, skipped), (PAGE, 0));
+
+        let mut prints = L1Fingerprints::default();
+        let mut runs = vec![UploadRun {
+            source: src.as_ptr() as usize,
+            heap: 0,
+            heap_offset: 0,
+            staging_offset: 0,
+            bytes: PAGE,
+        }];
+        let mut staged_jobs = Vec::new();
+        let (staged, l1_skipped) = unsafe { filter_staged_runs(&mut runs, &mut prints, &mut staged_jobs, false) };
+        assert_eq!((staged, l1_skipped), (PAGE as usize, 0));
     }
 }
