@@ -2780,13 +2780,16 @@ unsafe fn view_texture(this: *mut Proxy, va: u64, rdesc: *const c_void) -> Optio
     let state = crate::abi::pc_initial_state(&d, 0xC0);
     // SAFETY: `D3D12_RESOURCE_DESC` is 56 bytes of plain data in this layout.
     let pc_desc: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(d.as_ptr().cast()) };
-    // SAFETY: `this` is a live device proxy.
-    let host_device = unsafe {
-        <windows::Win32::Graphics::Direct3D12::ID3D12Device as windows::core::Interface>::from_raw_borrowed(&(*this).pc)
-    };
-    if let Some(host) = host_device {
-        let _ = crate::views_at::view_texture_cap(host);
-    }
+    static CAP_INIT: std::sync::Once = std::sync::Once::new();
+    CAP_INIT.call_once(|| {
+        // SAFETY: `this` is a live device proxy.
+        let host_device = unsafe {
+            <windows::Win32::Graphics::Direct3D12::ID3D12Device as windows::core::Interface>::from_raw_borrowed(&(*this).pc)
+        };
+        if let Some(host) = host_device {
+            let _ = crate::views_at::view_texture_cap(host);
+        }
+    });
     let device = crate::title_mem::device();
     let placed = device.as_ref().and_then(|device| crate::view_heap::place(device, &pc_desc, state));
     let (heap_index, mut bytes) = placed.as_ref().map_or((None, 0), |(_, h, b)| (Some(*h), *b));
@@ -2839,7 +2842,10 @@ unsafe fn view_texture(this: *mut Proxy, va: u64, rdesc: *const c_void) -> Optio
         crate::detile::forget(old);
         crate::views_at::forget_resource(old);
     }
-    crate::views_at::with_view_textures(|t| t.note(va, crate::views_at::ViewEntry::new(raw, res, heap_index, bytes, crate::title_heap::presents(), view_clock_ms())));
+    let count = crate::views_at::with_view_textures(|t| {
+        t.note(va, crate::views_at::ViewEntry::new(raw, res, heap_index, bytes, crate::title_heap::presents(), view_clock_ms()));
+        t.len()
+    });
     mem_owners::add(
         mem_owners::Kind::ViewTexture,
         mem_owners::Segment::Local,
@@ -2850,14 +2856,13 @@ unsafe fn view_texture(this: *mut Proxy, va: u64, rdesc: *const c_void) -> Optio
     let width = u64::from_le_bytes(raw[0x10..0x18].try_into().unwrap_or([0; 8]));
     crate::views_at::record_resource(va, width, res, false);
     crate::detile::register(res, va, &raw, state, bytes);
-    if log_due(&MADE) || crate::views_at::with_view_textures(|t| t.len()).is_power_of_two() {
+    if log_due(&MADE) || count.is_power_of_two() {
         let height = u32::from_le_bytes(raw[0x18..0x1C].try_into().unwrap_or([0; 4]));
         let format = u32::from_le_bytes(raw[0x20..0x24].try_into().unwrap_or([0; 4]));
+        let (heaps, placed_bytes) = crate::view_heap::usage();
         xs_log!(
-            "console device slot 70: a texture {width}x{height} format {format} made for the view at {va:016X}, filled from title memory ({} such textures, {} heaps with {} MiB placed)",
-            crate::views_at::with_view_textures(|t| t.len()),
-            crate::view_heap::usage().0,
-            crate::view_heap::usage().1 >> 20
+            "console device slot 70: a texture {width}x{height} format {format} made for the view at {va:016X}, filled from title memory ({count} such textures, {heaps} heaps with {} MiB placed)",
+            placed_bytes >> 20
         );
     }
     Some(res)
@@ -2875,15 +2880,23 @@ fn view_clock_ms() -> u64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
+fn next_trim_present(present: u64, freed_empty: bool) -> u64 {
+    present.saturating_add(if freed_empty { 300 } else { 60 })
+}
+
 /// Gives back the view textures that no view of their address asked for lately when the cache is past
 /// its memory cap (`views_at::view_texture_cap_bytes`, `DECANT_D3D12X_VIEW_TEX_MIB`). Each goes through
 /// `retire`, so the GPU finishes the submissions that may read it first; its heap is used again once
 /// every texture placed in it is gone (`view_heap`). A line says how much went.
 fn trim_view_textures() {
+    static NEXT_TRIM_PRESENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let present = crate::title_heap::presents();
+    if present < NEXT_TRIM_PRESENT.load(Ordering::Relaxed) {
+        return;
+    }
     let _trace = decant_trace::span("views_at", "trim");
     static WAVES: AtomicI32 = AtomicI32::new(0);
     static STUCK: std::sync::Once = std::sync::Once::new();
-    static LAST_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let Some(device) = crate::title_mem::device() else { return };
     let (cap, dedicated, budget) = crate::views_at::view_texture_cap(&device);
     let lru_budget = crate::views_at::view_texture_budget();
@@ -2899,16 +2912,14 @@ fn trim_view_textures() {
             lru_budget >> 20
         );
     });
-    let (present, ms) = (crate::title_heap::presents(), view_clock_ms());
     if effective_cap == 0 || crate::views_at::with_view_textures(|t| t.held_bytes(crate::view_heap::HEAP_BYTES)) <= effective_cap {
+        NEXT_TRIM_PRESENT.store(next_trim_present(present, false), Ordering::Relaxed);
         return;
     }
-    if present < LAST_SCAN.load(Ordering::Relaxed) + 30 {
-        return;
-    }
-    LAST_SCAN.store(present, Ordering::Relaxed);
+    let ms = view_clock_ms();
     let referenced = crate::view_shadow::referenced();
     let pass = crate::views_at::with_view_textures(|t| t.collect(effective_cap, crate::view_heap::HEAP_BYTES, present, ms, &referenced));
+    NEXT_TRIM_PRESENT.store(next_trim_present(present, pass.freed.is_empty()), Ordering::Relaxed);
     if pass.stuck {
         STUCK.call_once(|| {
             xs_log!("view texture cache over its cap, nothing idle: {} MiB held for a cap of {} MiB, {} textures are held by a slot", pass.held_before >> 20, effective_cap >> 20, referenced.len());
@@ -5164,5 +5175,12 @@ mod tests {
         assert_eq!(u32::from_le_bytes(b[16..20].try_into().unwrap()), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
         assert_eq!(u32::from_le_bytes(b[20..24].try_into().unwrap()), D3D12_RESOURCE_STATE_COMMON.0 as u32);
         assert_eq!(u32::from_le_bytes(b[24..28].try_into().unwrap()), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0 as u32);
+    }
+
+    #[test]
+    fn next_trim_present_uses_normal_cadence_and_backs_off_when_empty() {
+        assert_eq!(super::next_trim_present(100, false), 160);
+        assert_eq!(super::next_trim_present(100, true), 400);
+        assert_eq!(super::next_trim_present(u64::MAX - 10, true), u64::MAX);
     }
 }
