@@ -860,6 +860,7 @@ struct Placed {
     bytes: u64,
     /// The states of the title's submitted work, one for all subresources or one each.
     states: Vec<u32>,
+    tiles: Option<Vec<u32>>,
     dirty: bool,
     attempts: u32,
 }
@@ -908,12 +909,14 @@ struct Registry {
     /// every DirectStorage request once stalled the loading of a large world.
     by_address: BTreeMap<u64, Vec<usize>>,
     largest: u64,
-    /// Cached reverse index from mirror tile index to placed texture resources, invalidated when
-    /// `title_mem::mapping_generation()` advances or textures are added or removed.
+    /// Cached reverse index from mirror tile index to placed texture resources, maintained
+    /// incrementally on insert and remove and rebuilt only when `title_mem::mapping_generation()`
+    /// changes structurally.
     tile_to_textures: HashMap<u32, Vec<usize>>,
-    unmapped_textures: Vec<usize>,
-    index_gen: u64,
-    index_dirty: bool,
+    unmapped_textures: HashSet<usize>,
+    pending_index: HashSet<usize>,
+    layout_gen: u64,
+    last_tile_gen: u64,
     scratch: RegistryScratch,
 }
 
@@ -922,7 +925,7 @@ impl Registry {
         self.remove(res);
         self.by_address.entry(texture.va).or_default().push(res);
         self.largest = self.largest.max(texture.plan.size);
-        self.index_dirty = true;
+        self.pending_index.insert(res);
         if texture.wants_fill() {
             self.pending.insert(res);
             HAS_PENDING_FILLS.store(true, Ordering::Release);
@@ -935,7 +938,18 @@ impl Registry {
     fn remove(&mut self, res: usize) -> bool {
         let Some(texture) = self.textures.remove(&res) else { return false };
         self.pending.remove(&res);
-        self.index_dirty = true;
+        self.pending_index.remove(&res);
+        self.unmapped_textures.remove(&res);
+        if let Some(tiles) = &texture.tiles {
+            for &tile in tiles {
+                if let Some(list) = self.tile_to_textures.get_mut(&tile) {
+                    list.retain(|&r| r != res);
+                    if list.is_empty() {
+                        self.tile_to_textures.remove(&tile);
+                    }
+                }
+            }
+        }
         if self.pending.is_empty() {
             HAS_PENDING_FILLS.store(false, Ordering::Release);
         }
@@ -979,31 +993,83 @@ impl Registry {
         out
     }
 
-    /// Rebuilds `tile_to_textures` and `unmapped_textures` from a batch of `(res, va, size)` and
-    /// their mirror tiles.
-    fn rebuild_tile_index(&mut self, items: &[(usize, u64, u64)], tiles_per_item: &[Option<Vec<u32>>], mapping_gen: u64, gen_current: bool) {
+    /// Rebuilds the entire `tile_to_textures` index after a structural layout change.
+    fn apply_full_index(
+        &mut self,
+        items: &[(usize, u64, u64)],
+        tiles_per_item: &[Option<Vec<u32>>],
+        layout_gen: u64,
+        tile_gen: u64,
+        layout_current: bool,
+    ) {
         self.tile_to_textures.clear();
         self.unmapped_textures.clear();
         let mut live_matched = 0usize;
         for (&(res, va, _), maybe_tiles) in items.iter().zip(tiles_per_item) {
-            if self.textures.get(&res).is_none_or(|t| t.va != va) {
+            let Some(texture) = self.textures.get_mut(&res).filter(|t| t.va == va) else {
                 continue;
-            }
+            };
             live_matched += 1;
+            self.pending_index.remove(&res);
             match maybe_tiles {
                 Some(tiles) => {
                     for &tile in tiles {
                         self.tile_to_textures.entry(tile).or_default().push(res);
                     }
+                    texture.tiles = Some(tiles.clone());
                 }
-                None => self.unmapped_textures.push(res),
+                None => {
+                    texture.tiles = None;
+                    self.unmapped_textures.insert(res);
+                }
             }
         }
-        if gen_current && live_matched == self.textures.len() {
-            self.index_gen = mapping_gen;
-            self.index_dirty = false;
+        if layout_current && live_matched == self.textures.len() {
+            self.layout_gen = layout_gen;
+            self.last_tile_gen = tile_gen;
         } else {
-            self.index_dirty = true;
+            self.layout_gen = 0;
+        }
+    }
+
+    /// Incrementally updates `tile_to_textures` for newly inserted or previously unmapped textures.
+    fn apply_incremental_index(
+        &mut self,
+        items: &[(usize, u64, u64)],
+        tiles_per_item: &[Option<Vec<u32>>],
+        tile_gen: u64,
+        tile_current: bool,
+    ) {
+        for (&(res, va, _), maybe_tiles) in items.iter().zip(tiles_per_item) {
+            let Some(texture) = self.textures.get_mut(&res).filter(|t| t.va == va) else {
+                continue;
+            };
+            self.pending_index.remove(&res);
+            self.unmapped_textures.remove(&res);
+            if let Some(old_tiles) = texture.tiles.take() {
+                for tile in old_tiles {
+                    if let Some(list) = self.tile_to_textures.get_mut(&tile) {
+                        list.retain(|&r| r != res);
+                        if list.is_empty() {
+                            self.tile_to_textures.remove(&tile);
+                        }
+                    }
+                }
+            }
+            match maybe_tiles {
+                Some(tiles) => {
+                    for &tile in tiles {
+                        self.tile_to_textures.entry(tile).or_default().push(res);
+                    }
+                    texture.tiles = Some(tiles.clone());
+                }
+                None => {
+                    self.unmapped_textures.insert(res);
+                }
+            }
+        }
+        if tile_current {
+            self.last_tile_gen = tile_gen;
         }
     }
 
@@ -1031,7 +1097,7 @@ impl Registry {
             let waiting = self.textures.values().filter(|t| t.dirty && t.attempts == 0).count();
             let filled = self.textures.values().filter(|t| !t.dirty).count() as u32;
             let unmapped = self.unmapped_textures.len() as u32;
-            let first_unmapped = self.unmapped_textures.first().and_then(|res| self.textures.get(res)).map_or(0, |t| t.va);
+            let first_unmapped = self.unmapped_textures.iter().next().and_then(|res| self.textures.get(res)).map_or(0, |t| t.va);
             let untouched = (self.textures.len() as u32).saturating_sub(marked + unmapped);
             xs_log!(
                 "detile: {} textures, {} pages written: {marked} marked, {waiting} wait for a fill, {untouched} not written ({filled} of them filled), {unmapped} with pages that are not mapped (first at {first_unmapped:#x})",
@@ -1131,7 +1197,7 @@ pub fn register(res: usize, va: u64, raw: &[u8; 0x38], state: u32, bytes: u64) {
                     plan.size
                 );
             }
-            r.insert(res, Placed { va, plan, bytes, states: vec![state], dirty: true, attempts: 0 });
+            r.insert(res, Placed { va, plan, bytes, states: vec![state], tiles: None, dirty: true, attempts: 0 });
         }),
         Err(why) => with_registry(|r| {
             let reason = why.split(':').next().unwrap_or("");
@@ -1213,26 +1279,54 @@ pub fn note_tiles(tiles: &[u32]) {
         return;
     }
     let report = probe_line_due();
-    let current_gen = crate::title_mem::mapping_generation();
+    let current_layout = crate::title_mem::mapping_generation();
+    let current_tile = crate::title_mem::tile_generation();
     let fast = with_registry(|r| {
         if r.textures.is_empty() {
             return Ok(0);
         }
-        if !r.index_dirty && r.index_gen == current_gen {
-            return Ok(r.mark_tiles_from_index(tiles, report));
+        if r.layout_gen != current_layout {
+            let items: Vec<(usize, u64, u64)> = r.textures.iter().map(|(&res, t)| (res, t.va, t.plan.size)).collect();
+            let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
+            return Err((true, current_layout, items, spans));
         }
-        let items: Vec<(usize, u64, u64)> = r.textures.iter().map(|(&res, t)| (res, t.va, t.plan.size)).collect();
-        let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
-        Err((items, spans))
+        let check_unmapped = current_tile != r.last_tile_gen && !r.unmapped_textures.is_empty();
+        if !r.pending_index.is_empty() || check_unmapped {
+            let mut items = Vec::with_capacity(r.pending_index.len() + if check_unmapped { r.unmapped_textures.len() } else { 0 });
+            for &res in &r.pending_index {
+                if let Some(t) = r.textures.get(&res) {
+                    items.push((res, t.va, t.plan.size));
+                }
+            }
+            if check_unmapped {
+                for &res in &r.unmapped_textures {
+                    if !r.pending_index.contains(&res)
+                        && let Some(t) = r.textures.get(&res)
+                    {
+                        items.push((res, t.va, t.plan.size));
+                    }
+                }
+            }
+            let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
+            return Err((false, current_layout, items, spans));
+        }
+        Ok(r.mark_tiles_from_index(tiles, report))
     });
     let marked = match fast {
         Ok(marked) => marked,
-        Err((items, spans)) => {
-            let build_gen = crate::title_mem::mapping_generation();
+        Err((full_rebuild, snap_layout, items, spans)) => {
+            let build_layout = crate::title_mem::mapping_generation();
+            let build_tile = crate::title_mem::tile_generation();
             let mut tiles_out = Vec::new();
             crate::title_mem::tiles_of_batch(&spans, &mut tiles_out);
             with_registry(|r| {
-                r.rebuild_tile_index(&items, &tiles_out, build_gen, crate::title_mem::mapping_generation() == build_gen);
+                if full_rebuild {
+                    r.apply_full_index(&items, &tiles_out, build_layout, build_tile, crate::title_mem::mapping_generation() == build_layout);
+                } else if crate::title_mem::mapping_generation() != snap_layout {
+                    r.layout_gen = 0;
+                } else {
+                    r.apply_incremental_index(&items, &tiles_out, build_tile, crate::title_mem::tile_generation() == build_tile);
+                }
                 r.mark_tiles_from_index(tiles, report)
             })
         }
@@ -1504,7 +1598,7 @@ mod tests {
     }
 
     fn placed(va: u64, size: u64) -> Placed {
-        Placed { va, plan: Arc::new(flat_plan(size)), bytes: size, states: vec![0], dirty: false, attempts: 0 }
+        Placed { va, plan: Arc::new(flat_plan(size)), bytes: size, states: vec![0], tiles: None, dirty: false, attempts: 0 }
     }
 
     #[test]
@@ -1680,30 +1774,46 @@ mod tests {
     }
 
     #[test]
-    fn reverse_tile_index_marks_matching_textures_and_tracks_unmapped() {
+    fn reverse_tile_index_updates_incrementally_and_rebuilds_on_layout_change() {
         let mut r = Registry::default();
         r.insert(1, placed(0x1000, 0x1000));
         r.insert(2, placed(0x4000, 0x1000));
+        assert!(r.pending_index.contains(&1) && r.pending_index.contains(&2));
+
+        // Initial full build at layout_gen 7, tile_gen 3.
+        let items = vec![(1, 0x1000, 0x1000), (2, 0x4000, 0x1000)];
+        r.apply_full_index(&items, &[Some(vec![10, 11]), None], 7, 3, true);
+        assert!(r.pending_index.is_empty());
+        assert_eq!(r.layout_gen, 7);
+        assert_eq!(r.last_tile_gen, 3);
+        assert!(r.unmapped_textures.contains(&2) && !r.unmapped_textures.contains(&1));
+
+        // Inserting a new texture only adds it to pending_index without invalidating layout_gen.
         r.insert(3, placed(0x8000, 0x1000));
-        assert!(r.index_dirty);
+        assert_eq!(r.layout_gen, 7);
+        assert!(r.pending_index.contains(&3));
 
-        let items = vec![(1, 0x1000, 0x1000), (2, 0x4000, 0x1000), (3, 0x8000, 0x1000)];
-        let tiles_per = vec![Some(vec![10, 11]), Some(vec![11, 12]), None];
-        r.rebuild_tile_index(&items, &tiles_per, 7, true);
-        assert!(!r.index_dirty);
-        assert_eq!(r.index_gen, 7);
-        assert_eq!(r.unmapped_textures, vec![3]);
+        // Incremental update resolves texture 3 and previously unmapped texture 2 at tile_gen 4.
+        r.apply_incremental_index(&[(3, 0x8000, 0x1000), (2, 0x4000, 0x1000)], &[Some(vec![12]), Some(vec![11, 13])], 4, true);
+        assert!(r.pending_index.is_empty());
+        assert!(r.unmapped_textures.is_empty());
+        assert_eq!(r.last_tile_gen, 4);
 
-        // Writing tile 99 marks nothing.
+        // Writing tile 99 marks nothing, and writing tiles 10 and 11 marks textures 1 and 2.
         assert_eq!(r.mark_tiles_from_index(&[99], false), 0);
-        assert!(r.pending.is_empty());
-
-        // Writing tiles 10 and 11 marks textures 1 and 2 once each, leaving 3 untouched.
         assert_eq!(r.mark_tiles_from_index(&[10, 11], false), 2);
         assert!(r.pending.contains(&1) && r.pending.contains(&2) && !r.pending.contains(&3));
 
-        // Removing a texture invalidates the cached index.
+        // Removing texture 2 cleans tile_to_textures incrementally without invalidating layout_gen.
         assert!(r.remove(2));
-        assert!(r.index_dirty);
+        assert_eq!(r.layout_gen, 7);
+        assert!(!r.tile_to_textures.contains_key(&13));
+        assert_eq!(r.mark_tiles_from_index(&[11, 13], false), 1);
+
+        // Structural layout rebuild replaces all mappings at layout_gen 8.
+        r.apply_full_index(&[(1, 0x1000, 0x1000), (3, 0x8000, 0x1000)], &[Some(vec![20]), Some(vec![21])], 8, 5, true);
+        assert_eq!(r.layout_gen, 8);
+        assert_eq!(r.mark_tiles_from_index(&[10], false), 0);
+        assert_eq!(r.mark_tiles_from_index(&[20, 21], false), 2);
     }
 }

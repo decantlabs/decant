@@ -227,16 +227,27 @@ const STATS_EVERY: u64 = 100;
 const ZERO_SCAN_TILES: usize = 4096;
 /// Identifies a device's state while a sampler chunk is read outside the state lock.
 static NEXT_STATE: AtomicU64 = AtomicU64::new(1);
-/// Incremented whenever virtual to mirror tile mappings change.
+/// Incremented whenever virtual to pool mappings change structurally (MAP, UNMAP, RELEASE, resync, device_created).
 static MAPPING_GEN: AtomicU64 = AtomicU64::new(1);
+/// Incremented whenever previously tileless pages receive mirror tiles.
+static TILE_GEN: AtomicU64 = AtomicU64::new(1);
 
 fn bump_mapping_gen() {
     MAPPING_GEN.fetch_add(1, Ordering::Release);
 }
 
-/// Current generation of virtual to mirror tile mappings.
+fn bump_tile_gen() {
+    TILE_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// Current generation of structural virtual to pool mappings.
 pub fn mapping_generation() -> u64 {
     MAPPING_GEN.load(Ordering::Acquire)
+}
+
+/// Current generation of mirror tile assignments on mapped pages.
+pub fn tile_generation() -> u64 {
+    TILE_GEN.load(Ordering::Acquire)
 }
 
 /// One complete rotating pass over the mirror tiles.
@@ -941,7 +952,7 @@ impl State {
             }
         }
         if new_tile {
-            bump_mapping_gen();
+            bump_tile_gen();
         }
         total
     }
@@ -1151,7 +1162,7 @@ impl State {
             let prev_tiles = self.mirror.tiles_given();
             self.mirror.give_span(va, len.clamp(1, ADDRESS_REACH));
             if self.mirror.tiles_given() != prev_tiles {
-                bump_mapping_gen();
+                bump_tile_gen();
             }
         }
         let placed = self.mirror.translate(va, len)?;
@@ -1574,9 +1585,13 @@ mod tests {
 
     #[test]
     fn mapping_generation_bumps_on_changes_and_sync_lock_does_not_block_translate() {
-        let before = mapping_generation();
+        let before_layout = mapping_generation();
+        let before_tile = tile_generation();
         bump_mapping_gen();
-        assert!(mapping_generation() > before);
+        assert!(mapping_generation() > before_layout);
+        assert_eq!(tile_generation(), before_tile);
+        bump_tile_gen();
+        assert!(tile_generation() > before_tile);
 
         let _sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let done = std::thread::spawn(|| translate(0x1000, 64)).join().unwrap();
