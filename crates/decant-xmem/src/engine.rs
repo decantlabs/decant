@@ -588,9 +588,10 @@ struct State {
     on_demand: BTreeMap<usize, Vec<bool>>,
 }
 
-const PROTECT_STRIPES: usize = 256;
+const PROTECT_STRIPES: usize = 64;
 const PROTECT_STRIPE_SHIFT: usize = 16;
-const PROTECT_STRIPE_BYTES: usize = 1 << PROTECT_STRIPE_SHIFT;
+
+type RunSnapshot = (usize, usize, u64, Vec<u64>);
 
 /// Coordinates page protection changes outside the `dirty` mutex so `VirtualProtect` and
 /// `VirtualQuery` syscalls do not block fault, I/O preparation, or tracking updates.
@@ -617,6 +618,23 @@ impl ProtectSync {
         (addr >> PROTECT_STRIPE_SHIFT) & (PROTECT_STRIPES - 1)
     }
 
+    fn stripe_mask(start: usize, bytes: usize) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
+        let first = start >> PROTECT_STRIPE_SHIFT;
+        let last = (start + bytes - 1) >> PROTECT_STRIPE_SHIFT;
+        let span = last - first + 1;
+        if span >= PROTECT_STRIPES {
+            return u64::MAX;
+        }
+        let mut mask = 0u64;
+        for k in 0..span {
+            mask |= 1u64 << ((first + k) & (PROTECT_STRIPES - 1));
+        }
+        mask
+    }
+
     fn has_pending(&self) -> bool {
         self.pending.load(Ordering::Acquire)
     }
@@ -625,80 +643,103 @@ impl ProtectSync {
         self.pending.store(has, Ordering::Release);
     }
 
-    fn generation(&self, addr: usize) -> u64 {
-        self.gens[Self::stripe(addr)].load(Ordering::Acquire)
-    }
-
     fn bump_addrs(&self, addrs: &[usize]) {
+        let mut mask = 0u64;
         for &addr in addrs {
-            self.gens[Self::stripe(addr)].fetch_add(1, Ordering::Release);
+            mask |= 1u64 << Self::stripe(addr);
+        }
+        while mask != 0 {
+            let s = mask.trailing_zeros() as usize;
+            self.gens[s].fetch_add(1, Ordering::Release);
+            mask &= mask - 1;
         }
     }
 
-    fn split_chunks(start: usize, bytes: usize) -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
-        let end = start + bytes;
-        let mut at = start;
-        while at < end {
-            let next_boundary = (at & !(PROTECT_STRIPE_BYTES - 1)) + PROTECT_STRIPE_BYTES;
-            let next = next_boundary.min(end);
-            out.push((at, next - at));
-            at = next;
+    fn read_mask_gens(&self, mut mask: u64) -> Vec<u64> {
+        let mut gens = Vec::with_capacity(mask.count_ones() as usize);
+        while mask != 0 {
+            let s = mask.trailing_zeros() as usize;
+            gens.push(self.gens[s].load(Ordering::Acquire));
+            mask &= mask - 1;
         }
-        out
+        gens
+    }
+
+    fn gens_match(&self, mut mask: u64, expected: &[u64]) -> bool {
+        let mut idx = 0usize;
+        while mask != 0 {
+            let s = mask.trailing_zeros() as usize;
+            if self.gens[s].load(Ordering::Acquire) != expected[idx] {
+                return false;
+            }
+            idx += 1;
+            mask &= mask - 1;
+        }
+        true
+    }
+
+    fn lock_mask(&self, mut mask: u64) -> Vec<MutexGuard<'_, ()>> {
+        let mut guards = Vec::with_capacity(mask.count_ones() as usize);
+        while mask != 0 {
+            let s = mask.trailing_zeros() as usize;
+            guards.push(self.locks[s].lock().unwrap_or_else(PoisonError::into_inner));
+            mask &= mask - 1;
+        }
+        guards
     }
 
     fn protect_rw_locked(&self, addrs: Vec<usize>) {
         for (start, bytes) in track::runs(addrs) {
-            for (cs, cb) in Self::split_chunks(start, bytes) {
-                let _guard = self.locks[Self::stripe(cs)].lock().unwrap_or_else(PoisonError::into_inner);
-                Engine::protect_range(cs, cb, PAGE_READWRITE);
-            }
+            let _guards = self.lock_mask(Self::stripe_mask(start, bytes));
+            Engine::protect_range(start, bytes, PAGE_READWRITE);
         }
     }
 
-    fn snapshot_chunks(&self, addrs: Vec<usize>) -> Vec<(usize, usize, u64)> {
-        let mut chunks = Vec::new();
+    fn snapshot_runs(&self, addrs: Vec<usize>) -> Vec<RunSnapshot> {
+        let mut runs = Vec::new();
         for (start, bytes) in track::runs(addrs) {
-            for (cs, cb) in Self::split_chunks(start, bytes) {
-                chunks.push((cs, cb, self.generation(cs)));
-            }
+            let mask = Self::stripe_mask(start, bytes);
+            let gens = self.read_mask_gens(mask);
+            runs.push((start, bytes, mask, gens));
         }
-        chunks
+        runs
     }
 
-    fn protect_rw_chunks(&self, chunks: Vec<(usize, usize, u64)>, dirty: &Mutex<Dirty>) {
-        for (cs, cb, expected_gen) in chunks {
-            let stripe = Self::stripe(cs);
-            let guard = self.locks[stripe].lock().unwrap_or_else(PoisonError::into_inner);
-            if self.generation(cs) == expected_gen {
-                Engine::protect_range(cs, cb, PAGE_READWRITE);
-                drop(guard);
+    fn protect_runs_checked(&self, runs: Vec<RunSnapshot>, protect: u32, want_clean: bool, dirty: &Mutex<Dirty>) {
+        for (start, bytes, mask, expected_gens) in runs {
+            let guards = self.lock_mask(mask);
+            if self.gens_match(mask, &expected_gens) {
+                Engine::protect_range(start, bytes, protect);
+                drop(guards);
                 continue;
             }
-            drop(guard);
-            let mut pending_addrs: Vec<usize> = (cs..cs + cb).step_by(PAGE_BYTES).collect();
+            drop(guards);
+            let mut pending_addrs: Vec<usize> = (start..start + bytes).step_by(PAGE_BYTES).collect();
             loop {
-                let (filtered, fresh_gen) = {
+                let sub_runs = {
                     let dirty_guard = dirty.lock().unwrap_or_else(PoisonError::into_inner);
                     let keep = match dirty_guard.track.as_ref() {
-                        Some(track) => pending_addrs.into_iter().filter(|&addr| !track.is_clean_addr(addr)).collect::<Vec<_>>(),
+                        Some(track) => pending_addrs
+                            .into_iter()
+                            .filter(|&addr| track.is_clean_addr(addr) == want_clean)
+                            .collect::<Vec<_>>(),
+                        None if want_clean => Vec::new(),
                         None => pending_addrs,
                     };
-                    (keep, self.generation(cs))
+                    self.snapshot_runs(keep)
                 };
-                if filtered.is_empty() {
+                if sub_runs.is_empty() {
                     break;
                 }
                 let mut retry = Vec::new();
-                for (sub_s, sub_b) in track::runs(filtered) {
-                    let guard = self.locks[stripe].lock().unwrap_or_else(PoisonError::into_inner);
-                    if self.generation(sub_s) == fresh_gen {
-                        Engine::protect_range(sub_s, sub_b, PAGE_READWRITE);
+                for (sub_s, sub_b, sub_mask, fresh_gens) in sub_runs {
+                    let guards = self.lock_mask(sub_mask);
+                    if self.gens_match(sub_mask, &fresh_gens) {
+                        Engine::protect_range(sub_s, sub_b, protect);
                     } else {
                         retry.extend((sub_s..sub_s + sub_b).step_by(PAGE_BYTES));
                     }
-                    drop(guard);
+                    drop(guards);
                 }
                 if retry.is_empty() {
                     break;
@@ -706,6 +747,14 @@ impl ProtectSync {
                 pending_addrs = retry;
             }
         }
+    }
+
+    fn protect_rw_runs(&self, runs: Vec<RunSnapshot>, dirty: &Mutex<Dirty>) {
+        self.protect_runs_checked(runs, PAGE_READWRITE, false, dirty);
+    }
+
+    fn protect_ro_runs(&self, runs: Vec<RunSnapshot>, dirty: &Mutex<Dirty>) {
+        self.protect_runs_checked(runs, PAGE_READONLY, true, dirty);
     }
 
     fn ensure_rw(&self, page: usize) -> bool {
@@ -1184,9 +1233,9 @@ impl Engine {
                         protect_sync.set_pending(true);
                     }
                 }
-                protect_sync.snapshot_chunks(open)
+                protect_sync.snapshot_runs(open)
             };
-            protect_sync.protect_rw_chunks(chunks, &dirty_state);
+            protect_sync.protect_rw_runs(chunks, &dirty_state);
         }
         let mut i = 0;
         while i < mapped.len() {
@@ -1802,12 +1851,12 @@ impl Engine {
                 }
             }
             protect_sync.bump_addrs(&open);
-            let chunks = protect_sync.snapshot_chunks(open);
+            let chunks = protect_sync.snapshot_runs(open);
             protect_sync.set_pending(false);
             dirty.track = None;
             self.tracking.store(false, Ordering::Release);
             drop(dirty_guard);
-            protect_sync.protect_rw_chunks(chunks, &dirty_state);
+            protect_sync.protect_rw_runs(chunks, &dirty_state);
             return;
         }
         let mut track = Track::new(st.pages.capacity());
@@ -1862,7 +1911,7 @@ impl Engine {
             let is_held = track.is_held(index, now);
             let chunks = open.map(|addrs| {
                 self.protect_sync.bump_addrs(&addrs);
-                self.protect_sync.snapshot_chunks(addrs)
+                self.protect_sync.snapshot_runs(addrs)
             });
             if track.pending_len() > 0 {
                 self.protect_sync.set_pending(true);
@@ -1871,7 +1920,7 @@ impl Engine {
         };
         let handled = match chunks {
             Some(chunks) => {
-                self.protect_sync.protect_rw_chunks(chunks, &self.dirty);
+                self.protect_sync.protect_rw_runs(chunks, &self.dirty);
                 true
             }
             None => self.protect_sync.ensure_rw(page),
@@ -1934,7 +1983,7 @@ impl Engine {
                 track.mark_committed(index as u32);
                 if let Some(addrs) = track.on_fault(index as u32, Instant::now()) {
                     protect_sync.bump_addrs(&addrs);
-                    chunks = Some(protect_sync.snapshot_chunks(addrs));
+                    chunks = Some(protect_sync.snapshot_runs(addrs));
                 }
                 if track.pending_len() > 0 {
                     protect_sync.set_pending(true);
@@ -1943,7 +1992,7 @@ impl Engine {
             chunks
         };
         if let Some(chunks) = chunks {
-            protect_sync.protect_rw_chunks(chunks, &dirty_state);
+            protect_sync.protect_rw_runs(chunks, &dirty_state);
         }
         let n = COMMITS.fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_multiple_of(16384) {
@@ -2028,49 +2077,12 @@ impl Engine {
             sync.set_pending(track.pending_len() > 0);
             sync.bump_addrs(&protect);
             let runs = protect.len();
-            let chunks = sync.snapshot_chunks(protect);
-            (pages, chunks, runs)
+            let snapshots = sync.snapshot_runs(protect);
+            (pages, snapshots, runs)
         };
         let taken = Instant::now();
         drop(dirty);
-        for (cs, cb, expected_gen) in chunks {
-            let stripe = ProtectSync::stripe(cs);
-            let guard = self.protect_sync.locks[stripe].lock().unwrap_or_else(PoisonError::into_inner);
-            if self.protect_sync.generation(cs) == expected_gen {
-                Self::protect_range(cs, cb, PAGE_READONLY);
-                drop(guard);
-                continue;
-            }
-            drop(guard);
-            let mut pending_addrs: Vec<usize> = (cs..cs + cb).step_by(PAGE_BYTES).collect();
-            loop {
-                let (filtered, fresh_gen) = {
-                    let dirty_guard = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
-                    let keep = match dirty_guard.track.as_ref() {
-                        Some(track) => pending_addrs.into_iter().filter(|&addr| track.is_clean_addr(addr)).collect::<Vec<_>>(),
-                        None => Vec::new(),
-                    };
-                    (keep, self.protect_sync.generation(cs))
-                };
-                if filtered.is_empty() {
-                    break;
-                }
-                let mut retry = Vec::new();
-                for (sub_s, sub_b) in track::runs(filtered) {
-                    let guard = self.protect_sync.locks[stripe].lock().unwrap_or_else(PoisonError::into_inner);
-                    if self.protect_sync.generation(sub_s) == fresh_gen {
-                        Self::protect_range(sub_s, sub_b, PAGE_READONLY);
-                    } else {
-                        retry.extend((sub_s..sub_s + sub_b).step_by(PAGE_BYTES));
-                    }
-                    drop(guard);
-                }
-                if retry.is_empty() {
-                    break;
-                }
-                pending_addrs = retry;
-            }
-        }
+        self.protect_sync.protect_ro_runs(chunks, &self.dirty);
         let done = Instant::now();
         take_stats(pages.len(), runs, pending, queries, [locked - asked, taken - locked, done - taken]);
         pages
@@ -2266,9 +2278,9 @@ impl Engine {
                 protect_sync.set_pending(true);
             }
         }
-        let chunks = protect_sync.snapshot_chunks(open);
+        let chunks = protect_sync.snapshot_runs(open);
         drop(dirty_guard);
-        protect_sync.protect_rw_chunks(chunks, &dirty_state);
+        protect_sync.protect_rw_runs(chunks, &dirty_state);
     }
 
     /// Commits and pins the writable view pages in `[address, address + len)` open for an active
@@ -2338,10 +2350,10 @@ impl Engine {
                 protect_sync.set_pending(true);
             }
         }
-        let chunks = protect_sync.snapshot_chunks(open);
+        let chunks = protect_sync.snapshot_runs(open);
         drop(dirty_guard);
         drop(st);
-        protect_sync.protect_rw_chunks(chunks, &dirty_state);
+        protect_sync.protect_rw_runs(chunks, &dirty_state);
         true
     }
 
@@ -3881,5 +3893,19 @@ mod tests {
 
         e.release(area).unwrap();
         e.free_pages(&frames).unwrap();
+    }
+
+    #[test]
+    fn protect_sync_coalesces_contiguous_pages_across_stripes_into_one_run() {
+        let sync = ProtectSync::default();
+        // 32 contiguous pages spanning 32 stripes.
+        let base = 0x10_0000usize;
+        let addrs: Vec<usize> = (0..32).rev().map(|k| base + k * P).collect();
+        let runs = sync.snapshot_runs(addrs);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].0, base);
+        assert_eq!(runs[0].1, 32 * P);
+        assert_eq!(runs[0].2.count_ones(), 32);
+        assert_eq!(runs[0].3.len(), 32);
     }
 }
