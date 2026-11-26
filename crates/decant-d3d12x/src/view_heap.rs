@@ -15,17 +15,46 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::core::Interface;
 
-/// Bytes of one heap.
+/// Bytes of one large streaming heap.
 pub const HEAP_BYTES: u64 = 64 << 20;
+/// Bytes of one small persistent texture heap.
+const SMALL_HEAP_BYTES: u64 = 16 << 20;
+/// Textures up to this byte size use small heaps so tiny persistent views do not pin 64 MiB heaps.
+const SMALL_TEXTURE_LIMIT: u64 = 64 << 10;
+/// Maximum warm empty heaps kept per size class for instant reuse.
+const WARM_FREE_HEAPS_PER_CLASS: usize = 2;
 /// The small resource placement alignment of the PC runtime.
 const SMALL: u64 = 4096;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizeClass {
+    Small = 0,
+    Large = 1,
+}
+
+fn size_class_for(size: u64) -> SizeClass {
+    if size <= SMALL_TEXTURE_LIMIT { SizeClass::Small } else { SizeClass::Large }
+}
+
+fn class_heap_bytes(class: SizeClass) -> u64 {
+    match class {
+        SizeClass::Small => SMALL_HEAP_BYTES,
+        SizeClass::Large => HEAP_BYTES,
+    }
+}
+
+fn fit_in(used: u64, size: u64, align: u64, capacity: u64) -> Option<u64> {
+    let at = used.checked_next_multiple_of(align.max(1))?;
+    (at.checked_add(size)? <= capacity).then_some(at)
+}
+
 /// Where the next placement of `size` bytes at `align` goes in a heap of [`HEAP_BYTES`] whose first
 /// `used` bytes are taken: the offset, or `None` when it does not fit (pure, for the tests).
+#[cfg(test)]
 pub fn fit(used: u64, size: u64, align: u64) -> Option<u64> {
-    let at = used.checked_next_multiple_of(align.max(1))?;
-    (at.checked_add(size)? <= HEAP_BYTES).then_some(at)
+    fit_in(used, size, align, HEAP_BYTES)
 }
 
 /// Presents a heap whose textures were all released waits before it is filled again.
@@ -112,6 +141,7 @@ struct SlotMeta {
 
 struct Heap {
     heap: ID3D12Heap,
+    class: SizeClass,
     meta: SlotMeta,
 }
 
@@ -120,59 +150,107 @@ unsafe impl Send for Heap {}
 
 #[derive(Default)]
 struct HeapPool {
-    heaps: Vec<Heap>,
-    active_hint: usize,
+    heaps: Vec<Option<Heap>>,
+    active_hint: [usize; 2],
 }
 
-static HEAPS: Mutex<HeapPool> = Mutex::new(HeapPool { heaps: Vec::new(), active_hint: 0 });
+static HEAPS: Mutex<HeapPool> = Mutex::new(HeapPool { heaps: Vec::new(), active_hint: [0, 0] });
 static HEAP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-fn reserve_in_pool(pool: &mut HeapPool, size: u64, align: u64, now: u64) -> Option<(ID3D12Heap, usize, u64)> {
-    if pool.heaps.is_empty() {
-        return None;
+fn insert_heap(pool: &mut HeapPool, heap: Heap) -> usize {
+    if let Some(index) = pool.heaps.iter().position(Option::is_none) {
+        pool.heaps[index] = Some(heap);
+        index
+    } else {
+        pool.heaps.push(Some(heap));
+        pool.heaps.len() - 1
     }
-    for h in &mut pool.heaps {
-        if h.meta.used != 0 && reusable(h.meta.live, h.meta.free_at, now) {
+}
+
+fn reclaim_empty_in_pool(pool: &mut HeapPool, now: u64) -> Vec<(ID3D12Heap, u64)> {
+    let mut warm = [0usize; 2];
+    let mut to_release = Vec::new();
+    for slot in &mut pool.heaps {
+        let Some(h) = slot.as_mut() else { continue };
+        if !reusable(h.meta.live, h.meta.free_at, now) {
+            continue;
+        }
+        let class_idx = h.class as usize;
+        if warm[class_idx] < WARM_FREE_HEAPS_PER_CLASS {
+            warm[class_idx] += 1;
             h.meta.used = 0;
             h.meta.free_at = None;
+        } else if let Some(gone) = slot.take() {
+            to_release.push((gone.heap, class_heap_bytes(gone.class)));
         }
     }
+    to_release
+}
+
+fn reserve_in_pool(pool: &mut HeapPool, class: SizeClass, size: u64, align: u64) -> Option<(ID3D12Heap, usize, u64)> {
     let len = pool.heaps.len();
-    let start = pool.active_hint.min(len - 1);
+    if len == 0 {
+        return None;
+    }
+    let capacity = class_heap_bytes(class);
+    let hint = &mut pool.active_hint[class as usize];
+    let start = (*hint).min(len - 1);
     for step in 0..len {
         let index = (start + step) % len;
-        let h = &mut pool.heaps[index];
-        if let Some(at) = fit(h.meta.used, size, align) {
+        let Some(h) = pool.heaps[index].as_mut() else { continue };
+        if h.class != class {
+            continue;
+        }
+        if let Some(at) = fit_in(h.meta.used, size, align, capacity) {
             h.meta.used = at + size;
             h.meta.live += 1;
             h.meta.free_at = None;
-            pool.active_hint = index;
+            *hint = index;
             return Some((h.heap.clone(), index, at));
         }
     }
     None
 }
 
+fn release_excess_heaps(heaps: Vec<(ID3D12Heap, u64)>) {
+    for (heap, bytes) in heaps {
+        crate::mem_owners::remove(
+            crate::mem_owners::Kind::ViewHeap,
+            crate::mem_owners::Segment::Local,
+            1,
+            bytes,
+        );
+        // SAFETY: `pool.heaps` dropped its only reference to this empty heap; `retire::release`
+        // holds it until in flight GPU work finishes.
+        unsafe { crate::retire::release(heap.into_raw(), "view heap") };
+    }
+}
+
 /// A texture of the PC description `desc` (after `abi::pc_resource_desc`) in state `state`, placed in
-/// one of the heaps. `None` for a texture larger than a heap or when the runtime refuses: the caller
-/// makes a committed one then.
+/// one of the heaps. `None` for a texture larger than its class heap or when the runtime refuses:
+/// the caller makes a committed one then.
 ///
 /// Returns the texture, the index of its heap and its size in bytes.
 pub fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: u32) -> Option<(ID3D12Resource, usize, u64)> {
     let (size, align) = allocation_info(device, desc)?;
-    if size > HEAP_BYTES {
+    let class = size_class_for(size);
+    let heap_bytes = class_heap_bytes(class);
+    if size > heap_bytes {
         return None;
     }
     let now = crate::title_heap::presents();
-    let reserved = {
+    let (reserved, excess) = {
         let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        reserve_in_pool(&mut pool, size, align, now)
+        let excess = reclaim_empty_in_pool(&mut pool, now);
+        let reserved = reserve_in_pool(&mut pool, class, size, align);
+        (reserved, excess)
     };
+    release_excess_heaps(excess);
     let (heap, index, at) = match reserved {
         Some(hit) => hit,
         None => {
             let heap_desc = D3D12_HEAP_DESC {
-                SizeInBytes: HEAP_BYTES,
+                SizeInBytes: heap_bytes,
                 Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
                 Alignment: 0,
                 Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
@@ -185,17 +263,20 @@ pub fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: u32) -> O
             // SAFETY: a live heap, named for DRED.
             let _ = unsafe { new_heap.SetName(&windows::core::HSTRING::from(format!("decant view texture heap {seq}"))) };
             let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-            let choice = if let Some(hit) = reserve_in_pool(&mut pool, size, align, now) {
-                pool.heaps.push(Heap { heap: new_heap, meta: SlotMeta::default() });
+            let choice = if let Some(hit) = reserve_in_pool(&mut pool, class, size, align) {
+                insert_heap(&mut pool, Heap { heap: new_heap, class, meta: SlotMeta::default() });
                 hit
             } else {
-                let new_index = pool.heaps.len();
                 let clone = new_heap.clone();
-                pool.heaps.push(Heap {
-                    heap: new_heap,
-                    meta: SlotMeta { used: size, live: 1, free_at: None },
-                });
-                pool.active_hint = new_index;
+                let new_index = insert_heap(
+                    &mut pool,
+                    Heap {
+                        heap: new_heap,
+                        class,
+                        meta: SlotMeta { used: size, live: 1, free_at: None },
+                    },
+                );
+                pool.active_hint[class as usize] = new_index;
                 (clone, new_index, 0)
             };
             drop(pool);
@@ -203,7 +284,7 @@ pub fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: u32) -> O
                 crate::mem_owners::Kind::ViewHeap,
                 crate::mem_owners::Segment::Local,
                 1,
-                HEAP_BYTES,
+                heap_bytes,
             );
             choice
         }
@@ -225,7 +306,7 @@ pub fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: u32) -> O
 pub fn released(index: usize) {
     let now = crate::title_heap::presents();
     let mut pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(h) = pool.heaps.get_mut(index) {
+    if let Some(Some(h)) = pool.heaps.get_mut(index) {
         h.meta.live = h.meta.live.saturating_sub(1);
         if h.meta.live == 0 {
             h.meta.free_at = Some(now);
@@ -251,12 +332,12 @@ pub fn adapter_memory(device: &windows::Win32::Graphics::Direct3D12::ID3D12Devic
 /// Heaps made so far and the bytes taken in them.
 pub fn usage() -> (usize, u64) {
     let pool = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    (pool.heaps.len(), pool.heaps.iter().map(|h| h.meta.used).sum())
+    (pool.heaps.iter().flatten().count(), pool.heaps.iter().flatten().map(|h| h.meta.used).sum())
 }
 
 /// Heaps with no live texture: kept, and reusable once their wait is over.
 pub fn empty_heaps() -> usize {
-    HEAPS.lock().unwrap_or_else(|e| e.into_inner()).heaps.iter().filter(|h| h.meta.live == 0).count()
+    HEAPS.lock().unwrap_or_else(|e| e.into_inner()).heaps.iter().flatten().filter(|h| h.meta.live == 0).count()
 }
 
 #[cfg(test)]
@@ -342,5 +423,49 @@ mod tests {
         // At present 100 + REUSE_PRESENTS, slot 0 resets and wrap around from hint 1 finds slot 0.
         assert_eq!(reserve(&mut slots, &mut hint, 4096, 4096, 100 + REUSE_PRESENTS), Some((0, 0)));
         assert_eq!(hint, 0);
+    }
+
+    #[test]
+    fn size_class_routes_small_and_large_textures() {
+        use super::{SMALL_HEAP_BYTES, SMALL_TEXTURE_LIMIT, SizeClass, class_heap_bytes, fit_in, size_class_for};
+        assert_eq!(size_class_for(4096), SizeClass::Small);
+        assert_eq!(size_class_for(SMALL_TEXTURE_LIMIT), SizeClass::Small);
+        assert_eq!(size_class_for(SMALL_TEXTURE_LIMIT + 4096), SizeClass::Large);
+        assert_eq!(class_heap_bytes(SizeClass::Small), SMALL_HEAP_BYTES);
+        assert_eq!(class_heap_bytes(SizeClass::Large), HEAP_BYTES);
+        assert_eq!(fit_in(SMALL_HEAP_BYTES - 4096, 4096, 4096, SMALL_HEAP_BYTES), Some(SMALL_HEAP_BYTES - 4096));
+        assert_eq!(fit_in(SMALL_HEAP_BYTES - 4096, 8192, 4096, SMALL_HEAP_BYTES), None);
+    }
+
+    #[test]
+    fn excess_empty_heaps_keep_warm_pool_and_reclaim_rest() {
+        use super::{SlotMeta, SizeClass, WARM_FREE_HEAPS_PER_CLASS};
+        let mut slots = [
+            Some((SizeClass::Small, SlotMeta { used: 4096, live: 0, free_at: Some(10) })),
+            Some((SizeClass::Small, SlotMeta { used: 4096, live: 0, free_at: Some(10) })),
+            Some((SizeClass::Small, SlotMeta { used: 4096, live: 0, free_at: Some(10) })),
+            Some((SizeClass::Large, SlotMeta { used: 65536, live: 0, free_at: Some(10) })),
+            Some((SizeClass::Large, SlotMeta { used: 65536, live: 0, free_at: Some(10) })),
+            Some((SizeClass::Large, SlotMeta { used: 65536, live: 0, free_at: Some(10) })),
+        ];
+        let now = 10 + REUSE_PRESENTS;
+        let mut warm = [0usize; 2];
+        let mut reclaimed = Vec::new();
+        for (idx, entry) in slots.iter_mut().enumerate() {
+            let Some((class, meta)) = entry.as_mut() else { continue };
+            if !reusable(meta.live, meta.free_at, now) {
+                continue;
+            }
+            if warm[*class as usize] < WARM_FREE_HEAPS_PER_CLASS {
+                warm[*class as usize] += 1;
+                meta.used = 0;
+                meta.free_at = None;
+            } else {
+                *entry = None;
+                reclaimed.push(idx);
+            }
+        }
+        assert_eq!(reclaimed, vec![2, 5], "excess empty heaps beyond warm pool per class are reclaimed");
+        assert_eq!(slots.iter().flatten().count(), 4);
     }
 }
