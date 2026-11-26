@@ -536,9 +536,16 @@ struct MakeJob {
     service: Option<&'static crate::compile_service::Service>,
 }
 
+struct PrewarmJob {
+    lazy: &'static Lazy,
+    attempts: u8,
+}
+
+const MAX_PREWARM_ATTEMPTS: u8 = 12;
+
 enum QueueJob {
     Live(MakeJob),
-    Prewarm(&'static Lazy),
+    Prewarm(PrewarmJob),
 }
 
 /// Jobs for the maker workers. Compute jobs are served before graphics and mesh jobs, and live
@@ -547,7 +554,7 @@ enum QueueJob {
 struct MakerQueues {
     compute: VecDeque<MakeJob>,
     graphics: VecDeque<MakeJob>,
-    prewarm: VecDeque<&'static Lazy>,
+    prewarm: VecDeque<PrewarmJob>,
 }
 
 impl MakerQueues {
@@ -610,12 +617,13 @@ fn maker_loop() {
         };
         match job {
             QueueJob::Live(job) => run_job(job.lazy, job.source, job.service),
-            QueueJob::Prewarm(lazy) => run_prewarm(lazy),
+            QueueJob::Prewarm(job) => run_prewarm(job),
         }
     }
 }
 
-fn run_prewarm(lazy: &'static Lazy) {
+fn run_prewarm(job: PrewarmJob) {
+    let PrewarmJob { lazy, attempts } = job;
     if lazy.made.get().is_some() || lazy.making.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -623,15 +631,24 @@ fn run_prewarm(lazy: &'static Lazy) {
         lazy.making.store(false, Ordering::Release);
         return;
     };
+    let budget = if attempts == 0 { Duration::ZERO } else { Duration::from_millis(100) };
     let source = {
         let guard = lazy.recipe.owned.read().unwrap_or_else(|e| e.into_inner());
         let Some(owned) = guard.as_ref() else {
             lazy.making.store(false, Ordering::Release);
             return;
         };
-        match crate::direct_pso::choose_with_budget(lazy as *const Lazy as usize, owned, lazy.precompile_key, Duration::from_millis(200)) {
+        match crate::direct_pso::choose_with_budget(lazy as *const Lazy as usize, owned, lazy.precompile_key, budget) {
             crate::direct_pso::Choice::Pending => {
                 lazy.making.store(false, Ordering::Release);
+                if attempts + 1 < MAX_PREWARM_ATTEMPTS && lazy.made.get().is_none() {
+                    let (queues, wake) = &*MAKER_JOBS;
+                    queues.lock().unwrap_or_else(|e| e.into_inner()).prewarm.push_back(PrewarmJob {
+                        lazy,
+                        attempts: attempts + 1,
+                    });
+                    wake.notify_one();
+                }
                 return;
             }
             crate::direct_pso::Choice::Direct(patched) => MakeSource::Direct(patched),
@@ -648,7 +665,7 @@ fn submit_prewarm(lazy: &'static Lazy) {
     let (queues, wake) = &*MAKER_JOBS;
     {
         let mut waiting = queues.lock().unwrap_or_else(|e| e.into_inner());
-        waiting.prewarm.push_back(lazy);
+        waiting.prewarm.push_back(PrewarmJob { lazy, attempts: 0 });
     }
     wake.notify_one();
 }
@@ -1300,12 +1317,12 @@ mod tests {
             (&*compute.cast::<Lazy>(), &*graphics.cast::<Lazy>(), &*prewarm.cast::<Lazy>())
         };
         let mut queues = MakerQueues::default();
-        queues.prewarm.push_back(prewarm);
+        queues.prewarm.push_back(PrewarmJob { lazy: prewarm, attempts: 0 });
         queues.graphics.push_back(MakeJob { lazy: graphics, source: MakeSource::Original, service: None });
         queues.compute.push_back(MakeJob { lazy: compute, source: MakeSource::Original, service: None });
         assert!(matches!(queues.next(), Some(QueueJob::Live(job)) if std::ptr::eq(job.lazy, compute)));
         assert!(matches!(queues.next(), Some(QueueJob::Live(job)) if std::ptr::eq(job.lazy, graphics)));
-        assert!(matches!(queues.next(), Some(QueueJob::Prewarm(p)) if std::ptr::eq(p, prewarm)));
+        assert!(matches!(queues.next(), Some(QueueJob::Prewarm(job)) if std::ptr::eq(job.lazy, prewarm) && job.attempts == 0));
         assert!(queues.next().is_none());
 
         assert!(parse_prewarm_history(None, true, true));

@@ -225,9 +225,12 @@ impl Store {
         if len <= HEADER as u64 || len > (HEADER + MAX_BLOB_BYTES) as u64 {
             return None;
         }
-        let mut bytes = Vec::with_capacity(len as usize);
-        file.read_to_end(&mut bytes).ok()?;
-        self.parse(key, &bytes).map(<[u8]>::to_vec)
+        let mut bytes = vec![0u8; len as usize];
+        file.read_exact(&mut bytes).ok()?;
+        self.parse(key, &bytes)?;
+        bytes.copy_within(HEADER.., 0);
+        bytes.truncate(bytes.len() - HEADER);
+        Some(bytes)
     }
 
     /// The blob of a file's bytes, when the header names this store and `key` and the length and
