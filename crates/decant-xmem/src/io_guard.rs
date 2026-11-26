@@ -11,12 +11,12 @@
 //! wrapper that still sees `ERROR_NOACCESS` logs it with the address.
 #![allow(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use windows_sys::Win32::Foundation::{ERROR_NOACCESS, GetLastError, HMODULE, SetLastError};
+use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_NOACCESS, GetLastError, HMODULE, SetLastError};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 use windows_sys::Win32::System::ProcessStatus::K32EnumProcessModules;
@@ -32,12 +32,42 @@ type ReadFileFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut 
 type ReadFileExFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, *mut c_void) -> BOOL;
 type ReadFileScatterFn = unsafe extern "system" fn(*mut c_void, *const u64, u32, *mut u32, *mut c_void) -> BOOL;
 type LoadLibraryExWFn = unsafe extern "system" fn(*const u16, *mut c_void, u32) -> HMODULE;
+type GetOverlappedResultFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut u32, BOOL) -> BOOL;
+type GetOverlappedResultExFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut u32, u32, BOOL) -> BOOL;
+type GetQueuedCompletionStatusFn = unsafe extern "system" fn(*mut c_void, *mut u32, *mut usize, *mut *mut c_void, u32) -> BOOL;
+type GetQueuedCompletionStatusExFn = unsafe extern "system" fn(*mut c_void, *mut OverlappedEntry, u32, *mut u32, u32, BOOL) -> BOOL;
+
+#[repr(C)]
+struct OverlappedEntry {
+    key: usize,
+    overlapped: *mut c_void,
+    internal: usize,
+    bytes: u32,
+}
+
+const MAX_PENDING_OVERLAPPED: usize = 4096;
+
+#[derive(Default)]
+struct PendingOverlapped {
+    map: HashMap<usize, Vec<(usize, usize)>>,
+    order: VecDeque<usize>,
+}
 
 /// The functions that were in the tables before the patch, 0 until a table was patched.
-static ORIGINAL: [AtomicUsize; 4] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static ORIGINAL: [AtomicUsize; 8] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 /// The modules whose tables were looked at.
 static DONE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 static XGR_PATH: OnceLock<Option<Vec<u16>>> = OnceLock::new();
+static PENDING_OVERLAPPED: Mutex<Option<PendingOverlapped>> = Mutex::new(None);
 
 fn xgr_path() -> Option<&'static [u16]> {
     XGR_PATH
@@ -72,11 +102,71 @@ fn wanted_dll(dll: &str) -> bool {
         || lower == "kernelbase.dll"
         || (lower.starts_with("api-ms-win-core-file-") && lower.ends_with(".dll"))
         || (lower.starts_with("api-ms-win-core-libraryloader-") && lower.ends_with(".dll"))
+        || (lower.starts_with("api-ms-win-core-io-") && lower.ends_with(".dll"))
 }
 
 /// The index in `ORIGINAL` of an imported function, when it is one of the hooked functions.
 fn wanted_function(name: &str) -> Option<usize> {
-    ["ReadFile", "ReadFileEx", "ReadFileScatter", "LoadLibraryExW"].iter().position(|&n| n == name)
+    [
+        "ReadFile",
+        "ReadFileEx",
+        "ReadFileScatter",
+        "LoadLibraryExW",
+        "GetOverlappedResult",
+        "GetOverlappedResultEx",
+        "GetQueuedCompletionStatus",
+        "GetQueuedCompletionStatusEx",
+    ]
+    .iter()
+    .position(|&n| n == name)
+}
+
+fn record_pending_overlapped(ov: usize, runs: Vec<(usize, usize)>) {
+    if ov == 0 || runs.is_empty() {
+        return;
+    }
+    let mut guard = PENDING_OVERLAPPED.lock().unwrap_or_else(PoisonError::into_inner);
+    let pending = guard.get_or_insert_with(PendingOverlapped::default);
+    if pending.map.insert(ov, runs).is_none() {
+        pending.order.push_back(ov);
+    }
+    while pending.map.len() > MAX_PENDING_OVERLAPPED {
+        let Some(oldest) = pending.order.pop_front() else { break };
+        pending.map.remove(&oldest);
+    }
+}
+
+fn take_pending_overlapped(ov: usize) -> Option<Vec<(usize, usize)>> {
+    if ov == 0 {
+        return None;
+    }
+    let mut guard = PENDING_OVERLAPPED.lock().unwrap_or_else(PoisonError::into_inner);
+    let pending = guard.as_mut()?;
+    let runs = pending.map.remove(&ov)?;
+    pending.order.retain(|&x| x != ov);
+    Some(runs)
+}
+
+fn complete_overlapped(ov: usize) {
+    let Some(runs) = take_pending_overlapped(ov) else { return };
+    if let Some(engine) = Engine::started() {
+        engine.clear_io_hold_runs(&runs);
+    }
+}
+
+fn finish_or_pend_read(engine: Option<&Engine>, overlapped: *mut c_void, result: BOOL, runs: Vec<(usize, usize)>) {
+    let Some(e) = engine else { return };
+    // SAFETY: GetLastError and SetLastError only touch the thread's error code, kept for the caller.
+    unsafe {
+        let err = GetLastError();
+        if overlapped.is_null() || result != 0 || err != ERROR_IO_PENDING {
+            e.finish_io_write_runs(&runs);
+        } else {
+            e.convert_pin_to_hold_runs(&runs);
+            record_pending_overlapped(overlapped as usize, runs);
+        }
+        SetLastError(err);
+    }
 }
 
 /// Coalesces contiguous `SEGMENT_BYTES` scatter segments into maximal `(base, run_len)` runs.
@@ -123,24 +213,15 @@ fn check(result: BOOL, buffer: *const c_void, len: usize) {
 }
 
 unsafe extern "system" fn read_file(file: *mut c_void, buffer: *mut c_void, len: u32, read: *mut u32, overlapped: *mut c_void) -> BOOL {
-    // Without OVERLAPPED the read is done when the call returns: its pages stay open until then.
-    let blocking = overlapped.is_null();
     let engine = Engine::started();
-    match engine {
-        Some(e) if blocking => e.begin_write(buffer as usize, len as usize),
-        _ => prepare(buffer, len as usize),
+    let runs = if len != 0 { vec![(buffer as usize, len as usize)] } else { Vec::new() };
+    if let Some(e) = engine {
+        e.begin_io_write_runs(&runs);
     }
     // SAFETY: the wrapper is only installed after `ORIGINAL[0]` holds the function it replaces, and the arguments are the caller's.
     let result = unsafe { std::mem::transmute::<usize, ReadFileFn>(ORIGINAL[0].load(Ordering::Acquire))(file, buffer, len, read, overlapped) };
     check(result, buffer, len as usize);
-    if let Some(e) = engine.filter(|_| blocking) {
-        // SAFETY: GetLastError and SetLastError only touch the thread's error code, kept for the caller.
-        unsafe {
-            let error = GetLastError();
-            e.end_write(buffer as usize, len as usize);
-            SetLastError(error);
-        }
-    }
+    finish_or_pend_read(engine, overlapped, result, runs);
     result
 }
 
@@ -153,18 +234,23 @@ unsafe extern "system" fn read_file_ex(file: *mut c_void, buffer: *mut c_void, l
 }
 
 unsafe extern "system" fn read_file_scatter(file: *mut c_void, segments: *const u64, len: u32, reserved: *mut u32, overlapped: *mut c_void) -> BOOL {
-    if !segments.is_null() && len != 0 {
+    let engine = Engine::started();
+    let runs = if !segments.is_null() && len != 0 {
         let count = (len as usize).div_ceil(SEGMENT_BYTES);
         // SAFETY: the caller's array has one element for each segment of `len` bytes.
         let slice = unsafe { std::slice::from_raw_parts(segments, count) };
         let runs = coalesce_scatter_segments(slice, len as usize);
-        if let Some(engine) = Engine::started() {
-            engine.prepare_write_runs(&runs);
+        if let Some(e) = engine {
+            e.begin_io_write_runs(&runs);
         }
-    }
+        runs
+    } else {
+        Vec::new()
+    };
     // SAFETY: as in `read_file`, with `ORIGINAL[2]`.
     let result = unsafe { std::mem::transmute::<usize, ReadFileScatterFn>(ORIGINAL[2].load(Ordering::Acquire))(file, segments, len, reserved, overlapped) };
     check(result, segments.cast(), len as usize);
+    finish_or_pend_read(engine, overlapped, result, runs);
     result
 }
 
@@ -191,12 +277,79 @@ unsafe extern "system" fn load_library_ex_w(lib_name: *const u16, file: *mut c_v
     unsafe { std::mem::transmute::<usize, LoadLibraryExWFn>(ORIGINAL[3].load(Ordering::Acquire))(target, file, flags) }
 }
 
+unsafe extern "system" fn get_overlapped_result(file: *mut c_void, overlapped: *mut c_void, bytes: *mut u32, wait: BOOL) -> BOOL {
+    // SAFETY: `ORIGINAL[4]` holds the original `GetOverlappedResult`.
+    let result = unsafe { std::mem::transmute::<usize, GetOverlappedResultFn>(ORIGINAL[4].load(Ordering::Acquire))(file, overlapped, bytes, wait) };
+    if result != 0 {
+        // SAFETY: preserves the caller's last error across completion cleanup.
+        unsafe {
+            let err = GetLastError();
+            complete_overlapped(overlapped as usize);
+            SetLastError(err);
+        }
+    }
+    result
+}
+
+unsafe extern "system" fn get_overlapped_result_ex(file: *mut c_void, overlapped: *mut c_void, bytes: *mut u32, timeout_ms: u32, alertable: BOOL) -> BOOL {
+    // SAFETY: `ORIGINAL[5]` holds the original `GetOverlappedResultEx`.
+    let result = unsafe { std::mem::transmute::<usize, GetOverlappedResultExFn>(ORIGINAL[5].load(Ordering::Acquire))(file, overlapped, bytes, timeout_ms, alertable) };
+    if result != 0 {
+        // SAFETY: preserves the caller's last error across completion cleanup.
+        unsafe {
+            let err = GetLastError();
+            complete_overlapped(overlapped as usize);
+            SetLastError(err);
+        }
+    }
+    result
+}
+
+unsafe extern "system" fn get_queued_completion_status(port: *mut c_void, bytes: *mut u32, key: *mut usize, overlapped: *mut *mut c_void, timeout_ms: u32) -> BOOL {
+    // SAFETY: `ORIGINAL[6]` holds the original `GetQueuedCompletionStatus`.
+    let result = unsafe { std::mem::transmute::<usize, GetQueuedCompletionStatusFn>(ORIGINAL[6].load(Ordering::Acquire))(port, bytes, key, overlapped, timeout_ms) };
+    if !overlapped.is_null() {
+        // SAFETY: `overlapped` is the caller's output pointer populated by `GetQueuedCompletionStatus`.
+        let ov = unsafe { *overlapped } as usize;
+        if ov != 0 {
+            // SAFETY: preserves the caller's last error across completion cleanup.
+            unsafe {
+                let err = GetLastError();
+                complete_overlapped(ov);
+                SetLastError(err);
+            }
+        }
+    }
+    result
+}
+
+unsafe extern "system" fn get_queued_completion_status_ex(port: *mut c_void, entries: *mut OverlappedEntry, count: u32, removed: *mut u32, timeout_ms: u32, alertable: BOOL) -> BOOL {
+    // SAFETY: `ORIGINAL[7]` holds the original `GetQueuedCompletionStatusEx`.
+    let result = unsafe { std::mem::transmute::<usize, GetQueuedCompletionStatusExFn>(ORIGINAL[7].load(Ordering::Acquire))(port, entries, count, removed, timeout_ms, alertable) };
+    if result != 0 && !entries.is_null() && !removed.is_null() {
+        // SAFETY: `removed` entries in `entries` were written by `GetQueuedCompletionStatusEx`.
+        unsafe {
+            let err = GetLastError();
+            let n = (*removed).min(count) as usize;
+            for i in 0..n {
+                complete_overlapped((*entries.add(i)).overlapped as usize);
+            }
+            SetLastError(err);
+        }
+    }
+    result
+}
+
 fn wrapper(index: usize) -> usize {
     [
         read_file as *const () as usize,
         read_file_ex as *const () as usize,
         read_file_scatter as *const () as usize,
         load_library_ex_w as *const () as usize,
+        get_overlapped_result as *const () as usize,
+        get_overlapped_result_ex as *const () as usize,
+        get_queued_completion_status as *const () as usize,
+        get_queued_completion_status_ex as *const () as usize,
     ][index]
 }
 
@@ -342,8 +495,13 @@ mod tests {
         assert_eq!(wanted_function("ReadFileEx"), Some(1));
         assert_eq!(wanted_function("ReadFileScatter"), Some(2));
         assert_eq!(wanted_function("LoadLibraryExW"), Some(3));
+        assert_eq!(wanted_function("GetOverlappedResult"), Some(4));
+        assert_eq!(wanted_function("GetOverlappedResultEx"), Some(5));
+        assert_eq!(wanted_function("GetQueuedCompletionStatus"), Some(6));
+        assert_eq!(wanted_function("GetQueuedCompletionStatusEx"), Some(7));
         assert_eq!(wanted_function("WriteFile"), None);
         assert!(wanted_dll("api-ms-win-core-libraryloader-l1-2-0.dll"));
+        assert!(wanted_dll("api-ms-win-core-io-l1-1-0.dll"));
         assert!(is_xgameruntime_load("xgameruntime.dll"));
         assert!(is_xgameruntime_load("C:\\Windows\\System32\\XGameRuntime.dll"));
         assert!(!is_xgameruntime_load("other_xgameruntime.dll"));
@@ -359,5 +517,15 @@ mod tests {
         let segs = [0x10_0000u64, 0x10_1000, 0x10_2000, 0x20_0000, 0x20_1000];
         assert_eq!(coalesce_scatter_segments(&segs, 5 * SEGMENT_BYTES), vec![(0x10_0000, 3 * SEGMENT_BYTES), (0x20_0000, 2 * SEGMENT_BYTES)]);
         assert_eq!(coalesce_scatter_segments(&segs, 4 * SEGMENT_BYTES + 123), vec![(0x10_0000, 3 * SEGMENT_BYTES), (0x20_0000, SEGMENT_BYTES + 123)]);
+    }
+
+    #[test]
+    fn pending_overlapped_records_takes_and_caps_at_limit() {
+        for i in 1..=(MAX_PENDING_OVERLAPPED + 5) {
+            record_pending_overlapped(i, vec![(i * 0x1000, 0x1000)]);
+        }
+        assert!(take_pending_overlapped(1).is_none(), "oldest entries evicted past cap");
+        assert_eq!(take_pending_overlapped(MAX_PENDING_OVERLAPPED + 5), Some(vec![((MAX_PENDING_OVERLAPPED + 5) * 0x1000, 0x1000)]));
+        assert!(take_pending_overlapped(MAX_PENDING_OVERLAPPED + 5).is_none());
     }
 }

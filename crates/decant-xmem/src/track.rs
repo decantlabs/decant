@@ -9,7 +9,7 @@
 //! frame) would fault once per frame. After `HOT_FAULTS` such faults in a row it is held like a page a
 //! kernel write may reach: unprotected and copied at every sync for `HOT_HOLD`, then protected again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::pages::PAGE_BYTES;
@@ -78,6 +78,7 @@ pub struct Track {
     aliases: HashMap<u32, Vec<Alias>>,
     addresses: HashMap<usize, (u32, bool)>,
     held: HashMap<u32, Instant>,
+    io_held: HashSet<u32>,
     active_writes: HashMap<u32, u32>,
     /// When `take` last made the page clean, and the quick faults in a row since (`HOT_WINDOW`).
     cleaned: HashMap<u32, (Instant, u8)>,
@@ -171,6 +172,7 @@ impl Track {
             if v.is_empty() {
                 self.aliases.remove(&page);
                 self.held.remove(&page);
+                self.io_held.remove(&page);
                 self.active_writes.remove(&page);
                 self.cleaned.remove(&page);
             }
@@ -190,6 +192,7 @@ impl Track {
             if *quick >= HOT_FAULTS {
                 *quick = 0;
                 self.held.insert(page, now + hot_hold());
+                self.io_held.remove(&page);
             }
         }
         Some(self.dirty(page))
@@ -218,6 +221,33 @@ impl Track {
             } else {
                 *count -= 1;
             }
+        }
+        let _ = self.dirty(page);
+    }
+
+    /// Transitions an active write pin on `page` into a timed fallback hold until `until` when
+    /// an overlapped read returns `ERROR_IO_PENDING`.
+    pub fn convert_pin_to_hold(&mut self, page: u32, until: Instant) {
+        if let Some(count) = self.active_writes.get_mut(&page) {
+            if *count <= 1 {
+                self.active_writes.remove(&page);
+            } else {
+                *count -= 1;
+            }
+        }
+        if self.aliases.contains_key(&page) {
+            let held = self.held.entry(page).or_insert(until);
+            *held = (*held).max(until);
+            self.io_held.insert(page);
+        }
+        let _ = self.dirty(page);
+    }
+
+    /// Clears an I/O fallback hold on `page` when the overlapped read completes and marks the
+    /// page dirty once so the next `take` copies it and protects it immediately.
+    pub fn clear_io_hold(&mut self, page: u32) {
+        if self.io_held.remove(&page) {
+            self.held.remove(&page);
         }
         let _ = self.dirty(page);
     }
@@ -289,6 +319,7 @@ impl Track {
             } else {
                 self.committed[i] = true;
                 self.held.remove(&page);
+                self.io_held.remove(&page);
                 protect.extend(self.rw(page));
                 let quick = self.cleaned.get(&page).map_or(0, |&(_, q)| q);
                 self.cleaned.insert(page, (now, quick));
@@ -539,5 +570,21 @@ mod tests {
         assert_eq!(io_hold(), Duration::from_millis(2000));
         assert!(io_hold_for(271 * 1024 * 1024) >= Duration::from_secs(8));
         assert_eq!(io_hold_for(4096), Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn convert_pin_to_hold_and_clear_io_hold_release_page_immediately() {
+        let mut t = track();
+        let now = Instant::now();
+        t.on_map(5, 0x10_0000, true);
+        assert_eq!(t.take(now, 10, all), (vec![5], vec![0x10_0000]));
+
+        assert_eq!(t.begin_write_pin(5), [0x10_0000]);
+        t.convert_pin_to_hold(5, now + Duration::from_secs(10));
+        assert_eq!(t.take(now + Duration::from_secs(1), 10, all), (vec![5], vec![]));
+
+        t.clear_io_hold(5);
+        assert_eq!(t.take(now + Duration::from_secs(1), 10, all), (vec![5], vec![0x10_0000]));
+        assert_eq!(t.take(now + Duration::from_secs(1), 10, all), (vec![], vec![]));
     }
 }

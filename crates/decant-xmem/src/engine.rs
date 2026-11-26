@@ -1788,18 +1788,6 @@ impl Engine {
         self.prepare_write_until(address, len, Instant::now() + track::io_hold_for(len));
     }
 
-    /// As `prepare_write` for a write that ends when a call returns (a `ReadFile` without
-    /// `OVERLAPPED`): the pages stay pinned writable until [`Engine::end_write`].
-    pub fn begin_write(&self, address: usize, len: usize) {
-        self.begin_io_write(address, len);
-    }
-
-    /// The write that [`Engine::begin_write`] opened is done: release the write pin so the next
-    /// `take_dirty` copies the page once and protects it again.
-    pub fn end_write(&self, address: usize, len: usize) {
-        self.finish_io_write(address, len);
-    }
-
     fn collect_rw_view_indices_into(st: &State, address: usize, len: usize, indices: &mut Vec<u32>) {
         if len == 0 {
             return;
@@ -1891,6 +1879,7 @@ impl Engine {
 
     /// Commits and opens the writable view pages across all `(address, len)` runs for a kernel
     /// write, acquiring the state and dirty locks once across the whole batch.
+    #[cfg(test)]
     pub fn prepare_write_runs(&self, runs: &[(usize, usize)]) {
         if runs.is_empty() {
             return;
@@ -1924,8 +1913,25 @@ impl Engine {
     /// Commits and pins the writable view pages in `[address, address + len)` open for an active
     /// asynchronous write until [`Engine::finish_io_write`] balances every overlapping pin.
     pub fn begin_io_write(&self, address: usize, len: usize) {
+        self.begin_io_write_runs(&[(address, len)]);
+    }
+
+    /// Releases one active write pin on each writable view page in `[address, address + len)`.
+    /// Once the last pin drops, the next `take_dirty` copies the page once and protects it again.
+    pub fn finish_io_write(&self, address: usize, len: usize) {
+        self.finish_io_write_runs(&[(address, len)]);
+    }
+
+    /// Commits and pins the writable view pages across all `(address, len)` runs open for an active write.
+    pub fn begin_io_write_runs(&self, runs: &[(usize, usize)]) {
+        if runs.is_empty() {
+            return;
+        }
         let st = self.lock();
-        let indices = Self::collect_rw_view_indices(&st, address, len);
+        let mut indices = Vec::new();
+        for &(address, len) in runs {
+            Self::collect_rw_view_indices_into(&st, address, len, &mut indices);
+        }
         if indices.is_empty() {
             return;
         }
@@ -1944,11 +1950,16 @@ impl Engine {
         Self::protect_runs(open, PAGE_READWRITE);
     }
 
-    /// Releases one active write pin on each writable view page in `[address, address + len)`.
-    /// Once the last pin drops, the next `take_dirty` copies the page once and protects it again.
-    pub fn finish_io_write(&self, address: usize, len: usize) {
+    /// Releases one active write pin on each writable view page across all `(address, len)` runs.
+    pub fn finish_io_write_runs(&self, runs: &[(usize, usize)]) {
+        if runs.is_empty() {
+            return;
+        }
         let st = self.lock();
-        let indices = Self::collect_rw_view_indices(&st, address, len);
+        let mut indices = Vec::new();
+        for &(address, len) in runs {
+            Self::collect_rw_view_indices_into(&st, address, len, &mut indices);
+        }
         if indices.is_empty() {
             return;
         }
@@ -1957,6 +1968,53 @@ impl Engine {
         if let Some(track) = dirty_guard.track.as_mut() {
             for index in indices {
                 track.finish_write_pin(index);
+            }
+        }
+    }
+
+    /// Transitions active write pins across `runs` into a timed fallback hold for pending overlapped I/O.
+    pub fn convert_pin_to_hold_runs(&self, runs: &[(usize, usize)]) {
+        if runs.is_empty() {
+            return;
+        }
+        let st = self.lock();
+        let mut indices = Vec::new();
+        let mut total_bytes = 0usize;
+        for &(address, len) in runs {
+            total_bytes = total_bytes.saturating_add(len);
+            Self::collect_rw_view_indices_into(&st, address, len, &mut indices);
+        }
+        if indices.is_empty() {
+            return;
+        }
+        let until = Instant::now() + track::io_hold_for(total_bytes);
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(track) = dirty_guard.track.as_mut() {
+            for index in indices {
+                track.convert_pin_to_hold(index, until);
+            }
+        }
+    }
+
+    /// Clears I/O fallback holds across `runs` when an overlapped read completes.
+    pub fn clear_io_hold_runs(&self, runs: &[(usize, usize)]) {
+        if runs.is_empty() {
+            return;
+        }
+        let st = self.lock();
+        let mut indices = Vec::new();
+        for &(address, len) in runs {
+            Self::collect_rw_view_indices_into(&st, address, len, &mut indices);
+        }
+        if indices.is_empty() {
+            return;
+        }
+        let dirty_state = Arc::clone(&st.dirty);
+        let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(track) = dirty_guard.track.as_mut() {
+            for index in indices {
+                track.clear_io_hold(index);
             }
         }
     }
@@ -3280,6 +3338,33 @@ mod tests {
         assert!(!accessible(area + 3 * P, false));
         assert!(accessible(area + 4 * P, true));
         assert!(accessible(area + 5 * P, true));
+
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
+    }
+
+    #[test]
+    fn convert_pin_to_hold_and_clear_io_hold_runs_protect_on_completion() {
+        let Some(e) = held(|| Engine::load_limited(4, 4)) else { return };
+        e.set_tracking(true);
+        let area = e.reserve(0, 2 * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(1).unwrap();
+        e.map_frames(area, &frames).unwrap();
+        let page = page_of(frames[0]);
+
+        assert!(Engine::commit_on_access_in(&e.state, area));
+        assert!(e.take_dirty(usize::MAX).contains(&page));
+        assert!(!accessible(area, true));
+
+        e.begin_io_write_runs(&[(area, P)]);
+        assert!(accessible(area, true));
+        e.convert_pin_to_hold_runs(&[(area, P)]);
+        assert!(e.take_dirty(usize::MAX).contains(&page));
+        assert!(accessible(area, true));
+
+        e.clear_io_hold_runs(&[(area, P)]);
+        assert!(e.take_dirty(usize::MAX).contains(&page));
+        assert!(!accessible(area, true));
 
         e.release(area).unwrap();
         e.free_pages(&frames).unwrap();
