@@ -419,6 +419,11 @@ static DEFERRED: AtomicU64 = AtomicU64::new(0);
 static MADE: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 
+/// Returns `(made, refused)` counts for trace counter reporting.
+pub(crate) fn trace_counts() -> (u64, u64) {
+    (MADE.load(Ordering::Relaxed), REFUSED.load(Ordering::Relaxed))
+}
+
 /// The wait cap of the async bind mode when `DECANT_D3D12X_ASYNC_BIND_WAIT_MS` is not set.
 const DEFAULT_ASYNC_BIND_WAIT_MS: u64 = 20;
 
@@ -1427,5 +1432,15 @@ mod tests {
         assert!(remaining < 50, "expected dead weak entries to be pruned, {remaining} remained");
         drop(table);
         drop(keeper);
+    }
+
+    #[test]
+    fn trace_counts_matches_made_and_refused_atomics() {
+        let (made_before, refused_before) = trace_counts();
+        MADE.fetch_add(2, Ordering::Relaxed);
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+        let (made_after, refused_after) = trace_counts();
+        assert_eq!(made_after, made_before + 2);
+        assert_eq!(refused_after, refused_before + 1);
     }
 }

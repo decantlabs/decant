@@ -78,7 +78,11 @@ impl crate::compile_service::Compiler for decant_dxc::Dxc {
 
     fn compile(&self, hlsl: &str, entry: &str, profile: &str, args: &[String]) -> Result<Vec<u8>, String> {
         let _trace = decant_trace::span("direct_pso", "compile");
-        decant_dxc::Dxc::compile(self, hlsl, entry, profile, args)
+        let began = Instant::now();
+        let res = decant_dxc::Dxc::compile(self, hlsl, entry, profile, args);
+        let us = u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX);
+        DXC_COMPILE_US.fetch_add(us, Ordering::Relaxed);
+        res
     }
 }
 
@@ -193,7 +197,85 @@ static SERVICE: OnceLock<Option<Service>> = OnceLock::new();
 static SOURCE: OnceLock<Arc<DirectSource>> = OnceLock::new();
 static QUEUE: OnceLock<Option<Arc<Queue>>> = OnceLock::new();
 static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+static DXC_COMPILE_US: AtomicU64 = AtomicU64::new(0);
 static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
+
+struct TraceCounterState {
+    pending_binds: AtomicU64,
+    ready_total: AtomicU64,
+    refused_total: AtomicU64,
+    dxc_compiled_total: AtomicU64,
+    dxc_compile_total_ms: AtomicU64,
+    library_hits: AtomicU64,
+    library_misses: AtomicU64,
+}
+
+impl TraceCounterState {
+    const fn new() -> Self {
+        Self {
+            pending_binds: AtomicU64::new(u64::MAX),
+            ready_total: AtomicU64::new(u64::MAX),
+            refused_total: AtomicU64::new(u64::MAX),
+            dxc_compiled_total: AtomicU64::new(u64::MAX),
+            dxc_compile_total_ms: AtomicU64::new(u64::MAX),
+            library_hits: AtomicU64::new(u64::MAX),
+            library_misses: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+static TRACE_COUNTERS: TraceCounterState = TraceCounterState::new();
+
+#[inline]
+fn emit_if_changed(slot: &AtomicU64, name: &'static str, value: u64) {
+    if slot.load(Ordering::Relaxed) != value {
+        slot.store(value, Ordering::Relaxed);
+        decant_trace::record_counter(name, value as f64);
+    }
+}
+
+fn emit_trace_counters_to(state: &TraceCounterState, values: [u64; 7]) {
+    if !decant_trace::enabled() {
+        return;
+    }
+    emit_if_changed(&state.pending_binds, "pso_pending_binds", values[0]);
+    emit_if_changed(&state.ready_total, "pso_ready_total", values[1]);
+    emit_if_changed(&state.refused_total, "pso_refused_total", values[2]);
+    emit_if_changed(&state.dxc_compiled_total, "dxc_compiled_total", values[3]);
+    emit_if_changed(&state.dxc_compile_total_ms, "dxc_compile_total_ms", values[4]);
+    emit_if_changed(&state.library_hits, "pso_library_hits", values[5]);
+    emit_if_changed(&state.library_misses, "pso_library_misses", values[6]);
+}
+
+fn emit_trace_counters() {
+    if !decant_trace::enabled() {
+        return;
+    }
+    let service = current();
+    let (made, refused_pso) = crate::lazy_pso::trace_counts();
+    let pending_binds = LEFT_OUT.load(Ordering::Relaxed);
+    let ready_total = service.map_or(made, |s| s.counters().ready.load(Ordering::Relaxed));
+    let service_refused = service.map_or(0, |s| s.counters().refused().values().sum::<u64>());
+    let refused_total = refused_pso.saturating_add(service_refused);
+    let dxc_compiled_total = service.map_or(0, |s| s.counters().compiled.load(Ordering::Relaxed));
+    let dxc_compile_total_ms = DXC_COMPILE_US.load(Ordering::Relaxed) / 1000;
+    let (library_hits, library_misses) = library().map_or((0, 0), |lib| {
+        let c = lib.counts();
+        (c.hits.load(Ordering::Relaxed), c.misses.load(Ordering::Relaxed))
+    });
+    emit_trace_counters_to(
+        &TRACE_COUNTERS,
+        [
+            pending_binds,
+            ready_total,
+            refused_total,
+            dxc_compiled_total,
+            dxc_compile_total_ms,
+            library_hits,
+            library_misses,
+        ],
+    );
+}
 
 const WAITING_SHARDS: usize = 16;
 
@@ -300,6 +382,7 @@ extern "C" fn log_final_summary() {
         library.flush();
         xs_log!("direct shaders: {}", library.summary());
     }
+    emit_trace_counters();
 }
 
 /// Logs the counts of the pipeline library when they changed since the last time, and saves the
@@ -320,6 +403,7 @@ fn log_library_if_changed() {
 
 pub(crate) fn note_present() {
     refill_frame_budget();
+    emit_trace_counters();
 }
 
 /// Refills the wait budgets of the frame, for graphics and mesh binds and for async compute binds.
@@ -345,6 +429,7 @@ pub(crate) fn pipeline_done_for(service: Option<&'static Service>, owned: &Owned
     if let Some(service) = service.or_else(current) {
         service.pipeline_done(kind, creation);
     }
+    emit_trace_counters();
 }
 
 /// The library key waiting for the PC creation of `owned`, taken out.
@@ -500,6 +585,9 @@ fn spend(spent: &AtomicU64, elapsed: Duration) {
 /// Counts a bind that went on without its pipeline, and logs only the first one of each object.
 pub(crate) fn note_pending(object: usize, logged: &AtomicBool) {
     let total = LEFT_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+    if decant_trace::enabled() {
+        emit_if_changed(&TRACE_COUNTERS.pending_binds, "pso_pending_binds", total);
+    }
     if !logged.swap(true, Ordering::Relaxed) {
         xs_log!("direct shaders: pipeline {object:#x} is still pending, bind left work out ({total} pending binds)");
     }
@@ -1102,5 +1190,39 @@ mod tests {
                 (StageKind::Geometry, 0x48),
             ]
         );
+    }
+
+    #[test]
+    fn trace_counters_emit_only_on_change_when_tracing_is_enabled() {
+        let dir = std::env::temp_dir().join(format!("decant-d3d12x-pso-counters-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("counters.json");
+        decant_trace::start(&path);
+
+        let state = TraceCounterState::new();
+        emit_trace_counters_to(&state, [3, 12, 1, 7, 450, 10, 2]);
+        // Repeating the exact same values must not emit duplicate events.
+        emit_trace_counters_to(&state, [3, 12, 1, 7, 450, 10, 2]);
+        // Changing one counter emits only that counter.
+        emit_trace_counters_to(&state, [4, 12, 1, 7, 450, 10, 2]);
+
+        decant_trace::stop();
+        decant_trace::flush().unwrap();
+        let json = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for name in [
+            "pso_pending_binds",
+            "pso_ready_total",
+            "pso_refused_total",
+            "dxc_compiled_total",
+            "dxc_compile_total_ms",
+            "pso_library_hits",
+            "pso_library_misses",
+        ] {
+            assert!(json.contains(name), "missing counter {name} in {json}");
+        }
+        assert_eq!(json.matches("\"pso_ready_total\"").count(), 1);
+        assert_eq!(json.matches("\"pso_pending_binds\"").count(), 2);
     }
 }
