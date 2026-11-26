@@ -534,11 +534,12 @@ struct Api {
     journal_seq: Option<JournalSeqFn>,
 }
 
-/// One pool heap: the buffer over it and where its memory is mapped (0 when in L1 VRAM).
+/// One pool heap: the buffer over it, where its memory is mapped (0 when in L1 VRAM), and its pool.
 struct Heap {
     _heap: ID3D12Heap,
     buffer: ID3D12Resource,
     ptr: usize,
+    is_l1: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -547,28 +548,104 @@ enum MirrorPool {
     L1,
 }
 
-const L1_MIN_VRAM_BYTES: u64 = 16 << 30;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MirrorPoolMode {
+    Auto,
+    StrictL0,
+    PreferL1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VramBudget {
+    r_drv: u64,
+    hwm_total: u64,
+    lwm_total: u64,
+    m_cap: u64,
+}
+
+impl VramBudget {
+    /// Computes Design Note F VRAM reserves, watermarks, and L1 mirror ceiling from local budget `budget`.
+    fn from_budget(budget: u64) -> Self {
+        let budget_mib = budget >> 20;
+        let r_drv = 1536u64.max(budget_mib * 16 / 100) << 20;
+        let hwm_total = (budget_mib << 20).saturating_sub(r_drv);
+        let delta_h = 1024u64.max(budget_mib / 10) << 20;
+        let lwm_total = hwm_total.saturating_sub(delta_h);
+        let m_cap = if budget_mib < 10_240 {
+            0
+        } else if budget_mib < 14_336 {
+            1_024 << 20
+        } else if budget_mib < 20_480 {
+            2_048 << 20
+        } else {
+            4_096 << 20
+        };
+        Self { r_drv, hwm_total, lwm_total, m_cap }
+    }
+}
+
 const STAGING_BYTES: usize = 64 << 20;
 const STAGING_MAX_PAGES: usize = STAGING_BYTES / PAGE as usize;
 const STAGING_ALLOCATORS: usize = 8;
 
-fn parse_mirror_pool(env: Option<&str>, dedicated_vram: u64) -> MirrorPool {
+fn parse_mirror_pool_mode(env: Option<&str>) -> MirrorPoolMode {
     if let Some(val) = env {
-        if val.eq_ignore_ascii_case("l0") {
-            return MirrorPool::L0;
+        let trimmed = val.trim();
+        if trimmed.eq_ignore_ascii_case("l0") {
+            return MirrorPoolMode::StrictL0;
         }
-        if val.eq_ignore_ascii_case("l1") {
-            return MirrorPool::L1;
+        if trimmed.eq_ignore_ascii_case("l1") {
+            return MirrorPoolMode::PreferL1;
         }
     }
-    if dedicated_vram >= L1_MIN_VRAM_BYTES { MirrorPool::L1 } else { MirrorPool::L0 }
+    MirrorPoolMode::Auto
 }
 
-fn dedicated_vram(device: &ID3D12Device) -> u64 {
+fn parse_mirror_l1_mib(env: Option<&str>) -> Option<u64> {
+    env.and_then(|v| v.trim().parse::<u64>().ok()).map(|mib| mib << 20)
+}
+
+fn should_use_l1(
+    mode: MirrorPoolMode,
+    budget: u64,
+    current_usage: u64,
+    l1_mirror_bytes: u64,
+    m_cap_override: Option<u64>,
+) -> bool {
+    let vram = VramBudget::from_budget(budget);
+    let m_cap = m_cap_override.unwrap_or(vram.m_cap);
+    match mode {
+        MirrorPoolMode::StrictL0 => false,
+        MirrorPoolMode::Auto => {
+            m_cap > 0
+                && current_usage.saturating_add(POOL_HEAP_BYTES) <= vram.hwm_total
+                && l1_mirror_bytes.saturating_add(POOL_HEAP_BYTES) <= m_cap
+        }
+        MirrorPoolMode::PreferL1 => {
+            current_usage.saturating_add(POOL_HEAP_BYTES) <= vram.hwm_total
+        }
+    }
+}
+
+fn local_adapter(device: &ID3D12Device) -> Option<IDXGIAdapter3> {
     // SAFETY: plain DXGI factory and adapter queries on a live D3D12 device.
-    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory4>() }) else { return 0 };
+    let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory4>() }.ok()?;
     // SAFETY: `device` is live and `GetAdapterLuid` returns its LUID by value.
-    let Ok(adapter) = (unsafe { factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()) }) else { return 0 };
+    unsafe { factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()) }.ok()
+}
+
+fn local_vram_info(adapter: &IDXGIAdapter3) -> Option<(u64, u64)> {
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
+    };
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: `adapter` is live and `info` is plain output data.
+    unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }.ok()?;
+    Some((info.Budget, info.CurrentUsage))
+}
+
+fn dedicated_vram(adapter: Option<&IDXGIAdapter3>) -> u64 {
+    let Some(adapter) = adapter else { return 0 };
     // SAFETY: `adapter` is live.
     unsafe { adapter.GetDesc() }.map_or(0, |d| d.DedicatedVideoMemory as u64)
 }
@@ -784,7 +861,12 @@ struct State {
     last_journal_seq: Option<u64>,
     /// Pool heaps by index. A heap that cannot be made is `None` and is not tried again.
     heaps: Vec<Option<Heap>>,
-    pool: MirrorPool,
+    adapter: Option<IDXGIAdapter3>,
+    pool_mode: MirrorPoolMode,
+    fallback_budget: u64,
+    m_cap_override: Option<u64>,
+    l1_heaps: u64,
+    l0_heaps: u64,
     staging: Option<StagingRing>,
     /// The heaps that could not be made.
     failed: HashSet<u32>,
@@ -809,14 +891,22 @@ struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        let heaps = self.heaps.iter().flatten().count() as u64;
-        let seg = if self.pool == MirrorPool::L1 { crate::mem_owners::Segment::Local } else { crate::mem_owners::Segment::System };
-        crate::mem_owners::remove(
-            crate::mem_owners::Kind::TitleMirrorHeap,
-            seg,
-            heaps,
-            heaps * POOL_HEAP_BYTES,
-        );
+        if self.l1_heaps > 0 {
+            crate::mem_owners::remove(
+                crate::mem_owners::Kind::TitleMirrorHeap,
+                crate::mem_owners::Segment::Local,
+                self.l1_heaps,
+                self.l1_heaps * POOL_HEAP_BYTES,
+            );
+        }
+        if self.l0_heaps > 0 {
+            crate::mem_owners::remove(
+                crate::mem_owners::Kind::TitleMirrorHeap,
+                crate::mem_owners::Segment::System,
+                self.l0_heaps,
+                self.l0_heaps * POOL_HEAP_BYTES,
+            );
+        }
         let windows: Vec<_> = self.windows.iter().flatten().collect();
         crate::mem_owners::remove(
             crate::mem_owners::Kind::WindowReserved,
@@ -1098,7 +1188,7 @@ fn make_heap(device: &ID3D12Device, index: u32, pool: MirrorPool) -> windows::co
         1,
         POOL_HEAP_BYTES,
     );
-    Ok(Heap { _heap: heap, buffer, ptr })
+    Ok(Heap { _heap: heap, buffer, ptr, is_l1: pool == MirrorPool::L1 })
 }
 
 /// A window buffer: a reserved buffer of `bytes` bytes.
@@ -1121,22 +1211,53 @@ fn make_window(device: &ID3D12Device, bytes: u64, index: usize) -> windows::core
 }
 
 impl State {
-    /// The pool heap `index`, made when first needed. `None` when it cannot be made.
-    fn heap(&mut self, index: u32) -> Option<usize> {
+    /// The pool heap `index` as `(mapped_ptr, is_l1)`, made when first needed. `None` when it cannot be made.
+    fn heap(&mut self, index: u32) -> Option<(usize, bool)> {
         let i = index as usize;
         if self.heaps.len() <= i {
             self.heaps.resize_with(i + 1, || None);
         }
         if self.heaps[i].is_none() && !self.failed.contains(&index) {
-            match make_heap(&self.device, index, self.pool) {
-                Ok(heap) => self.heaps[i] = Some(heap),
+            let (budget, current_usage) = self
+                .adapter
+                .as_ref()
+                .and_then(local_vram_info)
+                .unwrap_or((self.fallback_budget, 0));
+            let want_l1 = self.staging.is_some()
+                && should_use_l1(
+                    self.pool_mode,
+                    budget,
+                    current_usage,
+                    self.l1_heaps * POOL_HEAP_BYTES,
+                    self.m_cap_override,
+                );
+            let made = if want_l1 {
+                match make_heap(&self.device, index, MirrorPool::L1) {
+                    Ok(h) => Ok(h),
+                    Err(e) => {
+                        xs_log!("title memory: L1 pool heap {index} failed ({e}), spilling to L0");
+                        make_heap(&self.device, index, MirrorPool::L0)
+                    }
+                }
+            } else {
+                make_heap(&self.device, index, MirrorPool::L0)
+            };
+            match made {
+                Ok(heap) => {
+                    if heap.is_l1 {
+                        self.l1_heaps += 1;
+                    } else {
+                        self.l0_heaps += 1;
+                    }
+                    self.heaps[i] = Some(heap);
+                }
                 Err(e) => {
                     self.failed.insert(index);
                     xs_log!("title memory: pool heap {index} cannot be made ({e}), its pages stay invisible to the GPU");
                 }
             }
         }
-        self.heaps[i].as_ref().map(|h| h.ptr)
+        self.heaps[i].as_ref().map(|h| (h.ptr, h.is_l1))
     }
 
     /// Makes the window buffers the mirror has slots in.
@@ -1346,7 +1467,7 @@ impl State {
 
     fn plan_runs(&mut self, api: &Api, pages: &[u32], jobs: &mut Vec<CopyJob>, runs: &mut Vec<UploadRun>, copied: &mut u64) {
         let mut i = 0;
-        let use_staging = self.pool == MirrorPool::L1;
+        let mut staged_pages = runs.iter().map(|r| (r.bytes / PAGE) as usize).sum::<usize>();
         while i < pages.len() {
             let first = pages[i];
             let Some(first_tile) = self.mirror.tile_of(first) else {
@@ -1362,7 +1483,7 @@ impl State {
             {
                 n += 1;
             }
-            let (Some(dst), Some((src, in_section))) = (self.heap(heap), self.source_section(api, first)) else {
+            let (Some((dst, use_staging)), Some((src, in_section))) = (self.heap(heap), self.source_section(api, first)) else {
                 i += n;
                 continue;
             };
@@ -1370,7 +1491,7 @@ impl State {
             let head = n.min(in_section);
             i += head;
             if use_staging {
-                let staging_offset = *copied as usize * PAGE as usize;
+                let staging_offset = staged_pages * PAGE as usize;
                 plan_copy(jobs, src, staging_offset, head);
                 runs.push(UploadRun {
                     heap,
@@ -1378,6 +1499,7 @@ impl State {
                     staging_offset: staging_offset as u64,
                     bytes: head as u64 * PAGE,
                 });
+                staged_pages += head;
             } else {
                 plan_copy(jobs, src, dst + tile as usize * PAGE as usize, head);
             }
@@ -1422,14 +1544,25 @@ pub unsafe fn device_created(device: *mut c_void) {
         return;
     };
     let env_pool = std::env::var("DECANT_D3D12X_MIRROR_POOL").ok();
-    let vram = dedicated_vram(&device);
-    let mut pool = parse_mirror_pool(env_pool.as_deref(), vram);
-    let staging = if pool == MirrorPool::L1 {
+    let env_l1_mib = std::env::var("DECANT_D3D12X_MIRROR_L1_MIB").ok();
+    let adapter = local_adapter(&device);
+    let dedicated = dedicated_vram(adapter.as_ref());
+    let (budget, _) = adapter.as_ref().and_then(local_vram_info).unwrap_or((dedicated, 0));
+    let mut pool_mode = parse_mirror_pool_mode(env_pool.as_deref());
+    let m_cap_override = parse_mirror_l1_mib(env_l1_mib.as_deref());
+    let vram_budget = VramBudget::from_budget(budget);
+    let effective_m_cap = m_cap_override.unwrap_or(vram_budget.m_cap);
+    let needs_staging = match pool_mode {
+        MirrorPoolMode::StrictL0 => false,
+        MirrorPoolMode::Auto => effective_m_cap > 0,
+        MirrorPoolMode::PreferL1 => true,
+    };
+    let staging = if needs_staging {
         match StagingRing::new(&device) {
             Ok(ring) => Some(ring),
             Err(e) => {
                 xs_log!("title memory: L1 staging ring cannot be made ({e}), falling back to L0 mirror heaps");
-                pool = MirrorPool::L0;
+                pool_mode = MirrorPoolMode::StrictL0;
                 None
             }
         }
@@ -1437,9 +1570,13 @@ pub unsafe fn device_created(device: *mut c_void) {
         None
     };
     xs_log!(
-        "title memory: mirror heaps use {} (dedicated VRAM {} MiB)",
-        if pool == MirrorPool::L1 { "L1 VRAM with upload staging" } else { "L0 system memory" },
-        vram >> 20
+        "title memory: mirror mode {:?} (dedicated {} MiB, budget {} MiB, hwm {} MiB, lwm {} MiB, l1 cap {} MiB)",
+        pool_mode,
+        dedicated >> 20,
+        budget >> 20,
+        vram_budget.hwm_total >> 20,
+        vram_budget.lwm_total >> 20,
+        effective_m_cap >> 20
     );
     let _sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut st = STATE.write().unwrap_or_else(PoisonError::into_inner);
@@ -1460,7 +1597,12 @@ pub unsafe fn device_created(device: *mut c_void) {
         seq: 0,
         last_journal_seq: None,
         heaps: Vec::new(),
-        pool,
+        adapter,
+        pool_mode,
+        fallback_budget: budget,
+        m_cap_override,
+        l1_heaps: 0,
+        l0_heaps: 0,
         staging,
         failed: HashSet::new(),
         windows: Vec::new(),
@@ -2334,14 +2476,59 @@ mod tests {
     }
 
     #[test]
-    fn mirror_pool_selects_l1_on_16_gib_vram_and_honors_env_override() {
-        assert_eq!(parse_mirror_pool(None, 8 << 30), MirrorPool::L0);
-        assert_eq!(parse_mirror_pool(None, 16 << 30), MirrorPool::L1);
-        assert_eq!(parse_mirror_pool(None, 24 << 30), MirrorPool::L1);
-        assert_eq!(parse_mirror_pool(Some("l0"), 24 << 30), MirrorPool::L0);
-        assert_eq!(parse_mirror_pool(Some("L0"), 24 << 30), MirrorPool::L0);
-        assert_eq!(parse_mirror_pool(Some("l1"), 4 << 30), MirrorPool::L1);
-        assert_eq!(parse_mirror_pool(Some("L1"), 4 << 30), MirrorPool::L1);
+    fn mirror_pool_mode_parses_auto_l0_and_l1_overrides() {
+        assert_eq!(parse_mirror_pool_mode(None), MirrorPoolMode::Auto);
+        assert_eq!(parse_mirror_pool_mode(Some("auto")), MirrorPoolMode::Auto);
+        assert_eq!(parse_mirror_pool_mode(Some("l0")), MirrorPoolMode::StrictL0);
+        assert_eq!(parse_mirror_pool_mode(Some("L0")), MirrorPoolMode::StrictL0);
+        assert_eq!(parse_mirror_pool_mode(Some("l1")), MirrorPoolMode::PreferL1);
+        assert_eq!(parse_mirror_pool_mode(Some("L1")), MirrorPoolMode::PreferL1);
+        assert_eq!(parse_mirror_l1_mib(Some("2048")), Some(2048 << 20));
+        assert_eq!(parse_mirror_l1_mib(None), None);
+    }
+
+    #[test]
+    fn vram_budget_matches_design_note_f_tiers() {
+        let b8 = VramBudget::from_budget(7_680 << 20);
+        assert_eq!(b8.r_drv, 1_536 << 20);
+        assert_eq!(b8.hwm_total, 6_144 << 20);
+        assert_eq!(b8.lwm_total, 5_120 << 20);
+        assert_eq!(b8.m_cap, 0);
+
+        let b12 = VramBudget::from_budget(11_520 << 20);
+        assert_eq!(b12.m_cap, 1_024 << 20);
+        assert_eq!(b12.r_drv, 1_843 << 20);
+        assert_eq!(b12.hwm_total, 9_677 << 20);
+
+        let b16 = VramBudget::from_budget(15_360 << 20);
+        assert_eq!(b16.m_cap, 2_048 << 20);
+        assert_eq!(b16.hwm_total, 12_903 << 20);
+        assert_eq!(b16.lwm_total, 11_367 << 20);
+
+        let b24 = VramBudget::from_budget(23_558 << 20);
+        assert_eq!(b24.r_drv, 3_769 << 20);
+        assert_eq!(b24.hwm_total, 19_789 << 20);
+        assert_eq!(b24.lwm_total, 17_434 << 20);
+        assert_eq!(b24.m_cap, 4_096 << 20);
+    }
+
+    #[test]
+    fn hybrid_mirror_spills_from_l1_to_l0_at_m_cap_and_hwm() {
+        let budget_24 = 23_558 << 20;
+        // Under both HWM_total and M_cap: Auto places heap in L1.
+        assert!(should_use_l1(MirrorPoolMode::Auto, budget_24, 10_000 << 20, 0, None));
+        assert!(should_use_l1(MirrorPoolMode::Auto, budget_24, 10_000 << 20, 4_080 << 20, None));
+        // At M_cap (4096 MiB): Auto spills cleanly to L0.
+        assert!(!should_use_l1(MirrorPoolMode::Auto, budget_24, 10_000 << 20, 4_096 << 20, None));
+        // Near HWM_total (19789 MiB): Auto and PreferL1 both spill to L0 before OOM.
+        assert!(!should_use_l1(MirrorPoolMode::Auto, budget_24, 19_780 << 20, 1_024 << 20, None));
+        assert!(!should_use_l1(MirrorPoolMode::PreferL1, budget_24, 19_780 << 20, 4_096 << 20, None));
+        // PreferL1 allows beyond M_cap while below HWM_total.
+        assert!(should_use_l1(MirrorPoolMode::PreferL1, budget_24, 10_000 << 20, 5_000 << 20, None));
+        // StrictL0 always stays on L0.
+        assert!(!should_use_l1(MirrorPoolMode::StrictL0, budget_24, 0, 0, None));
+        // 8 GiB class has M_cap = 0 so Auto stays on L0.
+        assert!(!should_use_l1(MirrorPoolMode::Auto, 7_680 << 20, 1_000 << 20, 0, None));
     }
 
     #[test]
