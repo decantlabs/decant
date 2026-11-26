@@ -1579,7 +1579,7 @@ fn wait_fence(fence: &ID3D12Fence, event: usize, target: u64, fence_value: &Atom
 }
 
 impl StagingRing {
-    fn new(device: &ID3D12Device, size_bytes: usize) -> windows::core::Result<Self> {
+    fn new(device: &ID3D12Device, size_bytes: usize, list_type: D3D12_COMMAND_LIST_TYPE) -> windows::core::Result<Self> {
         let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
         let mut buffer: Option<ID3D12Resource> = None;
         // SAFETY: plain D3D12 upload buffer creation on a live device.
@@ -1602,12 +1602,12 @@ impl StagingRing {
         let _ = unsafe { buffer.SetName(&windows::core::HSTRING::from("decant title mirror staging")) };
         let mut allocators = Vec::with_capacity(STAGING_ALLOCATORS);
         for _ in 0..STAGING_ALLOCATORS {
-            // SAFETY: plain D3D12 command allocator creation.
-            let alloc: ID3D12CommandAllocator = unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }?;
+            // SAFETY: plain D3D12 command allocator creation matching `map_queue`.
+            let alloc: ID3D12CommandAllocator = unsafe { device.CreateCommandAllocator(list_type) }?;
             allocators.push(alloc);
         }
-        // SAFETY: plain D3D12 command list creation and immediate close.
-        let list: ID3D12GraphicsCommandList = unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocators[0], None) }?;
+        // SAFETY: plain D3D12 command list creation matching `map_queue` and immediate close.
+        let list: ID3D12GraphicsCommandList = unsafe { device.CreateCommandList(0, list_type, &allocators[0], None) }?;
         // SAFETY: list was just opened above.
         unsafe { list.Close() }?;
         // SAFETY: plain Win32 auto-reset event.
@@ -2737,6 +2737,31 @@ fn update_call(queue: &ID3D12CommandQueue, window: &ID3D12Resource, call: &TileC
     crate::diagnose::removed_after(|| format!("UpdateTileMappings of {n} ranges on window buffer {} (heap {:?}, first tile {:?})", call.buffer, call.heap, call.ranges.first()));
 }
 
+/// Creates the private mirror queue used for `CopyBufferRegion`, `UpdateTileMappings`, and fence
+/// signals. Prefers a hardware copy queue (`D3D12_COMMAND_LIST_TYPE_COPY`) so mirror uploads and
+/// tile mapping updates remain independent of 3D and compute engine load or stalls, falling back to
+/// `D3D12_COMMAND_LIST_TYPE_DIRECT` only if copy queue creation fails.
+fn create_map_queue(device: &ID3D12Device) -> windows::core::Result<(ID3D12CommandQueue, D3D12_COMMAND_LIST_TYPE)> {
+    // SAFETY: plain D3D12 command queue creation on a live device.
+    let copy_q = unsafe {
+        device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        })
+    };
+    if let Ok(queue) = copy_q {
+        return Ok((queue, D3D12_COMMAND_LIST_TYPE_COPY));
+    }
+    // SAFETY: fallback to a direct queue on the same live device.
+    let queue = unsafe {
+        device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            ..Default::default()
+        })
+    }?;
+    Ok((queue, D3D12_COMMAND_LIST_TYPE_DIRECT))
+}
+
 /// Notes the PC device that the mirror is made on, with its private queue and fence. A second device
 /// starts a new mirror.
 ///
@@ -2748,9 +2773,10 @@ pub unsafe fn device_created(device: *mut c_void) {
     }
     // SAFETY: by the contract above. `from_raw_borrowed` takes no reference, the clone takes one.
     let Some(device) = (unsafe { ID3D12Device::from_raw_borrowed(&device) }).cloned() else { return };
-    let queue = unsafe { device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }) };
+    let queue = create_map_queue(&device);
+    // SAFETY: plain D3D12 fence creation on a live device.
     let fence = unsafe { device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) };
-    let (Ok(map_queue), Ok(map_fence)) = (queue, fence) else {
+    let (Ok((map_queue, map_queue_type)), Ok(map_fence)) = (queue, fence) else {
         xs_log!("title memory: the queue or the fence of the tile mappings cannot be made, title memory stays off");
         return;
     };
@@ -2774,7 +2800,7 @@ pub unsafe fn device_created(device: *mut c_void) {
         MirrorPoolMode::PreferL1 => true,
     };
     let staging = if needs_staging {
-        match StagingRing::new(&device, ring_bytes) {
+        match StagingRing::new(&device, ring_bytes, map_queue_type) {
             Ok(ring) => Some(ring),
             Err(e) => {
                 xs_log!("title memory: L1 staging ring cannot be made ({e}), falling back to L0 mirror heaps");
@@ -2785,8 +2811,9 @@ pub unsafe fn device_created(device: *mut c_void) {
     } else {
         None
     };
+    let map_queue_kind = if map_queue_type == D3D12_COMMAND_LIST_TYPE_COPY { "COPY" } else { "DIRECT" };
     xs_log!(
-        "title memory: mirror mode {:?} (dedicated {} MiB, budget {} MiB, hwm {} MiB, lwm {} MiB, l1 cap {} MiB, l0 cap {} MiB, staging {} MiB)",
+        "title memory: mirror mode {:?} (dedicated {} MiB, budget {} MiB, hwm {} MiB, lwm {} MiB, l1 cap {} MiB, l0 cap {} MiB, staging {} MiB, map queue {})",
         pool_mode,
         dedicated >> 20,
         budget >> 20,
@@ -2794,7 +2821,8 @@ pub unsafe fn device_created(device: *mut c_void) {
         vram_budget.lwm_total >> 20,
         effective_m_cap >> 20,
         l0_cap >> 20,
-        staging.as_ref().map_or(0, |r| r.size >> 20)
+        staging.as_ref().map_or(0, |r| r.size >> 20),
+        map_queue_kind
     );
     let has_staging = staging.is_some();
     let mut sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -5125,12 +5153,9 @@ mod tests {
 
         // SAFETY: plain D3D12 resource, queue, and fence setup on the test device above.
         unsafe {
-            let Ok(map_q) = dev.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                ..Default::default()
-            }) else {
-                return;
-            };
+            let Ok((map_q, map_q_type)) = create_map_queue(&dev) else { return };
+            assert_eq!(map_q_type, D3D12_COMMAND_LIST_TYPE_COPY);
+            assert_eq!(map_q.GetDesc().Type, D3D12_COMMAND_LIST_TYPE_COPY);
             let Ok(map_fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
             let Ok(comp_q) = dev.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
@@ -5139,7 +5164,7 @@ mod tests {
                 return;
             };
             let Ok(comp_fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
-            let Ok(mut ring) = StagingRing::new(&dev, (PAGE as usize) * 4) else { return };
+            let Ok(mut ring) = StagingRing::new(&dev, (PAGE as usize) * 4, map_q_type) else { return };
             let Ok(pool_heap) = make_heap(&dev, 0, MirrorPool::L1) else { return };
             let Ok(window) = make_window(&dev, PAGE * 4, 0) else { return };
 
@@ -5181,6 +5206,48 @@ mod tests {
             assert_eq!(wait_res, FenceWaitResult::Reached(final_val));
             let comp_res = wait_fence(&comp_fence, ring.event, 200, &fence_value, "test compute drain");
             assert_eq!(comp_res, FenceWaitResult::Reached(200));
+
+            // Verify copy-queue staging upload and tile mapping produce exact bytes readable from
+            // a separate queue after waiting on `map_fence`.
+            let pattern = 0x5A3C_96E1u32;
+            let base = ring.reserve(PAGE as usize, &map_fence, &fence_value).expect("staging pattern reserve");
+            let dst_words = std::slice::from_raw_parts_mut((ring.ptr + base) as *mut u32, (PAGE as usize) / 4);
+            dst_words.fill(pattern);
+            assert!(ring.copy_to_heaps(&map_q, &map_fence, &heaps, (base, PAGE as usize), &runs, &fence_value));
+            let rb_props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let mut readback: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &rb_props,
+                D3D12_HEAP_FLAG_NONE,
+                &buffer_desc(PAGE, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut readback,
+            )
+            .expect("readback buffer");
+            let readback = readback.expect("readback handle");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("direct alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("direct list");
+            rb_list.CopyBufferRegion(&readback, 0, &window.resource, 0, PAGE);
+            rb_list.Close().expect("close readback list");
+            let rb_cmd: ID3D12CommandList = rb_list.cast().expect("cast cmd");
+            let direct_q: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("direct queue");
+            let direct_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("direct fence");
+            wait_queue_for_map_fence(&direct_q, direct_q.as_raw() as usize, &map_fence, &fence_value, &mut waited);
+            direct_q.ExecuteCommandLists(&[Some(rb_cmd)]);
+            direct_q.Signal(&direct_fence, 1).expect("direct signal");
+            assert_eq!(wait_fence(&direct_fence, ring.event, 1, &fence_value, "readback drain"), FenceWaitResult::Reached(1));
+            let mut rb_ptr = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut rb_ptr)).expect("map readback");
+            let rb_words = std::slice::from_raw_parts(rb_ptr.cast::<u32>(), (PAGE as usize) / 4);
+            assert_eq!(rb_words[0], pattern);
+            assert_eq!(rb_words[rb_words.len() - 1], pattern);
+            readback.Unmap(0, None);
         }
     }
 }

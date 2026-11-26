@@ -26,7 +26,7 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, WaitForSingleObject};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, EnumWindows, GetClientRect, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
@@ -51,6 +51,66 @@ fn enabled() -> bool {
 }
 
 const TIMESTAMP_RING_SLOTS: usize = 2;
+
+/// Maximum time `present::show` waits for a previous back buffer copy to finish before reporting a
+/// stalled graphics queue and skipping this present without resetting the live command allocator.
+const PRESENT_FENCE_WAIT_MS: u64 = 10_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentFenceWait {
+    Reached(u64),
+    DeviceRemoved,
+    TimedOut { completed: u64, target: u64 },
+}
+
+fn wait_present_fence_with(
+    target: u64,
+    timeout_ms: u64,
+    mut completed: impl FnMut() -> u64,
+    mut arm: impl FnMut(u64) -> bool,
+    mut wait_ms: impl FnMut(u32),
+    mut elapsed_ms: impl FnMut() -> u64,
+) -> PresentFenceWait {
+    let cur = completed();
+    if cur == u64::MAX {
+        return PresentFenceWait::DeviceRemoved;
+    }
+    if cur >= target {
+        return PresentFenceWait::Reached(cur);
+    }
+    loop {
+        let elapsed = elapsed_ms();
+        if elapsed >= timeout_ms {
+            let final_val = completed();
+            return if final_val == u64::MAX {
+                PresentFenceWait::DeviceRemoved
+            } else if final_val >= target {
+                PresentFenceWait::Reached(final_val)
+            } else {
+                PresentFenceWait::TimedOut { completed: final_val, target }
+            };
+        }
+        if !arm(target) {
+            let final_val = completed();
+            return if final_val == u64::MAX {
+                PresentFenceWait::DeviceRemoved
+            } else if final_val >= target {
+                PresentFenceWait::Reached(final_val)
+            } else {
+                PresentFenceWait::TimedOut { completed: final_val, target }
+            };
+        }
+        let rem = (timeout_ms - elapsed).clamp(1, u64::from(u32::MAX)) as u32;
+        wait_ms(rem);
+        let cur = completed();
+        if cur == u64::MAX {
+            return PresentFenceWait::DeviceRemoved;
+        }
+        if cur >= target {
+            return PresentFenceWait::Reached(cur);
+        }
+    }
+}
 
 /// Converts a pair of D3D12 GPU timestamps `(start, end)` at tick frequency `freq` Hz to
 /// milliseconds. Returns `None` when `freq == 0` or `end < start`.
@@ -700,18 +760,57 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
         (|| {
             let i = ring_index(u64::from(p.swap.GetCurrentBackBufferIndex()), TIMESTAMP_RING_SLOTS);
             let mut wait_ns = 0u128;
-            if p.fence.GetCompletedValue() < p.marks[i] {
+            let done_now = p.fence.GetCompletedValue();
+            if done_now == u64::MAX {
+                return Err(p.dev.GetDeviceRemovedReason().err().unwrap_or_else(|| {
+                    windows::core::Error::from_hresult(windows::core::HRESULT(0x887A_0005_u32 as i32))
+                }));
+            }
+            if done_now < p.marks[i] {
                 let _wait = decant_trace::span("present", "fence_wait");
-                let wait_began = trace_on.then(std::time::Instant::now);
-                if let Some(ev) = p.wait_event {
-                    p.fence.SetEventOnCompletion(p.marks[i], ev)?;
-                    WaitForSingleObject(ev, INFINITE);
+                let wait_began = std::time::Instant::now();
+                let wait_res = if let Some(ev) = p.wait_event {
+                    wait_present_fence_with(
+                        p.marks[i],
+                        PRESENT_FENCE_WAIT_MS,
+                        || p.fence.GetCompletedValue(),
+                        |t| p.fence.SetEventOnCompletion(t, ev).is_ok(),
+                        |ms| {
+                            WaitForSingleObject(ev, ms);
+                        },
+                        || wait_began.elapsed().as_millis() as u64,
+                    )
                 } else {
-                    // A null event makes the call wait until the value is reached.
-                    p.fence.SetEventOnCompletion(p.marks[i], HANDLE::default())?;
+                    // Fallback when event creation failed: poll bounded to PRESENT_FENCE_WAIT_MS.
+                    wait_present_fence_with(
+                        p.marks[i],
+                        PRESENT_FENCE_WAIT_MS,
+                        || p.fence.GetCompletedValue(),
+                        |_| true,
+                        |ms| std::thread::sleep(std::time::Duration::from_millis(u64::from(ms.min(5)))),
+                        || wait_began.elapsed().as_millis() as u64,
+                    )
+                };
+                if trace_on {
+                    wait_ns += wait_began.elapsed().as_nanos();
                 }
-                if let Some(b) = wait_began {
-                    wait_ns += b.elapsed().as_nanos();
+                match wait_res {
+                    PresentFenceWait::Reached(_) => {}
+                    PresentFenceWait::DeviceRemoved => {
+                        return Err(p.dev.GetDeviceRemovedReason().err().unwrap_or_else(|| {
+                            windows::core::Error::from_hresult(windows::core::HRESULT(0x887A_0005_u32 as i32))
+                        }));
+                    }
+                    PresentFenceWait::TimedOut { completed, target } => {
+                        let removed = p.dev.GetDeviceRemovedReason().err().map_or(0u32, |e| e.code().0 as u32);
+                        let queue_addr = p.queue.as_raw() as usize;
+                        let subs = crate::pso_diag::peek_queue_submissions(queue_addr);
+                        let summary = crate::pso_diag::format_submissions(&subs);
+                        xs_log!(
+                            "present: graphics queue {queue_addr:#x} fence stalled at {completed} waiting for {target} after {PRESENT_FENCE_WAIT_MS} ms (removed {removed:#x}), recent submissions: {summary}"
+                        );
+                        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8007_0102_u32 as i32)));
+                    }
                 }
             }
             let gpu_frame_ms = if trace_on {
@@ -1306,5 +1405,47 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(count.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn wait_present_fence_with_handles_completion_removal_spurious_wakes_and_timeout() {
+        assert_eq!(
+            wait_present_fence_with(5, 1000, || 5, |_| true, |_| {}, || 0),
+            PresentFenceWait::Reached(5)
+        );
+        assert_eq!(
+            wait_present_fence_with(5, 1000, || u64::MAX, |_| true, |_| {}, || 0),
+            PresentFenceWait::DeviceRemoved
+        );
+
+        let mut polls = 0u64;
+        let clock = std::cell::Cell::new(0u64);
+        assert_eq!(
+            wait_present_fence_with(
+                7,
+                1000,
+                || {
+                    polls += 1;
+                    if polls >= 3 { 7 } else { 6 }
+                },
+                |_| true,
+                |_| clock.set(clock.get() + 10),
+                || clock.get(),
+            ),
+            PresentFenceWait::Reached(7)
+        );
+
+        let clock = std::cell::Cell::new(0u64);
+        assert_eq!(
+            wait_present_fence_with(
+                9,
+                100,
+                || 4,
+                |_| true,
+                |ms| clock.set(clock.get() + u64::from(ms)),
+                || clock.get(),
+            ),
+            PresentFenceWait::TimedOut { completed: 4, target: 9 }
+        );
     }
 }

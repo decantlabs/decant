@@ -303,6 +303,8 @@ struct Job {
     writes: Vec<CpuWrite>,
     /// The clock of the queue, present when some write is a timestamp.
     clock: Option<Clock>,
+    /// Pipelines submitted on `queue` since the previous fence signal, for silent-stall diagnostics.
+    submissions: Vec<crate::pso_diag::QueueSubmission>,
     guard: JobActivityGuard,
 }
 
@@ -375,6 +377,14 @@ impl Job {
                                 "bottom-of-pipe writes: queue {:#x} fence stalled at {after} waiting for {}, applying writes after {limit_ms} ms ({n} so far)",
                                 self.queue,
                                 self.value
+                            );
+                        }
+                        if !already_stalled && !self.submissions.is_empty() {
+                            xs_log!(
+                                "bottom-of-pipe writes: queue {:#x} stalled submissions before fence {}: {}",
+                                self.queue,
+                                self.value,
+                                crate::pso_diag::format_submissions(&self.submissions)
                             );
                         }
                     }
@@ -712,7 +722,8 @@ pub(crate) unsafe fn after(queue: Object, writes: Vec<CpuWrite>) {
             return;
         }
         let guard = slot.activity.enqueue();
-        let job = Job { queue: queue as usize, fence: *fence, value: *signalled, writes, clock, guard };
+        let submissions = crate::pso_diag::take_queue_submissions(queue as usize);
+        let job = Job { queue: queue as usize, fence: *fence, value: *signalled, writes, clock, submissions, guard };
         (sender, job)
     };
     if ANNOUNCED.fetch_add(1, Ordering::Relaxed) < 3 {

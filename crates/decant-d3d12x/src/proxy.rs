@@ -4185,6 +4185,7 @@ unsafe fn execute_closed(pc: Object, lists: &[Object]) {
     if UNCLOSED_COUNT.load(Ordering::Relaxed) == 0 {
         // SAFETY: by the contract above.
         unsafe { method::<Execute>(pc, 10)(pc, lists.len() as u32, lists.as_ptr()) };
+        record_executed_lists(pc, lists);
         crate::diagnose::removed_after(|| format!("a title submission of {} lists on queue {pc:p}", lists.len()));
         return;
     }
@@ -4197,7 +4198,26 @@ unsafe fn execute_closed(pc: Object, lists: &[Object]) {
     }
     // SAFETY: by the contract above.
     unsafe { method::<Execute>(pc, 10)(pc, kept.len() as u32, kept.as_ptr()) };
+    record_executed_lists(pc, &kept);
     crate::diagnose::removed_after(|| format!("a title submission of {} lists on queue {pc:p}", kept.len()));
+}
+
+fn record_executed_lists(pc: Object, lists: &[Object]) {
+    if lists.is_empty() {
+        return;
+    }
+    let mut stack = [0usize; STACK_LISTS];
+    let heap;
+    let addrs: &[usize] = if lists.len() <= STACK_LISTS {
+        for (dst, &src) in stack[..lists.len()].iter_mut().zip(lists) {
+            *dst = src as usize;
+        }
+        &stack[..lists.len()]
+    } else {
+        heap = lists.iter().map(|&l| l as usize).collect::<Vec<_>>();
+        &heap
+    };
+    crate::pso_diag::record_submission(pc as usize, addrs);
 }
 
 /// Lists of a submission kept on the stack before a heap allocation is needed.

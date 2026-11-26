@@ -13,7 +13,7 @@
 
 #![allow(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -144,6 +144,21 @@ pub struct RecordedOp {
     pub pso: ActivePso,
 }
 
+/// Pipelines bound on one queue submission, retained for stalled-queue diagnostics when the GPU
+/// hangs without reporting device removal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueSubmission {
+    pub list_count: usize,
+    pub psos: Vec<ActivePso>,
+    pub overflow_psos: usize,
+    pub ops: Vec<RecordedOp>,
+}
+
+const MAX_BOUND_PSOS_PER_LIST: usize = 16;
+const MAX_PENDING_SUBMISSIONS_PER_QUEUE: usize = 16;
+const MAX_SUBMISSION_PSOS: usize = 16;
+const MAX_SUBMISSION_OPS: usize = 16;
+
 #[derive(Default)]
 struct State {
     /// Stand in number to the description of the refused pipeline it stands for.
@@ -156,12 +171,55 @@ struct State {
     frame_skips: BTreeMap<u32, u64>,
     /// Command list pointer (PC list when available, otherwise proxy) to its active pipeline.
     active: HashMap<usize, ActivePso>,
+    /// Distinct non-missing pipelines bound on each PC command list since its last reset, plus any
+    /// overflow count beyond [`MAX_BOUND_PSOS_PER_LIST`].
+    bound_psos: HashMap<usize, (Vec<ActivePso>, usize)>,
     /// Command list proxy pointer to its PC command list pointer.
     proxy_to_pc: HashMap<usize, usize>,
     /// Pipeline pointer to its recorded number and shader hashes.
     pipelines: HashMap<usize, ActivePso>,
     /// Per PC command list recorded draws and dispatches for exact DRED breadcrumb matching.
     recorded_ops: HashMap<usize, Vec<RecordedOp>>,
+    /// Recent submissions on each PC command queue since the last bottom-of-pipe fence signal.
+    pending_submissions: HashMap<usize, VecDeque<QueueSubmission>>,
+}
+
+fn pso_matches(a: &ActivePso, b: &ActivePso) -> bool {
+    (a.number.is_some() && a.number == b.number) || (a.pso != 0 && a.pso == b.pso)
+}
+
+fn push_unique_pso(out: &mut Vec<ActivePso>, overflow: &mut usize, cap: usize, entry: ActivePso, alias_pso: usize) {
+    if entry.missing || (entry.number.is_none() && entry.pso == 0) {
+        return;
+    }
+    if let Some(existing) = out
+        .iter_mut()
+        .find(|e| pso_matches(e, &entry) || (alias_pso != 0 && e.pso == alias_pso))
+    {
+        if existing.number.is_none() {
+            existing.number = entry.number;
+        }
+        if existing.shaders.is_empty() && !entry.shaders.is_empty() {
+            existing.shaders = entry.shaders;
+        }
+        if entry.pso != 0 && existing.pso == 0 {
+            existing.pso = entry.pso;
+        }
+        return;
+    }
+    if out.len() < cap {
+        out.push(entry);
+    } else {
+        *overflow += 1;
+    }
+}
+
+fn record_bound_pso(state: &mut State, track_key: usize, entry: &ActivePso, alias_pso: usize) {
+    if track_key == 0 || entry.missing {
+        return;
+    }
+    let (list, overflow) = state.bound_psos.entry(track_key).or_default();
+    push_unique_pso(list, overflow, MAX_BOUND_PSOS_PER_LIST, entry.clone(), alias_pso);
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -255,6 +313,7 @@ pub unsafe fn bind(list: usize, pso: *mut c_void) -> bool {
                 let mut entry = s.pipelines.get(&(pso as usize)).cloned().unwrap_or_default();
                 entry.pso = pso as usize;
                 entry.number = entry.number.or(lazy_number);
+                record_bound_pso(s, track_key, &entry, 0);
                 s.active.insert(track_key, entry);
             }
         }
@@ -292,6 +351,14 @@ pub fn bind_missing(list: usize) {
         if key != 0 {
             let entry = s.active.entry(key).or_default();
             entry.missing = true;
+            let missing_pso = entry.pso;
+            let missing_num = entry.number;
+            if let Some((bound, _)) = s.bound_psos.get_mut(&key) {
+                bound.retain(|e| {
+                    let same = (missing_pso != 0 && e.pso == missing_pso) || (missing_num.is_some() && e.number == missing_num);
+                    !(same && e.shaders.is_empty())
+                });
+            }
         }
     });
 }
@@ -330,7 +397,16 @@ pub fn bind_resolved(list: usize, pc_list: usize, title_pso: usize, pc_pso: usiz
             s.proxy_to_pc.insert(list, pc_list);
         }
         if let Some(entry) = s.pipelines.get(&title_pso).or_else(|| s.pipelines.get(&pc_pso)).cloned() {
+            record_bound_pso(s, track_key, &entry, title_pso);
             s.active.insert(track_key, entry);
+        } else if pc_pso != 0 {
+            let fallback = s.active.get(&track_key).cloned().unwrap_or(ActivePso {
+                number: None,
+                pso: pc_pso,
+                shaders: String::new(),
+                missing: false,
+            });
+            record_bound_pso(s, track_key, &fallback, title_pso);
         }
     });
 }
@@ -344,6 +420,7 @@ pub fn rebind_pc_list(list: usize, new_pc_list: usize) {
     with(|s| {
         s.proxy_to_pc.insert(list, new_pc_list);
         s.active.remove(&new_pc_list);
+        s.bound_psos.remove(&new_pc_list);
         s.recorded_ops.remove(&new_pc_list);
     });
 }
@@ -356,8 +433,112 @@ pub fn reset_pc_list(pc_list: usize) {
     }
     with(|s| {
         s.active.remove(&pc_list);
+        s.bound_psos.remove(&pc_list);
         s.recorded_ops.remove(&pc_list);
     });
+}
+
+/// Records the pipelines bound on `pc_lists` for `queue` so a later silent GPU stall (where
+/// `GetDeviceRemovedReason` stays `S_OK`) can still report which pipelines and shader hashes were
+/// submitted before the stalled fence.
+pub fn record_submission(queue: usize, pc_lists: &[usize]) {
+    if queue == 0 || pc_lists.is_empty() {
+        return;
+    }
+    with(|s| {
+        let mut psos = Vec::new();
+        let mut overflow_psos = 0usize;
+        let mut ops = Vec::new();
+        for &pc_list in pc_lists {
+            if pc_list == 0 {
+                continue;
+            }
+            if let Some((bound, extra)) = s.bound_psos.get(&pc_list) {
+                overflow_psos += *extra;
+                for p in bound {
+                    push_unique_pso(&mut psos, &mut overflow_psos, MAX_SUBMISSION_PSOS, p.clone(), 0);
+                }
+            } else if let Some(active) = s.active.get(&pc_list) {
+                push_unique_pso(&mut psos, &mut overflow_psos, MAX_SUBMISSION_PSOS, active.clone(), 0);
+            }
+            if ops.len() < MAX_SUBMISSION_OPS
+                && let Some(recorded) = s.recorded_ops.get(&pc_list)
+            {
+                let take = (MAX_SUBMISSION_OPS - ops.len()).min(recorded.len());
+                ops.extend(recorded[..take].iter().cloned());
+            }
+        }
+        let ring = s.pending_submissions.entry(queue).or_default();
+        if ring.len() >= MAX_PENDING_SUBMISSIONS_PER_QUEUE {
+            ring.pop_front();
+        }
+        ring.push_back(QueueSubmission { list_count: pc_lists.len(), psos, overflow_psos, ops });
+    });
+}
+
+/// Drains all submissions recorded on `queue` since the previous bottom-of-pipe fence signal.
+pub fn take_queue_submissions(queue: usize) -> Vec<QueueSubmission> {
+    if queue == 0 {
+        return Vec::new();
+    }
+    with(|s| s.pending_submissions.remove(&queue).map_or_else(Vec::new, Vec::from))
+}
+
+/// Returns a snapshot of recent submissions recorded on `queue` without draining them.
+pub fn peek_queue_submissions(queue: usize) -> Vec<QueueSubmission> {
+    if queue == 0 {
+        return Vec::new();
+    }
+    with(|s| s.pending_submissions.get(&queue).map_or_else(Vec::new, |q| q.iter().cloned().collect()))
+}
+
+/// Formats one or more queue submissions into a compact summary naming bound pipelines, shader
+/// hashes, and any recorded draws or dispatches.
+pub fn format_submissions(submissions: &[QueueSubmission]) -> String {
+    if submissions.is_empty() {
+        return String::from("none recorded");
+    }
+    let total_lists: usize = submissions.iter().map(|s| s.list_count).sum();
+    let mut psos = Vec::new();
+    let mut overflow = 0usize;
+    let mut ops = Vec::new();
+    for sub in submissions {
+        overflow += sub.overflow_psos;
+        for p in &sub.psos {
+            push_unique_pso(&mut psos, &mut overflow, MAX_SUBMISSION_PSOS, p.clone(), 0);
+        }
+        if ops.len() < MAX_SUBMISSION_OPS {
+            let take = (MAX_SUBMISSION_OPS - ops.len()).min(sub.ops.len());
+            ops.extend(sub.ops[..take].iter().cloned());
+        }
+    }
+    let mut out = format!("{} submission(s), {} list(s)", submissions.len(), total_lists);
+    if psos.is_empty() {
+        out.push_str(", no pipelines bound");
+    } else {
+        out.push_str(", pipelines: ");
+        let joined = psos.iter().map(ActivePso::format_summary).collect::<Vec<_>>().join(", ");
+        out.push_str(&joined);
+        if overflow > 0 {
+            out.push_str(&format!(" (+{overflow} more)"));
+        }
+    }
+    if !ops.is_empty() {
+        let formatted_ops = ops
+            .iter()
+            .map(|op| {
+                if op.detail.is_empty() {
+                    format!("{} on {}", op.kind.label(), op.pso.format_summary())
+                } else {
+                    format!("{} {} on {}", op.kind.label(), op.detail, op.pso.format_summary())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(", ops: ");
+        out.push_str(&formatted_ops);
+    }
+    out
 }
 
 /// Records one draw or dispatch on `pc_list` alongside the currently active pipeline.
@@ -429,9 +610,11 @@ fn forget_list(list: usize) {
     }
     with(|s| {
         s.active.remove(&list);
+        s.bound_psos.remove(&list);
         s.recorded_ops.remove(&list);
         if let Some(pc) = s.proxy_to_pc.get(&list).copied() {
             s.active.remove(&pc);
+            s.bound_psos.remove(&pc);
             s.recorded_ops.remove(&pc);
         }
     });
@@ -745,6 +928,58 @@ mod tests {
         assert_eq!(recorded_op(pc_a, RecordedOpKind::Dispatch, 0), None);
         assert_eq!(active_pso(pc_a), None);
         assert!(recorded_op(pc_b, RecordedOpKind::Dispatch, 0).is_some());
+        reset_pc_list(pc_b);
+    }
+
+    #[test]
+    fn records_and_drains_queue_submissions_preserving_earlier_pipelines() {
+        let queue = 0x5001_0000usize;
+        let pc_a = 0x5001_0010usize;
+        let pc_b = 0x5001_0020usize;
+        let proxy_a: [usize; 2] = [0x9000, pc_a];
+        let proxy_b: [usize; 2] = [0x9000, pc_b];
+        let pso_vtbl: usize = 0x8000;
+        let pso1_stub: [usize; 2] = [&raw const pso_vtbl as usize, 0];
+        let pso2_stub: [usize; 2] = [&raw const pso_vtbl as usize, 0];
+        let pso_missing_stub: [usize; 2] = [&raw const pso_vtbl as usize, 0];
+        let pso1 = pso1_stub.as_ptr() as *mut c_void;
+        let pso2 = pso2_stub.as_ptr() as *mut c_void;
+        let pso_missing = pso_missing_stub.as_ptr() as *mut c_void;
+
+        let _ = take_queue_submissions(queue);
+        reset_pc_list(pc_a);
+        reset_pc_list(pc_b);
+
+        register_pipeline_summary(pso1 as usize, 0x5101, Some(101), "CS aaaa0000bbbb1111 direct".to_owned());
+        register_pipeline_summary(pso2 as usize, 0x5102, Some(202), "CS cccc2222dddd3333 direct".to_owned());
+
+        // SAFETY: proxies store their PC command list in word 1 and PSO stubs start with a vtable pointer.
+        unsafe {
+            assert!(!bind(proxy_a.as_ptr() as usize, pso1));
+            bind_resolved(proxy_a.as_ptr() as usize, pc_a, pso1 as usize, 0x5101);
+            assert!(!bind(proxy_a.as_ptr() as usize, pso_missing));
+            bind_missing(proxy_a.as_ptr() as usize);
+            assert!(!bind(proxy_b.as_ptr() as usize, pso2));
+            bind_resolved(proxy_b.as_ptr() as usize, pc_b, pso2 as usize, 0x5102);
+        }
+
+        // Two separate submissions before a fence signal: both stay captured when drained.
+        record_submission(queue, &[pc_a]);
+        record_submission(queue, &[pc_b]);
+        let peeked = peek_queue_submissions(queue);
+        assert_eq!(peeked.len(), 2);
+
+        let drained = take_queue_submissions(queue);
+        assert_eq!(drained.len(), 2);
+        assert!(take_queue_submissions(queue).is_empty());
+
+        let text = format_submissions(&drained);
+        assert!(text.contains("2 submission(s), 2 list(s)"), "{text}");
+        assert!(text.contains("pipeline 101 [CS aaaa0000bbbb1111 direct]"), "{text}");
+        assert!(text.contains("pipeline 202 [CS cccc2222dddd3333 direct]"), "{text}");
+        assert!(!text.contains(&format!("{:#x}", pso_missing as usize)), "missing pipeline must not be blamed: {text}");
+
+        reset_pc_list(pc_a);
         reset_pc_list(pc_b);
     }
 }
