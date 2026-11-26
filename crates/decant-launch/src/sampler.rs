@@ -57,6 +57,10 @@ fn is_ntdll_top(key: &str) -> bool {
     key.starts_with("ntdll.dll+") || key.starts_with("ntdll!")
 }
 
+fn is_idle_top(key: &str) -> bool {
+    is_ntdll_top(key) || key.starts_with("win32u.dll+") || key.starts_with("win32u!")
+}
+
 /// Sample counts per thread and key.
 #[derive(Default)]
 pub struct Profile {
@@ -122,8 +126,15 @@ impl Profile {
             let mut agg_keys: Vec<(String, u64)> = agg.into_iter().collect();
             agg_keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             let _ = writeln!(out, "aggregated (all threads, top {top_agg}):");
-            for (k, n) in agg_keys.into_iter().take(top_agg) {
-                let _ = writeln!(out, "  {:5.1}% {n:6} {k}", 100.0 * n as f64 / total_all as f64);
+            for (k, n) in agg_keys.iter().take(top_agg) {
+                let _ = writeln!(out, "  {:5.1}% {n:6} {k}", 100.0 * *n as f64 / total_all as f64);
+            }
+            let active_total: u64 = agg_keys.iter().filter(|(k, _)| !is_idle_top(k)).map(|(_, n)| *n).sum();
+            if active_total > 0 {
+                let _ = writeln!(out, "active (outside ntdll/win32u, top 20):");
+                for (k, n) in agg_keys.iter().filter(|(k, _)| !is_idle_top(k)).take(20) {
+                    let _ = writeln!(out, "  {:5.1}% {n:6} {k}", 100.0 * *n as f64 / active_total as f64);
+                }
             }
         }
         threads.sort_by_key(|(tid, m)| (std::cmp::Reverse(busy(m)), *tid));
@@ -201,5 +212,24 @@ mod tests {
             (addr == 0x1010).then(|| "a!foo+0x10".to_owned())
         });
         assert_eq!(k, "a!foo+0x10 < t.exe+0x20 < a.dll+0xff0");
+    }
+
+    #[test]
+    fn active_section_excludes_ntdll_and_win32u_idle_stacks() {
+        let mut p = Profile::default();
+        p.add(1, "ntdll!NtWaitForSingleObject+0x14".into());
+        p.add(2, "win32u.dll+0x100".into());
+        p.add(3, "win32u!NtUserMsgWaitForMultipleObjectsEx+0x14".into());
+        p.add(4, "d3d12_xs!busy+0x10".into());
+        p.add(4, "d3d12_xs!busy+0x10".into());
+        p.add(5, "xmem!work+0x20".into());
+        p.tick();
+        let r = p.take_window_report(0.0, 30.0, 5, 5, 10);
+        let active_idx = r.find("active (outside ntdll/win32u, top 20):").expect("active section missing");
+        let thread_idx = r.find("thread 4:").expect("thread section missing");
+        let active_sec = &r[active_idx..thread_idx];
+        assert!(active_sec.contains(" 66.7%      2 d3d12_xs!busy+0x10"), "{active_sec}");
+        assert!(active_sec.contains(" 33.3%      1 xmem!work+0x20"), "{active_sec}");
+        assert!(!active_sec.contains("ntdll!") && !active_sec.contains("win32u!") && !active_sec.contains("win32u.dll"), "{active_sec}");
     }
 }
