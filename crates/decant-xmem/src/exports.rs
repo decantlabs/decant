@@ -988,6 +988,11 @@ fn this_module() -> HMODULE {
 extern "C" fn on_process_attach() {
     // SAFETY: the handle is this module, loaded while this code runs.
     unsafe { DisableThreadLibraryCalls(this_module()) };
+    #[cfg(target_arch = "x86_64")]
+    crate::cpu_emu_veh::install();
+    if crate::io_guard::has_xgr_redirect() {
+        crate::io_guard::install();
+    }
     decant_log::trace("[xmem] Decant xmem.dll charge\r\n");
 }
 

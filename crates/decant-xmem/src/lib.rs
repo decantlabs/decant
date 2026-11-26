@@ -14,6 +14,8 @@ pub mod pages;
 pub mod regions;
 pub mod track;
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod cpu_emu_veh;
 #[cfg(windows)]
 mod engine;
 #[cfg(windows)]

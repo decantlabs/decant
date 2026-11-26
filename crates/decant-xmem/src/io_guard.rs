@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use windows_sys::Win32::Foundation::{ERROR_NOACCESS, GetLastError, HMODULE, SetLastError};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
@@ -31,21 +31,52 @@ const SEGMENT_BYTES: usize = 4096;
 type ReadFileFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32, *mut c_void) -> BOOL;
 type ReadFileExFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, *mut c_void) -> BOOL;
 type ReadFileScatterFn = unsafe extern "system" fn(*mut c_void, *const u64, u32, *mut u32, *mut c_void) -> BOOL;
+type LoadLibraryExWFn = unsafe extern "system" fn(*const u16, *mut c_void, u32) -> HMODULE;
 
 /// The functions that were in the tables before the patch, 0 until a table was patched.
-static ORIGINAL: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static ORIGINAL: [AtomicUsize; 4] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
 /// The modules whose tables were looked at.
 static DONE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static XGR_PATH: OnceLock<Option<Vec<u16>>> = OnceLock::new();
 
-/// Whether an import table named `dll` can hold the file functions.
-fn wanted_dll(dll: &str) -> bool {
-    let lower = dll.to_ascii_lowercase();
-    lower == "kernel32.dll" || lower == "kernelbase.dll" || (lower.starts_with("api-ms-win-core-file-") && lower.ends_with(".dll"))
+fn xgr_path() -> Option<&'static [u16]> {
+    XGR_PATH
+        .get_or_init(|| {
+            let val = std::env::var("DECANT_XGR_PATH").ok()?;
+            let trimmed = val.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let mut wide: Vec<u16> = trimmed.encode_utf16().collect();
+            wide.push(0);
+            Some(wide)
+        })
+        .as_deref()
 }
 
-/// The index in `ORIGINAL` of an imported function, when it is one of the three.
+/// Whether `DECANT_XGR_PATH` is set for in-process `LoadLibraryExW` redirection.
+pub fn has_xgr_redirect() -> bool {
+    xgr_path().is_some()
+}
+
+/// Whether `name` is a load of `xgameruntime.dll`.
+pub(crate) fn is_xgameruntime_load(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower == "xgameruntime.dll" || lower.ends_with("\\xgameruntime.dll") || lower.ends_with("/xgameruntime.dll")
+}
+
+/// Whether an import table named `dll` can hold the file or library loader functions.
+fn wanted_dll(dll: &str) -> bool {
+    let lower = dll.to_ascii_lowercase();
+    lower == "kernel32.dll"
+        || lower == "kernelbase.dll"
+        || (lower.starts_with("api-ms-win-core-file-") && lower.ends_with(".dll"))
+        || (lower.starts_with("api-ms-win-core-libraryloader-") && lower.ends_with(".dll"))
+}
+
+/// The index in `ORIGINAL` of an imported function, when it is one of the hooked functions.
 fn wanted_function(name: &str) -> Option<usize> {
-    ["ReadFile", "ReadFileEx", "ReadFileScatter"].iter().position(|&n| n == name)
+    ["ReadFile", "ReadFileEx", "ReadFileScatter", "LoadLibraryExW"].iter().position(|&n| n == name)
 }
 
 /// Coalesces contiguous `SEGMENT_BYTES` scatter segments into maximal `(base, run_len)` runs.
@@ -137,8 +168,36 @@ unsafe extern "system" fn read_file_scatter(file: *mut c_void, segments: *const 
     result
 }
 
+unsafe extern "system" fn load_library_ex_w(lib_name: *const u16, file: *mut c_void, flags: u32) -> HMODULE {
+    let target = if !lib_name.is_null()
+        && let Some(redirect) = xgr_path()
+    {
+        let mut len = 0usize;
+        // SAFETY: `lib_name` is a NUL-terminated UTF-16 string passed to `LoadLibraryExW`.
+        while len < 1024 && unsafe { *lib_name.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `len` UTF-16 units were just checked before the terminator.
+        let requested = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(lib_name, len) });
+        if is_xgameruntime_load(&requested) {
+            redirect.as_ptr()
+        } else {
+            lib_name
+        }
+    } else {
+        lib_name
+    };
+    // SAFETY: `ORIGINAL[3]` holds the original `LoadLibraryExW` address before this wrapper was installed.
+    unsafe { std::mem::transmute::<usize, LoadLibraryExWFn>(ORIGINAL[3].load(Ordering::Acquire))(target, file, flags) }
+}
+
 fn wrapper(index: usize) -> usize {
-    [read_file as *const () as usize, read_file_ex as *const () as usize, read_file_scatter as *const () as usize][index]
+    [
+        read_file as *const () as usize,
+        read_file_ex as *const () as usize,
+        read_file_scatter as *const () as usize,
+        load_library_ex_w as *const () as usize,
+    ][index]
 }
 
 /// A zero terminated name at `address` as text, `None` when it is not UTF 8 or runs on.
@@ -282,7 +341,12 @@ mod tests {
         assert_eq!(wanted_function("ReadFile"), Some(0));
         assert_eq!(wanted_function("ReadFileEx"), Some(1));
         assert_eq!(wanted_function("ReadFileScatter"), Some(2));
+        assert_eq!(wanted_function("LoadLibraryExW"), Some(3));
         assert_eq!(wanted_function("WriteFile"), None);
+        assert!(wanted_dll("api-ms-win-core-libraryloader-l1-2-0.dll"));
+        assert!(is_xgameruntime_load("xgameruntime.dll"));
+        assert!(is_xgameruntime_load("C:\\Windows\\System32\\XGameRuntime.dll"));
+        assert!(!is_xgameruntime_load("other_xgameruntime.dll"));
         assert_eq!(folder("c:\\game\\title.exe"), "c:\\game\\");
         assert_eq!(folder("title.exe"), "");
     }
