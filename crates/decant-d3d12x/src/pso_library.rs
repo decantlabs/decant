@@ -42,14 +42,14 @@
 //!   made from the title's shaders by `lazy_pso`, as any refused direct pipeline is. After
 //!   [`MAX_REJECTIONS`] refusals the library stops for the run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, RwLock, Weak};
 use std::thread::JoinHandle;
 
 use crate::direct_cache::Fnv128;
@@ -203,14 +203,35 @@ fn resolve_root(configured: Option<OsString>, default: Option<PathBuf>) -> Optio
 pub struct Store {
     dir: PathBuf,
     context: u128,
+    keys: Arc<RwLock<HashSet<u128>>>,
 }
 
 static TEMP_NUMBER: AtomicU64 = AtomicU64::new(0);
 
+fn scan_store_keys(dir: &Path) -> HashSet<u128> {
+    let mut keys = HashSet::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return keys;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(text) = name.to_str() else { continue };
+        let Some(hex) = text.strip_suffix(".pso") else { continue };
+        if hex.len() == 32
+            && let Ok(key) = u128::from_str_radix(hex, 16)
+        {
+            keys.insert(key);
+        }
+    }
+    keys
+}
+
 impl Store {
     /// The store of `context` under the library folder `root`.
     pub fn new(root: &Path, context: u128) -> Store {
-        Store { dir: root.join(format!("{context:032x}")), context }
+        let dir = root.join(format!("{context:032x}"));
+        let keys = Arc::new(RwLock::new(scan_store_keys(&dir)));
+        Store { dir, context, keys }
     }
 
     pub fn dir(&self) -> &Path {
@@ -221,9 +242,42 @@ impl Store {
         self.dir.join(format!("{key:032x}.pso"))
     }
 
+    fn has_key(&self, key: u128) -> bool {
+        self.keys.read().unwrap_or_else(|e| e.into_inner()).contains(&key)
+    }
+
+    fn insert_key(&self, key: u128) {
+        self.keys.write().unwrap_or_else(|e| e.into_inner()).insert(key);
+    }
+
+    fn remove_key(&self, key: u128) {
+        self.keys.write().unwrap_or_else(|e| e.into_inner()).remove(&key);
+    }
+
     /// The blob stored for `key`. `None` on a miss or a file that fails any check.
     pub fn read(&self, key: u128) -> Option<Vec<u8>> {
+        if !self.has_key(key) {
+            return None;
+        }
+        let path = self.path(key);
+        let Ok(mut file) = File::open(&path) else {
+            self.remove_key(key);
+            return None;
+        };
+        let blob = self.read_open_file(key, &mut file);
+        if blob.is_none() {
+            self.remove_key(key);
+            let _ = std::fs::remove_file(&path);
+        }
+        blob
+    }
+
+    fn read_from_disk(&self, key: u128) -> Option<Vec<u8>> {
         let mut file = File::open(self.path(key)).ok()?;
+        self.read_open_file(key, &mut file)
+    }
+
+    fn read_open_file(&self, key: u128, file: &mut File) -> Option<Vec<u8>> {
         let mut header = [0u8; HEADER];
         file.read_exact(&mut header).ok()?;
         let (blob_len, expected_hash) = self.parse_header(key, &header)?;
@@ -278,8 +332,14 @@ impl Store {
         let mut retries = 5;
         loop {
             match std::fs::rename(temp, self.path(key)) {
-                Ok(()) => return Ok(()),
-                Err(_) if self.read(key).is_some() => return Ok(()),
+                Ok(()) => {
+                    self.insert_key(key);
+                    return Ok(());
+                }
+                Err(_) if self.read_from_disk(key).is_some() => {
+                    self.insert_key(key);
+                    return Ok(());
+                }
                 Err(e) if retries == 0 => return Err(e),
                 Err(_) => {
                     retries -= 1;
@@ -291,6 +351,7 @@ impl Store {
 
     /// Deletes the file of `key`, after the PC runtime refused its blob.
     pub fn forget(&self, key: u128) {
+        self.remove_key(key);
         let _ = std::fs::remove_file(self.path(key));
     }
 }
@@ -925,5 +986,35 @@ mod tests {
             assert_eq!(library.lookup(key), Some(expected), "key {key}");
         }
         assert_eq!(library.lookup(999), None);
+    }
+
+    #[test]
+    fn store_key_index_tracks_startup_scan_writes_forgets_and_corrupt_eviction() {
+        let dir = TempDir::new("pso-library-key-index");
+        let writer = Store::new(&dir.0, 0xAA);
+        writer.write(10, b"initial blob").unwrap();
+        assert!(writer.has_key(10));
+        assert!(!writer.has_key(99));
+
+        // Startup scan picks up existing `.pso` files and ignores non-`.pso` files.
+        std::fs::write(writer.dir().join("not_a_key.tmp"), b"ignored").unwrap();
+        let reader = Store::new(&dir.0, 0xAA);
+        assert!(reader.has_key(10));
+        assert!(!reader.has_key(99));
+        assert_eq!(reader.read(10).as_deref(), Some(&b"initial blob"[..]));
+        assert_eq!(reader.read(99), None);
+
+        // Corrupting a file on disk evicts it from the index and unlinks it on read.
+        std::fs::write(reader.path(10), b"corrupt").unwrap();
+        assert_eq!(reader.read(10), None);
+        assert!(!reader.has_key(10));
+        assert!(!reader.path(10).exists());
+
+        // Writing inserts and forgetting removes from the index.
+        reader.write(20, b"second blob").unwrap();
+        assert!(reader.has_key(20));
+        assert_eq!(reader.read(20).as_deref(), Some(&b"second blob"[..]));
+        reader.forget(20);
+        assert!(!reader.has_key(20));
     }
 }

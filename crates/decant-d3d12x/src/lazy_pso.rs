@@ -1022,13 +1022,48 @@ enum MakeOutcome {
     Refused,
 }
 
+struct CachedPsoPriorityGuard {
+    restore_below_normal: bool,
+}
+
+impl CachedPsoPriorityGuard {
+    fn new() -> Self {
+        // SAFETY: GetCurrentThread returns the pseudo handle of the calling thread.
+        let restore_below_normal = unsafe {
+            use windows_sys::Win32::System::Threading::{
+                GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL,
+            };
+            if GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_BELOW_NORMAL {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) != 0
+            } else {
+                false
+            }
+        };
+        Self { restore_below_normal }
+    }
+}
+
+impl Drop for CachedPsoPriorityGuard {
+    fn drop(&mut self) {
+        if self.restore_below_normal {
+            // SAFETY: GetCurrentThread returns the pseudo handle of the calling thread.
+            unsafe {
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+        }
+    }
+}
+
 /// Calls the creation path for `lazy` with `desc`.
 fn make(lazy: &Lazy, owned: &Owned, desc: &[u8], direct: bool, service: Option<&'static crate::compile_service::Service>) -> MakeOutcome {
     let recipe = &lazy.recipe;
     let begun = Instant::now();
     let mut out: *mut c_void = std::ptr::null_mut();
+    let cached = has_cached_pso(desc);
     let hr = {
-        let _large_guard = is_large_compute(lazy, desc).then(|| LARGE_PSO_GATE.acquire());
+        let _large_guard = (!cached && is_large_compute(lazy, desc)).then(|| LARGE_PSO_GATE.acquire());
+        let _cached_priority = cached.then(CachedPsoPriorityGuard::new);
         let _span = decant_trace::span("lazy_pso", "create");
         // SAFETY: the recipe holds the device and a description that the creation path took the same
         // way when the title called it, or a copy of it with other shaders.
@@ -1811,5 +1846,29 @@ mod tests {
         desc[at..at + 8].copy_from_slice(&(blob.as_ptr() as u64).to_le_bytes());
         desc[at + 8..at + 16].copy_from_slice(&(blob.len() as u64).to_le_bytes());
         assert!(!is_large_compute(&lazy, &desc));
+    }
+
+    #[test]
+    fn cached_pso_priority_guard_raises_below_normal_and_restores_on_drop() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL,
+        };
+        // SAFETY: GetCurrentThread returns the pseudo handle of the calling thread.
+        unsafe {
+            let prev = GetThreadPriority(GetCurrentThread());
+            let guard_normal = CachedPsoPriorityGuard::new();
+            assert!(!guard_normal.restore_below_normal);
+            drop(guard_normal);
+            assert_eq!(GetThreadPriority(GetCurrentThread()), prev);
+
+            assert_ne!(SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL), 0);
+            {
+                let guard = CachedPsoPriorityGuard::new();
+                assert!(guard.restore_below_normal);
+                assert_eq!(GetThreadPriority(GetCurrentThread()), THREAD_PRIORITY_NORMAL);
+            }
+            assert_eq!(GetThreadPriority(GetCurrentThread()), THREAD_PRIORITY_BELOW_NORMAL);
+            SetThreadPriority(GetCurrentThread(), prev);
+        }
     }
 }
