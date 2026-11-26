@@ -74,7 +74,7 @@ type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastIntHasher>>;
 type FastSet<K> = HashSet<K, BuildHasherDefault<FastIntHasher>>;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use windows::Win32::Foundation::CloseHandle;
@@ -1238,12 +1238,17 @@ struct DetilerState {
     unavailable: bool,
 }
 
-static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
+static REGISTRY: RwLock<Option<Registry>> = RwLock::new(None);
 static DETILER: Mutex<DetilerState> = Mutex::new(DetilerState { detiler: None, unavailable: false });
 
 fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
-    let mut guard = decant_trace::timed_lock("detile::REGISTRY", || REGISTRY.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut guard = decant_trace::timed_lock("detile::REGISTRY", || REGISTRY.write().unwrap_or_else(|e| e.into_inner()));
     f(guard.get_or_insert_with(Registry::default))
+}
+
+fn with_registry_read<R>(f: impl FnOnce(&Registry) -> R) -> Option<R> {
+    let guard = decant_trace::timed_lock("detile::REGISTRY_READ", || REGISTRY.read().unwrap_or_else(|e| e.into_inner()));
+    guard.as_ref().map(f)
 }
 
 fn with_detiler<R>(f: impl FnOnce(&mut DetilerState) -> R) -> R {
@@ -1255,7 +1260,7 @@ fn with_detiler<R>(f: impl FnOnce(&mut DetilerState) -> R) -> R {
 /// is reported as such.
 pub fn summary() -> String {
     let (textures_len, flushes, detiled, deferred, dirty, retried) = {
-        let Ok(guard) = REGISTRY.try_lock() else { return "detile: the table is busy".into() };
+        let Ok(guard) = REGISTRY.try_read() else { return "detile: the table is busy".into() };
         let Some(r) = guard.as_ref() else { return "detile: no table".into() };
         let dirty = r.textures.values().filter(|t| t.dirty).count();
         let retried = r.textures.values().filter(|t| t.wants_fill()).count();
@@ -1329,7 +1334,7 @@ pub fn register(res: usize, va: u64, raw: &[u8; 0x38], state: u32, bytes: u64) {
 /// address and size, whether its pages are mapped, whether it waits for a fill and how many of the
 /// first 64 KiB of its bytes are not zero. `None` for a resource the registry does not hold.
 pub fn describe(res: usize) -> Option<String> {
-    let (va, size, mode, dirty, attempts) = with_registry(|r| r.textures.get(&res).map(|t| (t.va, t.plan.size, t.plan.mode, t.dirty, t.attempts)))?;
+    let (va, size, mode, dirty, attempts) = with_registry_read(|r| r.textures.get(&res).map(|t| (t.va, t.plan.size, t.plan.mode, t.dirty, t.attempts))).flatten()?;
     let mapped = crate::title_mem::tiles_of(va, size).is_some();
     let probe = size.min(64 << 10) as usize;
     let content = if crate::title_mem::writable(va as usize, probe) {
@@ -1345,6 +1350,9 @@ pub fn describe(res: usize) -> Option<String> {
 
 /// The resource was released.
 pub fn forget(res: usize) {
+    if with_registry_read(|r| r.textures.contains_key(&res)) != Some(true) {
+        return;
+    }
     with_registry(|r| {
         r.remove(res);
     });
@@ -1397,6 +1405,17 @@ pub fn note_tiles(tiles: &[u32]) {
     let report = probe_line_due();
     let current_layout = crate::title_mem::mapping_generation();
     let current_tile = crate::title_mem::tile_generation();
+    if !report
+        && with_registry_read(|r| {
+            r.textures.is_empty()
+                || (r.layout_gen == current_layout
+                    && r.pending_index.is_empty()
+                    && (current_tile == r.last_tile_gen || r.unmapped_textures.is_empty())
+                    && !tiles.iter().any(|t| r.tile_to_textures.contains_key(t)))
+        }) != Some(false)
+    {
+        return;
+    }
     let fast = with_registry(|r| {
         if r.textures.is_empty() {
             return Ok(0);
@@ -1455,6 +1474,9 @@ pub fn note_tiles(tiles: &[u32]) {
 /// The title's GPU work writes into the texture (a copy). The CPU view is stale from then on, so
 /// the texture is not detiled any more.
 pub fn note_gpu_write(res: usize) {
+    if with_registry_read(|r| r.textures.contains_key(&res)) != Some(true) {
+        return;
+    }
     with_registry(|r| {
         if r.remove(res) {
             static ANNOUNCED: AtomicU32 = AtomicU32::new(0);
@@ -1470,6 +1492,9 @@ pub fn note_transitions(list: usize, transitions: &[(usize, u32, u32)]) {
     if !enabled() || transitions.is_empty() {
         return;
     }
+    if with_registry_read(|r| transitions.iter().any(|(res, _, _)| r.textures.contains_key(res))) != Some(true) {
+        return;
+    }
     with_registry(|r| {
         let mut iter = transitions.iter().filter(|(res, _, _)| r.textures.contains_key(res)).copied().peekable();
         if iter.peek().is_some() {
@@ -1480,6 +1505,9 @@ pub fn note_transitions(list: usize, transitions: &[(usize, u32, u32)]) {
 
 /// PC list `list` starts a new recording, so the transitions noted for it are dropped.
 pub fn list_reset(list: usize) {
+    if with_registry_read(|r| r.noted.get(&list).is_some_and(|v| !v.is_empty())) != Some(true) {
+        return;
+    }
     with_registry(|r| {
         if let Some(entries) = r.noted.get_mut(&list) {
             entries.clear();
@@ -1513,6 +1541,9 @@ pub fn apply_transition(states: &mut Vec<u32>, count: usize, sub: u32, after: u3
 /// the transitions of those lists left them in.
 pub fn submitted(lists: &[usize]) {
     if lists.is_empty() {
+        return;
+    }
+    if with_registry_read(|r| !r.noted.is_empty() && lists.iter().any(|l| r.noted.get(l).is_some_and(|v| !v.is_empty()))) != Some(true) {
         return;
     }
     with_registry(|r| {
@@ -2057,5 +2088,18 @@ mod tests {
         assert_eq!(*states_snap, [0]);
         assert_eq!(*p.states, [7]);
         assert!(!Arc::ptr_eq(&p.states, &states_snap));
+    }
+
+    #[test]
+    fn registry_rwlock_allows_concurrent_reads_and_fast_misses() {
+        let r1 = REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+        let r2 = std::thread::spawn(|| REGISTRY.read().unwrap_or_else(|e| e.into_inner()).is_some()).join().unwrap();
+        assert_eq!(r2, r1.is_some());
+        drop(r1);
+        note_transitions(0xDEAD, &[(0xBEEF, 0, 1)]);
+        list_reset(0xDEAD);
+        submitted(&[0xDEAD]);
+        forget(0xBEEF);
+        note_gpu_write(0xBEEF);
     }
 }
