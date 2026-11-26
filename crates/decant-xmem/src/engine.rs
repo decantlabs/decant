@@ -1783,9 +1783,9 @@ impl Engine {
     /// A kernel write (a file read, a DirectStorage request) may land in `[address, address + len)`: the
     /// pages of it that views map are committed (a kernel write into a page that is not fails instead of
     /// faulting), and with the dirty tracking on they become dirty and writable, and stay so for
-    /// `track::io_hold()`.
+    /// `track::io_hold_for(len)`.
     pub fn prepare_write(&self, address: usize, len: usize) {
-        self.prepare_write_until(address, len, Instant::now() + track::io_hold());
+        self.prepare_write_until(address, len, Instant::now() + track::io_hold_for(len));
     }
 
     /// As `prepare_write` for a write that ends when a call returns (a `ReadFile` without
@@ -1844,13 +1844,15 @@ impl Engine {
         }
         let st = self.lock();
         let mut indices = Vec::new();
+        let mut total_bytes = 0usize;
         for &(address, len) in runs {
+            total_bytes = total_bytes.saturating_add(len);
             Self::collect_rw_view_indices_into(&st, address, len, true, &mut indices);
         }
         if indices.is_empty() {
             return;
         }
-        let until = Instant::now() + track::io_hold();
+        let until = Instant::now() + track::io_hold_for(total_bytes);
         let dirty_state = Arc::clone(&st.dirty);
         let mut dirty_guard = dirty_state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut open = Vec::new();

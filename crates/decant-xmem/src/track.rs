@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crate::pages::PAGE_BYTES;
 
 /// How long a page that a kernel write may still reach (`prepare`) stays unprotected by default.
-pub const IO_HOLD: Duration = Duration::from_millis(500);
+pub const IO_HOLD: Duration = Duration::from_secs(2);
 /// How long a page stays open for a write that ends when a call returns (`Engine::begin_write`) at most,
 /// should the call never come back.
 pub const CALL_HOLD: Duration = Duration::from_secs(600);
@@ -55,6 +55,11 @@ pub fn hot_hold() -> Duration {
 pub fn io_hold() -> Duration {
     static HOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *HOLD.get_or_init(|| parse_io_hold_ms(std::env::var("DECANT_XMEM_IO_HOLD_MS").ok().as_deref()))
+}
+
+/// Scales the hold for large overlapped reads so multi-hundred-MB buffers do not expire mid-read.
+pub fn io_hold_for(bytes: usize) -> Duration {
+    io_hold().max(Duration::from_millis(((bytes as u64) / (32 * 1024)).min(30_000)))
 }
 
 /// One title view page of a pool page: its address and whether the title protection is read write.
@@ -525,11 +530,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_io_hold_ms_parses_override_and_defaults_to_500_ms() {
-        assert_eq!(IO_HOLD, Duration::from_millis(500));
-        assert_eq!(parse_io_hold_ms(None), Duration::from_millis(500));
-        assert_eq!(parse_io_hold_ms(Some("")), Duration::from_millis(500));
-        assert_eq!(parse_io_hold_ms(Some("invalid")), Duration::from_millis(500));
+    fn parse_io_hold_ms_parses_override_and_defaults_to_2000_ms() {
+        assert_eq!(IO_HOLD, Duration::from_secs(2));
+        assert_eq!(parse_io_hold_ms(None), Duration::from_millis(2000));
+        assert_eq!(parse_io_hold_ms(Some("")), Duration::from_millis(2000));
+        assert_eq!(parse_io_hold_ms(Some("invalid")), Duration::from_millis(2000));
         assert_eq!(parse_io_hold_ms(Some(" 1200 ")), Duration::from_millis(1200));
+        assert_eq!(io_hold(), Duration::from_millis(2000));
+        assert!(io_hold_for(271 * 1024 * 1024) >= Duration::from_secs(8));
+        assert_eq!(io_hold_for(4096), Duration::from_millis(2000));
     }
 }
