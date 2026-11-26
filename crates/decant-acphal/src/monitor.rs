@@ -11,6 +11,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use decant_log::trace;
 
+use crate::stats;
+
 /// The device rate.
 pub const RATE: u32 = 48_000;
 /// At most this many source frames are kept per context (two seconds at 48 kHz). Older ones are dropped.
@@ -38,7 +40,18 @@ pub fn enabled_value(value: Option<&str>) -> bool {
 
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| enabled_value(std::env::var("DECANT_AUDIO_RAW_MONITOR").ok().as_deref()))
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("DECANT_AUDIO_RAW_MONITOR").ok();
+        let on = enabled_value(value.as_deref());
+        trace(&read_line(value.as_deref(), on));
+        on
+    })
+}
+
+/// The line written the first time the variable is read: what it held and whether the monitor is on.
+pub fn read_line(value: Option<&str>, on: bool) -> String {
+    let held = value.map_or_else(|| "unset".to_owned(), |v| format!("{v:?}"));
+    format!("AcpHal: DECANT_AUDIO_RAW_MONITOR read as {held}: raw monitor {}", if on { "on" } else { "off" })
 }
 
 /// Samples (interleaved, `channels` 1 or 2) that context `index` wrote at `rate`.
@@ -72,8 +85,11 @@ pub fn end(index: u32) {
 pub fn mix(out: &mut [f32]) {
     out.fill(0.0);
     let mut s = streams();
-    for stream in s.values_mut() {
+    let total = out.len() / 2;
+    stats::device_period(total as u64);
+    for (&index, stream) in s.iter_mut() {
         let step = f64::from(stream.rate) / f64::from(RATE);
+        let mut done = 0;
         for frame in out.as_chunks_mut::<2>().0 {
             if stream.frames.len() < 2 {
                 break;
@@ -87,6 +103,11 @@ pub fn mix(out: &mut [f32]) {
                 stream.frames.pop_front();
                 stream.phase -= 1.0;
             }
+            done += 1;
+        }
+        // A voice that is still running and had too little to play: an underrun (a stopped one just ran out).
+        if done < total && !stream.ended {
+            stats::underrun(index, (total - done) as u64);
         }
     }
     s.retain(|_, stream| !(stream.ended && stream.frames.len() < 2));
@@ -104,10 +125,17 @@ fn start_device() {
                 trace(&format!("AcpHal: the XMA monitor has no audio device ({e})"));
             }
         });
-        if spawned.is_ok() {
-            trace("AcpHal: the raw XMA monitor plays on the default device (DECANT_AUDIO_RAW_MONITOR=1 enables it)");
+        match spawned {
+            Ok(_) => trace("AcpHal: the raw XMA monitor plays on the default device (DECANT_AUDIO_RAW_MONITOR=1 enables it)"),
+            // Before this line was written, a failed spawn left no trace at all: the monitor looked off without a reason.
+            Err(e) => trace(&spawn_error_line(&e.to_string())),
         }
     });
+}
+
+/// The line written when the monitor's thread cannot be created (the process may be at its thread limit).
+pub fn spawn_error_line(error: &str) -> String {
+    format!("AcpHal: the XMA monitor thread could not start ({error}): the raw monitor plays nothing this run")
 }
 
 #[cfg(windows)]
@@ -184,6 +212,20 @@ mod tests {
         assert!(!enabled_value(Some("0")));
         assert!(!enabled_value(Some("true")));
         assert!(enabled_value(Some("1")));
+    }
+
+    #[test]
+    fn the_read_of_the_variable_is_written_with_what_it_held() {
+        let unset = read_line(None, false);
+        assert!(unset.contains("read as unset: raw monitor off"), "{unset}");
+        let on = read_line(Some("1"), true);
+        assert!(on.contains("read as \"1\": raw monitor on"), "{on}");
+    }
+
+    #[test]
+    fn a_failed_thread_start_is_written_with_its_reason() {
+        let line = spawn_error_line("resource temporarily unavailable");
+        assert!(line.contains("could not start (resource temporarily unavailable)"), "{line}");
     }
 
     #[test]

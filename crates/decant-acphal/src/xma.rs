@@ -39,6 +39,8 @@ use decant_xma::{Decoder, FRAME_SAMPLES, HEADER_BITS, PACKET_BYTES, RATES, SUBFR
 
 use crate::heap::with_heaps;
 use crate::monitor;
+use crate::stats as audio_stats;
+use crate::stats::Ring;
 
 /// Bytes of one output block.
 pub const BLOCK_BYTES: usize = 256;
@@ -229,6 +231,16 @@ pub fn disable(index: u32) {
         "AcpHal: XMA context {index} disabled: {} frames ({} bad), {} blocks written, {} taken",
         voice.frames, voice.bad_frames, voice.blocks_written, voice.blocks_taken
     ));
+    if let Some(context) = engine.context(index)
+        && let Some(line) = audio_stats::voice_end(index, ring_of(context), voice.frames, voice.bad_frames)
+    {
+        trace(&line);
+    }
+}
+
+/// The ring of a context, for the statistics.
+fn ring_of(context: Context) -> Ring {
+    Ring { blocks: context.read(RING_BLOCKS), read: context.read(READ_BLOCK), write: context.read(WRITE_BLOCK), writable: context.flag(WRITABLE) }
 }
 
 /// Command 0x12: the title took `blocks` output blocks, the read block moves on and the ring is writable again.
@@ -244,6 +256,7 @@ pub fn output_consumed(index: u32, blocks: u32) {
     if let Some(voice) = engine.voices[index as usize].as_mut() {
         voice.blocks_taken += u64::from(blocks);
     }
+    audio_stats::blocks_taken(index, blocks);
 }
 
 /// What the engine did for context `index` while it is enabled: frames decoded, frames that did not decode, blocks written
@@ -277,6 +290,27 @@ pub fn pump() {
             fill_ring(index, context, voice);
         }
     }
+    if audio_stats::report_due() {
+        report_running();
+    }
+}
+
+/// The periodic statistics lines: the device, then the running voices (`DECANT_AUDIO_STATS=1` only).
+fn report_running() {
+    let running: Vec<(u32, Ring, u64, u64)> = {
+        let guard = lock();
+        let Some(engine) = guard.as_ref() else { return };
+        let voices = engine.voices.iter().enumerate();
+        voices
+            .filter_map(|(index, slot)| {
+                let voice = slot.as_ref()?;
+                let context = engine.context(index as u32)?;
+                Some((index as u32, ring_of(context), voice.frames, voice.bad_frames))
+            })
+            .collect()
+    };
+    // Written without the engine lock: the mixer thread of the title must not wait for the log.
+    audio_stats::report(&running);
 }
 
 /// `len` bytes of APU memory at `apu`, when one live allocation holds them.
@@ -295,6 +329,7 @@ fn fill_ring(index: u32, context: Context, voice: &mut Voice) {
     while context.flag(WRITABLE) {
         while voice.pending.len() < BLOCK_SAMPLES && decode_next_frame(index, context, voice) {}
         if voice.pending.is_empty() {
+            audio_stats::decoder_empty(index);
             return;
         }
         let position = context.read(WRITE_BLOCK);
@@ -307,11 +342,13 @@ fn fill_ring(index: u32, context: Context, voice: &mut Voice) {
         }
         monitor::feed(index, context.rate(), context.channels(), &block);
         voice.blocks_written += 1;
+        audio_stats::block_written(index);
         let next = (position + 1) % ring;
         context.write(WRITE_BLOCK, next);
         if next == context.read(READ_BLOCK) {
             // Full until the title takes blocks.
             context.write(WRITABLE, 0);
+            audio_stats::ring_full(index);
         }
     }
 }

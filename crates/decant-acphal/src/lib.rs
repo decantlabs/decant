@@ -13,6 +13,7 @@ pub mod heap;
 pub mod monitor;
 pub mod priority;
 pub mod shape;
+pub mod stats;
 pub mod xma;
 
 pub use exports::EXPORT_NAMES;
