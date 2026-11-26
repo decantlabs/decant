@@ -128,7 +128,7 @@ pub enum PipelineKind {
 const SUMMARY_INTERVAL: u64 = 64;
 
 /// A live cache miss of a stage with at least this much HLSL is compiled with `-O0` by default.
-pub const O0_HLSL_BYTES: usize = 32 * 1024;
+pub const O0_HLSL_BYTES: usize = 8 * 1024;
 
 /// Parses `DECANT_D3D12X_DIRECT_O0_BYTES`: `0`, `off`, or `false` disables `-O0` (`usize::MAX`),
 /// a positive integer sets the byte threshold, and missing or invalid values return [`O0_HLSL_BYTES`].
@@ -866,6 +866,8 @@ impl Shared {
         answers.resize_with(items.len(), || None);
         std::thread::scope(|scope| {
             let mut helpers = Vec::new();
+            let mut handled_mask = 0u64;
+            let mut handled_extra = Vec::new();
             for (at, item) in items.iter().enumerate().skip(1) {
                 if !self.take_stage_slot() {
                     continue;
@@ -877,15 +879,22 @@ impl Shared {
                     answer
                 });
                 match spawned {
-                    Ok(handle) => helpers.push((at, handle)),
+                    Ok(handle) => {
+                        if at < 64 {
+                            handled_mask |= 1u64 << at;
+                        } else {
+                            handled_extra.push(at);
+                        }
+                        helpers.push((at, handle));
+                    }
                     Err(_) => {
                         self.stage_slots.fetch_add(1, Ordering::AcqRel);
                     }
                 }
             }
-            let handled: Vec<usize> = helpers.iter().map(|(at, _)| *at).collect();
             for (at, item) in items.iter().enumerate() {
-                if !handled.contains(&at) {
+                let is_handled = if at < 64 { (handled_mask & (1u64 << at)) != 0 } else { handled_extra.contains(&at) };
+                if !is_handled {
                     answers[at] = Some(work(item));
                 }
             }
@@ -909,7 +918,12 @@ impl Shared {
         // signed by `dxil.dll`. Never `-Vd`, the PC runtime refuses unsigned DXIL.
         let o0 = self.live.load(Ordering::Relaxed) && stage.hlsl.len() >= o0_hlsl_bytes();
         let args: std::borrow::Cow<'_, [String]> = if o0 {
-            std::borrow::Cow::Owned(stage.args.iter().cloned().chain(["-O0".to_string()]).collect())
+            if stage.args.is_empty() {
+                static O0_ONLY: OnceLock<[String; 1]> = OnceLock::new();
+                std::borrow::Cow::Borrowed(O0_ONLY.get_or_init(|| ["-O0".to_string()]))
+            } else {
+                std::borrow::Cow::Owned(stage.args.iter().cloned().chain(["-O0".to_string()]).collect())
+            }
         } else {
             std::borrow::Cow::Borrowed(&stage.args)
         };
@@ -1483,7 +1497,7 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_o0_hlsl_bytes_handles_defaults_overrides_and_off() {
-        assert_eq!(O0_HLSL_BYTES, 32 * 1024);
+        assert_eq!(O0_HLSL_BYTES, 8 * 1024);
         assert_eq!(MAX_LIVE_HLSL_BYTES, 16 * 1024 * 1024);
         assert_eq!(parse_o0_hlsl_bytes(None), O0_HLSL_BYTES);
         assert_eq!(parse_o0_hlsl_bytes(Some("")), O0_HLSL_BYTES);
@@ -1492,6 +1506,18 @@ pub(crate) mod tests {
         for off in ["0", "off", "OFF", "false"] {
             assert_eq!(parse_o0_hlsl_bytes(Some(off)), usize::MAX, "{off}");
         }
+    }
+
+    #[test]
+    fn live_stage_at_8_kib_uses_o0_even_with_empty_extra_args() {
+        let compiler = Arc::new(ArgsCompiler::default());
+        let service = Service::new(Arc::new(FixedSource::simple()), compiler.clone(), Settings::quiet(1));
+        service.set_live(MAX_LIVE_HLSL_BYTES);
+        let stage = StageHlsl { hlsl: "x".repeat(O0_HLSL_BYTES), entry: "main".into(), profile: "ps_6_0".into(), args: Vec::new() };
+        assert!(service.shared.compile_stage(0x1234, &stage).is_ok());
+        let calls = compiler.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, ["-O0"]);
     }
 
     #[test]
