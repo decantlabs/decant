@@ -44,9 +44,10 @@
 // `d3d12xs_test` includes this file and uses only part of it.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -585,6 +586,8 @@ struct State {
     windows: Vec<Option<Window>>,
     /// The read only section views of `xmem.dll`: address, first pool page, pages.
     sections: Vec<(usize, u32, u32)>,
+    /// Index of the most recently matched section in `sections`.
+    last_section: usize,
     /// The map fence value each submitting queue has waited for.
     waited: HashMap<usize, u64>,
     tracking: bool,
@@ -719,6 +722,19 @@ fn drain_journal(api: &Api, cursor: &mut DrainCursor) -> DrainBatch {
 
 /// Last `DecantXmemJournalSeq` drained into `STATE` (`u64::MAX` when unknown).
 static LAST_JOURNAL_SEQ: AtomicU64 = AtomicU64::new(u64::MAX);
+/// True once `DecantXmemGpuTrack(1)` has been enabled, so `with_state` can skip `DRAIN_LOCK`.
+static TRACKING_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn journal_unchanged(api: &Api) -> bool {
+    if !TRACKING_ACTIVE.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(get_seq) = api.journal_seq else { return false };
+    // SAFETY: `DecantXmemJournalSeq` is a lock-free atomic load returning `u64`.
+    let cur_seq = unsafe { get_seq() };
+    let last = LAST_JOURNAL_SEQ.load(Ordering::Acquire);
+    last != u64::MAX && last == cur_seq
+}
 /// Serializes `sync` and `device_created` across queues so `execute_copies` runs without holding `STATE`,
 /// and reuses the `CopyJob` buffer across syncs.
 static SYNC_LOCK: Mutex<Vec<CopyJob>> = Mutex::new(Vec::new());
@@ -917,8 +933,15 @@ impl State {
 
     /// The address of pool page `page` and how many pages remain in its section from `page`.
     fn source_section(&mut self, api: &Api, page: u32) -> Option<(usize, usize)> {
+        if let Some(&(base, first, pages)) = self.sections.get(self.last_section)
+            && page >= first
+            && page - first < pages
+        {
+            return Some((base + (page - first) as usize * PAGE as usize, (first + pages - page) as usize));
+        }
         loop {
-            if let Some(&(base, first, pages)) = self.sections.iter().find(|&&(_, first, pages)| page >= first && page - first < pages) {
+            if let Some((idx, &(base, first, pages))) = self.sections.iter().enumerate().find(|&(_, &(_, first, pages))| page >= first && page - first < pages) {
+                self.last_section = idx;
                 return Some((base + (page - first) as usize * PAGE as usize, (first + pages - page) as usize));
             }
             let (mut base, mut first, mut pages) = (0usize, 0u32, 0u32);
@@ -1133,16 +1156,16 @@ impl State {
             {
                 n += 1;
             }
-            i += n;
-            let (Some(dst), Some((src, in_section))) = (self.heap(heap), self.source_section(api, first)) else { continue };
+            let (Some(dst), Some((src, in_section))) = (self.heap(heap), self.source_section(api, first)) else {
+                i += n;
+                continue;
+            };
             // One run never leaves its section: the tail of a section is cut off and copied by page.
-            let (head, rest) = (n.min(in_section), n.saturating_sub(in_section));
+            let head = n.min(in_section);
+            i += head;
             plan_copy(jobs, src, dst + tile as usize * PAGE as usize, head);
             *copied += head as u64;
             self.written.extend(first_tile..first_tile + head as u32);
-            if rest > 0 {
-                self.plan_runs(api, &pages[i - rest..i], jobs, copied);
-            }
         }
     }
 }
@@ -1203,6 +1226,7 @@ pub unsafe fn device_created(device: *mut c_void) {
         failed: HashSet::new(),
         windows: Vec::new(),
         sections: Vec::new(),
+        last_section: 0,
         waited: HashMap::new(),
         tracking: false,
         last_guard: Instant::now(),
@@ -1222,6 +1246,17 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
         return None;
     }
     let api = api()?;
+    if ACTIVE_STATE_ID.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    if journal_unchanged(api) {
+        let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
+        let st = guard.as_mut()?;
+        if st.last_journal_seq.is_some() {
+            st.tracking = true;
+            return Some(f(st, api));
+        }
+    }
     let mut cursor = decant_trace::timed_lock("title_mem::DRAIN_LOCK", || DRAIN_LOCK.lock().unwrap_or_else(PoisonError::into_inner));
     if ACTIVE_STATE_ID.load(Ordering::Acquire) == 0 {
         return None;
@@ -1230,6 +1265,7 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
         cursor.tracking = true;
         // SAFETY: the export takes a flag.
         unsafe { (api.track)(1) };
+        TRACKING_ACTIVE.store(true, Ordering::Release);
         xs_log!("title memory: xmem.dll tracks written pages now, every mapped page is copied at the first sync");
     }
     let batch = drain_journal(api, &mut cursor);
@@ -1572,12 +1608,18 @@ pub unsafe fn sync(queue: *mut c_void) {
     let Some(queue_ref) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
     let mut jobs = decant_trace::timed_lock("title_mem::SYNC_LOCK", || SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
     jobs.clear();
+    thread_local! {
+        static SYNC_WRITTEN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    }
+    let mut written = SYNC_WRITTEN.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    written.clear();
     let started = Instant::now();
-    let Some((phase1_id, pages, written)) = with_state(|st, api| {
+    let Some((phase1_id, pages)) = with_state(|st, api| {
         let pages = st.prepare_upload(api, &mut jobs);
-        let written = std::mem::take(&mut st.written);
-        (st.id, pages, written)
+        std::mem::swap(&mut st.written, &mut written);
+        (st.id, pages)
     }) else {
+        SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
         return;
     };
 
@@ -1653,6 +1695,8 @@ pub unsafe fn sync(queue: *mut c_void) {
         let _note_tiles = decant_trace::span("title_mem", "note_tiles");
         crate::detile::note_tiles(&written);
     }
+    written.clear();
+    SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
 }
 
 /// `pages` pages from title address `to` show the pool pages that the pages from `from` show, or
@@ -1874,5 +1918,40 @@ mod tests {
         assert_eq!(HEAP_PAGES, 256);
         assert_eq!(POOL_HEAP_BYTES, 16 * 1024 * 1024);
         assert_eq!(POOL_HEAP_BYTES % PAGE, 0);
+    }
+
+    #[test]
+    fn journal_unchanged_fast_path_checks_tracking_and_last_seq() {
+        unsafe extern "system" fn stub_track(_: i32) {}
+        unsafe extern "system" fn stub_changes(_: u64, _: *mut GpuChange, _: u32, _: *mut u32) -> i32 { 1 }
+        unsafe extern "system" fn stub_snapshot(_: *mut GpuChange, _: u32, _: *mut u32, _: *mut u64) -> i32 { 1 }
+        unsafe extern "system" fn stub_take(_: *mut u32, _: u32) -> u32 { 0 }
+        unsafe extern "system" fn stub_view(_: u32, _: *mut usize, _: *mut u32, _: *mut u32) -> i32 { 0 }
+        unsafe extern "system" fn stub_guard() {}
+        unsafe extern "system" fn stub_writable(_: usize, _: usize) -> i32 { 0 }
+        unsafe extern "system" fn stub_use(_: usize, _: usize) -> u32 { 0 }
+        unsafe extern "system" fn stub_seq_7() -> u64 { 7 }
+
+        let api = Api {
+            track: stub_track,
+            changes: stub_changes,
+            snapshot: stub_snapshot,
+            take_dirty: stub_take,
+            section_view: stub_view,
+            guard_modules: stub_guard,
+            writable: stub_writable,
+            gpu_use: stub_use,
+            show: None,
+            journal_seq: Some(stub_seq_7),
+        };
+        let prev_track = TRACKING_ACTIVE.swap(false, Ordering::AcqRel);
+        let prev_seq = LAST_JOURNAL_SEQ.swap(7, Ordering::AcqRel);
+        assert!(!journal_unchanged(&api));
+        TRACKING_ACTIVE.store(true, Ordering::Release);
+        assert!(journal_unchanged(&api));
+        LAST_JOURNAL_SEQ.store(6, Ordering::Release);
+        assert!(!journal_unchanged(&api));
+        TRACKING_ACTIVE.store(prev_track, Ordering::Release);
+        LAST_JOURNAL_SEQ.store(prev_seq, Ordering::Release);
     }
 }
