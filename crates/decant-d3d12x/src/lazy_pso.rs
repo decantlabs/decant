@@ -38,7 +38,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -576,9 +576,87 @@ static MAKER_JOBS: LazyLock<(Mutex<MakerQueues>, Condvar)> = LazyLock::new(Defau
 /// Signalled whenever a worker has finished a pipeline.
 static MAKER_FINISHED: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Maker workers on a host with `cores` cores: half of them, 2 to 16.
+/// Maker workers on a host with `cores` cores: half of them, 2 to 6.
 fn default_maker_count(cores: usize) -> usize {
-    (cores / 2).clamp(2, 16)
+    (cores / 2).clamp(2, 6)
+}
+
+const LARGE_COMPUTE_DXIL_BYTES: usize = 128 * 1024;
+const DEFAULT_LARGE_PSO_LIMIT: usize = 2;
+
+fn parse_large_pso_limit(setting: Option<&str>) -> usize {
+    let Some(text) = setting.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_LARGE_PSO_LIMIT;
+    };
+    if matches!(text.to_ascii_lowercase().as_str(), "0" | "off" | "false") {
+        return usize::MAX;
+    }
+    text.parse::<usize>().unwrap_or(DEFAULT_LARGE_PSO_LIMIT)
+}
+
+fn large_pso_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| parse_large_pso_limit(std::env::var("DECANT_D3D12X_LARGE_PSO_LIMIT").ok().as_deref()))
+}
+
+struct LargePsoGate {
+    active: Mutex<usize>,
+    ready: Condvar,
+    limit: AtomicUsize,
+}
+
+impl LargePsoGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            active: Mutex::new(0),
+            ready: Condvar::new(),
+            limit: AtomicUsize::new(limit),
+        }
+    }
+
+    fn acquire(&self) -> LargePsoGuard<'_> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= self.limit.load(Ordering::Relaxed) {
+            active = self.ready.wait(active).unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+        // SAFETY: GetCurrentThread returns the pseudo handle of the calling thread.
+        let restore_below_normal = unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) != 0
+        };
+        LargePsoGuard { gate: self, restore_below_normal }
+    }
+}
+
+struct LargePsoGuard<'a> {
+    gate: &'a LargePsoGate,
+    restore_below_normal: bool,
+}
+
+impl Drop for LargePsoGuard<'_> {
+    fn drop(&mut self) {
+        if self.restore_below_normal {
+            // SAFETY: GetCurrentThread returns the pseudo handle of the calling thread.
+            unsafe {
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+        }
+        let mut active = self.gate.active.lock().unwrap_or_else(|e| e.into_inner());
+        *active = active.saturating_sub(1);
+        self.gate.ready.notify_one();
+    }
+}
+
+static LARGE_PSO_GATE: LazyLock<LargePsoGate> = LazyLock::new(|| LargePsoGate::new(large_pso_limit()));
+
+fn is_large_compute(lazy: &Lazy, desc: &[u8]) -> bool {
+    if !lazy.recipe.is_compute || desc.len() < 24 {
+        return false;
+    }
+    let cs_len = u64::from_le_bytes(desc[16..24].try_into().unwrap_or_default()) as usize;
+    cs_len > LARGE_COMPUTE_DXIL_BYTES
 }
 
 fn maker_thread_count() -> usize {
@@ -903,9 +981,12 @@ fn make(lazy: &Lazy, owned: &Owned, desc: &[u8], direct: bool, service: Option<&
     let recipe = &lazy.recipe;
     let begun = Instant::now();
     let mut out: *mut c_void = std::ptr::null_mut();
-    // SAFETY: the recipe holds the device and a description that the creation path took the same
-    // way when the title called it, or a copy of it with other shaders.
-    let hr = unsafe { (recipe.create)(recipe.device, desc.as_ptr().cast(), &recipe.riid, &mut out) };
+    let hr = {
+        let _large_guard = is_large_compute(lazy, desc).then(|| LARGE_PSO_GATE.acquire());
+        // SAFETY: the recipe holds the device and a description that the creation path took the same
+        // way when the title called it, or a copy of it with other shaders.
+        unsafe { (recipe.create)(recipe.device, desc.as_ptr().cast(), &recipe.riid, &mut out) }
+    };
     // SAFETY: `out` is null or the object the creation path wrote.
     let stand_in = unsafe { crate::pso_diag::standin_id(out) }.is_some();
     let made = if hr >= 0 && !out.is_null() && !stand_in { out as usize } else { 0 };
@@ -1295,8 +1376,8 @@ mod tests {
     fn maker_workers_scale_with_the_cores() {
         assert_eq!(default_maker_count(1), 2, "never below 2");
         assert_eq!(default_maker_count(8), 4);
-        assert_eq!(default_maker_count(24), 12);
-        assert_eq!(default_maker_count(1000), 16, "never above 16");
+        assert_eq!(default_maker_count(24), 6);
+        assert_eq!(default_maker_count(1000), 6, "never above 6");
     }
 
     #[test]
@@ -1447,5 +1528,111 @@ mod tests {
     #[test]
     fn async_make_enabled_is_true_by_default() {
         assert!(async_make_enabled());
+    }
+
+    #[test]
+    fn parse_large_pso_limit_handles_defaults_overrides_and_unlimited() {
+        assert_eq!(LARGE_COMPUTE_DXIL_BYTES, 128 * 1024);
+        assert_eq!(DEFAULT_LARGE_PSO_LIMIT, 2);
+        assert_eq!(parse_large_pso_limit(None), DEFAULT_LARGE_PSO_LIMIT);
+        assert_eq!(parse_large_pso_limit(Some("")), DEFAULT_LARGE_PSO_LIMIT);
+        assert_eq!(parse_large_pso_limit(Some("bad")), DEFAULT_LARGE_PSO_LIMIT);
+        assert_eq!(parse_large_pso_limit(Some(" 3 ")), 3);
+        for unlimited in ["0", "off", "OFF", "false"] {
+            assert_eq!(parse_large_pso_limit(Some(unlimited)), usize::MAX, "{unlimited}");
+        }
+    }
+
+    #[test]
+    fn large_compute_pso_gate_caps_concurrent_make_calls_while_small_and_graphics_run_unblocked() {
+        static LARGE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        static LARGE_PEAK: AtomicUsize = AtomicUsize::new(0);
+        static SMALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+        unsafe fn tracking_create(device: usize, desc: *const c_void, _riid: *const windows_sys::core::GUID, out: *mut *mut c_void) -> i32 {
+            // SAFETY: tests pass valid 56-byte compute or 656-byte graphics descriptions.
+            let bytes = unsafe { std::slice::from_raw_parts(desc.cast::<u8>(), 24) };
+            let cs_len = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+            if device == 0x1111 && cs_len > LARGE_COMPUTE_DXIL_BYTES {
+                let cur = LARGE_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+                LARGE_PEAK.fetch_max(cur, Ordering::SeqCst);
+                let mut guard = RELEASE.0.lock().unwrap();
+                while !*guard {
+                    guard = RELEASE.1.wait(guard).unwrap();
+                }
+                LARGE_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            } else {
+                SMALL_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+            // SAFETY: `out` is writable.
+            unsafe { *out = 0x1234 as *mut c_void };
+            0
+        }
+
+        LARGE_PSO_GATE.limit.store(2, Ordering::Relaxed);
+        let large_cs = vec![0u8; LARGE_COMPUTE_DXIL_BYTES + 16];
+        let small_cs = vec![0u8; 1024];
+
+        let make_lazy = |device: usize, owned: Owned| -> &'static Lazy {
+            let mut out = std::ptr::null_mut();
+            // SAFETY: `out` is writable and `owned` is valid.
+            assert_eq!(unsafe { defer(device, owned, std::ptr::null(), &mut out, tracking_create) }, 0);
+            // SAFETY: `defer` returns a leaked `Lazy` pointer.
+            unsafe { &*out.cast::<Lazy>() }
+        };
+
+        let large_jobs: Vec<&'static Lazy> = (0..4)
+            .map(|_| {
+                let desc = compute_desc(&large_cs);
+                // SAFETY: `desc` and `large_cs` are live.
+                make_lazy(0x1111, unsafe { copy_compute(desc.as_ptr().cast()) })
+            })
+            .collect();
+        let small_desc = compute_desc(&small_cs);
+        // SAFETY: `small_desc` and `small_cs` are live.
+        let small_job = make_lazy(0x1111, unsafe { copy_compute(small_desc.as_ptr().cast()) });
+
+        let mut g_desc = [0u8; GRAPHICS_DESC_SIZE];
+        let vs = vec![0u8; LARGE_COMPUTE_DXIL_BYTES + 16];
+        g_desc[0x08..0x10].copy_from_slice(&(vs.as_ptr() as u64).to_le_bytes());
+        g_desc[0x10..0x18].copy_from_slice(&(vs.len() as u64).to_le_bytes());
+        // SAFETY: `g_desc` and `vs` are live.
+        let g_lazy = make_lazy(0x2222, unsafe { copy_graphics(&g_desc) });
+
+        std::thread::scope(|scope| {
+            for lazy in &large_jobs {
+                scope.spawn(move || {
+                    let guard = lazy.recipe.owned.read().unwrap();
+                    let owned = guard.as_ref().unwrap();
+                    assert_ne!(make(lazy, owned, owned.desc(), false, None), 0);
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while LARGE_ACTIVE.load(Ordering::SeqCst) < 2 {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(LARGE_ACTIVE.load(Ordering::SeqCst), 2);
+            assert_eq!(LARGE_PEAK.load(Ordering::SeqCst), 2);
+
+            // Small compute and large graphics PSOs are not blocked by the large compute gate.
+            {
+                let guard = small_job.recipe.owned.read().unwrap();
+                let owned = guard.as_ref().unwrap();
+                assert_ne!(make(small_job, owned, owned.desc(), false, None), 0);
+            }
+            {
+                let guard = g_lazy.recipe.owned.read().unwrap();
+                let owned = guard.as_ref().unwrap();
+                assert_ne!(make(g_lazy, owned, owned.desc(), false, None), 0);
+            }
+            assert_eq!(SMALL_COUNT.load(Ordering::SeqCst), 2);
+
+            *RELEASE.0.lock().unwrap() = true;
+            RELEASE.1.notify_all();
+        });
+        assert_eq!(LARGE_PEAK.load(Ordering::SeqCst), 2);
     }
 }
