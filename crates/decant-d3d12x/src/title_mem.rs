@@ -789,10 +789,10 @@ impl StagingRing {
         &mut self,
         queue: &ID3D12CommandQueue,
         fence: &ID3D12Fence,
-        heaps: &[Option<Heap>],
+        heaps: &[Option<ID3D12Resource>],
         span: (usize, usize),
         runs: &[UploadRun],
-        fence_value: &mut u64,
+        fence_value: &AtomicU64,
     ) -> bool {
         let (base_offset, total_bytes) = span;
         if runs.is_empty() {
@@ -800,15 +800,16 @@ impl StagingRing {
         }
         wait_fence(fence, self.event, self.alloc_fences[self.slot]);
         let alloc = &self.allocators[self.slot];
+        let next_val;
         // SAFETY: `alloc_fences[slot]` has completed above, and `list` is closed before reset.
         unsafe {
             if alloc.Reset().is_err() || self.list.Reset(alloc, None).is_err() {
                 return false;
             }
             for run in runs {
-                if let Some(dst) = heaps.get(run.heap as usize).and_then(|h| h.as_ref()) {
+                if let Some(Some(dst)) = heaps.get(run.heap as usize) {
                     self.list.CopyBufferRegion(
-                        &dst.buffer,
+                        dst,
                         run.heap_offset,
                         &self.buffer,
                         base_offset as u64 + run.staging_offset,
@@ -821,11 +822,11 @@ impl StagingRing {
             }
             let Ok(cmd) = self.list.cast::<ID3D12CommandList>() else { return false };
             queue.ExecuteCommandLists(&[Some(cmd)]);
-            *fence_value += 1;
-            let _ = queue.Signal(fence, *fence_value);
+            next_val = fence_value.fetch_add(1, Ordering::AcqRel) + 1;
+            let _ = queue.Signal(fence, next_val);
         }
-        self.in_flight.push_back((base_offset, total_bytes, *fence_value));
-        self.alloc_fences[self.slot] = *fence_value;
+        self.in_flight.push_back((base_offset, total_bytes, next_val));
+        self.alloc_fences[self.slot] = next_val;
         self.slot = (self.slot + 1) % self.allocators.len();
         true
     }
@@ -866,7 +867,7 @@ struct State {
     /// The private queue that applies the tile mappings, and the fence that says when.
     map_queue: ID3D12CommandQueue,
     map_fence: ID3D12Fence,
-    fence_value: u64,
+    fence_value: Arc<AtomicU64>,
     mirror: Mirror,
     /// The sequence number of the last journal record applied.
     seq: u64,
@@ -880,7 +881,7 @@ struct State {
     m_cap_override: Option<u64>,
     l1_heaps: u64,
     l0_heaps: u64,
-    staging: Option<StagingRing>,
+    has_staging: bool,
     /// The heaps that could not be made.
     failed: HashSet<u32>,
     windows: Vec<Option<Window>>,
@@ -888,8 +889,6 @@ struct State {
     sections: Vec<(usize, u32, u32)>,
     /// Index of the most recently matched section in `sections`.
     last_section: usize,
-    /// The map fence value each submitting queue has waited for.
-    waited: HashMap<usize, u64>,
     tracking: bool,
     last_guard: Instant,
     stats: Stats,
@@ -1047,11 +1046,20 @@ struct SyncScratch {
     jobs: Vec<CopyJob>,
     dirty: Vec<u32>,
     runs: Vec<UploadRun>,
+    staging: Option<StagingRing>,
+    /// The map fence value each submitting queue has waited for.
+    waited: Option<HashMap<usize, u64>>,
 }
 
-/// Serializes `sync` and `device_created` across queues so `execute_copies` runs without holding `STATE`,
-/// and reuses the `CopyJob`, dirty page, and upload run buffers across syncs.
-static SYNC_LOCK: Mutex<SyncScratch> = Mutex::new(SyncScratch { jobs: Vec::new(), dirty: Vec::new(), runs: Vec::new() });
+/// Serializes `sync` and `device_created` across queues so `execute_copies` and staging GPU
+/// submissions run without holding `STATE`, and reuses buffers across syncs.
+static SYNC_LOCK: Mutex<SyncScratch> = Mutex::new(SyncScratch {
+    jobs: Vec::new(),
+    dirty: Vec::new(),
+    runs: Vec::new(),
+    staging: None,
+    waited: None,
+});
 
 fn should_skip_drain(last_seq: Option<u64>, current_seq: Option<u64>) -> bool {
     matches!((last_seq, current_seq), (Some(a), Some(b)) if a == b)
@@ -1236,7 +1244,7 @@ impl State {
                 .as_ref()
                 .and_then(local_vram_info)
                 .unwrap_or((self.fallback_budget, 0));
-            let want_l1 = self.staging.is_some()
+            let want_l1 = self.has_staging
                 && should_use_l1(
                     self.pool_mode,
                     budget,
@@ -1447,9 +1455,9 @@ impl State {
             ranges += call.ranges.len() as u64;
             update_call(&self.map_queue, &window.resource, &call, call.heap.and_then(|h| self.heaps.get(h as usize)).and_then(|h| h.as_ref()).map(|h| &h._heap), &mut self.tile_scratch);
         }
-        self.fence_value += 1;
+        let next_val = self.fence_value.fetch_add(1, Ordering::AcqRel) + 1;
         // SAFETY: both objects are live.
-        if let Err(e) = unsafe { self.map_queue.Signal(&self.map_fence, self.fence_value) } {
+        if let Err(e) = unsafe { self.map_queue.Signal(&self.map_fence, next_val) } {
             xs_log!("title memory: the map fence cannot be signalled ({e})");
         }
         ranges
@@ -1591,7 +1599,10 @@ pub unsafe fn device_created(device: *mut c_void) {
         vram_budget.lwm_total >> 20,
         effective_m_cap >> 20
     );
-    let _sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let has_staging = staging.is_some();
+    let mut sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    sync_guard.staging = staging;
+    sync_guard.waited = Some(HashMap::new());
     let mut st = STATE.write().unwrap_or_else(PoisonError::into_inner);
     if st.is_some() {
         xs_log!("title memory: a second PC device, the heaps of the first are not used for it");
@@ -1605,7 +1616,7 @@ pub unsafe fn device_created(device: *mut c_void) {
         device,
         map_queue,
         map_fence,
-        fence_value: 0,
+        fence_value: Arc::new(AtomicU64::new(0)),
         mirror: Mirror::new(window_bytes()),
         seq: 0,
         last_journal_seq: None,
@@ -1616,12 +1627,11 @@ pub unsafe fn device_created(device: *mut c_void) {
         m_cap_override,
         l1_heaps: 0,
         l0_heaps: 0,
-        staging,
+        has_staging,
         failed: HashSet::new(),
         windows: Vec::new(),
         sections: Vec::new(),
         last_section: 0,
-        waited: HashMap::new(),
         tracking: false,
         last_guard: Instant::now(),
         stats: Stats::default(),
@@ -1951,9 +1961,9 @@ impl State {
             };
             update_call(&self.map_queue, buffer, &call, Some(&pool._heap), &mut self.tile_scratch);
         }
-        self.fence_value += 1;
+        let next_val = self.fence_value.fetch_add(1, Ordering::AcqRel) + 1;
         // SAFETY: both objects are live.
-        if let Err(e) = unsafe { self.map_queue.Signal(&self.map_fence, self.fence_value) } {
+        if let Err(e) = unsafe { self.map_queue.Signal(&self.map_fence, next_val) } {
             xs_log!("title memory: the map fence cannot be signalled ({e})");
         }
         Some(())
@@ -2049,7 +2059,8 @@ pub unsafe fn sync(queue: *mut c_void) {
     let Some(queue_ref) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else { return };
     let Some(api_ref) = api() else { return };
     let mut sync_scratch = decant_trace::timed_lock("title_mem::SYNC_LOCK", || SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-    let SyncScratch { jobs, dirty, runs } = &mut *sync_scratch;
+    let SyncScratch { jobs, dirty, runs, staging, waited } = &mut *sync_scratch;
+    let waited = waited.get_or_insert_with(HashMap::new);
     thread_local! {
         static SYNC_WRITTEN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     }
@@ -2073,25 +2084,42 @@ pub unsafe fn sync(queue: *mut c_void) {
         runs.clear();
         let started = Instant::now();
         let batch_take = if total_pages == 0 && total_ranges == 0 { take_micros } else { 0 };
-        let Some((phase1_id, pages, staging_span)) = with_state(|st, api| {
+        let Some((phase1_id, pages, map_queue, map_fence, fence_value, target_heaps)) = with_state(|st, api| {
             st.stats.take_micros += batch_take;
             let pages = st.plan_upload(api, batch_pages, jobs, runs);
             let mut batch_written = std::mem::take(&mut st.written);
             written.append(&mut batch_written);
             st.written = batch_written;
-            let staged_bytes: usize = runs.iter().map(|r| r.bytes as usize).sum();
-            let staging_span = if let (true, Some(ring)) = (staged_bytes > 0, st.staging.as_mut()) {
-                let base = ring.reserve(staged_bytes, &st.map_fence)?;
-                let dst_base = ring.ptr + base;
-                apply_staging_base(jobs, runs, dst_base);
-                Some((base, staged_bytes))
-            } else {
-                None
-            };
-            Some((st.id, pages, staging_span))
-        }).flatten() else {
+            let mut target_heaps: Vec<Option<ID3D12Resource>> = Vec::new();
+            if !runs.is_empty() {
+                let max_heap = runs.iter().map(|r| r.heap as usize).max().unwrap_or(0);
+                target_heaps.resize(max_heap + 1, None);
+                for r in runs.iter() {
+                    let idx = r.heap as usize;
+                    if target_heaps[idx].is_none()
+                        && let Some(Some(h)) = st.heaps.get(idx)
+                    {
+                        target_heaps[idx] = Some(h.buffer.clone());
+                    }
+                }
+            }
+            (st.id, pages, st.map_queue.clone(), st.map_fence.clone(), st.fence_value.clone(), target_heaps)
+        }) else {
             SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
             return;
+        };
+
+        let staged_bytes: usize = runs.iter().map(|r| r.bytes as usize).sum();
+        let staging_span = if let (true, Some(ring)) = (staged_bytes > 0, staging.as_mut()) {
+            let Some(base) = ring.reserve(staged_bytes, &map_fence) else {
+                SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
+                return;
+            };
+            let dst_base = ring.ptr + base;
+            apply_staging_base(jobs, runs, dst_base);
+            Some((base, staged_bytes))
+        } else {
+            None
         };
 
         let copy_micros = if !jobs.is_empty() {
@@ -2100,64 +2128,64 @@ pub unsafe fn sync(queue: *mut c_void) {
             // SAFETY: sorted unique pool pages have unique mirror tiles. Planning keeps each job
             // inside a live section and heap (or reserved staging span), and SYNC_LOCK keeps `device_created` from replacing heaps.
             unsafe { execute_copies(jobs, cores) };
+            if let (Some((base, staged_bytes)), Some(ring)) = (staging_span, staging.as_mut()) {
+                ring.copy_to_heaps(&map_queue, &map_fence, &target_heaps, (base, staged_bytes), runs, &fence_value);
+            }
             copying.elapsed().as_micros() as u64
         } else {
             0
         };
 
-        let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
-        if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
-            st.stats.copy_micros += copy_micros;
-            if let (Some((base, staged_bytes)), Some(ring)) = (staging_span, st.staging.as_mut()) {
-                ring.copy_to_heaps(
-                    &st.map_queue,
-                    &st.map_fence,
-                    &st.heaps,
-                    (base, staged_bytes),
-                    runs,
-                    &mut st.fence_value,
-                );
-            }
-            let tiles = Instant::now();
-            let ranges = st.update_tiles();
-            total_ranges += ranges;
-            st.stats.tile_micros += tiles.elapsed().as_micros() as u64;
-            if st.fence_value > 0 && st.waited.get(&(queue as usize)).is_none_or(|&v| v < st.fence_value) {
-                // SAFETY: both objects are live. The queue waits on the GPU, the CPU does not.
-                match unsafe { queue_ref.Wait(&st.map_fence, st.fence_value) } {
-                    Ok(()) => {
-                        st.waited.insert(queue as usize, st.fence_value);
-                    }
-                    Err(e) => xs_log!("title memory: a queue cannot wait for the tile mappings ({e})"),
+        let mut wait_target = None;
+        {
+            let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
+            if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
+                st.stats.copy_micros += copy_micros;
+                let tiles = Instant::now();
+                let ranges = st.update_tiles();
+                total_ranges += ranges;
+                st.stats.tile_micros += tiles.elapsed().as_micros() as u64;
+                let cur_fence = st.fence_value.load(Ordering::Acquire);
+                if cur_fence > 0 && waited.get(&(queue as usize)).is_none_or(|&v| v < cur_fence) {
+                    wait_target = Some(cur_fence);
+                }
+                crate::diagnose::removed_after(|| format!("a sync of {pages} pages and {ranges} tile ranges"));
+                if st.last_guard.elapsed() >= GUARD_EVERY {
+                    st.last_guard = Instant::now();
+                    run_guard = true;
+                }
+                let micros = started.elapsed().as_micros() as u64;
+                let s = &mut st.stats;
+                s.syncs += 1;
+                s.pages += pages;
+                s.ranges += ranges;
+                s.micros += micros;
+                s.worst_micros = s.worst_micros.max(micros);
+                if s.syncs.is_multiple_of(STATS_EVERY) {
+                    xs_log!(
+                        "title memory: {} syncs, {} pages copied ({} MiB), {} tile ranges updated, {} us in total ({} us asking for written pages, {} us copying, {} us mapping tiles), {} us at worst, {} slots",
+                        s.syncs,
+                        s.pages,
+                        (s.pages * PAGE) >> 20,
+                        s.ranges,
+                        s.micros,
+                        s.take_micros,
+                        s.copy_micros,
+                        s.tile_micros,
+                        s.worst_micros,
+                        st.mirror.slots().len()
+                    );
+                    st.stats = Stats { syncs: st.stats.syncs, ..Stats::default() };
                 }
             }
-            crate::diagnose::removed_after(|| format!("a sync of {pages} pages and {ranges} tile ranges"));
-            if st.last_guard.elapsed() >= GUARD_EVERY {
-                st.last_guard = Instant::now();
-                run_guard = true;
-            }
-            let micros = started.elapsed().as_micros() as u64;
-            let s = &mut st.stats;
-            s.syncs += 1;
-            s.pages += pages;
-            s.ranges += ranges;
-            s.micros += micros;
-            s.worst_micros = s.worst_micros.max(micros);
-            if s.syncs.is_multiple_of(STATS_EVERY) {
-                xs_log!(
-                    "title memory: {} syncs, {} pages copied ({} MiB), {} tile ranges updated, {} us in total ({} us asking for written pages, {} us copying, {} us mapping tiles), {} us at worst, {} slots",
-                    s.syncs,
-                    s.pages,
-                    (s.pages * PAGE) >> 20,
-                    s.ranges,
-                    s.micros,
-                    s.take_micros,
-                    s.copy_micros,
-                    s.tile_micros,
-                    s.worst_micros,
-                    st.mirror.slots().len()
-                );
-                st.stats = Stats { syncs: st.stats.syncs, ..Stats::default() };
+        }
+        if let Some(cur_fence) = wait_target {
+            // SAFETY: both objects are live. The queue waits on the GPU, the CPU does not.
+            match unsafe { queue_ref.Wait(&map_fence, cur_fence) } {
+                Ok(()) => {
+                    waited.insert(queue as usize, cur_fence);
+                }
+                Err(e) => xs_log!("title memory: a queue cannot wait for the tile mappings ({e})"),
             }
         }
         total_pages += pages;
@@ -2579,5 +2607,15 @@ mod tests {
         assert!(m.has_tiles_for_span(0x1000_0000, PAGE));
         assert!(should_skip_drain(Some(7), Some(7)));
         assert!(!should_skip_drain(Some(7), Some(8)));
+    }
+
+    #[test]
+    fn sync_lock_staging_does_not_block_state_read() {
+        let mut sync_guard = SYNC_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        sync_guard.waited.get_or_insert_with(HashMap::new).insert(0x1234, 7);
+        let read_guard = STATE.try_read();
+        assert!(read_guard.is_ok(), "STATE.read() must not block while SYNC_LOCK / staging is held");
+        drop(read_guard);
+        sync_guard.waited = None;
     }
 }
