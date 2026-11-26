@@ -169,7 +169,7 @@ enum QueueOp {
 }
 
 /// Maximum consecutive reads batched into one submission or parallel CPU read pass.
-const READ_BATCH_LIMIT: usize = 256;
+const READ_BATCH_LIMIT: usize = 512;
 
 /// The PC DirectStorage queue behind a project queue, with double-buffered status/event slots
 /// for overlapped batch submission and decode/write pipelining.
@@ -435,7 +435,7 @@ fn finish_written(destination: *mut c_void, len: u32) {
 
 /// Decodes handed on by one queue that may wait or run at once. The queue's worker waits beyond
 /// that, so the buffers they hold stay bounded.
-const MAX_IN_FLIGHT: usize = 512;
+const MAX_IN_FLIGHT: usize = 1024;
 
 /// Minimum pooled buffer size (4 KiB, one OS page).
 const POOL_MIN_SHIFT: u32 = 12;
@@ -556,7 +556,7 @@ impl InputBuffer {
 }
 
 /// Maximum gap between adjacent reads in the same file to coalesce into one sequential read.
-const MAX_COALESCE_GAP: u64 = 4096;
+const MAX_COALESCE_GAP: u64 = 64 * 1024;
 /// Maximum total byte span of a single coalesced read.
 const MAX_COALESCE_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -635,6 +635,32 @@ struct Staged {
     read_time: Duration,
 }
 
+/// Maximum size of the per-decode-thread scratch buffer kept without returning to `BufferPool`.
+const THREAD_SCRATCH_MAX: usize = 4 * 1024 * 1024;
+
+thread_local! {
+    static DECODE_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_decode_output<F: FnOnce(&mut [u8]) -> HRESULT>(size: usize, f: F) -> HRESULT {
+    if size <= THREAD_SCRATCH_MAX {
+        return DECODE_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            scratch.clear();
+            if scratch.capacity() < size && scratch.try_reserve_exact(size).is_err() {
+                return E_OUTOFMEMORY;
+            }
+            // SAFETY: capacity >= size, and `f` initializes/writes the output slice before reading.
+            unsafe { scratch.set_len(size) };
+            f(&mut scratch[..size])
+        });
+    }
+    let Ok(mut output) = buffer_capacity(size as u32) else { return E_OUTOFMEMORY };
+    // SAFETY: `output` has capacity >= `size`.
+    unsafe { output.set_len(size) };
+    f(&mut output[..size])
+}
+
 impl Staged {
     /// Decodes into the destination, or decodes (or copies) into the physical pages.
     fn finish(self, pool: &dyn PagePool) -> HRESULT {
@@ -659,25 +685,42 @@ impl Staged {
             self.core_timing.record_and_log(self.source_bytes, self.destination_size, self.read_time, decode_time, write_time);
             return hr;
         };
-        let (decoded_buf, decode_time) = if self.decode {
-            let Ok(mut output) = buffer_capacity(self.destination_size) else { return E_OUTOFMEMORY };
-            // SAFETY: `input` holds the source bytes and `output` has capacity for `destination_size` bytes.
-            let decode_started = Instant::now();
-            let hr = unsafe { codecs::decode(self.codec, self.bc_mode, input_slice.as_ptr(), input_slice.len() as u32, output.as_mut_ptr(), self.destination_size) };
-            let decode_time = decode_started.elapsed();
-            if hr < 0 {
-                return hr;
-            }
-            // SAFETY: `codecs::decode` initialized all `destination_size` bytes on success.
-            unsafe { output.set_len(self.destination_size as usize) };
-            (Some(output), decode_time)
-        } else {
-            (None, Duration::ZERO)
-        };
-        let output_slice = decoded_buf.as_deref().map_or(input_slice, Vec::as_slice);
+        if self.decode {
+            let out_len = self.destination_size as usize;
+            return with_decode_output(out_len, |output_slice| {
+                let decode_started = Instant::now();
+                // SAFETY: `input_slice` holds the source bytes and `output_slice` is writable for `out_len` bytes.
+                let hr = unsafe { codecs::decode(self.codec, self.bc_mode, input_slice.as_ptr(), input_slice.len() as u32, output_slice.as_mut_ptr(), self.destination_size) };
+                let decode_time = decode_started.elapsed();
+                if hr < 0 {
+                    return hr;
+                }
+                let write_started = Instant::now();
+                let frames = target.frames_now_cow();
+                let result = match pool.write(&frames, target.offset, output_slice) {
+                    Ok(views) => {
+                        static WRITTEN: AtomicU64 = AtomicU64::new(0);
+                        let n = WRITTEN.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 || n.is_multiple_of(1000) {
+                            storage_log(&format!("page destination: {n} reads written into physical pages so far\n"));
+                        }
+                        for (address, len) in views {
+                            note_written(address as *mut c_void, len as u32);
+                        }
+                        S_OK
+                    }
+                    Err(error) => {
+                        storage_log(&format!("page destination frames={:x?} (at enqueue {:x?}) offset={:#x} bytes={} hr={:08x}\n", frames.as_ref(), target.frames, target.offset, output_slice.len(), error as u32));
+                        error
+                    }
+                };
+                self.core_timing.record_and_log(self.source_bytes, self.destination_size, self.read_time, decode_time, write_started.elapsed());
+                result
+            });
+        }
         let write_started = Instant::now();
         let frames = target.frames_now_cow();
-        let result = match pool.write(&frames, target.offset, output_slice) {
+        let result = match pool.write(&frames, target.offset, input_slice) {
             Ok(views) => {
                 static WRITTEN: AtomicU64 = AtomicU64::new(0);
                 let n = WRITTEN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -690,11 +733,11 @@ impl Staged {
                 S_OK
             }
             Err(error) => {
-                storage_log(&format!("page destination frames={:x?} (at enqueue {:x?}) offset={:#x} bytes={} hr={:08x}\n", frames.as_ref(), target.frames, target.offset, output_slice.len(), error as u32));
+                storage_log(&format!("page destination frames={:x?} (at enqueue {:x?}) offset={:#x} bytes={} hr={:08x}\n", frames.as_ref(), target.frames, target.offset, input_slice.len(), error as u32));
                 error
             }
         };
-        self.core_timing.record_and_log(self.source_bytes, output_slice.len() as u32, self.read_time, decode_time, write_started.elapsed());
+        self.core_timing.record_and_log(self.source_bytes, input_slice.len() as u32, self.read_time, Duration::ZERO, write_started.elapsed());
         result
     }
 }
@@ -1403,7 +1446,7 @@ impl Queue {
         let spawned = std::thread::Builder::new().spawn(move || run(&core, &work));
         queue.worker = Some(spawned.map_err(|_| E_OUTOFMEMORY)?);
         let Some(factory) = queue.core.backend.factory.as_ref() else { return Ok(queue) };
-        let native_capacity = capacity.max(pc::MIN_QUEUE_CAPACITY).clamp(1024, 4096);
+        let native_capacity = capacity.max(pc::MIN_QUEUE_CAPACITY).clamp(2048, 4096);
         let desc = pc::QueueDesc { source_type: 0, capacity: native_capacity, priority: 0, name: std::ptr::null(), device: std::ptr::null_mut() };
         let mut raw = std::ptr::null_mut();
         // SAFETY: the factory is an `IDStorageFactory`, `desc` and `raw` live for the call.
@@ -1989,5 +2032,60 @@ fn multi_batch_pipelined_reads_settle_before_status_barrier() {
     for (i, buf) in bufs.iter().enumerate() {
         assert_eq!(buf.as_slice(), &data[i * chunk_size..(i + 1) * chunk_size], "mismatch at chunk {i}");
     }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(test)]
+#[test]
+fn coalesces_across_64k_gap_and_reuses_decode_scratch() {
+    use std::io::Write;
+    let mut data = vec![0u8; 256 * 1024];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i * 11 + i / 97) as u8;
+    }
+    let path = std::env::temp_dir().join(format!("dstorage_gap64k_{}.bin", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&path).expect("creates temp file");
+        f.write_all(&data).expect("writes temp file");
+    }
+    let wide: Vec<u16> = {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let factory = Ref::new(Factory::new(Backend::cpu(), Arc::new(XmemPool)));
+    let file = factory.open_file(wide.as_ptr()).expect("opens file");
+    let op0 = ReadOp {
+        file: file.clone(),
+        read: Sendable(DecantRead {
+            file: file.as_ptr().cast(),
+            offset: 0,
+            source_size: 4096,
+            destination: std::ptr::null_mut(),
+            destination_size: 4096,
+            codec: codec::COPY,
+            bc_mode: 0,
+        }),
+        pages: None,
+    };
+    let op1 = ReadOp {
+        file: file.clone(),
+        read: Sendable(DecantRead {
+            file: file.as_ptr().cast(),
+            offset: 4096 + 48 * 1024, // 48 KiB gap <= 64 KiB
+            source_size: 4096,
+            destination: std::ptr::null_mut(),
+            destination_size: 4096,
+            codec: codec::COPY,
+            bc_mode: 0,
+        }),
+        pages: None,
+    };
+    let plan = plan_coalesced_batches(&[op0, op1], false);
+    assert_eq!(plan.groups.len(), 1);
+    assert!(plan.singles.is_empty());
+    assert_eq!(plan.groups[0].span, 4096 + 48 * 1024 + 4096);
+
+    assert_eq!(with_decode_output(1024, |buf| { buf.fill(0xAA); S_OK }), S_OK);
+    assert_eq!(with_decode_output(2048, |buf| { assert_eq!(buf.len(), 2048); S_OK }), S_OK);
     let _ = std::fs::remove_file(&path);
 }

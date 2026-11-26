@@ -15,6 +15,7 @@ const BAD: HRESULT = hresult_from_win32(ERROR_INVALID_DATA);
 
 /// A BCPack stream of `mode` (1 = BC1 ... 7 = BC7, as `DSTORAGE_BCPACK_MODE`) to exactly
 /// `output.len()` bytes of blocks. BC2 and unknown modes are not implemented.
+#[inline]
 fn bcpack(mode: u32, source: &[u8], output: &mut [u8]) -> HRESULT {
     let Some(format) = decant_bcpack::Format::from_mode(mode) else {
         decant_log::calls::record_with(decant_log::calls::Kind::NotImplemented, || format!("BCPack mode {mode}"));
@@ -37,6 +38,7 @@ fn bcpack(mode: u32, source: &[u8], output: &mut [u8]) -> HRESULT {
 }
 
 /// zlib stream to exactly `output.len()` bytes, the whole input consumed.
+#[inline]
 fn zlib(source: &[u8], output: &mut [u8]) -> HRESULT {
     thread_local! {
         static DECOMPRESS: std::cell::RefCell<flate2::Decompress> = std::cell::RefCell::new(flate2::Decompress::new(true));
@@ -197,6 +199,7 @@ fn tiles(_data: &[u8], _out: &mut [u8]) -> HRESULT {
 ///
 /// # Safety
 /// `source` is readable for `size` bytes and `output` writable for `capacity` bytes, and they do not overlap.
+#[inline]
 pub unsafe fn decode(kind: u32, bc_mode: u32, source: *const u8, size: u32, output: *mut u8, capacity: u32) -> HRESULT {
     if kind != codec::GDEFLATE && kind != codec::ZLIB && kind != codec::BCPACK {
         return E_NOTIMPL;
