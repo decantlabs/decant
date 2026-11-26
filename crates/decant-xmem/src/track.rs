@@ -85,6 +85,18 @@ impl Track {
         self.addresses.get(&addr).and_then(|&(page, rw)| rw.then_some(page))
     }
 
+    /// Whether `page` is known to be committed in its backing section.
+    pub fn is_committed(&self, page: u32) -> bool {
+        self.committed.get(page as usize).copied().unwrap_or(false)
+    }
+
+    /// Records that `page` is committed in its backing section.
+    pub fn mark_committed(&mut self, page: u32) {
+        if let Some(slot) = self.committed.get_mut(page as usize) {
+            *slot = true;
+        }
+    }
+
     /// The addresses of the read write views of `page`.
     fn rw(&self, page: u32) -> Vec<usize> {
         self.aliases.get(&page).map(|v| v.iter().filter(|a| a.rw).map(|a| a.addr).collect()).unwrap_or_default()
