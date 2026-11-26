@@ -82,16 +82,29 @@ struct CopyJob {
     source: usize,
     destination: usize,
     pages: usize,
+    staged: bool,
 }
 
-fn plan_copy(jobs: &mut Vec<CopyJob>, source: usize, destination: usize, pages: usize) {
+fn plan_copy(jobs: &mut Vec<CopyJob>, source: usize, destination: usize, pages: usize, staged: bool) {
     for start in (0..pages).step_by(COPY_CHUNK_PAGES) {
         jobs.push(CopyJob {
             source: source + start * PAGE as usize,
             destination: destination + start * PAGE as usize,
             pages: (pages - start).min(COPY_CHUNK_PAGES),
+            staged,
         });
     }
+}
+
+/// Rebases staged L1 copy destinations by `dst_base` while leaving direct L0 pointers untouched.
+/// Returns the total byte size of staged upload runs.
+fn apply_staging_base(jobs: &mut [CopyJob], runs: &[UploadRun], dst_base: usize) -> usize {
+    for job in jobs.iter_mut() {
+        if job.staged {
+            job.destination += dst_base;
+        }
+    }
+    runs.iter().map(|r| r.bytes as usize).sum()
 }
 
 fn copy_threads(pages: usize, cores: usize) -> usize {
@@ -1492,7 +1505,7 @@ impl State {
             i += head;
             if use_staging {
                 let staging_offset = staged_pages * PAGE as usize;
-                plan_copy(jobs, src, staging_offset, head);
+                plan_copy(jobs, src, staging_offset, head, true);
                 runs.push(UploadRun {
                     heap,
                     heap_offset: tile as u64 * PAGE,
@@ -1501,7 +1514,7 @@ impl State {
                 });
                 staged_pages += head;
             } else {
-                plan_copy(jobs, src, dst + tile as usize * PAGE as usize, head);
+                plan_copy(jobs, src, dst + tile as usize * PAGE as usize, head, false);
             }
             *copied += head as u64;
             self.written.extend(first_tile..first_tile + head as u32);
@@ -2060,24 +2073,22 @@ pub unsafe fn sync(queue: *mut c_void) {
         runs.clear();
         let started = Instant::now();
         let batch_take = if total_pages == 0 && total_ranges == 0 { take_micros } else { 0 };
-        let Some((phase1_id, pages, staging_base)) = with_state(|st, api| {
+        let Some((phase1_id, pages, staging_span)) = with_state(|st, api| {
             st.stats.take_micros += batch_take;
             let pages = st.plan_upload(api, batch_pages, jobs, runs);
             let mut batch_written = std::mem::take(&mut st.written);
             written.append(&mut batch_written);
             st.written = batch_written;
-            let staging_base = if let (true, Some(ring)) = (pages > 0, st.staging.as_mut()) {
-                let bytes = pages as usize * PAGE as usize;
-                let base = ring.reserve(bytes, &st.map_fence)?;
+            let staged_bytes: usize = runs.iter().map(|r| r.bytes as usize).sum();
+            let staging_span = if let (true, Some(ring)) = (staged_bytes > 0, st.staging.as_mut()) {
+                let base = ring.reserve(staged_bytes, &st.map_fence)?;
                 let dst_base = ring.ptr + base;
-                for job in jobs.iter_mut() {
-                    job.destination += dst_base;
-                }
-                Some(base)
+                apply_staging_base(jobs, runs, dst_base);
+                Some((base, staged_bytes))
             } else {
                 None
             };
-            Some((st.id, pages, staging_base))
+            Some((st.id, pages, staging_span))
         }).flatten() else {
             SYNC_WRITTEN.with(|cell| *cell.borrow_mut() = written);
             return;
@@ -2097,12 +2108,12 @@ pub unsafe fn sync(queue: *mut c_void) {
         let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
         if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
             st.stats.copy_micros += copy_micros;
-            if let (Some(base), Some(ring)) = (staging_base, st.staging.as_mut()) {
+            if let (Some((base, staged_bytes)), Some(ring)) = (staging_span, st.staging.as_mut()) {
                 ring.copy_to_heaps(
                     &st.map_queue,
                     &st.map_fence,
                     &st.heaps,
-                    (base, pages as usize * PAGE as usize),
+                    (base, staged_bytes),
                     runs,
                     &mut st.fence_value,
                 );
@@ -2250,9 +2261,9 @@ mod tests {
         assert_eq!(copy_threads(4096, 1), 1);
         assert_eq!(copy_threads(4096, 0), 1);
         let mut jobs = Vec::new();
-        plan_copy(&mut jobs, 0, 1024, 0);
+        plan_copy(&mut jobs, 0, 1024, 0, false);
         assert!(jobs.is_empty());
-        plan_copy(&mut jobs, 0, 1024, 15);
+        plan_copy(&mut jobs, 0, 1024, 15, false);
         assert_eq!(jobs.iter().map(|job| job.pages).collect::<Vec<_>>(), [4, 4, 4, 3]);
         for (i, job) in jobs.iter().enumerate() {
             assert_eq!(job.source, i * COPY_CHUNK_PAGES * PAGE as usize);
@@ -2270,7 +2281,7 @@ mod tests {
         for (output, cores) in [(&mut inline, 1), (&mut parallel, 4)] {
             jobs.clear();
             for (src, dst, count) in [(130, 0, 129), (0, 130, 128)] {
-                plan_copy(&mut jobs, source.as_ptr() as usize + src * PAGE as usize, output.as_mut_ptr() as usize + dst * PAGE as usize, count);
+                plan_copy(&mut jobs, source.as_ptr() as usize + src * PAGE as usize, output.as_mut_ptr() as usize + dst * PAGE as usize, count, false);
             }
             for _ in 0..3 {
                 // SAFETY: vectors live until the workers join and the destination spans are disjoint.
@@ -2529,6 +2540,29 @@ mod tests {
         assert!(!should_use_l1(MirrorPoolMode::StrictL0, budget_24, 0, 0, None));
         // 8 GiB class has M_cap = 0 so Auto stays on L0.
         assert!(!should_use_l1(MirrorPoolMode::Auto, 7_680 << 20, 1_000 << 20, 0, None));
+    }
+
+    #[test]
+    fn mixed_l1_and_l0_jobs_rebase_only_staged_destinations() {
+        let mut jobs = Vec::new();
+        let mut runs = Vec::new();
+        let l0_ptr = 0x7ff0_0000_0000usize;
+        // Two staged L1 pages (offset 0) and three direct L0 pages (absolute host pointer).
+        plan_copy(&mut jobs, 0x1000_0000, 0, 2, true);
+        runs.push(UploadRun {
+            heap: 0,
+            heap_offset: 0,
+            staging_offset: 0,
+            bytes: 2 * PAGE,
+        });
+        plan_copy(&mut jobs, 0x2000_0000, l0_ptr + PAGE as usize, 3, false);
+
+        let dst_base = 0x1234_0000usize;
+        let staged_bytes = apply_staging_base(&mut jobs, &runs, dst_base);
+        assert_eq!(staged_bytes, 2 * PAGE as usize);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].destination, dst_base);
+        assert_eq!(jobs[1].destination, l0_ptr + PAGE as usize);
     }
 
     #[test]
