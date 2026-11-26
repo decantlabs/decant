@@ -967,4 +967,17 @@ mod tests {
         assert_eq!(stub_rcx[0], 0x52, "uses rdx as scratch when limit is rcx");
         assert_eq!(stub_rcx[80], 0x5A, "pops rdx before exit");
     }
+
+    #[test]
+    fn the_clear_loop_matches_with_each_limit_register() {
+        // `cmp rax,<reg>` with r10, r9, r8 and rdx as the limit register, in the `cmp r/m64,r64` form.
+        for (cmp, reg) in [([0x4C, 0x39, 0xD0], 10), ([0x4C, 0x39, 0xC8], 9), ([0x4C, 0x39, 0xC0], 8), ([0x48, 0x39, 0xD0], 2)] {
+            let code = assemble(&ADD_SHORT, &cmp, jb_short);
+            assert_eq!(match_loop(&code), Some((code.len(), reg)), "{code:02x?}");
+        }
+        assert_eq!(cmp_rax_with(&[0x48, 0x3B, 0xC2]), Some(2), "cmp rax,rdx in the other encoding");
+        assert_eq!(cmp_rax_with(&[0x49, 0x3B, 0xC3]), Some(11));
+        assert_eq!(cmp_rax_with(&[0x48, 0x39, 0xE0]), None, "rsp");
+        assert_eq!(cmp_rax_with(&[0x48, 0x3B, 0xC8]), None, "cmp rcx,rax");
+    }
 }
