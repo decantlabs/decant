@@ -73,7 +73,7 @@ impl Hasher for FastIntHasher {
 type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastIntHasher>>;
 type FastSet<K> = HashSet<K, BuildHasherDefault<FastIntHasher>>;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -927,6 +927,9 @@ fn select_staging_to_trim(frames: impl Iterator<Item = (usize, u64, u64)>, compl
 
 /// Fast path flag indicating whether at least one registered texture may want a fill.
 static HAS_PENDING_FILLS: AtomicBool = AtomicBool::new(false);
+/// Fast path counters to skip `REGISTRY_READ` when no textures or noted transitions exist.
+static TEXTURE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static NOTED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct OwnedJob {
     texture: ID3D12Resource,
@@ -1029,11 +1032,13 @@ impl Registry {
         }
         crate::mem_owners::add(crate::mem_owners::Kind::DetileTexture, crate::mem_owners::Segment::Local, 1, texture.bytes);
         self.textures.insert(res, texture);
+        TEXTURE_COUNT.store(self.textures.len(), Ordering::Release);
     }
 
     /// Drops `res`. Whether it was held.
     fn remove(&mut self, res: usize) -> bool {
         let Some(texture) = self.textures.remove(&res) else { return false };
+        TEXTURE_COUNT.store(self.textures.len(), Ordering::Release);
         self.pending.remove(&res);
         self.pending_index.remove(&res);
         self.unmapped_textures.remove(&res);
@@ -1096,17 +1101,43 @@ impl Registry {
         out
     }
 
-    /// Rebuilds the entire `tile_to_textures` index after a structural layout change.
-    fn apply_full_index(
-        &mut self,
+    /// Builds the reverse index maps outside `REGISTRY` so the write lock only swaps pointers and
+    /// moves tile vectors into `Placed::tiles`.
+    fn build_full_index_maps(
         items: &[(usize, u64, u64)],
         tiles_per_item: &[Option<Vec<u32>>],
+    ) -> (FastMap<u32, Vec<usize>>, FastSet<usize>) {
+        let mut tile_to_textures: FastMap<u32, Vec<usize>> = FastMap::default();
+        let mut unmapped_textures: FastSet<usize> = FastSet::default();
+        for (&(res, _, _), maybe_tiles) in items.iter().zip(tiles_per_item) {
+            match maybe_tiles {
+                Some(tiles) => {
+                    for &tile in tiles {
+                        tile_to_textures.entry(tile).or_default().push(res);
+                    }
+                }
+                None => {
+                    unmapped_textures.insert(res);
+                }
+            }
+        }
+        (tile_to_textures, unmapped_textures)
+    }
+
+    /// Swaps in prebuilt `tile_to_textures` / `unmapped_textures` under the write lock and returns
+    /// the old maps so they can be dropped outside the lock.
+    fn apply_precomputed_full_index(
+        &mut self,
+        items: &[(usize, u64, u64)],
+        tiles_per_item: Vec<Option<Vec<u32>>>,
+        precomputed: (FastMap<u32, Vec<usize>>, FastSet<usize>),
         layout_gen: u64,
         tile_gen: u64,
         layout_current: bool,
-    ) {
-        self.tile_to_textures.clear();
-        self.unmapped_textures.clear();
+    ) -> (FastMap<u32, Vec<usize>>, FastSet<usize>) {
+        let (mut new_tile_to_textures, mut new_unmapped) = precomputed;
+        std::mem::swap(&mut self.tile_to_textures, &mut new_tile_to_textures);
+        std::mem::swap(&mut self.unmapped_textures, &mut new_unmapped);
         let mut live_matched = 0usize;
         for (&(res, va, _), maybe_tiles) in items.iter().zip(tiles_per_item) {
             let Some(texture) = self.textures.get_mut(&res).filter(|t| t.va == va) else {
@@ -1114,18 +1145,7 @@ impl Registry {
             };
             live_matched += 1;
             self.pending_index.remove(&res);
-            match maybe_tiles {
-                Some(tiles) => {
-                    for &tile in tiles {
-                        self.tile_to_textures.entry(tile).or_default().push(res);
-                    }
-                    texture.tiles = Some(tiles.clone());
-                }
-                None => {
-                    texture.tiles = None;
-                    self.unmapped_textures.insert(res);
-                }
-            }
+            texture.tiles = maybe_tiles;
         }
         if layout_current && live_matched == self.textures.len() {
             self.layout_gen = layout_gen;
@@ -1133,6 +1153,13 @@ impl Registry {
         } else {
             self.layout_gen = 0;
         }
+        (new_tile_to_textures, new_unmapped)
+    }
+
+    #[cfg(test)]
+    fn apply_full_index(&mut self, items: &[(usize, u64, u64)], tiles_per_item: &[Option<Vec<u32>>], layout_gen: u64, tile_gen: u64, layout_current: bool) {
+        let precomputed = Self::build_full_index_maps(items, tiles_per_item);
+        let _ = self.apply_precomputed_full_index(items, tiles_per_item.to_vec(), precomputed, layout_gen, tile_gen, layout_current);
     }
 
     /// Incrementally updates `tile_to_textures` for newly inserted or previously unmapped textures.
@@ -1195,8 +1222,10 @@ impl Registry {
         let mut marked = 0u32;
         for &res in &hit {
             if let Some(texture) = self.textures.get_mut(&res) {
-                texture.invalidate();
-                self.pending.insert(res);
+                if !(texture.dirty && texture.attempts == 0) {
+                    texture.invalidate();
+                    self.pending.insert(res);
+                }
                 marked += 1;
             }
         }
@@ -1361,6 +1390,9 @@ pub fn describe(res: usize) -> Option<String> {
 
 /// The resource was released.
 pub fn forget(res: usize) {
+    if TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     if with_registry_read(|r| r.textures.contains_key(&res)) != Some(true) {
         return;
     }
@@ -1376,7 +1408,7 @@ pub fn mark_resource(_res: usize) {}
 /// The title or a layer wrote `len` bytes at title address `va` (a DirectStorage completion or a
 /// copy).
 pub fn note_write(va: u64, len: u64) {
-    if !enabled() || len == 0 {
+    if !enabled() || len == 0 || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
     let end = va.saturating_add(len);
@@ -1413,7 +1445,7 @@ fn probe_line_due() -> bool {
 /// address at its first tries.
 pub fn note_tiles(tiles: &[u32]) {
     static ANNOUNCED: AtomicU32 = AtomicU32::new(0);
-    if !enabled() || tiles.is_empty() {
+    if !enabled() || tiles.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
     let report = probe_line_due();
@@ -1460,16 +1492,33 @@ pub fn note_tiles(tiles: &[u32]) {
             let build_tile = crate::title_mem::tile_generation();
             let mut tiles_out = Vec::new();
             crate::title_mem::tiles_of_batch(&spans, &mut tiles_out);
-            with_registry(|r| {
-                if full_rebuild {
-                    r.apply_full_index(&items, &tiles_out, build_layout, build_tile, crate::title_mem::mapping_generation() == build_layout);
-                } else if crate::title_mem::mapping_generation() != snap_layout {
-                    r.layout_gen = 0;
-                } else {
-                    r.apply_incremental_index(&items, &tiles_out, build_tile, crate::title_mem::tile_generation() == build_tile);
-                }
-                r.mark_tiles_from_index(tiles, report)
-            })
+            if full_rebuild {
+                let precomputed = Registry::build_full_index_maps(&items, &tiles_out);
+                let (old_map, old_unmapped, marked) = with_registry(|r| {
+                    let (old_map, old_unmapped) = r.apply_precomputed_full_index(
+                        &items,
+                        tiles_out,
+                        precomputed,
+                        build_layout,
+                        build_tile,
+                        crate::title_mem::mapping_generation() == build_layout,
+                    );
+                    let marked = r.mark_tiles_from_index(tiles, report);
+                    (old_map, old_unmapped, marked)
+                });
+                drop(old_map);
+                drop(old_unmapped);
+                marked
+            } else {
+                with_registry(|r| {
+                    if crate::title_mem::mapping_generation() != snap_layout {
+                        r.layout_gen = 0;
+                    } else {
+                        r.apply_incremental_index(&items, &tiles_out, build_tile, crate::title_mem::tile_generation() == build_tile);
+                    }
+                    r.mark_tiles_from_index(tiles, report)
+                })
+            }
         }
     };
     if marked > 0 && ANNOUNCED.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -1480,6 +1529,9 @@ pub fn note_tiles(tiles: &[u32]) {
 /// The title's GPU work writes into the texture (a copy). The CPU view is stale from then on, so
 /// the texture is not detiled any more.
 pub fn note_gpu_write(res: usize) {
+    if TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     if with_registry_read(|r| r.textures.contains_key(&res)) != Some(true) {
         return;
     }
@@ -1495,7 +1547,7 @@ pub fn note_gpu_write(res: usize) {
 
 /// The title recorded `transitions` (resource, subresource, state after) on PC list `list`.
 pub fn note_transitions(list: usize, transitions: &[(usize, u32, u32)]) {
-    if !enabled() || transitions.is_empty() {
+    if !enabled() || transitions.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
     if with_registry_read(|r| transitions.iter().any(|(res, _, _)| r.textures.contains_key(res))) != Some(true) {
@@ -1504,13 +1556,18 @@ pub fn note_transitions(list: usize, transitions: &[(usize, u32, u32)]) {
     with_registry(|r| {
         let mut iter = transitions.iter().filter(|(res, _, _)| r.textures.contains_key(res)).copied().peekable();
         if iter.peek().is_some() {
-            r.noted.entry(list).or_default().extend(iter);
+            let entry = r.noted.entry(list).or_default();
+            entry.extend(iter);
+            NOTED_COUNT.store(r.noted.len(), Ordering::Release);
         }
     });
 }
 
 /// PC list `list` starts a new recording, so the transitions noted for it are dropped.
 pub fn list_reset(list: usize) {
+    if NOTED_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     if with_registry_read(|r| r.noted.get(&list).is_some_and(|v| !v.is_empty())) != Some(true) {
         return;
     }
@@ -1546,7 +1603,7 @@ pub fn apply_transition(states: &mut Vec<u32>, count: usize, sub: u32, after: u3
 /// The PC lists `lists` were submitted in this order, so the textures now are in the states that
 /// the transitions of those lists left them in.
 pub fn submitted(lists: &[usize]) {
-    if lists.is_empty() {
+    if lists.is_empty() || NOTED_COUNT.load(Ordering::Acquire) == 0 || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
     if with_registry_read(|r| !r.noted.is_empty() && lists.iter().any(|l| r.noted.get(l).is_some_and(|v| !v.is_empty()))) != Some(true) {
@@ -2108,5 +2165,43 @@ mod tests {
         submitted(&[0xDEAD]);
         forget(0xBEEF);
         note_gpu_write(0xBEEF);
+    }
+
+    #[test]
+    fn precomputed_full_index_swaps_maps_and_preserves_concurrent_pending_index() {
+        let mut r = Registry::default();
+        r.insert(1, placed(0x1000, 0x1000));
+        r.insert(2, placed(0x2000, 0x1000));
+        let items = vec![(1, 0x1000, 0x1000), (2, 0x2000, 0x1000)];
+        let tiles_out = vec![Some(vec![10, 11]), None];
+        let precomputed = Registry::build_full_index_maps(&items, &tiles_out);
+        // Simulate a new texture registered concurrently while tiles_of_batch ran.
+        r.insert(3, placed(0x3000, 0x1000));
+        let (old_map, old_unmapped) = r.apply_precomputed_full_index(&items, tiles_out, precomputed, 42, 7, true);
+        assert!(old_map.is_empty() && old_unmapped.is_empty());
+        assert_eq!(r.tile_to_textures.get(&10).map(Vec::as_slice), Some(&[1][..]));
+        assert!(r.unmapped_textures.contains(&2));
+        assert!(!r.pending_index.contains(&1) && !r.pending_index.contains(&2));
+        assert!(r.pending_index.contains(&3), "concurrently inserted texture stays queued");
+        assert_eq!(r.layout_gen, 0, "live_matched != r.textures.len() keeps layout_gen 0");
+    }
+
+    #[test]
+    fn mark_tiles_from_index_keeps_already_dirty_zero_attempt_and_requeues_settled() {
+        let mut r = Registry::default();
+        let mut p1 = placed(0x1000, 0x1000);
+        p1.dirty = true;
+        p1.attempts = 0;
+        r.insert(1, p1);
+        let mut p2 = placed(0x2000, 0x1000);
+        p2.dirty = false;
+        p2.attempts = 0;
+        r.insert(2, p2);
+        r.tile_to_textures.insert(5, vec![1, 2]);
+        let marked = r.mark_tiles_from_index(&[5], false);
+        assert_eq!(marked, 2);
+        assert!(r.pending.contains(&1));
+        assert!(r.pending.contains(&2));
+        assert!(r.textures[&2].dirty);
     }
 }
