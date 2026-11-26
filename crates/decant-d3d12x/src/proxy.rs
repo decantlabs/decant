@@ -190,11 +190,11 @@ unsafe fn is_iid(riid: *const GUID, guid: &GUID) -> bool {
     { let a = unsafe { &*riid }; a.data1 == guid.data1 && a.data2 == guid.data2 && a.data3 == guid.data3 && a.data4 == guid.data4 }
 }
 
-/// True for the first three calls of a counter, then every thousandth: enough to see a method in
-/// the log without flooding it from a per frame loop.
+/// True for the first three calls of a counter, then at powers of two from 1024 on: enough to
+/// see a method in the log without flooding it from a per-draw loop.
 pub(crate) fn log_due(counter: &AtomicI32) -> bool {
-    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-    n <= 3 || n % 1000 == 0
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    n <= 3 || (n >= 1024 && (n & (n - 1)) == 0)
 }
 
 /// The proxy of one PC object. The relay stubs read the PC object at +0x08.
@@ -5349,5 +5349,12 @@ mod tests {
         let empty = super::StackBarriers::empty();
         assert!(empty.is_empty());
         assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn log_due_throttles_after_first_three_to_powers_of_two() {
+        let c = std::sync::atomic::AtomicI32::new(0);
+        let due: Vec<usize> = (1..=5000).filter(|_| super::log_due(&c)).collect();
+        assert_eq!(due, vec![1, 2, 3, 1024, 2048, 4096]);
     }
 }
