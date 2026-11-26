@@ -609,6 +609,54 @@ fn make(queue: &ID3D12CommandQueue, w: u32, h: u32, fmt: DXGI_FORMAT) -> windows
 /// Flush recorded trace events periodically so long runs keep trace JSON on disk.
 const TRACE_FLUSH_INTERVAL: u64 = 300;
 
+struct AsyncFlush {
+    pending: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl AsyncFlush {
+    fn new(name: &str, flush_fn: impl Fn() + Send + 'static) -> std::sync::Arc<Self> {
+        let state = std::sync::Arc::new(Self {
+            pending: Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        });
+        let worker = std::sync::Arc::clone(&state);
+        let _ = std::thread::Builder::new().name(name.into()).spawn(move || {
+            loop {
+                {
+                    let mut guard = worker.pending.lock().unwrap_or_else(|e| e.into_inner());
+                    while !*guard {
+                        guard = worker.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                    }
+                    *guard = false;
+                }
+                flush_fn();
+            }
+        });
+        state
+    }
+
+    fn trigger(&self) {
+        if let Ok(mut guard) = self.pending.try_lock()
+            && !*guard
+        {
+            *guard = true;
+            self.cv.notify_one();
+        }
+    }
+}
+
+fn request_trace_flush() {
+    static FLUSHER: OnceLock<std::sync::Arc<AsyncFlush>> = OnceLock::new();
+    FLUSHER
+        .get_or_init(|| {
+            AsyncFlush::new("d3d12xs-trace-flush", || {
+                let _ = decant_trace::flush();
+            })
+        })
+        .trigger();
+}
+
 /// Copies `resource` into the next back buffer and presents it. False when it cannot be shown
 /// (not enabled, no window, a format a swap chain does not take, a failed call), logged once.
 ///
@@ -905,7 +953,7 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
                 if (frame_num.is_multiple_of(TRACE_FLUSH_INTERVAL) || time_due)
                     && LAST_FLUSH_MS.compare_exchange(prev_ms, elapsed_ms, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok()
                 {
-                    let _ = decant_trace::flush();
+                    request_trace_flush();
                 }
             }
             true
@@ -1243,5 +1291,20 @@ mod tests {
         assert_eq!(ring_index(5, 0), 0);
         assert_eq!(timestamp_pair(0), (0, 1));
         assert_eq!(timestamp_pair(1), (2, 3));
+    }
+
+    #[test]
+    fn async_trace_flush_runs_off_thread_without_blocking_caller() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = std::sync::Arc::clone(&count);
+        let flusher = AsyncFlush::new("test-trace-flush", move || {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
+        flusher.trigger();
+        let start = std::time::Instant::now();
+        while count.load(Ordering::Relaxed) == 0 && start.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(count.load(Ordering::Relaxed) >= 1);
     }
 }
