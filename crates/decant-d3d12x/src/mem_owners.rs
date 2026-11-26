@@ -64,6 +64,7 @@ impl Kind {
     }
 }
 
+#[repr(align(64))]
 struct Slot {
     count: AtomicU64,
     bytes: AtomicU64,
@@ -105,8 +106,12 @@ impl Accounting {
 
     fn remove(&self, kind: Kind, segment: Segment, count: u64, bytes: u64) {
         let slot = self.slot(kind, segment);
-        subtract(&slot.count, count);
-        subtract(&slot.bytes, bytes);
+        if count != 0 {
+            subtract(&slot.count, count);
+        }
+        if bytes != 0 {
+            subtract(&slot.bytes, bytes);
+        }
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -295,7 +300,8 @@ fn segment_committed(snapshot: &Snapshot, segment: Segment) -> String {
 }
 
 pub(crate) fn format(snapshot: &Snapshot, local_usage: Option<u64>) -> String {
-    let mut out = String::from("memory by owner (count/MiB): GPU local:");
+    let mut out = String::with_capacity(768);
+    out.push_str("memory by owner (count/MiB): GPU local:");
     let textures = snapshot.total(Kind::ViewTexture);
     let heaps = snapshot.total(Kind::ViewHeap);
     let cap = if snapshot.view_cap_bytes == 0 {
@@ -518,5 +524,15 @@ mod tests {
     fn a_typical_line_fits_one_log_line() {
         let line = format(&sample(), Some(20 * 1024 * MIB));
         assert!(line.len() < 1000, "owner line was {} bytes", line.len());
+    }
+
+    #[test]
+    fn slots_are_cache_line_aligned_and_zero_remove_is_noop() {
+        assert_eq!(std::mem::align_of::<Slot>(), 64);
+        assert_eq!(std::mem::size_of::<Slot>(), 64);
+        let accounting = Accounting::new();
+        accounting.add(Kind::Readback, Segment::System, 2, 16 * MIB);
+        accounting.remove(Kind::Readback, Segment::System, 0, 0);
+        assert_eq!(accounting.snapshot().total(Kind::Readback), OwnerValue { count: 2, bytes: 16 * MIB });
     }
 }

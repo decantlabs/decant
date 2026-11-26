@@ -8,9 +8,31 @@
 //!
 //! The switch `DECANT_D3D12X_TITLE_HEAP=0` turns the adoption off (it is on by default).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+#[derive(Default)]
+struct FastUsizeHasher(u64);
+
+impl Hasher for FastUsizeHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(b);
+        }
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type FastMap<V> = HashMap<usize, V, BuildHasherDefault<FastUsizeHasher>>;
 
 /// `XALLOC_ATTRIBUTES` for descriptor heap memory: object type 4, 64 KiB pages, allocator 0x80
 /// (the D3D runtime), graphics memory.
@@ -91,14 +113,15 @@ impl Table {
     }
 }
 
-static TABLE: Mutex<Table> = Mutex::new(Table::empty());
+static TABLE: RwLock<Table> = RwLock::new(Table::empty());
 /// Lowest and highest address (the end is one past the last byte) of any registered heap, a lock free first test.
 static BOUND_LO: AtomicUsize = AtomicUsize::new(usize::MAX);
 static BOUND_HI: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(windows)]
 fn enabled() -> bool {
-    std::env::var_os("DECANT_D3D12X_TITLE_HEAP").is_none_or(|v| v != "0")
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DECANT_D3D12X_TITLE_HEAP").is_none_or(|v| v != "0"))
 }
 
 /// Translates one CPU descriptor handle. The answer is the handle itself when it is in no title
@@ -108,7 +131,7 @@ pub fn translate_cpu(cpu: usize) -> Option<usize> {
     if !(BOUND_LO.load(Ordering::Relaxed)..BOUND_HI.load(Ordering::Relaxed)).contains(&cpu) {
         return Some(cpu);
     }
-    match TABLE.lock().unwrap_or_else(|e| e.into_inner()).translate(cpu) {
+    match TABLE.read().unwrap_or_else(|e| e.into_inner()).translate(cpu) {
         None => Some(cpu),
         Some(host) => host,
     }
@@ -119,7 +142,7 @@ pub fn title_start_for_heap(host_heap: usize) -> Option<usize> {
     if BOUND_HI.load(Ordering::Relaxed) == 0 {
         return None;
     }
-    TABLE.lock().unwrap_or_else(|e| e.into_inner()).title_start_for_heap(host_heap)
+    TABLE.read().unwrap_or_else(|e| e.into_inner()).title_start_for_heap(host_heap)
 }
 
 /// The first word of a slot tag. On the console a descriptor is plain memory, and the title copies
@@ -154,7 +177,7 @@ pub fn tag_slot(cpu: usize, host: usize) {
     if cpu == host || cpu < BOUND_LO.load(Ordering::Relaxed) || cpu >= BOUND_HI.load(Ordering::Relaxed) {
         return;
     }
-    if TABLE.lock().unwrap_or_else(|e| e.into_inner()).translate(cpu).is_none() {
+    if TABLE.read().unwrap_or_else(|e| e.into_inner()).translate(cpu).is_none() {
         return;
     }
     // SAFETY: `cpu` is inside a registered heap, whose title memory is committed and writable for
@@ -180,7 +203,7 @@ pub fn copy_tags(dst: usize, src: usize, n: u32, increment: u32) {
     if bytes == 0 || dst == src || !inside(dst) || !inside(src) {
         return;
     }
-    let t = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let t = TABLE.read().unwrap_or_else(|e| e.into_inner());
     let whole = |a: usize| t.translate(a).is_some() && t.translate(a + bytes - 1).is_some();
     if whole(dst) && whole(src) {
         // SAFETY: both ranges are inside registered heaps (committed and writable title memory).
@@ -213,7 +236,7 @@ pub struct Visible {
     pub ring_next: u32,
 }
 
-static VISIBLE: Mutex<Vec<Visible>> = Mutex::new(Vec::new());
+static VISIBLE: RwLock<Vec<Visible>> = RwLock::new(Vec::new());
 /// The tables in the ring of each [`Visible`] heap (keyed by its `gpu_start`): host slot of the
 /// first, console slot of the first, slots, and the present at which each was written (as
 /// `Paged::moved`). Apart from [`Visible`], which is `Copy` and copied by every lookup.
@@ -229,7 +252,7 @@ pub fn visible_created(v: Visible) {
     if v.ring_slots > 0 {
         ANY_RING.store(true, Ordering::Release);
     }
-    let mut g = VISIBLE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = VISIBLE.write().unwrap_or_else(|e| e.into_inner());
     g.retain(|o| o.gpu_start != v.gpu_start);
     g.push(v);
     RING_MOVED.lock().unwrap_or_else(|e| e.into_inner()).retain(|o| o.0 != v.gpu_start);
@@ -238,7 +261,7 @@ pub fn visible_created(v: Visible) {
 /// Forgets the shader visible heap of PC heap `heap`.
 pub fn visible_released(heap: usize) {
     crate::zero_null::clear();
-    let mut g = VISIBLE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = VISIBLE.write().unwrap_or_else(|e| e.into_inner());
     let gone: Vec<u64> = g.iter().filter(|o| o.heap == heap).map(|o| o.gpu_start).collect();
     g.retain(|o| o.heap != heap);
     RING_MOVED.lock().unwrap_or_else(|e| e.into_inner()).retain(|o| !gone.contains(&o.0));
@@ -285,19 +308,28 @@ pub fn table_copies(v: &Visible, handle: u64, read: impl Fn(usize) -> [u64; 3]) 
 /// Host slots that hold a constant buffer view whose title address is not on 256 bytes, with that
 /// address and the title's size. A PC view cannot start there, so the view in the slot starts on the
 /// 256 bytes below, and a table that reads the slot gets a view of a copy of the bytes instead.
-static UNALIGNED_CBV: Mutex<Option<std::collections::HashMap<usize, (u64, u32)>>> = Mutex::new(None);
+static UNALIGNED_CBV: RwLock<Option<FastMap<(u64, u32)>>> = RwLock::new(None);
+static UNALIGNED_CBV_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Notes that host slot `host` holds a constant buffer view of the unaligned title range `cbv`, or no
 /// such view (`None`).
 pub fn note_cbv(host: usize, cbv: Option<(u64, u32)>) {
-    let mut g = UNALIGNED_CBV.lock().unwrap_or_else(|e| e.into_inner());
+    if cbv.is_none() && UNALIGNED_CBV_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut g = UNALIGNED_CBV.write().unwrap_or_else(|e| e.into_inner());
     match cbv {
         Some(c) => {
-            g.get_or_insert_with(Default::default).insert(host, c);
+            let m = g.get_or_insert_with(FastMap::default);
+            if m.insert(host, c).is_none() {
+                UNALIGNED_CBV_COUNT.store(m.len(), Ordering::Relaxed);
+            }
         }
         None => {
-            if let Some(m) = g.as_mut() {
-                m.remove(&host);
+            if let Some(m) = g.as_mut()
+                && m.remove(&host).is_some()
+            {
+                UNALIGNED_CBV_COUNT.store(m.len(), Ordering::Relaxed);
             }
         }
     }
@@ -305,12 +337,15 @@ pub fn note_cbv(host: usize, cbv: Option<(u64, u32)>) {
 
 /// The unaligned title range of the constant buffer view in host slot `host`.
 pub fn unaligned_cbv(host: usize) -> Option<(u64, u32)> {
-    UNALIGNED_CBV.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&host).copied()
+    if UNALIGNED_CBV_COUNT.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    UNALIGNED_CBV.read().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&host).copied()
 }
 
 /// The registered shader visible heap that holds GPU handle `handle`.
 pub fn visible_for(handle: u64) -> Option<Visible> {
-    let g = VISIBLE.lock().unwrap_or_else(|e| e.into_inner());
+    let g = VISIBLE.read().unwrap_or_else(|e| e.into_inner());
     g.iter().find(|v| handle >= v.gpu_start && handle < v.gpu_start + u64::from(v.title_count) * u64::from(v.increment)).copied()
 }
 
@@ -416,7 +451,7 @@ pub struct Pager {
     /// Per host page, the range of its slots that differs from the backing heap.
     dirty: Vec<Option<(u32, u32)>>,
     /// The host pages each command list bound since its last reset.
-    lists: HashMap<usize, HashSet<u32>>,
+    lists: FastMap<Vec<u32>>,
     /// The page map changed since it was last taken.
     map_changed: bool,
     /// Next host page index to check for a free (`NONE`) slot.
@@ -442,7 +477,7 @@ impl Pager {
             used: vec![0; host_pages],
             pins: vec![0; host_pages],
             dirty: vec![None; host_pages],
-            lists: HashMap::new(),
+            lists: FastMap::default(),
             map_changed: true,
             free_hint: 0,
             flush_buf: Vec::new(),
@@ -599,7 +634,8 @@ impl Pager {
         let pinned = self.lists.entry(list).or_default();
         for k in h..h + n {
             self.used[k as usize] = now;
-            if pinned.insert(k) {
+            if !pinned.contains(&k) {
+                pinned.push(k);
                 self.pins[k as usize] += 1;
             }
         }
@@ -609,7 +645,10 @@ impl Pager {
     /// Command list `list` was reset or released at present `now`: the host pages it bound are free
     /// to go once [`KEEP_PRESENTS`] presents have passed.
     pub fn release_list(&mut self, list: usize, now: u64) {
-        for h in self.lists.remove(&list).unwrap_or_default() {
+        let Some(pinned) = self.lists.get_mut(&list) else {
+            return;
+        };
+        for h in pinned.drain(..) {
             self.pins[h as usize] -= 1;
             self.used[h as usize] = self.used[h as usize].max(now);
         }
@@ -811,7 +850,7 @@ fn moved_run(lo: u32, hi: u32, next: u32, n: u32) -> Option<(u32, bool)> {
 /// that reads it may not have run yet), the caller then copies into the shared slots.
 pub fn move_table(console: u64, n: u32, copy: CopyFn) -> Option<Moved> {
     if ANY_PAGED.load(Ordering::Acquire) {
-        let mut g = PAGED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = PAGED.write().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = g.iter_mut().find(|p| {
             let (lo, hi) = p.console_range();
             console >= lo && console < hi
@@ -834,7 +873,7 @@ pub fn move_table(console: u64, n: u32, copy: CopyFn) -> Option<Moved> {
         }
     }
     if ANY_RING.load(Ordering::Acquire) {
-        let mut g = VISIBLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = VISIBLE.write().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = g.iter_mut().find(|v| {
             v.ring_slots > 0 && console >= v.gpu_start && console < v.gpu_start + u64::from(v.title_count) * u64::from(v.increment)
         }) {
@@ -876,7 +915,7 @@ impl Paged {
     }
 }
 
-static PAGED: Mutex<Vec<Paged>> = Mutex::new(Vec::new());
+static PAGED: RwLock<Vec<Paged>> = RwLock::new(Vec::new());
 static ANY_PAGED: AtomicBool = AtomicBool::new(false);
 static DIRTY: AtomicBool = AtomicBool::new(false);
 static PRESENTS: AtomicU64 = AtomicU64::new(0);
@@ -893,7 +932,7 @@ fn run_fill(p: &Paged, f: Fill, copy: CopyFn) {
 
 /// Registers a paged heap.
 pub fn paged_created(p: Paged) {
-    let mut g = PAGED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = PAGED.write().unwrap_or_else(|e| e.into_inner());
     g.retain(|o| o.heap != p.heap);
     g.push(p);
     ANY_PAGED.store(true, Ordering::Release);
@@ -905,7 +944,7 @@ pub(crate) fn paged_released(heap: usize) -> Option<(usize, Option<crate::mem_ow
     if !ANY_PAGED.load(Ordering::Acquire) {
         return None;
     }
-    let mut g = PAGED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = PAGED.write().unwrap_or_else(|e| e.into_inner());
     let at = g.iter().position(|p| p.heap == heap)?;
     let p = g.remove(at);
     Some((p.backing, p.backing_charge))
@@ -924,7 +963,8 @@ pub struct PageMap {
     pub(crate) charge: Option<crate::mem_owners::Charge>,
 }
 
-static PAGE_MAPS: Mutex<Vec<PageMap>> = Mutex::new(Vec::new());
+static PAGE_MAPS: RwLock<Vec<PageMap>> = RwLock::new(Vec::new());
+static ANY_PAGE_MAPS: AtomicBool = AtomicBool::new(false);
 
 /// The page map of a heap of `count` slots that is not paged: page `p` at host index `p * PAGE`.
 pub fn identity_map(count: u32) -> Vec<u32> {
@@ -938,14 +978,18 @@ pub fn empty_map(count: u32) -> Vec<u32> {
 
 /// Registers the page map of a shader visible view heap.
 pub fn page_map_created(m: PageMap) {
-    let mut g = PAGE_MAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = PAGE_MAPS.write().unwrap_or_else(|e| e.into_inner());
     g.retain(|o| o.heap != m.heap);
     g.push(m);
+    ANY_PAGE_MAPS.store(true, Ordering::Release);
 }
 
 /// Forgets the page map of PC heap `heap`. Returns its buffer, for the caller to release.
 pub(crate) fn page_map_released(heap: usize) -> Option<(usize, Option<crate::mem_owners::Charge>)> {
-    let mut g = PAGE_MAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if !ANY_PAGE_MAPS.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut g = PAGE_MAPS.write().unwrap_or_else(|e| e.into_inner());
     let at = g.iter().position(|m| m.heap == heap)?;
     let m = g.remove(at);
     Some((m.buffer, m.charge))
@@ -954,7 +998,10 @@ pub(crate) fn page_map_released(heap: usize) -> Option<(usize, Option<crate::mem
 /// The GPU address of the page map of the shader visible view heap that starts at GPU handle
 /// `gpu_start`, for the root parameter a directly translated shader reads it from.
 pub fn page_map_address(gpu_start: u64) -> Option<u64> {
-    PAGE_MAPS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|m| m.gpu_start == gpu_start).map(|m| m.address)
+    if !ANY_PAGE_MAPS.load(Ordering::Acquire) {
+        return None;
+    }
+    PAGE_MAPS.read().unwrap_or_else(|e| e.into_inner()).iter().find(|m| m.gpu_start == gpu_start).map(|m| m.address)
 }
 
 /// A present happened. Returns the present count.
@@ -972,7 +1019,7 @@ pub fn stats() -> Vec<PageStats> {
     if !ANY_PAGED.load(Ordering::Acquire) {
         return Vec::new();
     }
-    PAGED.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| p.pager.stats()).collect()
+    PAGED.read().unwrap_or_else(|e| e.into_inner()).iter().map(|p| p.pager.stats()).collect()
 }
 
 /// Command list `list` was reset or released.
@@ -981,7 +1028,7 @@ pub fn list_reset(list: usize) {
         return;
     }
     let now = PRESENTS.load(Ordering::Relaxed);
-    for p in PAGED.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+    for p in PAGED.write().unwrap_or_else(|e| e.into_inner()).iter_mut() {
         p.pager.release_list(list, now);
     }
 }
@@ -1000,7 +1047,7 @@ pub enum TableAt {
 /// Whether the title's GPU handle `handle` is in a paged heap.
 pub fn paged(handle: u64) -> bool {
     ANY_PAGED.load(Ordering::Acquire)
-        && PAGED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| {
+        && PAGED.read().unwrap_or_else(|e| e.into_inner()).iter().any(|p| {
             let (lo, hi) = p.console_range();
             handle >= lo && handle < hi
         })
@@ -1013,7 +1060,7 @@ pub fn table(list: usize, handle: u64, extent: u32, copy: CopyFn) -> TableAt {
         return TableAt::Same;
     }
     let now = PRESENTS.load(Ordering::Relaxed);
-    let mut g = PAGED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = PAGED.write().unwrap_or_else(|e| e.into_inner());
     let Some(p) = g.iter_mut().find(|p| {
         let (lo, hi) = p.console_range();
         handle >= lo && handle < hi
@@ -1038,7 +1085,7 @@ pub fn console_handle(handle: u64) -> Option<u64> {
     if !ANY_PAGED.load(Ordering::Acquire) {
         return Some(handle);
     }
-    let g = PAGED.lock().unwrap_or_else(|e| e.into_inner());
+    let g = PAGED.read().unwrap_or_else(|e| e.into_inner());
     let Some(p) = g.iter().find(|p| handle >= p.gpu_start && handle < p.gpu_start + u64::from(p.pager.host_pages() * PAGE) * u64::from(p.increment)) else {
         return Some(handle);
     };
@@ -1052,12 +1099,12 @@ pub fn console_handle(handle: u64) -> Option<u64> {
 /// an unpaged heap and its ring. `None` for any other handle.
 pub fn host_slot(handle: u64) -> Option<(usize, u32)> {
     if ANY_PAGED.load(Ordering::Acquire) {
-        let g = PAGED.lock().unwrap_or_else(|e| e.into_inner());
+        let g = PAGED.read().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = g.iter().find(|p| handle >= p.gpu_start && handle < p.gpu_start + u64::from(p.host_count) * u64::from(p.increment)) {
             return Some((p.host_cpu + (handle - p.gpu_start) as usize, p.increment));
         }
     }
-    let g = VISIBLE.lock().unwrap_or_else(|e| e.into_inner());
+    let g = VISIBLE.read().unwrap_or_else(|e| e.into_inner());
     let v = g.iter().find(|v| v.heap_type == 0 && handle >= v.gpu_start && handle < v.gpu_start + u64::from(v.host_count + v.ring_slots) * u64::from(v.increment))?;
     Some((v.host_cpu + (handle - v.gpu_start) as usize, v.increment))
 }
@@ -1068,7 +1115,7 @@ pub fn console_index(gpu_start: u64, index: u32) -> Option<u32> {
     if !ANY_PAGED.load(Ordering::Acquire) {
         return Some(index);
     }
-    let g = PAGED.lock().unwrap_or_else(|e| e.into_inner());
+    let g = PAGED.read().unwrap_or_else(|e| e.into_inner());
     match g.iter().find(|p| p.gpu_start == gpu_start) {
         Some(p) => p.console_slot(index),
         None => Some(index),
@@ -1082,7 +1129,7 @@ pub fn written(cpu: usize, n: u32) {
         return;
     }
     let now = PRESENTS.load(Ordering::Relaxed);
-    let mut g = PAGED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = PAGED.write().unwrap_or_else(|e| e.into_inner());
     let Some(p) = g.iter_mut().find(|p| cpu >= p.backing_cpu && cpu < p.backing_cpu + p.pager.count as usize * p.increment as usize) else { return };
     let first = ((cpu - p.backing_cpu) / p.increment as usize) as u32;
     if p.pager.written(first, n, now) || p.pager.map_changed() {
@@ -1096,7 +1143,7 @@ pub fn flush(copy: CopyFn, map: MapFn) {
     if !DIRTY.swap(false, Ordering::AcqRel) {
         return;
     }
-    let mut g = PAGED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = PAGED.write().unwrap_or_else(|e| e.into_inner());
     for p in g.iter_mut() {
         let fills = p.pager.take_flush_into();
         for &f in &fills {
@@ -1287,7 +1334,7 @@ mod win {
         }
         let entry = Entry { title_base: base, title_bytes, host_cpu, host_bytes, host_heap };
         let registered = {
-            let mut table = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut table = TABLE.write().unwrap_or_else(|e| e.into_inner());
             let result = table.insert(entry);
             if result.is_ok() {
                 BOUND_LO.fetch_min(base, Ordering::Relaxed);
@@ -1316,7 +1363,7 @@ mod win {
         let Some(hooks) = title_hooks() else {
             return;
         };
-        let Some(gone) = TABLE.lock().unwrap_or_else(|e| e.into_inner()).remove_by_heap(host_heap) else {
+        let Some(gone) = TABLE.write().unwrap_or_else(|e| e.into_inner()).remove_by_heap(host_heap) else {
             return;
         };
         // SAFETY: `title_base` came from the alloc hook with `ATTR_DESCRIPTOR_HEAP`.
@@ -1723,5 +1770,17 @@ mod tests {
         assert_eq!(t.remove_by_heap(0xA), None);
         assert_eq!(t.translate(0x4000), None);
         assert_eq!(t.translate(0x2000), Some(Some(0x10)), "the other heap stays");
+    }
+
+    #[test]
+    fn pager_release_list_reuses_pinned_list_capacity() {
+        let mut p = super::Pager::new(4 * super::PAGE, 4 * super::PAGE);
+        let list = 0xDEAD_0001usize;
+        assert!(p.map(list, 0, super::PAGE * 2, 0).is_some());
+        let cap = p.lists.get(&list).map(Vec::capacity).unwrap();
+        assert!(cap >= 2);
+        p.release_list(list, 1);
+        let after = p.lists.get(&list).map(|v| (v.len(), v.capacity()));
+        assert_eq!(after, Some((0, cap)));
     }
 }

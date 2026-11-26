@@ -58,7 +58,7 @@ pub struct Show {
 /// `pool_pages` pages at `pool`, and how many ranges were refused (a kind that is not known, or
 /// pool pages past the end of the pool). A refused range still takes its room at the destination.
 pub fn requests(destination: u64, ranges: &[Range], pool: u64, pool_pages: u32) -> (Vec<Show>, u32) {
-    let mut out = Vec::with_capacity(ranges.len());
+    let mut out: Vec<Show> = Vec::with_capacity(ranges.len());
     let mut refused = 0;
     let mut to = destination;
     for r in ranges {
@@ -67,13 +67,30 @@ pub fn requests(destination: u64, ranges: &[Range], pool: u64, pool_pages: u32) 
         match r.kind {
             KIND_RUN if inside(r.pages) => {
                 if r.pages > 0 {
-                    out.push(Show { to, from, pages: r.pages });
+                    match out.last_mut() {
+                        Some(prev)
+                            if prev.from != 0
+                                && prev.to + u64::from(prev.pages) * PAGE == to
+                                && prev.from + u64::from(prev.pages) * PAGE == from =>
+                        {
+                            prev.pages += r.pages;
+                        }
+                        _ => out.push(Show { to, from, pages: r.pages }),
+                    }
                 }
             }
-            KIND_REPEAT if inside(1) => out.extend((0..u64::from(r.pages)).map(|k| Show { to: to + k * PAGE, from, pages: 1 })),
+            KIND_REPEAT if inside(1) => {
+                out.reserve(r.pages as usize);
+                out.extend((0..u64::from(r.pages)).map(|k| Show { to: to + k * PAGE, from, pages: 1 }));
+            }
             KIND_UNMAP => {
                 if r.pages > 0 {
-                    out.push(Show { to, from: 0, pages: r.pages });
+                    match out.last_mut() {
+                        Some(prev) if prev.from == 0 && prev.to + u64::from(prev.pages) * PAGE == to => {
+                            prev.pages += r.pages;
+                        }
+                        _ => out.push(Show { to, from: 0, pages: r.pages }),
+                    }
                 }
             }
             KIND_KEEP => {}
@@ -136,5 +153,24 @@ mod tests {
         assert_eq!(std::mem::size_of::<Batch>(), 24);
         assert_eq!(std::mem::offset_of!(Batch, count), 8);
         assert_eq!(std::mem::offset_of!(Batch, ranges), 16);
+    }
+
+    #[test]
+    fn adjacent_contiguous_runs_and_unmaps_coalesce() {
+        let ranges = [
+            Range { kind: KIND_RUN, first: 2, pages: 3 },
+            Range { kind: KIND_RUN, first: 5, pages: 4 },
+            Range { kind: KIND_UNMAP, first: 0, pages: 2 },
+            Range { kind: KIND_UNMAP, first: 0, pages: 3 },
+        ];
+        let (shows, refused) = requests(0x1000_0000, &ranges, POOL, 20);
+        assert_eq!(refused, 0);
+        assert_eq!(
+            shows,
+            vec![
+                Show { to: 0x1000_0000, from: POOL + 2 * PAGE, pages: 7 },
+                Show { to: 0x1000_0000 + 7 * PAGE, from: 0, pages: 5 },
+            ]
+        );
     }
 }
