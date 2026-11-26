@@ -27,11 +27,11 @@ pub const HOT_FAULTS: u8 = 3;
 /// How long a hot page stays unprotected and is copied at every sync by default.
 pub const HOT_HOLD: Duration = Duration::from_millis(250);
 /// Minimum writable rest after a CPU write fault before `take` re-protects the page by default.
-pub const GUARD_REST: Duration = Duration::from_millis(8);
+pub const GUARD_REST: Duration = Duration::from_millis(16);
 /// Minimum interval between `VirtualProtect(PAGE_READONLY)` waves in `Engine::take_dirty` by default.
-pub const REPROTECT_INTERVAL: Duration = Duration::from_millis(12);
+pub const REPROTECT_INTERVAL: Duration = Duration::from_millis(25);
 /// Pending page count that forces an immediate re-protect wave regardless of `REPROTECT_INTERVAL`.
-pub const REPROTECT_WATERMARK: usize = 1024;
+pub const REPROTECT_WATERMARK: usize = 4096;
 
 /// Parses a hold duration in milliseconds from an optional string, falling back to `default`.
 fn parse_hold_ms(raw: Option<&str>, default: Duration) -> Duration {
@@ -985,11 +985,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_guard_rest_ms_parses_override_and_defaults_to_8_ms() {
-        assert_eq!(GUARD_REST, Duration::from_millis(8));
+    fn parse_guard_rest_ms_parses_override_and_defaults_to_16_ms() {
+        assert_eq!(GUARD_REST, Duration::from_millis(16));
         assert_eq!(parse_guard_rest_ms(None), GUARD_REST);
         assert_eq!(parse_guard_rest_ms(Some("0")), Duration::ZERO);
-        assert_eq!(parse_guard_rest_ms(Some(" 16 ")), Duration::from_millis(16));
+        assert_eq!(parse_guard_rest_ms(Some(" 32 ")), Duration::from_millis(32));
         assert_eq!(parse_guard_rest_ms(Some("bad")), GUARD_REST);
     }
 
@@ -1010,7 +1010,8 @@ mod tests {
 
     #[test]
     fn batched_reprotect_defers_protection_until_interval_or_watermark() {
-        assert_eq!(REPROTECT_INTERVAL, Duration::from_millis(12));
+        assert_eq!(REPROTECT_INTERVAL, Duration::from_millis(25));
+        assert_eq!(REPROTECT_WATERMARK, 4096);
         assert_eq!(parse_reprotect_ms(None), REPROTECT_INTERVAL);
         assert_eq!(parse_reprotect_ms(Some("0")), Duration::ZERO);
         assert_eq!(parse_reprotect_ms(Some(" 20 ")), Duration::from_millis(20));
@@ -1025,9 +1026,9 @@ mod tests {
         t.on_map(2, 0x11_0000, true);
         assert_eq!(t.take_batched(t0 + Duration::from_millis(2), 10, REPROTECT_INTERVAL, all), (vec![2], vec![]));
         assert!(!t.is_clean_addr(0x11_0000));
-        assert_eq!(t.take_batched(t0 + Duration::from_millis(6), 10, REPROTECT_INTERVAL, all), (vec![2], vec![]));
+        assert_eq!(t.take_batched(t0 + Duration::from_millis(15), 10, REPROTECT_INTERVAL, all), (vec![2], vec![]));
 
-        // Once the 12 ms interval elapses, protection runs and marks page 2 clean.
+        // Once the 25 ms interval elapses, protection runs and marks page 2 clean.
         assert_eq!(t.take_batched(t0 + REPROTECT_INTERVAL, 10, REPROTECT_INTERVAL, all), (vec![2], vec![0x11_0000]));
         assert!(t.is_clean_addr(0x11_0000));
         assert_eq!(t.take_batched(t0 + REPROTECT_INTERVAL + Duration::from_millis(1), 10, REPROTECT_INTERVAL, all), (vec![], vec![]));

@@ -816,6 +816,8 @@ impl ProtectSync {
     fn protect_runs_checked(&self, runs: Vec<RunSnapshot>, protect: u32, want_clean: bool, release_rw: bool, dirty: &Mutex<Dirty>) -> (usize, usize) {
         let mut protected_runs = 0usize;
         let mut retries = 0usize;
+        let mut retry_addrs = Vec::new();
+        let mut rw_masks_to_release = Vec::new();
         for (start, bytes, mask, expected_gens) in runs {
             let guards = self.lock_mask(mask);
             if self.gens_match(mask, expected_gens.as_slice()) {
@@ -825,47 +827,47 @@ impl ProtectSync {
                 if release_rw {
                     self.release_in_flight_rw(mask);
                 }
-                continue;
+            } else {
+                drop(guards);
+                retries += 1;
+                retry_addrs.extend((start..start + bytes).step_by(PAGE_BYTES));
+                if release_rw {
+                    rw_masks_to_release.push(mask);
+                }
             }
-            drop(guards);
-            retries += 1;
-            let mut pending_addrs: Vec<usize> = (start..start + bytes).step_by(PAGE_BYTES).collect();
-            loop {
-                let sub_runs = {
-                    let dirty_guard = dirty.lock().unwrap_or_else(PoisonError::into_inner);
-                    let keep = match dirty_guard.track.as_ref() {
-                        Some(track) => pending_addrs
-                            .into_iter()
-                            .filter(|&addr| track.is_clean_addr(addr) == want_clean)
-                            .collect::<Vec<_>>(),
-                        None if want_clean => Vec::new(),
-                        None => pending_addrs,
-                    };
-                    self.snapshot_runs(keep)
+        }
+        while !retry_addrs.is_empty() {
+            let sub_runs = {
+                let dirty_guard = dirty.lock().unwrap_or_else(PoisonError::into_inner);
+                let keep = match dirty_guard.track.as_ref() {
+                    Some(track) => retry_addrs
+                        .into_iter()
+                        .filter(|&addr| track.is_clean_addr(addr) == want_clean)
+                        .collect::<Vec<_>>(),
+                    None if want_clean => Vec::new(),
+                    None => retry_addrs,
                 };
-                if sub_runs.is_empty() {
-                    break;
-                }
-                let mut retry = Vec::new();
-                for (sub_s, sub_b, sub_mask, fresh_gens) in sub_runs {
-                    let guards = self.lock_mask(sub_mask);
-                    if self.gens_match(sub_mask, fresh_gens.as_slice()) {
-                        Engine::protect_range(sub_s, sub_b, protect);
-                        protected_runs += 1;
-                    } else {
-                        retries += 1;
-                        retry.extend((sub_s..sub_s + sub_b).step_by(PAGE_BYTES));
-                    }
-                    drop(guards);
-                }
-                if retry.is_empty() {
-                    break;
-                }
-                pending_addrs = retry;
+                self.snapshot_runs(keep)
+            };
+            if sub_runs.is_empty() {
+                break;
             }
-            if release_rw {
-                self.release_in_flight_rw(mask);
+            let mut next_retry = Vec::new();
+            for (sub_s, sub_b, sub_mask, fresh_gens) in sub_runs {
+                let guards = self.lock_mask(sub_mask);
+                if self.gens_match(sub_mask, fresh_gens.as_slice()) {
+                    Engine::protect_range(sub_s, sub_b, protect);
+                    protected_runs += 1;
+                } else {
+                    retries += 1;
+                    next_retry.extend((sub_s..sub_s + sub_b).step_by(PAGE_BYTES));
+                }
+                drop(guards);
             }
+            retry_addrs = next_retry;
+        }
+        for mask in rw_masks_to_release {
+            self.release_in_flight_rw(mask);
         }
         (protected_runs, retries)
     }
@@ -2199,7 +2201,7 @@ impl Engine {
             };
             let interval = std::time::Duration::from_millis(self.reprotect_interval_ms.load(Ordering::Relaxed));
             let (pages, protect) = track.take_batched(Instant::now(), cap, interval, committed);
-            let protect = track.bridge_clean_gaps(protect, 4);
+            let protect = track.bridge_clean_gaps(protect, 12);
             queries += runs_seen.borrow().queries;
             sync.set_pending(track.pending_len() > 0);
             sync.bump_addrs(&protect);
@@ -4147,6 +4149,49 @@ mod tests {
         std::thread::sleep(track::GUARD_REST + std::time::Duration::from_millis(5));
         assert_eq!(e.take_dirty(10).len(), 1);
         assert!(!accessible(area, true));
+
+        e.release(area).unwrap();
+        e.free_pages(&frames).unwrap();
+    }
+
+    #[test]
+    fn protect_runs_checked_batches_failed_run_retries() {
+        let Some(e) = held(|| Engine::load_limited(8, 8)) else { return };
+        e.set_tracking(true);
+        let area = e.reserve(0, 3 * P, PAGE_READWRITE).unwrap();
+        let frames = e.allocate_pages(3).unwrap();
+        e.map_frames(area, &frames).unwrap();
+        for p in 0..3 {
+            assert!(Engine::commit_on_access_in(&e.state, area + p * P));
+        }
+        let _ = e.take_dirty(usize::MAX);
+        assert!(!accessible(area, true));
+        assert!(!accessible(area + P, true));
+        assert!(!accessible(area + 2 * P, true));
+
+        // Open all 3 pages and snapshot two separate runs before bumping their stripe gens.
+        assert!(e.on_write_fault(area));
+        assert!(e.on_write_fault(area + 2 * P));
+        let snapshots = {
+            let mut dirty = e.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+            let track = dirty.track.as_mut().unwrap();
+            let (_, _) = track.take(Instant::now() + track::GUARD_REST + std::time::Duration::from_millis(1), usize::MAX, |_| true);
+            dirty.sync.snapshot_runs(vec![area, area + 2 * P])
+        };
+        // Simulate a concurrent fault bumping stripe gens on both runs, while leaving page 0 dirty and page 2 clean.
+        {
+            let mut dirty = e.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+            let Dirty { track, sync, .. } = &mut *dirty;
+            let track = track.as_mut().unwrap();
+            let _ = track.on_changed(page_of(frames[0]));
+            sync.bump_addrs(&[area, area + 2 * P]);
+        }
+
+        let (protected_runs, retries) = e.protect_sync.protect_runs_checked(snapshots, PAGE_READONLY, true, false, &e.dirty);
+        assert_eq!(retries, 2);
+        assert_eq!(protected_runs, 1);
+        assert!(accessible(area, true), "dirty page 0 must stay writable");
+        assert!(!accessible(area + 2 * P, true), "clean page 2 must be protected on batched retry");
 
         e.release(area).unwrap();
         e.free_pages(&frames).unwrap();
