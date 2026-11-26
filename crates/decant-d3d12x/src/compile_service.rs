@@ -314,7 +314,7 @@ impl Service {
             live: AtomicBool::new(false),
             live_limit: AtomicUsize::new(usize::MAX),
             last_summary: Mutex::new(String::new()),
-            stage_slots: AtomicUsize::new(std::thread::available_parallelism().map_or(1, |cores| cores.get() / 4)),
+            stage_slots: AtomicUsize::new(std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 2).max(1))),
         });
         let rx = Arc::new(Mutex::new(rx));
         for i in 0..settings.threads.max(1) {
@@ -785,28 +785,53 @@ impl Shared {
                 ));
             }
         }
-        let parts: Vec<_> = stages.iter().zip(keys).zip(&pipeline.stages).collect();
-        let result = self.map_stages(&parts, |&((stage, key), input)| {
-            let cell = self.stages.lock().unwrap_or_else(|e| e.into_inner()).entry(*key).or_default().clone();
-            let mut fresh = false;
-            let result = cell.get_or_init(|| {
-                fresh = true;
-                self.compile_stage(*key, stage)
-            });
-            if !fresh && result.is_ok() {
+        let mut resolved: Vec<Option<Arc<[u8]>>> = Vec::with_capacity(stages.len());
+        let mut misses = Vec::new();
+        for (idx, ((stage, &key), input)) in stages.iter().zip(keys).zip(&pipeline.stages).enumerate() {
+            if let Some(dxil) = self.cached(key) {
                 self.stage_hit();
+                resolved.push(Some(dxil));
+            } else {
+                resolved.push(None);
+                misses.push((idx, stage, key, input));
             }
-            result.as_ref().cloned().map_err(|msg| {
-                let first = msg.lines().next().unwrap_or("");
-                Refusal::new("dxc error", format!("{} {key:032x}: {first}", input.kind.short()))
-            })
-        }).into_iter().collect::<Result<Vec<_>, _>>();
+        }
+        let result = if misses.is_empty() {
+            Ok(resolved.into_iter().flatten().collect())
+        } else {
+            let compiled = self.map_stages(&misses, |&(idx, stage, key, input)| {
+                let cell = self.stages.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_default().clone();
+                let mut fresh = false;
+                let result = cell.get_or_init(|| {
+                    fresh = true;
+                    self.compile_stage(key, stage)
+                });
+                if !fresh && result.is_ok() {
+                    self.stage_hit();
+                }
+                result
+                    .as_ref()
+                    .cloned()
+                    .map(|dxil| (idx, dxil))
+                    .map_err(|msg| {
+                        let first = msg.lines().next().unwrap_or("");
+                        Refusal::new("dxc error", format!("{} {key:032x}: {first}", input.kind.short()))
+                    })
+            });
+            for item in compiled {
+                match item {
+                    Ok((idx, dxil)) => resolved[idx] = Some(dxil),
+                    Err(refusal) => return self.refused(&refusal),
+                }
+            }
+            Ok(resolved.into_iter().flatten().collect())
+        };
         // With a disk cache the files keep the results. Leave cells still in use to their owners.
-        if self.cache.is_some() {
+        if self.cache.is_some() && !misses.is_empty() {
             let mut map = self.stages.lock().unwrap_or_else(|e| e.into_inner());
-            for k in keys {
-                if map.get(k).is_some_and(|cell| Arc::strong_count(cell) == 1) {
-                    map.remove(k);
+            for &(_, _, k, _) in &misses {
+                if map.get(&k).is_some_and(|cell| Arc::strong_count(cell) == 1) {
+                    map.remove(&k);
                 }
             }
         }
@@ -1496,5 +1521,24 @@ pub(crate) mod tests {
         assert_eq!(service.shared.active_objects.load(Ordering::Acquire), 0);
         assert!(service.shared.map_stages::<i32, i32>(&[], |x| x + 1).is_empty());
         assert_eq!(service.shared.map_stages(&[41], |x| x + 1), vec![42]);
+    }
+
+    #[test]
+    fn compile_stages_skips_helper_spawns_when_one_stage_misses() {
+        let cache_dir = crate::direct_cache::tests::TempDir::new("compile-stages-partial-hit");
+        let mut settings = Settings::quiet(1);
+        settings.cache = Some(DiskCache::new(cache_dir.0.clone()));
+        let compiler = Arc::new(OverlapCompiler::default());
+        let service = Service::new(Arc::new(FixedSource::simple()), compiler.clone(), settings);
+        service.set_stage_slots(1);
+
+        let first = pipeline(&[(StageKind::Vertex, b"vs cached"), (StageKind::Pixel, b"ps first")]);
+        assert!(matches!(poll_until_final(&service, 1, &first), Poll::Ready(_)));
+        assert_eq!(service.counters().compiled.load(Ordering::Relaxed), 2);
+
+        let second = pipeline(&[(StageKind::Vertex, b"vs cached"), (StageKind::Pixel, b"ps second")]);
+        assert!(matches!(poll_until_final(&service, 2, &second), Poll::Ready(_)));
+        assert_eq!(service.shared.stage_slots.load(Ordering::SeqCst), 1);
+        assert_eq!(service.counters().compiled.load(Ordering::Relaxed), 3);
     }
 }

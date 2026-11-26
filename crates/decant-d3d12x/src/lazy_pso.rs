@@ -629,7 +629,7 @@ fn run_prewarm(lazy: &'static Lazy) {
             lazy.making.store(false, Ordering::Release);
             return;
         };
-        match crate::direct_pso::choose_with_budget(lazy as *const Lazy as usize, owned, lazy.precompile_key, Duration::from_secs(5)) {
+        match crate::direct_pso::choose_with_budget(lazy as *const Lazy as usize, owned, lazy.precompile_key, Duration::from_millis(200)) {
             crate::direct_pso::Choice::Pending => {
                 lazy.making.store(false, Ordering::Release);
                 return;
@@ -642,7 +642,7 @@ fn run_prewarm(lazy: &'static Lazy) {
 }
 
 fn submit_prewarm(lazy: &'static Lazy) {
-    if start_makers() == 0 {
+    if lazy.made.get().is_some() || lazy.making.load(Ordering::Acquire) || start_makers() == 0 {
         return;
     }
     let (queues, wake) = &*MAKER_JOBS;
@@ -1314,6 +1314,25 @@ mod tests {
         assert!(!parse_prewarm_history(Some("off"), true, true));
         assert!(!parse_prewarm_history(None, false, true));
         assert!(!parse_prewarm_history(None, true, false));
+    }
+
+    #[test]
+    fn submit_prewarm_skips_already_making_pipelines() {
+        let shader = b"DXBC0123456789abcdefprewarm";
+        let ptr = defer_compute(4, shader, counting_create);
+        // SAFETY: `ptr` is a `Lazy` object that is never freed.
+        let lazy: &'static Lazy = unsafe { &*ptr.cast::<Lazy>() };
+        lazy.making.store(true, Ordering::Release);
+        let before = {
+            let (queues, _) = &*MAKER_JOBS;
+            queues.lock().unwrap_or_else(|e| e.into_inner()).prewarm.len()
+        };
+        submit_prewarm(lazy);
+        let after = {
+            let (queues, _) = &*MAKER_JOBS;
+            queues.lock().unwrap_or_else(|e| e.into_inner()).prewarm.len()
+        };
+        assert_eq!(after, before);
     }
 
     #[test]

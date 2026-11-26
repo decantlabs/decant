@@ -137,11 +137,11 @@ impl Limits {
     const SERIAL: Limits = Limits { busy_background: 1, urgent_yield: 1 };
 
     /// The limits for `workers` precompile workers on a machine with `cores` logical cores. Every
-    /// 4 cores let one more background job run while the title binds, never more than there are
-    /// workers. Every 8 cores let one more urgent job run before background jobs yield.
+    /// 2 cores let one background job run while the title binds, never more than there are workers.
+    /// Every 4 cores let one urgent job run before low priority background jobs yield.
     #[cfg_attr(not(windows), allow(dead_code))]
     fn for_machine(workers: usize, cores: usize) -> Limits {
-        Limits { busy_background: (cores / 4).clamp(1, workers.max(1)), urgent_yield: (cores / 8).max(1) }
+        Limits { busy_background: (cores / 2).clamp(1, workers.max(1)), urgent_yield: (cores / 4).max(1) }
     }
 }
 
@@ -607,7 +607,7 @@ mod runtime {
                 }
                 state.slots.insert(key, Status::Pending);
                 state.schedule.insert(key, Job { pipeline, translated: None }, priority, sequence, compute);
-                self.changed.notify_all();
+                self.changed.notify_one();
             }
             Some(key)
         }
@@ -1251,28 +1251,29 @@ mod tests {
 
     #[test]
     fn limits_follow_the_core_count_and_never_exceed_the_workers() {
-        // Up to 7 cores keep the serial gate: one background job while the title binds.
-        for cores in [1, 2, 4, 7] {
+        // Up to 3 cores keep the serial gate: one background job while the title binds.
+        for cores in [1, 2, 3] {
             assert_eq!(Limits::for_machine(4, cores), Limits::SERIAL, "{cores} cores");
         }
-        assert_eq!(Limits::for_machine(4, 8), Limits { busy_background: 2, urgent_yield: 1 });
-        assert_eq!(Limits::for_machine(4, 16), Limits { busy_background: 4, urgent_yield: 2 });
-        assert_eq!(Limits::for_machine(4, 64), Limits { busy_background: 4, urgent_yield: 8 }, "capped at the workers");
+        assert_eq!(Limits::for_machine(4, 4), Limits { busy_background: 2, urgent_yield: 1 });
+        assert_eq!(Limits::for_machine(4, 8), Limits { busy_background: 4, urgent_yield: 2 });
+        assert_eq!(Limits::for_machine(8, 16), Limits { busy_background: 8, urgent_yield: 4 });
+        assert_eq!(Limits::for_machine(4, 64), Limits { busy_background: 4, urgent_yield: 16 }, "capped at the workers");
         assert_eq!(Limits::for_machine(0, 64).busy_background, 1, "at least one");
     }
 
     #[test]
     fn a_wide_machine_runs_more_background_jobs_while_the_title_binds() {
-        let wide = Limits::for_machine(4, 16);
+        let wide = Limits::for_machine(8, 16);
         // A busy title with two background jobs running: serial machines stop, wide ones go on.
         assert!(!Role::Bulk.background(true, 2, 0, Limits::SERIAL));
         assert!(Role::Bulk.background(true, 2, 0, wide));
-        assert!(Role::All.background(true, 3, 0, wide));
-        assert!(!Role::Bulk.background(true, 4, 0, wide), "the limit still holds");
+        assert!(Role::All.background(true, 7, 0, wide));
+        assert!(!Role::Bulk.background(true, 8, 0, wide), "the limit still holds");
         // One urgent job holds background work back on a serial machine, not on a wide one.
         assert!(!Role::Bulk.background(false, 0, 1, Limits::SERIAL));
-        assert!(Role::Bulk.background(false, 0, 1, wide));
-        assert!(!Role::Bulk.background(false, 0, 2, wide));
+        assert!(Role::Bulk.background(false, 0, 3, wide));
+        assert!(!Role::Bulk.background(false, 0, 4, wide));
         // The fast lane never takes background work.
         assert!(!Role::Fast.background(false, 0, 0, wide));
     }
