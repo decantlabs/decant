@@ -231,6 +231,8 @@ const STATS_EVERY: u64 = 100;
 const ZERO_SCAN_TILES: usize = 4096;
 /// Identifies a device's state while a sampler chunk is read outside the state lock.
 static NEXT_STATE: AtomicU64 = AtomicU64::new(1);
+/// Active `State::id` for out-of-lock journal draining.
+static ACTIVE_STATE_ID: AtomicU64 = AtomicU64::new(0);
 /// Incremented whenever virtual to pool mappings change structurally (MAP, UNMAP, RELEASE, resync, device_created).
 static MAPPING_GEN: AtomicU64 = AtomicU64::new(1);
 /// Incremented whenever previously tileless pages receive mirror tiles.
@@ -625,6 +627,96 @@ impl Drop for State {
 }
 
 static STATE: RwLock<Option<State>> = RwLock::new(None);
+/// Serializes `DecantXmemGpuChanges` and `DecantXmemGpuSnapshot` calls outside `STATE`.
+static DRAIN_LOCK: Mutex<DrainCursor> = Mutex::new(DrainCursor {
+    state_id: 0,
+    seq: 0,
+    last_journal_seq: None,
+    tracking: false,
+    scratch: Vec::new(),
+    records: Vec::new(),
+});
+
+struct DrainCursor {
+    state_id: u64,
+    seq: u64,
+    last_journal_seq: Option<u64>,
+    tracking: bool,
+    scratch: Vec<GpuChange>,
+    records: Vec<GpuChange>,
+}
+
+enum DrainBatch {
+    Unchanged,
+    Changes { state_id: u64, seq: u64, journal_seq: Option<u64> },
+    Snapshot { state_id: u64, seq: u64, journal_seq: Option<u64> },
+}
+
+fn read_snapshot(api: &Api, out: &mut Vec<GpuChange>) -> u64 {
+    let mut records = vec![GpuChange::default(); CHANGE_RECORDS];
+    let (mut written, mut seq) = (0u32, 0u64);
+    loop {
+        // SAFETY: `records` has room for its length, the outputs are valid locations.
+        let ok = unsafe { (api.snapshot)(records.as_mut_ptr(), records.len() as u32, &mut written, &mut seq) };
+        if ok != 0 {
+            break;
+        }
+        records.resize(written as usize + 1024, GpuChange::default());
+    }
+    records.truncate(written as usize);
+    out.clear();
+    out.extend_from_slice(&records);
+    seq
+}
+
+/// Drains `xmem.dll` journal records under `DRAIN_LOCK` without holding `STATE`.
+fn drain_journal(api: &Api, cursor: &mut DrainCursor) -> DrainBatch {
+    let active_id = ACTIVE_STATE_ID.load(Ordering::Acquire);
+    if active_id == 0 {
+        return DrainBatch::Unchanged;
+    }
+    if cursor.state_id != active_id {
+        cursor.state_id = active_id;
+        cursor.seq = 0;
+        cursor.last_journal_seq = None;
+    }
+    let cur_seq = api.journal_seq.map(|f| {
+        // SAFETY: `DecantXmemJournalSeq` is a lock-free atomic load returning `u64`.
+        unsafe { f() }
+    });
+    if should_skip_drain(cursor.last_journal_seq, cur_seq) {
+        return DrainBatch::Unchanged;
+    }
+    let _trace = decant_trace::span("title_mem", "drain");
+    cursor.records.clear();
+    let mut is_snapshot = false;
+    loop {
+        let mut written = 0u32;
+        cursor.scratch.resize(CHANGE_RECORDS, GpuChange::default());
+        // SAFETY: `scratch` has room for `CHANGE_RECORDS` records, `written` is a valid location.
+        let ok = unsafe { (api.changes)(cursor.seq, cursor.scratch.as_mut_ptr(), CHANGE_RECORDS as u32, &mut written) };
+        if ok == 0 {
+            cursor.seq = read_snapshot(api, &mut cursor.records);
+            is_snapshot = true;
+            continue;
+        }
+        let n = (written as usize).min(CHANGE_RECORDS);
+        cursor.records.extend_from_slice(&cursor.scratch[..n]);
+        if let Some(last) = cursor.scratch[..n].last() {
+            cursor.seq = last.seq;
+        }
+        if n < CHANGE_RECORDS {
+            break;
+        }
+    }
+    cursor.last_journal_seq = cur_seq;
+    if is_snapshot {
+        DrainBatch::Snapshot { state_id: active_id, seq: cursor.seq, journal_seq: cur_seq }
+    } else {
+        DrainBatch::Changes { state_id: active_id, seq: cursor.seq, journal_seq: cur_seq }
+    }
+}
+
 /// Last `DecantXmemJournalSeq` drained into `STATE` (`u64::MAX` when unknown).
 static LAST_JOURNAL_SEQ: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Serializes `sync` and `device_created` across queues so `execute_copies` runs without holding `STATE`,
@@ -1096,8 +1188,10 @@ pub unsafe fn device_created(device: *mut c_void) {
     }
     bump_mapping_gen();
     LAST_JOURNAL_SEQ.store(u64::MAX, Ordering::Release);
+    let id = NEXT_STATE.fetch_add(1, Ordering::Relaxed);
+    ACTIVE_STATE_ID.store(id, Ordering::Release);
     *st = Some(State {
-        id: NEXT_STATE.fetch_add(1, Ordering::Relaxed),
+        id,
         device,
         map_queue,
         map_fence,
@@ -1128,16 +1222,60 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
         return None;
     }
     let api = api()?;
-    let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
-    let st = guard.as_mut()?;
-    if !st.tracking {
-        st.tracking = true;
+    let mut cursor = decant_trace::timed_lock("title_mem::DRAIN_LOCK", || DRAIN_LOCK.lock().unwrap_or_else(PoisonError::into_inner));
+    if ACTIVE_STATE_ID.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    if !cursor.tracking {
+        cursor.tracking = true;
         // SAFETY: the export takes a flag.
         unsafe { (api.track)(1) };
         xs_log!("title memory: xmem.dll tracks written pages now, every mapped page is copied at the first sync");
     }
-    st.drain(api);
-    Some(f(st, api))
+    let batch = drain_journal(api, &mut cursor);
+    let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
+    let st = guard.as_mut()?;
+    st.tracking = true;
+    match batch {
+        DrainBatch::Unchanged => {}
+        DrainBatch::Changes { state_id, seq, journal_seq } if st.id == state_id => {
+            for c in &cursor.records {
+                st.apply(c);
+            }
+            st.seq = seq;
+            st.make_windows();
+            st.last_journal_seq = journal_seq;
+            if let Some(jseq) = journal_seq {
+                LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
+            }
+        }
+        DrainBatch::Snapshot { state_id, seq, journal_seq } if st.id == state_id => {
+            xs_log!("title memory: the journal of xmem.dll overran, starting again from a snapshot of {} records", cursor.records.len());
+            st.mirror.reset();
+            bump_mapping_gen();
+            for c in &cursor.records {
+                st.apply(c);
+            }
+            st.seq = seq;
+            st.make_windows();
+            st.last_journal_seq = journal_seq;
+            if let Some(jseq) = journal_seq {
+                LAST_JOURNAL_SEQ.store(jseq, Ordering::Release);
+            }
+        }
+        DrainBatch::Changes { .. } | DrainBatch::Snapshot { .. } => {
+            st.drain(api);
+            cursor.state_id = st.id;
+            cursor.seq = st.seq;
+            cursor.last_journal_seq = st.last_journal_seq;
+        }
+    }
+    let res = f(st, api);
+    if st.seq != cursor.seq {
+        cursor.seq = st.seq;
+        cursor.last_journal_seq = st.last_journal_seq;
+    }
+    Some(res)
 }
 
 /// Runs `f` under a shared read lock when tracking is already active and the journal sequence is
@@ -1721,5 +1859,15 @@ mod tests {
         let r1 = STATE.read().unwrap_or_else(PoisonError::into_inner);
         let r2 = std::thread::spawn(|| STATE.read().unwrap_or_else(PoisonError::into_inner).is_some()).join().unwrap();
         assert_eq!(r2, r1.is_some());
+    }
+
+    #[test]
+    fn drain_lock_does_not_block_state_reads_or_writes() {
+        let mut cursor = DRAIN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        cursor.state_id = 0;
+        let read_ok = std::thread::spawn(|| STATE.read().unwrap_or_else(PoisonError::into_inner).is_none()).join().unwrap();
+        let write_ok = std::thread::spawn(|| STATE.write().unwrap_or_else(PoisonError::into_inner).is_none()).join().unwrap();
+        assert!(read_ok);
+        assert!(write_ok);
     }
 }

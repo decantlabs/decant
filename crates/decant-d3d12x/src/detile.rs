@@ -928,6 +928,13 @@ fn select_staging_to_trim(frames: impl Iterator<Item = (usize, u64, u64)>, compl
 /// Fast path flag indicating whether at least one registered texture may want a fill.
 static HAS_PENDING_FILLS: AtomicBool = AtomicBool::new(false);
 
+struct OwnedJob {
+    texture: ID3D12Resource,
+    src_gpu: u64,
+    plan: Arc<Plan>,
+    states: Arc<Vec<u32>>,
+}
+
 /// Scratch buffers owned by [`Registry`] and reused across flushes, transitions, writes and tile
 /// notifications to avoid per call heap allocations.
 #[derive(Default)]
@@ -937,7 +944,7 @@ struct RegistryScratch {
     pending_items: Vec<(usize, u64, u64)>,
     pending_spans: Vec<(u64, u64)>,
     translated: Vec<Option<(crate::title_mem::Span, bool)>>,
-    resources: Vec<Option<ID3D12Resource>>,
+    owned_jobs: Vec<OwnedJob>,
     job_res: Vec<usize>,
     outcome: Vec<bool>,
     overlapping: Vec<usize>,
@@ -951,7 +958,7 @@ struct Placed {
     /// PC allocation size, for the informational owner statistics.
     bytes: u64,
     /// The states of the title's submitted work, one for all subresources or one each.
-    states: Vec<u32>,
+    states: Arc<Vec<u32>>,
     tiles: Option<Vec<u32>>,
     dirty: bool,
     attempts: u32,
@@ -1306,7 +1313,7 @@ pub fn register(res: usize, va: u64, raw: &[u8; 0x38], state: u32, bytes: u64) {
                     plan.size
                 );
             }
-            r.insert(res, Placed { va, plan, bytes, states: vec![state], tiles: None, dirty: true, attempts: 0 });
+            r.insert(res, Placed { va, plan, bytes, states: Arc::new(vec![state]), tiles: None, dirty: true, attempts: 0 });
         }),
         Err(why) => with_registry(|r| {
             let reason = why.split(':').next().unwrap_or("");
@@ -1522,7 +1529,7 @@ pub fn submitted(lists: &[usize]) {
         for &(res, sub, after) in &changes {
             if let Some(texture) = r.textures.get_mut(&res) {
                 let count = (texture.plan.mips.len() as u32 * texture.plan.slices) as usize;
-                apply_transition(&mut texture.states, count, sub, after);
+                apply_transition(Arc::make_mut(&mut texture.states), count, sub, after);
             }
         }
         r.scratch.changes = changes;
@@ -1635,18 +1642,11 @@ pub unsafe fn flush(queue: *mut c_void) {
         crate::title_mem::translate_fresh_batch(&pending_spans, &mut translated);
     }
 
-    struct OwnedJob {
-        texture: ID3D12Resource,
-        src_gpu: u64,
-        plan: Arc<Plan>,
-        states: Vec<u32>,
-    }
-
     let prepared = with_registry(|r| {
         let mut ready = std::mem::take(&mut r.scratch.ready);
         ready.clear();
-        let mut resources = std::mem::take(&mut r.scratch.resources);
-        resources.clear();
+        let mut owned_jobs = std::mem::take(&mut r.scratch.owned_jobs);
+        owned_jobs.clear();
         let mut job_res = std::mem::take(&mut r.scratch.job_res);
         job_res.clear();
         let mut outcome = std::mem::take(&mut r.scratch.outcome);
@@ -1688,31 +1688,25 @@ pub unsafe fn flush(queue: *mut c_void) {
         }
         if ready.is_empty() {
             r.scratch.ready = ready;
-            r.scratch.resources = resources;
+            r.scratch.owned_jobs = owned_jobs;
             r.scratch.job_res = job_res;
             r.scratch.outcome = outcome;
             return None;
         }
         ready.sort_unstable_by_key(|&(res, _)| res);
-        resources.extend(ready.iter().map(|&(res, _)| {
+        for &(res, gpu) in &ready {
             let raw = res as *mut c_void;
             // SAFETY: the registry holds the entry, so the title still owns the resource (it is forgotten before it is released).
-            unsafe { ID3D12Resource::from_raw_borrowed(&raw) }.cloned()
-        }));
-        let mut owned_jobs = Vec::with_capacity(ready.len());
-        for (&(res, gpu), resource) in ready.iter().zip(&resources) {
-            if let (Some(texture), Some(placed)) = (resource, r.textures.get(&res)) {
-                owned_jobs.push(OwnedJob { texture: texture.clone(), src_gpu: gpu, plan: Arc::clone(&placed.plan), states: placed.states.clone() });
+            if let (Some(texture), Some(placed)) = (unsafe { ID3D12Resource::from_raw_borrowed(&raw) }.cloned(), r.textures.get(&res)) {
+                owned_jobs.push(OwnedJob { texture, src_gpu: gpu, plan: Arc::clone(&placed.plan), states: Arc::clone(&placed.states) });
                 job_res.push(res);
             }
         }
-        resources.clear();
         let ready_count = ready.len();
         r.scratch.ready = ready;
-        r.scratch.resources = resources;
         Some((owned_jobs, job_res, outcome, ready_count))
     });
-    let Some((owned_jobs, job_res, mut outcome, ready_count)) = prepared else {
+    let Some((mut owned_jobs, job_res, mut outcome, ready_count)) = prepared else {
         return;
     };
 
@@ -1728,9 +1722,10 @@ pub unsafe fn flush(queue: *mut c_void) {
         Some(detiler.footprint())
     });
     drop(jobs);
-    drop(owned_jobs);
+    owned_jobs.clear();
     let Some((frames, queues, staging)) = footprint else {
         with_registry(|r| {
+            r.scratch.owned_jobs = owned_jobs;
             r.scratch.job_res = job_res;
             r.scratch.outcome = outcome;
         });
@@ -1738,6 +1733,7 @@ pub unsafe fn flush(queue: *mut c_void) {
     };
 
     let streaming_units = with_registry(|r| {
+        r.scratch.owned_jobs = owned_jobs;
         let mut filled_bytes = 0u64;
         for (&res, &ok) in job_res.iter().zip(&outcome) {
             if let Some(texture) = r.textures.get_mut(&res) {
@@ -1785,7 +1781,7 @@ mod tests {
     }
 
     fn placed(va: u64, size: u64) -> Placed {
-        Placed { va, plan: Arc::new(flat_plan(size)), bytes: size, states: vec![0], tiles: None, dirty: false, attempts: 0 }
+        Placed { va, plan: Arc::new(flat_plan(size)), bytes: size, states: Arc::new(vec![0]), tiles: None, dirty: false, attempts: 0 }
     }
 
     #[test]
@@ -2048,5 +2044,18 @@ mod tests {
         r.apply_incremental_index(&[(1, 0x1000, 0x2000)], &[Some(vec![40, 41, 42])], 1, true);
         assert_eq!(r.mark_tiles_from_index(&[40, 41, 41, 42], false), 1);
         assert!(r.pending.contains(&1));
+    }
+
+    #[test]
+    fn arc_plan_and_states_snapshot_share_without_deep_copy_and_cow_on_transition() {
+        let mut p = placed(0x1000, 0x2000);
+        let plan_snap = Arc::clone(&p.plan);
+        let states_snap = Arc::clone(&p.states);
+        assert!(Arc::ptr_eq(&p.plan, &plan_snap));
+        assert!(Arc::ptr_eq(&p.states, &states_snap));
+        apply_transition(Arc::make_mut(&mut p.states), 1, 0, 7);
+        assert_eq!(*states_snap, [0]);
+        assert_eq!(*p.states, [7]);
+        assert!(!Arc::ptr_eq(&p.states, &states_snap));
     }
 }
