@@ -24,10 +24,11 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::rts0::{RegisterClass, RootLayout, RootParamKind};
@@ -47,30 +48,50 @@ impl Default for Fnv128 {
 }
 
 impl Fnv128 {
+    const fn with_bytes(mut self, bytes: &[u8]) -> Self {
+        let mut i = 0;
+        while i < bytes.len() {
+            self.0 ^= bytes[i] as u128;
+            self.0 = self.0.wrapping_mul(FNV128_PRIME);
+            i += 1;
+        }
+        self
+    }
+
+    const fn with_field(self, bytes: &[u8]) -> Self {
+        let len = (bytes.len() as u64).to_le_bytes();
+        self.with_bytes(&len).with_bytes(bytes)
+    }
+
     /// Adds `bytes`.
+    #[inline]
     pub fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
-        for b in bytes {
-            self.0 ^= u128::from(*b);
+        for &b in bytes {
+            self.0 ^= u128::from(b);
             self.0 = self.0.wrapping_mul(FNV128_PRIME);
         }
         self
     }
 
     /// Adds a length prefixed field, so that `("ab", "c")` and `("a", "bc")` differ.
+    #[inline]
     pub fn field(&mut self, bytes: &[u8]) -> &mut Self {
         self.bytes(&(bytes.len() as u64).to_le_bytes()).bytes(bytes)
     }
 
+    #[inline]
     fn u32(&mut self, v: u32) -> &mut Self {
         self.bytes(&v.to_le_bytes())
     }
 
+    #[inline]
     fn u64(&mut self, v: u64) -> &mut Self {
         self.bytes(&v.to_le_bytes())
     }
 
     /// The hash so far.
-    pub fn finish(&self) -> u128 {
+    #[inline]
+    pub const fn finish(&self) -> u128 {
         self.0
     }
 }
@@ -78,6 +99,21 @@ impl Fnv128 {
 /// Bumped when the layout of the keys or of the files changes.
 const FORMAT: u32 = 3;
 const TRANSLATOR_HASH: &str = env!("DECANT_DIRECT_TRANSLATOR_HASH");
+
+const STAGE_KEY_PREFIX: Fnv128 = Fnv128(FNV128_OFFSET)
+    .with_field(b"decant direct stage")
+    .with_field(&FORMAT.to_le_bytes())
+    .with_field(TRANSLATOR_HASH.as_bytes());
+
+const SOURCE_STAGE_KEY_PREFIX: Fnv128 = Fnv128(FNV128_OFFSET)
+    .with_field(b"decant direct stage by source key")
+    .with_field(&FORMAT.to_le_bytes())
+    .with_field(TRANSLATOR_HASH.as_bytes());
+
+const PIPELINE_KEY_PREFIX: Fnv128 = Fnv128(FNV128_OFFSET)
+    .with_field(b"decant direct pipeline")
+    .with_field(&FORMAT.to_le_bytes())
+    .with_field(TRANSLATOR_HASH.as_bytes());
 
 fn class_tag(c: RegisterClass) -> u8 {
     match c {
@@ -145,12 +181,8 @@ fn hash_linkage(h: &mut Fnv128, linkage: &Linkage) {
 
 /// The cache key of one stage from its console input, root layout and linkage.
 pub fn stage_key(kind: StageKind, bytes: &[u8], root: &RootLayout, linkage: &Linkage, translator: &str, dxc: &str) -> u128 {
-    let mut h = Fnv128::default();
-    h.field(b"decant direct stage")
-        .field(&FORMAT.to_le_bytes())
-        .field(TRANSLATOR_HASH.as_bytes())
-        .field(kind.short().as_bytes())
-        .field(bytes);
+    let mut h = STAGE_KEY_PREFIX;
+    h.field(kind.short().as_bytes()).field(bytes);
     hash_root(&mut h, root);
     hash_linkage(&mut h, linkage);
     h.field(translator.as_bytes()).field(dxc.as_bytes());
@@ -161,11 +193,8 @@ pub fn stage_key(kind: StageKind, bytes: &[u8], root: &RootLayout, linkage: &Lin
 /// (`ShaderSource::stage_keys`), which stands for the console bytes, the root signature and the
 /// linkage of [`stage_key`].
 pub fn source_stage_key(kind: StageKind, source_key: u128, translator: &str, dxc: &str) -> u128 {
-    let mut h = Fnv128::default();
-    h.field(b"decant direct stage by source key")
-        .field(&FORMAT.to_le_bytes())
-        .field(TRANSLATOR_HASH.as_bytes())
-        .field(kind.short().as_bytes())
+    let mut h = SOURCE_STAGE_KEY_PREFIX;
+    h.field(kind.short().as_bytes())
         .field(&source_key.to_le_bytes())
         .field(translator.as_bytes())
         .field(dxc.as_bytes());
@@ -174,11 +203,8 @@ pub fn source_stage_key(kind: StageKind, source_key: u128, translator: &str, dxc
 
 /// The cache key of a whole pipeline from its inputs before translation runs.
 pub fn pipeline_key(pipeline: &Pipeline, translator: &str, dxc: &str) -> u128 {
-    let mut h = Fnv128::default();
-    h.field(b"decant direct pipeline")
-        .field(&FORMAT.to_le_bytes())
-        .field(TRANSLATOR_HASH.as_bytes())
-        .u64(pipeline.stages.len() as u64);
+    let mut h = PIPELINE_KEY_PREFIX;
+    h.u64(pipeline.stages.len() as u64);
     for st in &pipeline.stages {
         h.field(st.kind.short().as_bytes()).field(&st.bytes);
     }
@@ -203,6 +229,7 @@ const CACHE_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 pub struct DiskCache {
     dir: PathBuf,
     pipeline_records: bool,
+    dir_ready: Arc<AtomicBool>,
     // The estimate includes new writes. Rescan when it reaches the budget.
     size: Arc<Mutex<CacheSize>>,
 }
@@ -233,7 +260,7 @@ impl DiskCache {
             // Without an override, standalone sources can use an explicit cache directory.
             override_path.is_none()
         };
-        DiskCache { dir, pipeline_records, size: Arc::default() }
+        DiskCache { dir, pipeline_records, dir_ready: Arc::default(), size: Arc::default() }
     }
 
     /// The folder.
@@ -249,7 +276,12 @@ impl DiskCache {
     /// The configured cache if this process can own its persistent sampler registry.
     pub fn from_env() -> Option<DiskCache> {
         let dir = Self::configured_dir()?;
-        owns_sampler_registry(&dir).then(|| DiskCache { dir, pipeline_records: true, size: Arc::default() })
+        owns_sampler_registry(&dir).then(|| DiskCache {
+            dir,
+            pipeline_records: true,
+            dir_ready: Arc::default(),
+            size: Arc::default(),
+        })
     }
 
     fn resolve_dir(configured: Option<OsString>, default: Option<PathBuf>) -> Option<PathBuf> {
@@ -265,12 +297,26 @@ impl DiskCache {
         }
     }
 
+    fn entry_name(key: u128, ext: &[u8; 5]) -> [u8; 37] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut buf = [0u8; 37];
+        let mut k = key;
+        for b in buf[..32].iter_mut().rev() {
+            *b = HEX[(k & 0xf) as usize];
+            k >>= 4;
+        }
+        buf[32..37].copy_from_slice(ext);
+        buf
+    }
+
     fn path(&self, key: u128) -> PathBuf {
-        self.dir.join(format!("{key:032x}.dxil"))
+        let name = Self::entry_name(key, b".dxil");
+        self.dir.join(std::str::from_utf8(&name).unwrap_or(""))
     }
 
     fn pipe_path(&self, key: u128) -> PathBuf {
-        self.dir.join(format!("{key:032x}.pipe"))
+        let name = Self::entry_name(key, b".pipe");
+        self.dir.join(std::str::from_utf8(&name).unwrap_or(""))
     }
 
     fn samplers_state(&self) -> io::Result<(usize, u128)> {
@@ -279,27 +325,42 @@ impl DiskCache {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((0, FNV128_OFFSET)),
             Err(e) => return Err(e),
         };
-        let mut bytes = [0; MAX_SAMPLER_BYTES];
         let len = file.metadata()?.len();
-        if len < 8 || len > bytes.len() as u64 || !(len - 8).is_multiple_of(16) {
+        if len < 8 || len > MAX_SAMPLER_BYTES as u64 || !(len - 8).is_multiple_of(16) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid sampler registry length"));
         }
         let len = len as usize;
-        file.read_exact(&mut bytes[..len])?;
+        let mut stack = [0u8; 512];
+        let mut heap = Vec::new();
+        let bytes = if len <= stack.len() {
+            &mut stack[..len]
+        } else {
+            heap.resize(len, 0);
+            &mut heap[..]
+        };
+        file.read_exact(bytes)?;
         if &bytes[..8] != b"SXSM\x01\x00\x00\x00" {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid sampler registry header"));
         }
-        Ok((len, Fnv128::default().bytes(&bytes[..len]).finish()))
+        Ok((len, Fnv128::default().bytes(bytes).finish()))
     }
 
     fn samplers_prefix_hash(&self, len: usize) -> Option<u128> {
         if len == 0 {
             return Some(FNV128_OFFSET);
         }
-        let mut bytes = [0; MAX_SAMPLER_BYTES];
-        let prefix = bytes.get_mut(..len)?;
-        File::open(self.dir.join(SAMPLERS_FILE)).ok()?.read_exact(prefix).ok()?;
-        Some(Fnv128::default().bytes(prefix).finish())
+        if !(8..=MAX_SAMPLER_BYTES).contains(&len) || !(len - 8).is_multiple_of(16) {
+            return None;
+        }
+        let mut file = File::open(self.dir.join(SAMPLERS_FILE)).ok()?;
+        let mut stack = [0u8; 512];
+        if let Some(prefix) = stack.get_mut(..len) {
+            file.read_exact(prefix).ok()?;
+            return Some(Fnv128::default().bytes(prefix).finish());
+        }
+        let mut prefix = vec![0u8; len];
+        file.read_exact(&mut prefix).ok()?;
+        Some(Fnv128::default().bytes(&prefix).finish())
     }
 
     /// The DXIL stored for `key`, `None` on a miss or a file that fails any header or payload check.
@@ -309,8 +370,10 @@ impl DiskCache {
         if !(1..=MAX_DXIL_BYTES as u64).contains(&payload_len) {
             return None;
         }
-        let mut header = [0; STAGE_HEADER];
-        file.read_exact(&mut header).ok()?;
+        let payload_len_usize = payload_len as usize;
+        let mut buf = vec![0u8; STAGE_HEADER + payload_len_usize];
+        file.read_exact(&mut buf).ok()?;
+        let (header, dxil) = buf.split_at(STAGE_HEADER);
         if &header[..4] != STAGE_MAGIC
             || header[4..8] != FORMAT.to_le_bytes()
             || header[8..24] != key.to_le_bytes()
@@ -318,10 +381,13 @@ impl DiskCache {
         {
             return None;
         }
-        let mut dxil = vec![0; payload_len as usize];
-        file.read_exact(&mut dxil).ok()?;
-        let checksum = Fnv128::default().bytes(&dxil).finish();
-        (header[32..48] == checksum.to_le_bytes()).then_some(dxil)
+        let checksum = Fnv128::default().bytes(dxil).finish();
+        if header[32..48] != checksum.to_le_bytes() {
+            return None;
+        }
+        buf.copy_within(STAGE_HEADER.., 0);
+        buf.truncate(payload_len_usize);
+        Some(buf)
     }
 
     /// Stores `dxil` for `key`. Errors are returned for the log, the cache is best effort.
@@ -330,16 +396,16 @@ impl DiskCache {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid DXIL blob length"));
         }
         let checksum = Fnv128::default().bytes(dxil).finish();
-        let mut file = Vec::with_capacity(STAGE_HEADER + dxil.len());
-        file.extend_from_slice(STAGE_MAGIC);
-        file.extend_from_slice(&FORMAT.to_le_bytes());
-        file.extend_from_slice(&key.to_le_bytes());
-        file.extend_from_slice(&(dxil.len() as u64).to_le_bytes());
-        file.extend_from_slice(&checksum.to_le_bytes());
-        file.extend_from_slice(dxil);
-        let stem = format!("{key:032x}.dxil");
-        let dest = self.path(key);
-        self.write_atomic(&stem, &dest, &file, || self.read(key).is_some())
+        let mut header = [0u8; STAGE_HEADER];
+        header[..4].copy_from_slice(STAGE_MAGIC);
+        header[4..8].copy_from_slice(&FORMAT.to_le_bytes());
+        header[8..24].copy_from_slice(&key.to_le_bytes());
+        header[24..32].copy_from_slice(&(dxil.len() as u64).to_le_bytes());
+        header[32..48].copy_from_slice(&checksum.to_le_bytes());
+        let name = Self::entry_name(key, b".dxil");
+        let stem = std::str::from_utf8(&name).unwrap_or("");
+        let dest = self.dir.join(stem);
+        self.write_atomic(stem, &dest, &header, dxil, || self.read(key).is_some())
     }
 
     /// The stage keys stored for pipeline `key`, `None` on a miss or when the entry or the sampler
@@ -386,36 +452,65 @@ impl DiskCache {
             return Ok(());
         }
         let (samplers_len, samplers_hash) = self.samplers_state()?;
-        let mut body = Vec::with_capacity(stage_keys.len() * 16);
-        for k in stage_keys {
-            body.extend_from_slice(&k.to_le_bytes());
+        let mut buf = [0u8; PIPE_HEADER + MAX_STAGES * 16];
+        let body_len = stage_keys.len() * 16;
+        let total_len = PIPE_HEADER + body_len;
+        for (slot, k) in buf[PIPE_HEADER..total_len].as_chunks_mut::<16>().0.iter_mut().zip(stage_keys) {
+            *slot = k.to_le_bytes();
         }
-        let checksum = Fnv128::default().bytes(&samplers_hash.to_le_bytes()).bytes(&body).finish();
-        let mut file = Vec::with_capacity(PIPE_HEADER + body.len());
-        file.extend_from_slice(PIPE_MAGIC);
-        file.extend_from_slice(&FORMAT.to_le_bytes());
-        file.extend_from_slice(&key.to_le_bytes());
-        file.extend_from_slice(&(stage_keys.len() as u64).to_le_bytes());
-        file.extend_from_slice(&(samplers_len as u64).to_le_bytes());
-        file.extend_from_slice(&checksum.to_le_bytes());
-        file.extend_from_slice(&body);
-        let stem = format!("{key:032x}.pipe");
-        let dest = self.pipe_path(key);
-        self.write_atomic(&stem, &dest, &file, || self.read_pipeline(key).is_some())
+        let checksum = Fnv128::default()
+            .bytes(&samplers_hash.to_le_bytes())
+            .bytes(&buf[PIPE_HEADER..total_len])
+            .finish();
+        buf[..4].copy_from_slice(PIPE_MAGIC);
+        buf[4..8].copy_from_slice(&FORMAT.to_le_bytes());
+        buf[8..24].copy_from_slice(&key.to_le_bytes());
+        buf[24..32].copy_from_slice(&(stage_keys.len() as u64).to_le_bytes());
+        buf[32..40].copy_from_slice(&(samplers_len as u64).to_le_bytes());
+        buf[40..56].copy_from_slice(&checksum.to_le_bytes());
+        let name = Self::entry_name(key, b".pipe");
+        let stem = std::str::from_utf8(&name).unwrap_or("");
+        let dest = self.dir.join(stem);
+        self.write_atomic(stem, &dest, &buf[..total_len], &[], || self.read_pipeline(key).is_some())
     }
 
-    fn write_atomic(&self, stem: &str, dest: &Path, data: &[u8], valid: impl Fn() -> bool) -> io::Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
+    fn create_temp_file(&self, temp: &Path) -> io::Result<File> {
+        if !self.dir_ready.load(Ordering::Relaxed) {
+            std::fs::create_dir_all(&self.dir)?;
+            self.dir_ready.store(true, Ordering::Relaxed);
+        }
+        match File::create_new(temp) {
+            Ok(file) => Ok(file),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&self.dir)?;
+                self.dir_ready.store(true, Ordering::Relaxed);
+                File::create_new(temp)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn write_atomic(&self, stem: &str, dest: &Path, header: &[u8], payload: &[u8], valid: impl Fn() -> bool) -> io::Result<()> {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         let seq = TEMP_NUMBER.fetch_add(1, Ordering::Relaxed);
-        let temp = self.dir.join(format!(".{stem}.{}.{nanos}.{seq}.tmp", std::process::id()));
-        let mut file = File::create_new(&temp)?;
-        let result = file.write_all(data);
+        let mut temp_name = String::with_capacity(stem.len() + 48);
+        let _ = write!(temp_name, ".{stem}.{}.{nanos}.{seq}.tmp", std::process::id());
+        let temp = self.dir.join(&temp_name);
+        let mut file = self.create_temp_file(&temp)?;
+        let total_len = header.len() + payload.len();
+        let result = if total_len <= 4096 {
+            let mut stack = [0u8; 4096];
+            stack[..header.len()].copy_from_slice(header);
+            stack[header.len()..total_len].copy_from_slice(payload);
+            file.write_all(&stack[..total_len])
+        } else {
+            file.write_all(header).and_then(|()| file.write_all(payload))
+        };
         drop(file);
         let result = result.and_then(|()| Self::publish(|| std::fs::rename(&temp, dest), valid));
         let _ = std::fs::remove_file(&temp);
         if let Ok(true) = result {
-            self.check_size(data.len() as u64, CACHE_BUDGET, |bytes| {
+            self.check_size(total_len as u64, CACHE_BUDGET, |bytes| {
                 #[cfg(not(windows))]
                 let _ = bytes;
                 #[cfg(windows)]
@@ -768,5 +863,52 @@ pub(crate) mod tests {
             default_dir_from(false, None, None, Some("".into()), Some("home_root".into())),
             Some(PathBuf::from("home_root").join(".cache").join("Decant").join("direct-dxil"))
         );
+    }
+
+    #[test]
+    fn const_prefixes_and_entry_names_match_reference_formatting() {
+        let mut stage = Fnv128::default();
+        stage
+            .field(b"decant direct stage")
+            .field(&FORMAT.to_le_bytes())
+            .field(TRANSLATOR_HASH.as_bytes());
+        assert_eq!(STAGE_KEY_PREFIX.finish(), stage.finish());
+
+        let mut source = Fnv128::default();
+        source
+            .field(b"decant direct stage by source key")
+            .field(&FORMAT.to_le_bytes())
+            .field(TRANSLATOR_HASH.as_bytes());
+        assert_eq!(SOURCE_STAGE_KEY_PREFIX.finish(), source.finish());
+
+        let mut pipe = Fnv128::default();
+        pipe.field(b"decant direct pipeline")
+            .field(&FORMAT.to_le_bytes())
+            .field(TRANSLATOR_HASH.as_bytes());
+        assert_eq!(PIPELINE_KEY_PREFIX.finish(), pipe.finish());
+
+        for key in [0u128, 7, 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210, u128::MAX] {
+            let dxil = DiskCache::entry_name(key, b".dxil");
+            assert_eq!(std::str::from_utf8(&dxil).unwrap(), format!("{key:032x}.dxil"));
+            let pipe = DiskCache::entry_name(key, b".pipe");
+            assert_eq!(std::str::from_utf8(&pipe).unwrap(), format!("{key:032x}.pipe"));
+        }
+    }
+
+    #[test]
+    fn large_dxil_and_large_sampler_registry_round_trip() {
+        let tmp = TempDir::new("large_round_trip");
+        let cache = DiskCache::new(&tmp.0);
+
+        let large_dxil: Vec<u8> = (0..16384).map(|i| (i % 251) as u8).collect();
+        cache.write(0xdead_beef, &large_dxil).expect("write large dxil");
+        assert_eq!(cache.read(0xdead_beef).as_deref(), Some(large_dxil.as_slice()));
+
+        let mut samplers = Vec::from(&b"SXSM\x01\x00\x00\x00"[..]);
+        samplers.resize(8 + 64 * 16, 0x5a);
+        std::fs::write(tmp.0.join(SAMPLERS_FILE), &samplers).expect("write large samplers");
+        let keys = [1u128, 2, 3, 4, 5, 6, 7, 8];
+        cache.write_pipeline(0xcafe, &keys).expect("write max-stage pipeline");
+        assert_eq!(cache.read_pipeline(0xcafe).as_deref(), Some(&keys[..]));
     }
 }
