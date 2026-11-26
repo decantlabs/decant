@@ -4,7 +4,7 @@ The engine separates its address space state from GPU dirty tracking. The dirty 
 
 Mapping changes acquire the address space mutex before the dirty mutex. They keep both through Windows mapping calls, alias updates and protection changes. Dirty tracking never acquires the address space mutex while holding its mutex. Address space inspection, including the full commitment walk in `footprint`, does not acquire the dirty mutex.
 
-Every writable alias of a physical page shares its dirty state. Tracker transitions and Windows protection changes remain serialized. Read only aliases keep their protection. Hot page holds, kernel write holds, cached commitment and adjacent protection run merging keep their existing rules.
+Every writable alias of a physical page shares its dirty state. Tracker transitions and Windows protection changes remain serialized. Read only aliases keep their protection. Hot page holds (configurable via `DECANT_XMEM_HOT_HOLD_MS`, default 2000 ms), refcounted IO write pins (`DecantXmemBeginWrite` and `DecantXmemFinishWrite`), kernel write holds, cached commitment and adjacent protection run merging keep their existing rules.
 
 Issue #10 reported 781 ms waiting for the engine mutex and 53 ms inspecting pages per 200 calls during streaming. Those figures describe the original report. This change has no streaming workload measurement. It removes the address space mutex dependency from dirty takes and tracked write faults. Mapping transactions still serialize with dirty tracking, so they can still cause waits.
 

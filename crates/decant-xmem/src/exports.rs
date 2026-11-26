@@ -898,6 +898,22 @@ pub extern "system" fn DecantXmemPrepareWrite(address: usize, len: usize) {
     }
 }
 
+/// Outside the console API: pins `[address, address + len)` writable for an active asynchronous write.
+#[unsafe(no_mangle)]
+pub extern "system" fn DecantXmemBeginWrite(address: usize, len: usize) {
+    if let Some(engine) = Engine::started() {
+        engine.begin_io_write(address, len);
+    }
+}
+
+/// Outside the console API: releases an active asynchronous write pin on `[address, address + len)`.
+#[unsafe(no_mangle)]
+pub extern "system" fn DecantXmemFinishWrite(address: usize, len: usize) {
+    if let Some(engine) = Engine::started() {
+        engine.finish_io_write(address, len);
+    }
+}
+
 /// Outside the console API: writes `len` bytes at `data` into physical pages, for a DirectStorage request
 /// whose destination is a page array. `page_array` holds `count` frame numbers as
 /// `XMemAllocatePhysicalPages` gives them, one per 64 KiB, and the bytes start at `offset` in the first
