@@ -134,21 +134,33 @@ impl Track {
         }
     }
 
-    /// The addresses of the read write views of `page`.
-    fn rw(&self, page: u32) -> Vec<usize> {
-        self.aliases.get(&page).map(|v| v.iter().filter(|a| a.rw).map(|a| a.addr).collect()).unwrap_or_default()
+    /// Appends the addresses of the read write views of `page` to `out`.
+    fn extend_rw(&self, page: u32, out: &mut Vec<usize>) {
+        if let Some(v) = self.aliases.get(&page) {
+            out.extend(v.iter().filter(|a| a.rw).map(|a| a.addr));
+        }
     }
 
-    /// Makes the page dirty and queues it when it has a view. Returns the read write views to make
-    /// read write again when it was clean.
-    fn dirty(&mut self, page: u32) -> Vec<usize> {
+    /// Makes the page dirty and queues it when it has a view, appending read write views to
+    /// `out` when it was clean.
+    fn dirty_into(&mut self, page: u32, out: &mut Vec<usize>) {
         let i = page as usize;
         let was_clean = std::mem::replace(&mut self.clean[i], false);
         if !self.queued[i] && self.aliases.contains_key(&page) {
             self.queued[i] = true;
             self.pending.push(page);
         }
-        if was_clean { self.rw(page) } else { Vec::new() }
+        if was_clean {
+            self.extend_rw(page, out);
+        }
+    }
+
+    /// Makes the page dirty and queues it when it has a view. Returns the read write views to make
+    /// read write again when it was clean.
+    fn dirty(&mut self, page: u32) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.dirty_into(page, &mut out);
+        out
     }
 
     /// The bytes of the page changed outside its views: the allocator handed it out, or the engine
@@ -203,13 +215,20 @@ impl Track {
         self.held.get(&page).is_some_and(|&until| now < until)
     }
 
-    /// Pins `page` open for an active asynchronous write. Marks the page dirty, increments the
-    /// active write pin count, and returns the read write views to make writable.
-    pub fn begin_write_pin(&mut self, page: u32) -> Vec<usize> {
+    /// Pins `page` open for an active asynchronous write, appending read write views to `out`.
+    pub fn begin_write_pin_into(&mut self, page: u32, out: &mut Vec<usize>) {
         if self.aliases.contains_key(&page) {
             *self.active_writes.entry(page).or_insert(0) += 1;
         }
-        self.dirty(page)
+        self.dirty_into(page, out);
+    }
+
+    /// Pins `page` open for an active asynchronous write. Marks the page dirty, increments the
+    /// active write pin count, and returns the read write views to make writable.
+    pub fn begin_write_pin(&mut self, page: u32) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.begin_write_pin_into(page, &mut out);
+        out
     }
 
     /// Unpins `page` after an active asynchronous write finishes. Decrements the pin count and
@@ -258,13 +277,20 @@ impl Track {
         self.prepare_until(page, now + io_hold())
     }
 
-    /// As `prepare`, held until `until` (a longer hold already there stays).
-    pub fn prepare_until(&mut self, page: u32, until: Instant) -> Vec<usize> {
+    /// As `prepare`, held until `until`, appending read write views to `out`.
+    pub fn prepare_until_into(&mut self, page: u32, until: Instant, out: &mut Vec<usize>) {
         if self.aliases.contains_key(&page) {
             let held = self.held.entry(page).or_insert(until);
             *held = (*held).max(until);
         }
-        self.dirty(page)
+        self.dirty_into(page, out);
+    }
+
+    /// As `prepare`, held until `until` (a longer hold already there stays).
+    pub fn prepare_until(&mut self, page: u32, until: Instant) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.prepare_until_into(page, until, &mut out);
+        out
     }
 
     /// The write a long hold was for ended at `now`: the page is held for `io_hold()` from now. That
@@ -301,10 +327,11 @@ impl Track {
         let mut protect = Vec::new();
         let pending = std::mem::take(&mut self.pending);
         let mut keep = Vec::new();
-        for page in pending {
+        for (idx, &page) in pending.iter().enumerate() {
             let i = page as usize;
             if taken.len() >= cap {
-                keep.push(page);
+                keep.extend_from_slice(&pending[idx..]);
+                break;
             } else if !self.aliases.contains_key(&page) {
                 self.queued[i] = false;
             } else if !self.committed[i] && !committed(page) {
@@ -320,7 +347,7 @@ impl Track {
                 self.committed[i] = true;
                 self.held.remove(&page);
                 self.io_held.remove(&page);
-                protect.extend(self.rw(page));
+                self.extend_rw(page, &mut protect);
                 let quick = self.cleaned.get(&page).map_or(0, |&(_, q)| q);
                 self.cleaned.insert(page, (now, quick));
                 self.clean[i] = true;
@@ -586,5 +613,19 @@ mod tests {
         t.clear_io_hold(5);
         assert_eq!(t.take(now + Duration::from_secs(1), 10, all), (vec![5], vec![0x10_0000]));
         assert_eq!(t.take(now + Duration::from_secs(1), 10, all), (vec![], vec![]));
+    }
+
+    #[test]
+    fn take_with_cap_preserves_remaining_pending_order() {
+        let mut t = track();
+        let now = Instant::now();
+        for p in 0..5u32 {
+            t.on_map(p, 0x10_0000 + p as usize * P, true);
+        }
+        assert_eq!(t.take(now, 2, all).0, vec![0, 1]);
+        assert_eq!(t.pending_len(), 3);
+        assert_eq!(t.take(now, 2, all).0, vec![2, 3]);
+        assert_eq!(t.take(now, 2, all).0, vec![4]);
+        assert_eq!(t.pending_len(), 0);
     }
 }

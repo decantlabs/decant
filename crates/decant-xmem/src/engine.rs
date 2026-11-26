@@ -582,8 +582,6 @@ struct State {
     /// Commits that `place` backed with pool pages: base address to first frame and page count.
     commits: BTreeMap<usize, (u32, usize)>,
     dirty: Arc<Mutex<Dirty>>,
-    /// What changed in the address space, for the GPU mirror.
-    journal: Journal,
     /// The commits of `commit_region` by base, with one flag per page: the GPU was given an address in
     /// it (`gpu_use`). Only such pages are tracked and reported to the GPU mirror.
     on_demand: BTreeMap<usize, Vec<bool>>,
@@ -645,6 +643,8 @@ pub struct Engine {
     tracking: AtomicBool,
     /// The sequence number of the last journal record, readable without the lock.
     journal_seq: AtomicU64,
+    /// What changed in the address space, for the GPU mirror, locked separately from `state`.
+    journal: Mutex<Journal>,
     /// Boxed so that its address stays put when the engine moves: the fault handler finds it in `STATES`.
     state: Box<Mutex<State>>,
     dirty: Arc<Mutex<Dirty>>,
@@ -746,10 +746,10 @@ impl Engine {
         let api = Api::load()?;
         install_fault_handler();
         let dirty = Arc::new(Mutex::new(Dirty::default()));
-        let state = State { sections: Vec::new(), pages: PageAllocator::new(capacity_pages), regions: Regions::new(), commits: BTreeMap::new(), dirty: Arc::clone(&dirty), journal: Journal::new(), on_demand: BTreeMap::new() };
+        let state = State { sections: Vec::new(), pages: PageAllocator::new(capacity_pages), regions: Regions::new(), commits: BTreeMap::new(), dirty: Arc::clone(&dirty), on_demand: BTreeMap::new() };
         let state = Box::new(Mutex::new(state));
         STATES.lock().unwrap_or_else(PoisonError::into_inner).push(&raw const *state as usize);
-        Ok(Engine { api, limit_pages, tracking: AtomicBool::new(false), journal_seq: AtomicU64::new(0), state, dirty })
+        Ok(Engine { api, limit_pages, tracking: AtomicBool::new(false), journal_seq: AtomicU64::new(0), journal: Mutex::new(Journal::new()), state, dirty })
     }
 
     /// The engine of this process. The size of the section is `DECANT_XMEM_PHYSICAL_MIB` MiB when
@@ -781,8 +781,8 @@ impl Engine {
         self.note_flags(st, kind, va, pages, first_page, 0);
     }
 
-    fn note_flags(&self, st: &mut State, kind: u32, va: usize, pages: usize, first_page: u32, flags: u32) {
-        let seq = st.journal.push(kind, va, pages, first_page, flags);
+    fn note_flags(&self, _st: &mut State, kind: u32, va: usize, pages: usize, first_page: u32, flags: u32) {
+        let seq = self.journal.lock().unwrap_or_else(PoisonError::into_inner).push(kind, va, pages, first_page, flags);
         self.journal_seq.store(seq, Ordering::Release);
     }
 
@@ -1904,7 +1904,7 @@ impl Engine {
                 track.mark_committed(index);
             }
             for index in indices {
-                open.extend(track.prepare_until(index, until));
+                track.prepare_until_into(index, until, &mut open);
             }
         }
         Self::protect_runs(open, PAGE_READWRITE);
@@ -1944,7 +1944,7 @@ impl Engine {
                 track.mark_committed(index);
             }
             for index in indices {
-                open.extend(track.begin_write_pin(index));
+                track.begin_write_pin_into(index, &mut open);
             }
         }
         Self::protect_runs(open, PAGE_READWRITE);
@@ -2034,7 +2034,7 @@ impl Engine {
                 track.mark_committed(index);
             }
             for index in indices {
-                open.extend(track.prepare_until(index, until));
+                track.prepare_until_into(index, until, &mut open);
             }
         }
         Self::protect_runs(open, PAGE_READWRITE);
@@ -2119,14 +2119,14 @@ impl Engine {
 
     /// The journal records after `after`, at most `cap`. `None` when the ring no longer holds them.
     pub fn changes(&self, after: u64, cap: usize) -> Option<Vec<GpuChange>> {
-        self.lock().journal.since(after, cap)
+        self.journal.lock().unwrap_or_else(PoisonError::into_inner).since(after, cap)
     }
 
     /// Every live reservation and view as journal records (`RESERVE` and `MAP`), with the sequence
     /// number they are valid for: the changes after that number complete them.
     pub fn snapshot(&self) -> (Vec<GpuChange>, u64) {
         let st = self.lock();
-        let seq = st.journal.seq();
+        let seq = self.journal.lock().unwrap_or_else(PoisonError::into_inner).seq();
         let mut out: Vec<GpuChange> = st
             .regions
             .reservations()
@@ -3368,5 +3368,25 @@ mod tests {
 
         e.release(area).unwrap();
         e.free_pages(&frames).unwrap();
+    }
+
+    #[test]
+    fn changes_succeeds_while_state_lock_is_held() {
+        let Some(e) = held(|| Engine::load_limited(4, 4)) else { return };
+        let area = e.reserve(0, 2 * P, PAGE_READWRITE).unwrap();
+        let seq = e.journal_seq();
+        let (send, recv) = std::sync::mpsc::channel();
+        let state_guard = e.lock();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let got = e.changes(0, 64);
+                send.send(got.map(|v| v.len())).unwrap();
+            });
+            let count = recv.recv_timeout(std::time::Duration::from_secs(5)).expect("changes waited for state lock");
+            assert!(count >= Some(1));
+            assert_eq!(e.journal_seq(), seq);
+            drop(state_guard);
+        });
+        e.release(area).unwrap();
     }
 }
