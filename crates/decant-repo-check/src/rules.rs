@@ -28,6 +28,8 @@ const SPECIAL: &[&str] = &["LICENSE", ".github/CODEOWNERS", ".gitattributes", ".
 /// the files of the workspace root.
 const RUST_DIR: &str = "crates/";
 const RUST_ROOT_FILES: &[&str] = &["Cargo.toml", "Cargo.lock", "clippy.toml", "rust-toolchain.toml", ".cargo/config.toml"];
+/// Data files at the root that are TOML but no Rust: the feature map that the coordination hub reads.
+const DATA_ROOT_FILES: &[&str] = &["features.toml"];
 const REQUIRED: &[&str] = &[
     "README.md", "LICENSE", "docs/SHADER_TRANSLATOR.md", "build.cmd", ".github/CODEOWNERS", ".github/labels.yml", "SECURITY.md",
 ];
@@ -107,7 +109,7 @@ pub fn check(root: &Path, names: &[String]) -> Result<Outcome, Stop> {
             errors.push(name.clone());
             continue;
         }
-        if [".rs", ".toml", ".lock"].contains(&ext.as_str()) && !(name.starts_with(RUST_DIR) || RUST_ROOT_FILES.contains(&name.as_str())) {
+        if [".rs", ".toml", ".lock"].contains(&ext.as_str()) && !(name.starts_with(RUST_DIR) || RUST_ROOT_FILES.contains(&name.as_str()) || DATA_ROOT_FILES.contains(&name.as_str())) {
             errors.push(name.clone());
             continue;
         }
