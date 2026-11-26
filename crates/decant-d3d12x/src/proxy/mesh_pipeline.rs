@@ -176,6 +176,7 @@ fn dispatch_mesh(this: *mut Proxy, slot: u32, x: u32, y: u32, z: u32) {
         }
         super::list_mirror::prepare(this, crate::user_mirror::Bind::Graphics);
         let _ = crate::rt_diag::draw(this as usize, "DispatchMesh", x);
+        crate::pso_diag::record_op(this as usize, pc as usize, crate::pso_diag::RecordedOpKind::DispatchMesh, || format!("({x}, {y}, {z})"));
         method::<unsafe extern "system" fn(Object, u32, u32, u32)>(l6, PC_DISPATCH_MESH)(l6, x, y, z);
         method::<Release>(l6, 2)(l6);
     }

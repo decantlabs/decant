@@ -2409,13 +2409,38 @@ extern "system" fn dev_create_committed_resource_layout(
     hr
 }
 
-// The queue flags the PC runtime knows (`D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT`). Console
+/// The queue flags the PC runtime knows (`D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT`). Console
 /// bit 0x2 is unknown on the PC and ignored, the host rejects it with E_INVALIDARG.
 const HOST_QUEUE_FLAGS: u32 = 0x1;
 
+/// Opt in diagnostic switch (`DECANT_D3D12X_FORCE_GPU_TIMEOUT=1`, default off) that strips
+/// `D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT` from PC command queues and enables per op
+/// breadcrumb attribution in `pso_diag` so Windows TDR and DRED name the exact hanging dispatch.
+pub(crate) fn force_gpu_timeout() -> bool {
+    static STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var_os("DECANT_D3D12X_FORCE_GPU_TIMEOUT").is_some_and(|v| v == "1");
+            if STATE.compare_exchange(0, if on { 2 } else { 1 }, Ordering::Relaxed, Ordering::Relaxed).is_ok() && on {
+                xs_log!("DECANT_D3D12X_FORCE_GPU_TIMEOUT=1: stripping D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT from PC queues");
+            }
+            on
+        }
+    }
+}
+
+/// The console queue flags reduced to the ones the PC runtime accepts, optionally stripping
+/// `D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT` when `force_timeout` is set.
+fn host_queue_flags_with(console_flags: u32, force_timeout: bool) -> u32 {
+    let mask = if force_timeout { 0 } else { HOST_QUEUE_FLAGS };
+    console_flags & mask
+}
+
 /// The console queue flags reduced to the ones the PC runtime accepts.
 fn host_queue_flags(console_flags: u32) -> u32 {
-    console_flags & HOST_QUEUE_FLAGS
+    host_queue_flags_with(console_flags, force_gpu_timeout())
 }
 
 /// Console slot 48: queue creation from a console description whose first 16 bytes are the PC
@@ -2451,10 +2476,14 @@ extern "system" fn dev_create_queue_x(this: *mut Proxy, desc: *const c_void, rii
 /// A console queue description reduced to what the PC runtime accepts: the console DMA type
 /// (0x10) is a copy queue (3), priorities other than normal, high and global realtime become high,
 /// the flags keep only the PC ones, and the node mask is 0 or 1.
-fn host_queue_desc(d: [u32; 4]) -> [u32; 4] {
+fn host_queue_desc_with(d: [u32; 4], force_timeout: bool) -> [u32; 4] {
     let kind = if d[0] == 0x10 { 3 } else { d[0] };
     let priority = if matches!(d[1], 0 | 100 | 10000) { d[1] } else { 100 };
-    [kind, priority, host_queue_flags(d[2]), d[3].min(1)]
+    [kind, priority, host_queue_flags_with(d[2], force_timeout), d[3].min(1)]
+}
+
+fn host_queue_desc(d: [u32; 4]) -> [u32; 4] {
+    host_queue_desc_with(d, force_gpu_timeout())
 }
 
 /// Console slot 55: a pipeline made from a base pipeline plus patches. Patch contents
@@ -3860,18 +3889,33 @@ extern "system" fn list_copy_resource_x(this: *mut Proxy, dst: Object, src: Obje
 /// pipeline made on first bind that the PC runtime refused starts the list without one, and its
 /// work is left out.
 ///
+/// Records the pipeline bound by `Reset` on `this`, using an already resolved PC pipeline `made`.
+///
 /// # Safety
-/// `pso` is null or a pipeline the title holds (ours or a PC one).
-unsafe fn bound_at_reset(this: *mut Proxy, pso: Object) -> Object {
+/// `this` is a live proxy, `pso` is null or a pipeline the title holds, and `made` is `unwrap(pso)`.
+unsafe fn record_bound_at_reset(this: *mut Proxy, pso: Object, made: Object) -> Object {
     // SAFETY: by the contract above.
     unsafe {
         crate::pso_diag::bind(this as usize, pso);
-        let made = unwrap(pso);
         if made.is_null() && !pso.is_null() && crate::lazy_pso::is_lazy(pso) {
             crate::pso_diag::bind_missing(this as usize);
+        } else if !made.is_null() {
+            crate::pso_diag::bind_resolved(this as usize, (*this).pc as usize, pso as usize, made as usize);
         }
         crate::kind_check::bound(this as usize, made as usize);
         made
+    }
+}
+
+/// Resolves and records the pipeline bound by `Reset` on `this`.
+///
+/// # Safety
+/// `this` is a live proxy and `pso` is null or a pipeline the title holds (ours or a PC one).
+unsafe fn bound_at_reset(this: *mut Proxy, pso: Object) -> Object {
+    // SAFETY: by the contract above.
+    unsafe {
+        let made = unwrap(pso);
+        record_bound_at_reset(this, pso, made)
     }
 }
 
@@ -3992,6 +4036,7 @@ fn recycle_detached_list(pc_addr: usize, device_id: usize, spec: ListSpec) {
     crate::detile::list_reset(pc_addr);
     crate::present::list_reset(pc_addr);
     crate::title_heap::list_reset(pc_addr);
+    crate::pso_diag::reset_pc_list(pc_addr);
     if !was_unclosed && with_list_pool(|pool| pool.push(device_id, spec, pc_addr)) {
         return;
     }
@@ -4016,25 +4061,27 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
     crate::kind_check::reset(key);
     // SAFETY: `this` is a live proxy, `allocator` and `pso` are proxies or PC objects.
     unsafe {
-        let pso = bound_at_reset(this, pso);
-        crate::rt_diag::list_reset(key, pso as usize);
-        let allocator = unwrap(allocator);
-        crate::upload_mem::with(|m| m.set_allocator(key, allocator as usize));
         let old_pc = (*this).pc;
         let old_addr = old_pc as usize;
+        let allocator = unwrap(allocator);
+        crate::upload_mem::with(|m| m.set_allocator(key, allocator as usize));
         if crate::queue_fifo::is_list_held(old_addr) {
-            if let Some(spec) = side_list_spec(this)
-                && let Some((new_pc, device_id, hr)) = acquire_spare_list(old_pc, spec, allocator, pso)
-            {
-                std::sync::atomic::AtomicPtr::from_ptr(&raw mut (*this).pc).store(new_pc, Ordering::Release);
-                crate::queue_fifo::detach_or_recycle_list(old_addr, move || recycle_detached_list(old_addr, device_id, spec));
-                static SWAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let n = SWAPS.fetch_add(1, Ordering::Relaxed) + 1;
-                if n <= 8 || n.is_power_of_two() {
-                    let pooled = with_list_pool(|pool| pool.len());
-                    xs_log!("queue order: Reset of list {key:#x} swapped its backing PC list while queued ({n} swaps so far, {pooled} pooled)");
+            if let Some(spec) = side_list_spec(this) {
+                let pc_pso = unwrap(pso);
+                if let Some((new_pc, device_id, hr)) = acquire_spare_list(old_pc, spec, allocator, pc_pso) {
+                    std::sync::atomic::AtomicPtr::from_ptr(&raw mut (*this).pc).store(new_pc, Ordering::Release);
+                    crate::pso_diag::rebind_pc_list(key, new_pc as usize);
+                    let resolved_pso = record_bound_at_reset(this, pso, pc_pso);
+                    crate::rt_diag::list_reset(key, resolved_pso as usize);
+                    crate::queue_fifo::detach_or_recycle_list(old_addr, move || recycle_detached_list(old_addr, device_id, spec));
+                    static SWAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = SWAPS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 8 || n.is_power_of_two() {
+                        let pooled = with_list_pool(|pool| pool.len());
+                        xs_log!("queue order: Reset of list {key:#x} swapped its backing PC list while queued ({n} swaps so far, {pooled} pooled)");
+                    }
+                    return hr;
                 }
-                return hr;
             }
             crate::queue_fifo::wait_list_idle(old_addr, crate::list_sync::wait_limits().idle);
         }
@@ -4042,6 +4089,9 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
         crate::detile::list_reset(old_addr);
         crate::present::list_reset(old_addr);
         crate::title_heap::list_reset(old_addr);
+        crate::pso_diag::reset_pc_list(old_addr);
+        let pso = bound_at_reset(this, pso);
+        crate::rt_diag::list_reset(key, pso as usize);
         method::<Reset>(old_pc, 10)(old_pc, allocator, pso)
     }
 }
@@ -5368,17 +5418,21 @@ extern "system" fn list_set_pipeline_state(this: *mut Proxy, pso: Object) {
     // SAFETY: `this` is a live command list proxy; pso is a PC pipeline or null.
     unsafe {
         let pc = (*this).pc;
-        if crate::pso_diag::bind(this as usize, pso) {
+        let title_pso = pso;
+        if crate::pso_diag::bind(this as usize, title_pso) {
             return;
         }
-        let pso = match unwrap(pso) {
-            made if made.is_null() && !pso.is_null() => {
+        let pso = match unwrap(title_pso) {
+            made if made.is_null() && !title_pso.is_null() => {
                 // A pipeline made on first bind that the PC runtime refused: its work is left out.
                 crate::pso_diag::bind_missing(this as usize);
                 return;
             }
             made => made,
         };
+        if !pso.is_null() {
+            crate::pso_diag::bind_resolved(this as usize, pc as usize, title_pso as usize, pso as usize);
+        }
         crate::rt_diag::pipeline_set(this as usize, pso as usize);
         crate::kind_check::bound(this as usize, pso as usize);
         method::<unsafe extern "system" fn(Object, Object)>(pc, 25)(pc, pso);
@@ -5483,6 +5537,9 @@ extern "system" fn list_execute_indirect(this: *mut Proxy, sig: Object, max: u32
         if !before.is_empty() {
             method::<Barriers>(pc, 26)(pc, before.len() as u32, before.as_ptr().cast());
         }
+        crate::pso_diag::record_op(this as usize, pc as usize, crate::pso_diag::RecordedOpKind::ExecuteIndirect, || {
+            format!("(max={max}, arg_off={arg_off:#x})")
+        });
         method::<ExecuteIndirect>(pc, 59)(pc, unwrap(sig), max, pc_arg, arg_off, pc_count, count_off);
         if !after.is_empty() {
             method::<Barriers>(pc, 26)(pc, after.len() as u32, after.as_ptr().cast());
@@ -6057,6 +6114,26 @@ mod tests {
         assert_eq!(host_queue_flags(1), 1);
         assert_eq!(host_queue_flags(2), 0);
         assert_eq!(host_queue_flags(3), 1);
+    }
+
+    #[test]
+    fn force_gpu_timeout_strips_disable_gpu_timeout_flag() {
+        assert_eq!(super::host_queue_flags_with(0, false), 0);
+        assert_eq!(super::host_queue_flags_with(1, false), 1);
+        assert_eq!(super::host_queue_flags_with(2, false), 0);
+        assert_eq!(super::host_queue_flags_with(3, false), 1);
+
+        assert_eq!(super::host_queue_flags_with(0, true), 0);
+        assert_eq!(super::host_queue_flags_with(1, true), 0);
+        assert_eq!(super::host_queue_flags_with(2, true), 0);
+        assert_eq!(super::host_queue_flags_with(3, true), 0);
+
+        // Compute queue with DISABLE_GPU_TIMEOUT (0x1) and console bit 0x2 loses the flag while
+        // keeping queue type, priority, and node mask intact.
+        assert_eq!(super::host_queue_desc_with([2, 0, 0x3, 1], false), [2, 0, 1, 1]);
+        assert_eq!(super::host_queue_desc_with([2, 0, 0x3, 1], true), [2, 0, 0, 1]);
+        // Console DMA type 0x10 still maps to copy queue type 3.
+        assert_eq!(super::host_queue_desc_with([0x10, 100, 0x1, 0], true), [3, 100, 0, 0]);
     }
 
     #[test]

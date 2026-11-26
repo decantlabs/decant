@@ -114,6 +114,36 @@ impl ActivePso {
     }
 }
 
+/// Kind of GPU draw or dispatch tracked for DRED breadcrumb attribution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RecordedOpKind {
+    Draw,
+    DrawIndexed,
+    ExecuteIndirect,
+    Dispatch,
+    DispatchMesh,
+}
+
+impl RecordedOpKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Draw => "Draw",
+            Self::DrawIndexed => "DrawIndexed",
+            Self::ExecuteIndirect => "ExecuteIndirect",
+            Self::Dispatch => "Dispatch",
+            Self::DispatchMesh => "DispatchMesh",
+        }
+    }
+}
+
+/// One recorded draw or dispatch on a PC command list with the pipeline active at that point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedOp {
+    pub kind: RecordedOpKind,
+    pub detail: String,
+    pub pso: ActivePso,
+}
+
 #[derive(Default)]
 struct State {
     /// Stand in number to the description of the refused pipeline it stands for.
@@ -130,6 +160,8 @@ struct State {
     proxy_to_pc: HashMap<usize, usize>,
     /// Pipeline pointer to its recorded number and shader hashes.
     pipelines: HashMap<usize, ActivePso>,
+    /// Per PC command list recorded draws and dispatches for exact DRED breadcrumb matching.
+    recorded_ops: HashMap<usize, Vec<RecordedOp>>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -267,13 +299,103 @@ pub fn bind_missing(list: usize) {
 /// Records pipeline number and shader hashes for `pso` so later binds on any list report them.
 #[cfg(test)]
 pub fn register_pipeline(pso: usize, number: Option<u32>, stages: &[Stage]) {
-    if pso == 0 {
+    register_pipeline_summary(pso, 0, number, describe_stages(stages));
+}
+
+/// Records pipeline number and formatted shader summary for `lazy_pso` and its realized PC
+/// pipeline `pc_pso` so DRED diagnostics can name the exact shader hashes.
+pub fn register_pipeline_summary(lazy_pso: usize, pc_pso: usize, number: Option<u32>, shaders: String) {
+    if lazy_pso == 0 && pc_pso == 0 {
         return;
     }
-    let shaders = describe_stages(stages);
     with(|s| {
-        s.pipelines.insert(pso, ActivePso { number, pso, shaders, missing: false });
+        if lazy_pso != 0 {
+            s.pipelines.insert(lazy_pso, ActivePso { number, pso: lazy_pso, shaders: shaders.clone(), missing: false });
+        }
+        if pc_pso != 0 {
+            s.pipelines.insert(pc_pso, ActivePso { number, pso: pc_pso, shaders, missing: false });
+        }
     });
+}
+
+/// Refreshes the active pipeline entry for `list` after a lazy pipeline resolves on its first bind,
+/// when shader metadata was registered during `lazy_pso::resolve`.
+pub fn bind_resolved(list: usize, pc_list: usize, title_pso: usize, pc_pso: usize) {
+    let track_key = if pc_list != 0 { pc_list } else { list };
+    if track_key == 0 || (title_pso == 0 && pc_pso == 0) {
+        return;
+    }
+    with(|s| {
+        if pc_list != 0 && list != 0 {
+            s.proxy_to_pc.insert(list, pc_list);
+        }
+        if let Some(entry) = s.pipelines.get(&title_pso).or_else(|| s.pipelines.get(&pc_pso)).cloned() {
+            s.active.insert(track_key, entry);
+        }
+    });
+}
+
+/// Updates the PC command list associated with `list` after `Reset` swaps in a spare PC list,
+/// without discarding recorded ops still needed by the detached in flight PC list.
+pub fn rebind_pc_list(list: usize, new_pc_list: usize) {
+    if list == 0 || new_pc_list == 0 {
+        return;
+    }
+    with(|s| {
+        s.proxy_to_pc.insert(list, new_pc_list);
+        s.active.remove(&new_pc_list);
+        s.recorded_ops.remove(&new_pc_list);
+    });
+}
+
+/// Clears tracked active pipeline and recorded ops for a PC command list when it is reset or
+/// recycled after finishing on the GPU.
+pub fn reset_pc_list(pc_list: usize) {
+    if pc_list == 0 {
+        return;
+    }
+    with(|s| {
+        s.active.remove(&pc_list);
+        s.recorded_ops.remove(&pc_list);
+    });
+}
+
+/// Records one draw or dispatch on `pc_list` alongside the currently active pipeline.
+/// Only stores entries when `DECANT_D3D12X_FORCE_GPU_TIMEOUT=1` is enabled, keeping default runs
+/// free of per draw locking.
+#[inline]
+pub fn record_op(list: usize, pc_list: usize, kind: RecordedOpKind, detail: impl FnOnce() -> String) {
+    if !crate::proxy::force_gpu_timeout() {
+        return;
+    }
+    record_op_unconditional(list, pc_list, kind, detail());
+}
+
+fn record_op_unconditional(list: usize, pc_list: usize, kind: RecordedOpKind, detail: String) {
+    let key = if pc_list != 0 { pc_list } else { list };
+    if key == 0 {
+        return;
+    }
+    with(|s| {
+        let pso = s
+            .active
+            .get(&key)
+            .cloned()
+            .or_else(|| s.proxy_to_pc.get(&list).and_then(|pc| s.active.get(pc)).cloned())
+            .unwrap_or_default();
+        s.recorded_ops.entry(key).or_default().push(RecordedOp { kind, detail, pso });
+    });
+}
+
+/// Returns the `ordinal`th recorded op (0 based) of `kind` on `pc_list`, if tracked.
+pub fn recorded_op(pc_list: usize, kind: RecordedOpKind, ordinal: usize) -> Option<RecordedOp> {
+    if pc_list == 0 {
+        return None;
+    }
+    with(|s| {
+        let ops = s.recorded_ops.get(&pc_list)?;
+        ops.iter().filter(|op| op.kind == kind).nth(ordinal).cloned()
+    })
 }
 
 /// Records `active` as the active pipeline on command list `list`.
@@ -307,8 +429,10 @@ fn forget_list(list: usize) {
     }
     with(|s| {
         s.active.remove(&list);
+        s.recorded_ops.remove(&list);
         if let Some(pc) = s.proxy_to_pc.get(&list).copied() {
             s.active.remove(&pc);
+            s.recorded_ops.remove(&pc);
         }
     });
 }
@@ -558,5 +682,69 @@ mod tests {
 
         let raw_only = ActivePso { number: None, pso: 0xdeadbeef, shaders: String::new(), missing: false };
         assert_eq!(raw_only.format_summary(), "pso 0xdeadbeef");
+    }
+
+    #[test]
+    fn records_per_op_pipelines_and_survives_list_swap_until_pc_reset() {
+        let pc_a = 0x3001_0010usize;
+        let pc_b = 0x3001_0020usize;
+        let proxy_stub = [std::sync::atomic::AtomicUsize::new(0x9000), std::sync::atomic::AtomicUsize::new(pc_a)];
+        let proxy_ptr = proxy_stub.as_ptr() as usize;
+
+        let pso_vtbl: usize = 0x8000;
+        let pso1_stub: [usize; 2] = [&raw const pso_vtbl as usize, 0];
+        let pso2_stub: [usize; 2] = [&raw const pso_vtbl as usize, 0];
+        let pso1 = pso1_stub.as_ptr() as *mut c_void;
+        let pso2 = pso2_stub.as_ptr() as *mut c_void;
+
+        register_pipeline_summary(pso1 as usize, 0x4001, Some(10), "CS 1111111111111111 direct".to_owned());
+        register_pipeline_summary(pso2 as usize, 0x4002, Some(20), "CS 2222222222222222 direct".to_owned());
+
+        // SAFETY: `proxy_stub` holds `pc_a` in its second word and `pso1`/`pso2` start with vtable pointers.
+        unsafe {
+            assert!(!bind(proxy_ptr, pso1));
+            bind_resolved(proxy_ptr, pc_a, pso1 as usize, 0x4001);
+            record_op_unconditional(proxy_ptr, pc_a, RecordedOpKind::Dispatch, "(64, 1, 1)".to_owned());
+            assert!(!bind(proxy_ptr, pso2));
+            bind_resolved(proxy_ptr, pc_a, pso2 as usize, 0x4002);
+            record_op_unconditional(proxy_ptr, pc_a, RecordedOpKind::Dispatch, "(256, 2, 1)".to_owned());
+            record_op_unconditional(proxy_ptr, pc_a, RecordedOpKind::ExecuteIndirect, "max=4".to_owned());
+        }
+
+        // Swapping the proxy to `pc_b` preserves `pc_a`'s recorded ops while `pc_a` is in flight,
+        // and subsequent binds on the proxy record against `pc_b`.
+        proxy_stub[1].store(pc_b, Ordering::Release);
+        rebind_pc_list(proxy_ptr, pc_b);
+        // SAFETY: `proxy_stub` now holds `pc_b` in its second word and `pso1` starts with a vtable pointer.
+        unsafe {
+            assert!(!bind(proxy_ptr, pso1));
+            bind_resolved(proxy_ptr, pc_b, pso1 as usize, 0x4001);
+            record_op_unconditional(proxy_ptr, pc_b, RecordedOpKind::Dispatch, "(1, 1, 1)".to_owned());
+        }
+
+        let b0 = recorded_op(pc_b, RecordedOpKind::Dispatch, 0).expect("dispatch on pc_b");
+        assert_eq!(b0.detail, "(1, 1, 1)");
+        assert_eq!(b0.pso.number, Some(10));
+
+        let d0 = recorded_op(pc_a, RecordedOpKind::Dispatch, 0).expect("first dispatch on pc_a");
+        assert_eq!(d0.detail, "(64, 1, 1)");
+        assert_eq!(d0.pso.number, Some(10));
+        assert_eq!(d0.pso.shaders, "CS 1111111111111111 direct");
+
+        let d1 = recorded_op(pc_a, RecordedOpKind::Dispatch, 1).expect("second dispatch on pc_a");
+        assert_eq!(d1.detail, "(256, 2, 1)");
+        assert_eq!(d1.pso.number, Some(20));
+        assert_eq!(d1.pso.shaders, "CS 2222222222222222 direct");
+
+        let ind = recorded_op(pc_a, RecordedOpKind::ExecuteIndirect, 0).expect("indirect op on pc_a");
+        assert_eq!(ind.detail, "max=4");
+        assert_eq!(ind.pso.number, Some(20));
+
+        // Resetting `pc_a` once it finishes clears its recorded ops without touching `pc_b`.
+        reset_pc_list(pc_a);
+        assert_eq!(recorded_op(pc_a, RecordedOpKind::Dispatch, 0), None);
+        assert_eq!(active_pso(pc_a), None);
+        assert!(recorded_op(pc_b, RecordedOpKind::Dispatch, 0).is_some());
+        reset_pc_list(pc_b);
     }
 }

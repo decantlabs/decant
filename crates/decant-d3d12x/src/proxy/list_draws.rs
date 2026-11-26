@@ -73,6 +73,7 @@ fn draw_indexed_x(this: *mut Proxy, va: u64, format: u32, count: u32, flags: u32
         let _ = crate::rt_diag::draw(this as usize, "DrawIndexedX", count);
         crate::flicker_probe::draw(this as usize, crate::flicker_probe::Draw::IndexedAt { va, format, count });
         method::<SetIndexBuffer>(pc, 43)(pc, &view);
+        crate::pso_diag::record_op(this as usize, pc as usize, crate::pso_diag::RecordedOpKind::DrawIndexed, || format!("(indices={count}, inst=1)"));
         method::<DrawIndexed>(pc, 13)(pc, count, 1, 0, 0, 0);
         match crate::list_sync::index_view(this as usize) {
             Some(bound) => method::<SetIndexBuffer>(pc, 43)(pc, &bound),
@@ -97,6 +98,7 @@ pub(super) extern "system" fn list_dispatch_x(this: *mut Proxy, x: u32, y: u32, 
         super::list_mirror::prepare(this, crate::user_mirror::Bind::Compute);
         crate::rt_diag::count(&crate::rt_diag::DISPATCHES);
         super::list_mirror::describe_dispatch(this, crate::draw_diag::dispatch(this as usize, x, y, z));
+        crate::pso_diag::record_op(this as usize, pc as usize, crate::pso_diag::RecordedOpKind::Dispatch, || format!("({x}, {y}, {z})"));
         method::<Dispatch>(pc, 14)(pc, x, y, z);
     }
 }

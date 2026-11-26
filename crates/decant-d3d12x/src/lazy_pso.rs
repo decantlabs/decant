@@ -798,11 +798,17 @@ fn run_job(lazy: &Lazy, source: MakeSource, service: Option<&'static crate::comp
                         match make(lazy, owned, patched.desc(), true, service) {
                         MakeOutcome::Made(direct) => {
                             crate::direct_pso::kind_made(direct, owned);
+                            let summary = crate::direct_pso::describe_owned(owned, true);
+                            crate::pso_diag::register_pipeline_summary(lazy as *const Lazy as usize, direct, Some(lazy.number), summary);
                             Some(direct)
                         }
                         MakeOutcome::RetryOom => None,
                         MakeOutcome::Refused => match make(lazy, owned, owned.desc(), false, service) {
-                            MakeOutcome::Made(orig) => Some(orig),
+                            MakeOutcome::Made(orig) => {
+                                let summary = crate::direct_pso::describe_owned(owned, false);
+                                crate::pso_diag::register_pipeline_summary(lazy as *const Lazy as usize, orig, Some(lazy.number), summary);
+                                Some(orig)
+                            }
                             MakeOutcome::RetryOom => None,
                             MakeOutcome::Refused => Some(0),
                         },
@@ -811,7 +817,11 @@ fn run_job(lazy: &Lazy, source: MakeSource, service: Option<&'static crate::comp
                     MakeSource::Original => {
                         crate::direct_pso::pipeline_done_for(service, owned, None);
                         match make(lazy, owned, owned.desc(), false, service) {
-                            MakeOutcome::Made(orig) => Some(orig),
+                            MakeOutcome::Made(orig) => {
+                                let summary = crate::direct_pso::describe_owned(owned, false);
+                                crate::pso_diag::register_pipeline_summary(lazy as *const Lazy as usize, orig, Some(lazy.number), summary);
+                                Some(orig)
+                            }
                             MakeOutcome::RetryOom => None,
                             MakeOutcome::Refused => Some(0),
                         }

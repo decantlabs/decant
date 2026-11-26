@@ -490,6 +490,21 @@ fn current() -> Option<&'static Service> {
 /// stage reads from its tables for the kind check (`kind_check`), from the console containers, so a
 /// pipeline taken from the disk cache has it too.
 ///
+/// Formats the console shader stage names and content hashes of `owned` for pipeline fault
+/// diagnostics (for example `CS 1234567890abcdef direct`).
+pub fn describe_owned(owned: &Owned, direct: bool) -> String {
+    let desc = owned.desc();
+    let tag = if direct { "direct" } else { "original" };
+    let mut parts = Vec::new();
+    for &(kind, at) in stage_offsets(desc).iter() {
+        let (ptr, len) = (read_u64(desc, at), read_u64(desc, at + 8) as usize);
+        let Some(bytes) = owned.shaders().iter().find(|s| s.as_ptr() as u64 == ptr && s.len() == len) else { continue };
+        let hash = crate::dxil_override::content_hash(bytes);
+        parts.push(format!("{} {hash:016x} {tag}", kind.short().to_ascii_uppercase()));
+    }
+    parts.join(", ")
+}
+
 /// The pipeline library keeps the driver blob of the pipeline here as well.
 pub fn kind_made(made: usize, owned: &Owned) {
     let _trace = decant_trace::span("direct_pso", "create");

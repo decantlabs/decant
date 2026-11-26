@@ -103,6 +103,34 @@ pub fn watch(device: *mut c_void) {
     });
 }
 
+/// Maps a DRED breadcrumb operation to the recorded op kind tracked by `pso_diag`.
+fn breadcrumb_op_kind(op: D3D12_AUTO_BREADCRUMB_OP) -> Option<crate::pso_diag::RecordedOpKind> {
+    use crate::pso_diag::RecordedOpKind;
+    match op {
+        D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED => Some(RecordedOpKind::Draw),
+        D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED => Some(RecordedOpKind::DrawIndexed),
+        D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT => Some(RecordedOpKind::ExecuteIndirect),
+        D3D12_AUTO_BREADCRUMB_OP_DISPATCH => Some(RecordedOpKind::Dispatch),
+        D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH => Some(RecordedOpKind::DispatchMesh),
+        _ => None,
+    }
+}
+
+/// Finds the recorded op kind and 0 based ordinal corresponding to DRED breadcrumb index `done`
+/// in `ops`. If `ops[done]` is not itself a draw or dispatch (for example a trailing barrier),
+/// falls back to the nearest preceding draw or dispatch in `ops[..done]`.
+fn breadcrumb_fault_ordinal(ops: &[D3D12_AUTO_BREADCRUMB_OP], done: usize) -> Option<(crate::pso_diag::RecordedOpKind, usize, bool)> {
+    let at = done.min(ops.len().saturating_sub(1));
+    let (target_idx, kind, exact) = if let Some(kind) = ops.get(at).copied().and_then(breadcrumb_op_kind) {
+        (at, kind, true)
+    } else {
+        let (idx, kind) = ops[..at].iter().enumerate().rev().find_map(|(i, &op)| Some((i, breadcrumb_op_kind(op)?)))?;
+        (idx, kind, false)
+    };
+    let ordinal = ops[..target_idx].iter().filter(|&&op| breadcrumb_op_kind(op) == Some(kind)).count();
+    Some((kind, ordinal, exact))
+}
+
 /// The name of a breadcrumb operation (`D3D12_AUTO_BREADCRUMB_OP`, d3d12.h), its number for the rest.
 fn op_name(op: D3D12_AUTO_BREADCRUMB_OP) -> String {
     const NAMES: [&str; 21] = [
@@ -115,6 +143,7 @@ fn op_name(op: D3D12_AUTO_BREADCRUMB_OP) -> String {
         n @ 0..=20 => NAMES[n as usize].to_string(),
         26 => "WriteBufferImmediate".into(),
         39 => "SetPipelineState1".into(),
+        44 => "DispatchMesh".into(),
         45 => "Barrier".into(),
         46 => "BeginCommandList".into(),
         n => format!("{n}"),
@@ -122,6 +151,7 @@ fn op_name(op: D3D12_AUTO_BREADCRUMB_OP) -> String {
 }
 
 /// Formats one faulting command list line for DRED diagnostics.
+#[allow(clippy::too_many_arguments)]
 fn format_fault_list(
     list: Option<usize>,
     name: &str,
@@ -130,6 +160,7 @@ fn format_fault_list(
     total: u32,
     around: &[String],
     active_pso: Option<&crate::pso_diag::ActivePso>,
+    fault_op: Option<(&crate::pso_diag::RecordedOp, usize, bool)>,
 ) -> String {
     let list_ptr = list.map(|p| p as *const c_void);
     let queue_ptr = queue.map(|p| p as *const c_void);
@@ -137,6 +168,11 @@ fn format_fault_list(
         "list {list_ptr:?} {name:?} on queue {queue_ptr:?}: stopped at operation {done} of {total} (ops around it: {})",
         around.join(" ")
     );
+    if let Some((op, ordinal, exact)) = fault_op {
+        let relation = if exact { "faulting" } else { "preceding" };
+        let detail = if op.detail.is_empty() { String::new() } else { format!(" {}", op.detail) };
+        return format!("{base}, {relation} {} #{ordinal}{detail} on {}", op.kind.label(), op.pso.format_summary());
+    }
     match active_pso {
         Some(pso) => format!("{base}, active {}", pso.format_summary()),
         None => base,
@@ -178,6 +214,11 @@ fn report(device: &ID3D12Device, reason: u32) {
                     }).collect();
                     let list_ptr = n.pCommandList.as_ref().map(|l| l.as_raw() as usize);
                     let active = list_ptr.and_then(crate::pso_diag::active_pso);
+                    let fault_op = list_ptr.and_then(|ptr| {
+                        let (kind, ordinal, exact) = breadcrumb_fault_ordinal(ops, done as usize)?;
+                        let recorded = crate::pso_diag::recorded_op(ptr, kind, ordinal)?;
+                        Some((recorded, ordinal, exact))
+                    });
                     let line = format_fault_list(
                         list_ptr,
                         &name,
@@ -186,6 +227,7 @@ fn report(device: &ID3D12Device, reason: u32) {
                         n.BreadcrumbCount,
                         &around,
                         active.as_ref(),
+                        fault_op.as_ref().map(|(op, ord, ex)| (op, *ord, *ex)),
                     );
                     xs_log!("diagnose: {line}");
                     shown += 1;
@@ -255,6 +297,7 @@ mod tests {
             20,
             &around,
             Some(&active),
+            None,
         );
 
         assert!(line.contains("stopped at operation 12 of 20"));
@@ -265,9 +308,38 @@ mod tests {
     #[test]
     fn format_fault_list_without_active_pipeline_omits_suffix() {
         let around = vec![format!(">{}", op_name(D3D12_AUTO_BREADCRUMB_OP(6)))];
-        let line = format_fault_list(Some(0x3000), "", Some(0x4000), 0, 1, &around, None);
+        let line = format_fault_list(Some(0x3000), "", Some(0x4000), 0, 1, &around, None, None);
 
         assert!(line.contains("stopped at operation 0 of 1 (ops around it: >Dispatch)"));
         assert!(!line.contains("active"));
+    }
+
+    #[test]
+    fn breadcrumb_fault_ordinal_selects_exact_or_preceding_dispatch() {
+        use crate::pso_diag::{RecordedOp, RecordedOpKind};
+        let ops = [
+            D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER,
+            D3D12_AUTO_BREADCRUMB_OP_DISPATCH,
+            D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER,
+            D3D12_AUTO_BREADCRUMB_OP_DISPATCH,
+            D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER,
+        ];
+        assert_eq!(breadcrumb_fault_ordinal(&ops, 1), Some((RecordedOpKind::Dispatch, 0, true)));
+        assert_eq!(breadcrumb_fault_ordinal(&ops, 3), Some((RecordedOpKind::Dispatch, 1, true)));
+        assert_eq!(breadcrumb_fault_ordinal(&ops, 4), Some((RecordedOpKind::Dispatch, 1, false)));
+
+        let op = RecordedOp {
+            kind: RecordedOpKind::Dispatch,
+            detail: "(256, 2, 1)".to_owned(),
+            pso: ActivePso {
+                number: Some(77),
+                pso: 0x9999,
+                shaders: "CS 1234567890abcdef direct".to_owned(),
+                missing: false,
+            },
+        };
+        let around = vec!["ResourceBarrier".to_owned(), ">Dispatch".to_owned()];
+        let line = format_fault_list(Some(0x1000), "", Some(0x2000), 3, 5, &around, None, Some((&op, 1, true)));
+        assert!(line.contains("faulting Dispatch #1 (256, 2, 1) on pipeline 77 [CS 1234567890abcdef direct]"), "{line}");
     }
 }

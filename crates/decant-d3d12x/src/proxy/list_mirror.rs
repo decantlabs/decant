@@ -866,6 +866,7 @@ pub(super) extern "system" fn list_draw_instanced(this: *mut Proxy, vertices: u3
     // SAFETY: `this` is a live list proxy.
     unsafe {
         let pc = (*this).pc;
+        crate::pso_diag::record_op(this as usize, pc as usize, crate::pso_diag::RecordedOpKind::Draw, || format!("(verts={vertices}, inst={instances})"));
         method::<DrawInstanced>(pc, 12)(pc, vertices, instances, start_vertex, start_instance);
     }
 }
@@ -883,6 +884,7 @@ pub(super) extern "system" fn list_draw_indexed_instanced(this: *mut Proxy, indi
     // SAFETY: `this` is a live list proxy.
     unsafe {
         let pc = (*this).pc;
+        crate::pso_diag::record_op(this as usize, pc as usize, crate::pso_diag::RecordedOpKind::DrawIndexed, || format!("(indices={indices}, inst={instances})"));
         method::<DrawIndexedInstanced>(pc, 13)(pc, indices, instances, start_index, base_vertex, start_instance);
     }
 }
@@ -898,6 +900,7 @@ pub(super) extern "system" fn list_dispatch(this: *mut Proxy, x: u32, y: u32, z:
     // SAFETY: `this` is a live list proxy.
     unsafe {
         let pc = (*this).pc;
+        crate::pso_diag::record_op(this as usize, pc as usize, crate::pso_diag::RecordedOpKind::Dispatch, || format!("({x}, {y}, {z})"));
         method::<DispatchPc>(pc, 14)(pc, x, y, z);
     }
 }
