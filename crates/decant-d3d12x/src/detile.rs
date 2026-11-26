@@ -1045,12 +1045,13 @@ struct Registry {
     by_address: BTreeMap<u64, Vec<usize>>,
     largest: u64,
     /// Cached reverse index from mirror tile index to placed texture resources, maintained
-    /// incrementally on insert and remove and rebuilt only when `title_mem::mapping_generation()`
-    /// changes structurally.
+    /// incrementally on insert and remove and rebuilt only when `title_mem::unmap_generation()`
+    /// changes on unmap/release/reset.
     tile_to_textures: FastMap<u32, TileRefs>,
     unmapped_textures: FastSet<usize>,
     pending_index: FastSet<usize>,
     layout_gen: u64,
+    last_map_gen: u64,
     last_tile_gen: u64,
     scratch: RegistryScratch,
 }
@@ -1219,8 +1220,7 @@ impl Registry {
         items: &[(usize, u64, u64)],
         tiles_per_item: Vec<Option<Vec<u32>>>,
         precomputed: (FastMap<u32, TileRefs>, FastSet<usize>),
-        layout_gen: u64,
-        tile_gen: u64,
+        (layout_gen, map_gen, tile_gen): (u64, u64, u64),
         layout_current: bool,
     ) -> (FastMap<u32, TileRefs>, FastSet<usize>) {
         let (mut new_tile_to_textures, mut new_unmapped) = precomputed;
@@ -1237,6 +1237,7 @@ impl Registry {
         }
         if layout_current && live_matched == self.textures.len() {
             self.layout_gen = layout_gen;
+            self.last_map_gen = map_gen;
             self.last_tile_gen = tile_gen;
         } else {
             self.layout_gen = 0;
@@ -1245,9 +1246,17 @@ impl Registry {
     }
 
     #[cfg(test)]
-    fn apply_full_index(&mut self, items: &[(usize, u64, u64)], tiles_per_item: &[Option<Vec<u32>>], layout_gen: u64, tile_gen: u64, layout_current: bool) {
+    fn apply_full_index(
+        &mut self,
+        items: &[(usize, u64, u64)],
+        tiles_per_item: &[Option<Vec<u32>>],
+        layout_gen: u64,
+        map_gen: u64,
+        tile_gen: u64,
+        layout_current: bool,
+    ) {
         let precomputed = Self::build_full_index_maps(items, tiles_per_item, self.tile_to_textures.len());
-        let _ = self.apply_precomputed_full_index(items, tiles_per_item.to_vec(), precomputed, layout_gen, tile_gen, layout_current);
+        let _ = self.apply_precomputed_full_index(items, tiles_per_item.to_vec(), precomputed, (layout_gen, map_gen, tile_gen), layout_current);
     }
 
     /// Incrementally updates `tile_to_textures` for newly inserted or previously unmapped textures.
@@ -1255,6 +1264,8 @@ impl Registry {
         &mut self,
         items: &[(usize, u64, u64)],
         tiles_per_item: &[Option<Vec<u32>>],
+        map_gen: u64,
+        map_current: bool,
         tile_gen: u64,
         tile_current: bool,
     ) {
@@ -1289,6 +1300,9 @@ impl Registry {
                     self.unmapped_textures.insert(res);
                 }
             }
+        }
+        if map_current {
+            self.last_map_gen = map_gen;
         }
         if tile_current {
             self.last_tile_gen = tile_gen;
@@ -1557,27 +1571,96 @@ fn probe_line_due() -> bool {
     due
 }
 
-fn tiles_of_batch_parallel(spans: &[(u64, u64)], tiles_out: &mut Vec<Option<Vec<u32>>>) {
-    const PARALLEL_THRESHOLD: usize = 1024;
-    if spans.len() < PARALLEL_THRESHOLD {
-        crate::title_mem::tiles_of_batch(spans, tiles_out);
+type DropPayload = (FastMap<u32, TileRefs>, FastSet<usize>);
+
+fn background_drop_sender() -> Option<&'static std::sync::mpsc::Sender<DropPayload>> {
+    static DROP_TX: std::sync::OnceLock<Option<std::sync::mpsc::Sender<DropPayload>>> = std::sync::OnceLock::new();
+    DROP_TX
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<DropPayload>();
+            match std::thread::Builder::new().name("detile-drop".into()).spawn(move || {
+                while let Ok(payload) = rx.recv() {
+                    drop(payload);
+                }
+            }) {
+                Ok(_) => Some(tx),
+                Err(_) => None,
+            }
+        })
+        .as_ref()
+}
+
+fn enqueue_background_drop(old_map: FastMap<u32, TileRefs>, old_unmapped: FastSet<usize>) {
+    if old_map.len() > 2048
+        && let Some(tx) = background_drop_sender()
+    {
+        if let Err(std::sync::mpsc::SendError((m, u))) = tx.send((old_map, old_unmapped)) {
+            drop(m);
+            drop(u);
+        }
         return;
     }
-    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 4));
-    let chunk_len = spans.len().div_ceil(workers);
-    let mut chunk_results: Vec<Vec<Option<Vec<u32>>>> = vec![Vec::new(); workers];
-    std::thread::scope(|s| {
-        for (chunk, out) in spans.chunks(chunk_len).zip(chunk_results.iter_mut()) {
-            s.spawn(move || {
-                crate::title_mem::tiles_of_batch(chunk, out);
+    drop(old_map);
+    drop(old_unmapped);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IndexPlan {
+    Full {
+        unmap_gen: u64,
+        items: Vec<(usize, u64, u64)>,
+        spans: Vec<(u64, u64)>,
+        cap_hint: usize,
+    },
+    Incremental {
+        unmap_gen: u64,
+        items: Vec<(usize, u64, u64)>,
+        spans: Vec<(u64, u64)>,
+    },
+}
+
+impl Registry {
+    fn plan_index_update(&self, current_unmap: u64, current_map: u64, current_tile: u64) -> Option<IndexPlan> {
+        if self.layout_gen != current_unmap {
+            let items: Vec<(usize, u64, u64)> = self.textures.iter().map(|(&res, t)| (res, t.va, t.plan.size)).collect();
+            let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
+            return Some(IndexPlan::Full {
+                unmap_gen: current_unmap,
+                items,
+                spans,
+                cap_hint: self.tile_to_textures.len(),
             });
         }
-    });
-    tiles_out.clear();
-    tiles_out.reserve(spans.len());
-    for mut part in chunk_results {
-        tiles_out.append(&mut part);
+        let check_unmapped = (current_tile != self.last_tile_gen || current_map != self.last_map_gen) && !self.unmapped_textures.is_empty();
+        if !self.pending_index.is_empty() || check_unmapped {
+            let mut items = Vec::with_capacity(self.pending_index.len() + if check_unmapped { self.unmapped_textures.len() } else { 0 });
+            for &res in &self.pending_index {
+                if let Some(t) = self.textures.get(&res) {
+                    items.push((res, t.va, t.plan.size));
+                }
+            }
+            if check_unmapped {
+                for &res in &self.unmapped_textures {
+                    if !self.pending_index.contains(&res)
+                        && let Some(t) = self.textures.get(&res)
+                    {
+                        items.push((res, t.va, t.plan.size));
+                    }
+                }
+            }
+            let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
+            return Some(IndexPlan::Incremental {
+                unmap_gen: current_unmap,
+                items,
+                spans,
+            });
+        }
+        None
     }
+}
+
+fn tiles_of_batch_parallel(spans: &[(u64, u64)], tiles_out: &mut Vec<Option<Vec<u32>>>) {
+    crate::title_mem::tiles_of_batch(spans, tiles_out);
 }
 
 /// The title wrote the pages with mirror tiles `tiles` since its last submission (`title_mem::sync`).
@@ -1589,36 +1672,15 @@ pub fn note_tiles(tiles: &[u32]) {
         return;
     }
     let report = probe_line_due();
-    let current_layout = crate::title_mem::mapping_generation();
+    let current_unmap = crate::title_mem::unmap_generation();
+    let current_map = crate::title_mem::mapping_generation();
     let current_tile = crate::title_mem::tile_generation();
     let Some(fast) = with_registry_read(|r| {
         if r.textures.is_empty() {
             return Ok(false);
         }
-        if r.layout_gen != current_layout {
-            let items: Vec<(usize, u64, u64)> = r.textures.iter().map(|(&res, t)| (res, t.va, t.plan.size)).collect();
-            let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
-            return Err((true, current_layout, items, spans, r.tile_to_textures.len()));
-        }
-        let check_unmapped = current_tile != r.last_tile_gen && !r.unmapped_textures.is_empty();
-        if !r.pending_index.is_empty() || check_unmapped {
-            let mut items = Vec::with_capacity(r.pending_index.len() + if check_unmapped { r.unmapped_textures.len() } else { 0 });
-            for &res in &r.pending_index {
-                if let Some(t) = r.textures.get(&res) {
-                    items.push((res, t.va, t.plan.size));
-                }
-            }
-            if check_unmapped {
-                for &res in &r.unmapped_textures {
-                    if !r.pending_index.contains(&res)
-                        && let Some(t) = r.textures.get(&res)
-                    {
-                        items.push((res, t.va, t.plan.size));
-                    }
-                }
-            }
-            let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
-            return Err((false, current_layout, items, spans, 0));
+        if let Some(plan) = r.plan_index_update(current_unmap, current_map, current_tile) {
+            return Err(plan);
         }
         Ok(report
             || tiles.iter().any(|t| {
@@ -1632,44 +1694,47 @@ pub fn note_tiles(tiles: &[u32]) {
     let marked = match fast {
         Ok(false) => 0,
         Ok(true) => with_registry(|r| r.mark_tiles_from_index(tiles, report)),
-        Err((full_rebuild, snap_layout, items, spans, cap_hint)) => {
-            let build_layout = crate::title_mem::mapping_generation();
+        Err(plan) => {
+            let build_unmap = crate::title_mem::unmap_generation();
+            let build_map = crate::title_mem::mapping_generation();
             let build_tile = crate::title_mem::tile_generation();
             let mut tiles_out = Vec::new();
-            tiles_of_batch_parallel(&spans, &mut tiles_out);
-            if full_rebuild {
-                let precomputed = Registry::build_full_index_maps(&items, &tiles_out, cap_hint);
-                let (old_map, old_unmapped, marked) = with_registry(|r| {
-                    let (old_map, old_unmapped) = r.apply_precomputed_full_index(
-                        &items,
-                        tiles_out,
-                        precomputed,
-                        build_layout,
-                        build_tile,
-                        crate::title_mem::mapping_generation() == build_layout,
-                    );
-                    let marked = r.mark_tiles_from_index(tiles, report);
-                    (old_map, old_unmapped, marked)
-                });
-                if old_map.len() > 2048 {
-                    let _ = std::thread::Builder::new().name("detile-drop".into()).spawn(move || {
-                        drop(old_map);
-                        drop(old_unmapped);
+            match plan {
+                IndexPlan::Full { unmap_gen: _, items, spans, cap_hint } => {
+                    tiles_of_batch_parallel(&spans, &mut tiles_out);
+                    let precomputed = Registry::build_full_index_maps(&items, &tiles_out, cap_hint);
+                    let (old_map, old_unmapped, marked) = with_registry(|r| {
+                        let (old_map, old_unmapped) = r.apply_precomputed_full_index(
+                            &items,
+                            tiles_out,
+                            precomputed,
+                            (build_unmap, build_map, build_tile),
+                            crate::title_mem::unmap_generation() == build_unmap,
+                        );
+                        let marked = r.mark_tiles_from_index(tiles, report);
+                        (old_map, old_unmapped, marked)
                     });
-                } else {
-                    drop(old_map);
-                    drop(old_unmapped);
+                    enqueue_background_drop(old_map, old_unmapped);
+                    marked
                 }
-                marked
-            } else {
-                with_registry(|r| {
-                    if crate::title_mem::mapping_generation() != snap_layout {
-                        r.layout_gen = 0;
-                    } else {
-                        r.apply_incremental_index(&items, &tiles_out, build_tile, crate::title_mem::tile_generation() == build_tile);
-                    }
-                    r.mark_tiles_from_index(tiles, report)
-                })
+                IndexPlan::Incremental { unmap_gen: snap_unmap, items, spans } => {
+                    tiles_of_batch_parallel(&spans, &mut tiles_out);
+                    with_registry(|r| {
+                        if crate::title_mem::unmap_generation() != snap_unmap {
+                            r.layout_gen = 0;
+                        } else {
+                            r.apply_incremental_index(
+                                &items,
+                                &tiles_out,
+                                build_map,
+                                crate::title_mem::mapping_generation() == build_map,
+                                build_tile,
+                                crate::title_mem::tile_generation() == build_tile,
+                            );
+                        }
+                        r.mark_tiles_from_index(tiles, report)
+                    })
+                }
             }
         }
     };
@@ -2217,11 +2282,12 @@ mod tests {
         r.insert(2, placed(0x4000, 0x1000));
         assert!(r.pending_index.contains(&1) && r.pending_index.contains(&2));
 
-        // Initial full build at layout_gen 7, tile_gen 3.
+        // Initial full build at unmap_gen 7, map_gen 10, tile_gen 3.
         let items = vec![(1, 0x1000, 0x1000), (2, 0x4000, 0x1000)];
-        r.apply_full_index(&items, &[Some(vec![10, 11]), None], 7, 3, true);
+        r.apply_full_index(&items, &[Some(vec![10, 11]), None], 7, 10, 3, true);
         assert!(r.pending_index.is_empty());
         assert_eq!(r.layout_gen, 7);
+        assert_eq!(r.last_map_gen, 10);
         assert_eq!(r.last_tile_gen, 3);
         assert!(r.unmapped_textures.contains(&2) && !r.unmapped_textures.contains(&1));
 
@@ -2230,10 +2296,11 @@ mod tests {
         assert_eq!(r.layout_gen, 7);
         assert!(r.pending_index.contains(&3));
 
-        // Incremental update resolves texture 3 and previously unmapped texture 2 at tile_gen 4.
-        r.apply_incremental_index(&[(3, 0x8000, 0x1000), (2, 0x4000, 0x1000)], &[Some(vec![12]), Some(vec![11, 13])], 4, true);
+        // Incremental update resolves texture 3 and previously unmapped texture 2 at map_gen 11, tile_gen 4.
+        r.apply_incremental_index(&[(3, 0x8000, 0x1000), (2, 0x4000, 0x1000)], &[Some(vec![12]), Some(vec![11, 13])], 11, true, 4, true);
         assert!(r.pending_index.is_empty());
         assert!(r.unmapped_textures.is_empty());
+        assert_eq!(r.last_map_gen, 11);
         assert_eq!(r.last_tile_gen, 4);
 
         // Writing tile 99 marks nothing, and writing tiles 10 and 11 marks textures 1 and 2.
@@ -2247,8 +2314,8 @@ mod tests {
         assert!(!r.tile_to_textures.contains_key(&13));
         assert_eq!(r.mark_tiles_from_index(&[11, 13], false), 1);
 
-        // Structural layout rebuild replaces all mappings at layout_gen 8.
-        r.apply_full_index(&[(1, 0x1000, 0x1000), (3, 0x8000, 0x1000)], &[Some(vec![20]), Some(vec![21])], 8, 5, true);
+        // Structural layout rebuild replaces all mappings at unmap_gen 8.
+        r.apply_full_index(&[(1, 0x1000, 0x1000), (3, 0x8000, 0x1000)], &[Some(vec![20]), Some(vec![21])], 8, 12, 5, true);
         assert_eq!(r.layout_gen, 8);
         assert_eq!(r.mark_tiles_from_index(&[10], false), 0);
         assert_eq!(r.mark_tiles_from_index(&[20, 21], false), 2);
@@ -2294,7 +2361,7 @@ mod tests {
         let mut r = Registry::default();
         assert_eq!(r.mark_tiles_from_index(&[1, 2, 3], false), 0);
         r.insert(1, placed(0x1000, 0x2000));
-        r.apply_incremental_index(&[(1, 0x1000, 0x2000)], &[Some(vec![40, 41, 42])], 1, true);
+        r.apply_incremental_index(&[(1, 0x1000, 0x2000)], &[Some(vec![40, 41, 42])], 1, true, 1, true);
         assert_eq!(r.mark_tiles_from_index(&[40, 41, 41, 42], false), 1);
         assert!(r.pending.contains(&1));
     }
@@ -2337,7 +2404,7 @@ mod tests {
         let precomputed = Registry::build_full_index_maps(&items, &tiles_out, 0);
         // Simulate a new texture registered concurrently while tiles_of_batch ran.
         r.insert(3, placed(0x3000, 0x1000));
-        let (old_map, old_unmapped) = r.apply_precomputed_full_index(&items, tiles_out, precomputed, 42, 7, true);
+        let (old_map, old_unmapped) = r.apply_precomputed_full_index(&items, tiles_out, precomputed, (42, 7, 7), true);
         assert!(old_map.is_empty() && old_unmapped.is_empty());
         assert_eq!(r.tile_to_textures.get(&10).map(TileRefs::as_slice), Some(&[1][..]));
         assert!(r.unmapped_textures.contains(&2));
@@ -2373,6 +2440,49 @@ mod tests {
         let mut parallel = Vec::new();
         tiles_of_batch_parallel(&spans, &mut parallel);
         assert_eq!(parallel, serial);
+    }
+
+    #[test]
+    fn map_uses_incremental_unmapped_resolution_while_unmap_triggers_full_rebuild() {
+        let mut r = Registry::default();
+        r.insert(1, placed(0x1000, 0x1000));
+        r.insert(2, placed(0x4000, 0x1000));
+        let items = vec![(1, 0x1000, 0x1000), (2, 0x4000, 0x1000)];
+        r.apply_full_index(&items, &[Some(vec![10]), None], 1, 1, 1, true);
+        assert!(r.unmapped_textures.contains(&2));
+        assert_eq!(r.plan_index_update(1, 1, 1), None);
+
+        // MAP bumps mapping_generation without bumping unmap_generation: only unmapped texture 2 is checked.
+        match r.plan_index_update(1, 2, 1) {
+            Some(IndexPlan::Incremental { unmap_gen, items, .. }) => {
+                assert_eq!(unmap_gen, 1);
+                assert_eq!(items, vec![(2, 0x4000, 0x1000)]);
+            }
+            other => panic!("expected incremental unmapped plan on MAP, got {other:?}"),
+        }
+
+        // UNMAP/RELEASE bumps unmap_generation: full rebuild covers all placed textures.
+        match r.plan_index_update(2, 3, 1) {
+            Some(IndexPlan::Full { unmap_gen, items, .. }) => {
+                assert_eq!(unmap_gen, 2);
+                assert_eq!(items.len(), 2);
+            }
+            other => panic!("expected full rebuild plan on UNMAP, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn background_drop_channel_reuses_single_worker_thread() {
+        let tx1 = background_drop_sender().expect("drop worker sender");
+        let tx2 = background_drop_sender().expect("drop worker sender");
+        assert!(std::ptr::eq(tx1, tx2));
+
+        let mut big_map = FastMap::default();
+        for tile in 0..2050u32 {
+            big_map.insert(tile, TileRefs::One(tile as usize));
+        }
+        enqueue_background_drop(big_map, FastSet::default());
+        enqueue_background_drop(FastMap::default(), FastSet::default());
     }
 
     #[test]

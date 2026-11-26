@@ -378,11 +378,17 @@ static NEXT_STATE: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_STATE_ID: AtomicU64 = AtomicU64::new(0);
 /// Incremented whenever virtual to pool mappings change structurally (MAP, UNMAP, RELEASE, resync, device_created).
 static MAPPING_GEN: AtomicU64 = AtomicU64::new(1);
+/// Incremented whenever virtual to pool mappings are unmapped or reset (UNMAP, RELEASE, resync, device_created).
+static UNMAP_GEN: AtomicU64 = AtomicU64::new(1);
 /// Incremented whenever previously tileless pages receive mirror tiles.
 static TILE_GEN: AtomicU64 = AtomicU64::new(1);
 
 fn bump_mapping_gen() {
     MAPPING_GEN.fetch_add(1, Ordering::Release);
+}
+
+fn bump_unmap_gen() {
+    UNMAP_GEN.fetch_add(1, Ordering::Release);
 }
 
 fn bump_tile_gen() {
@@ -392,6 +398,11 @@ fn bump_tile_gen() {
 /// Current generation of structural virtual to pool mappings.
 pub fn mapping_generation() -> u64 {
     MAPPING_GEN.load(Ordering::Acquire)
+}
+
+/// Current generation of virtual to pool unmap or reset events.
+pub fn unmap_generation() -> u64 {
+    UNMAP_GEN.load(Ordering::Acquire)
 }
 
 /// Current generation of mirror tile assignments on mapped pages.
@@ -1799,6 +1810,9 @@ impl State {
         if matches!(c.kind, RELEASE | MAP | UNMAP) {
             bump_mapping_gen();
         }
+        if matches!(c.kind, RELEASE | UNMAP) {
+            bump_unmap_gen();
+        }
         if let Some(bytes) = self.mirror.apply(change)
             && REFUSED.fetch_add(1, Ordering::Relaxed) == 0
         {
@@ -1858,6 +1872,7 @@ impl State {
         xs_log!("title memory: the journal of xmem.dll overran, starting again from a snapshot of {} records", records.len());
         self.mirror.reset();
         bump_mapping_gen();
+        bump_unmap_gen();
         for c in &records {
             self.apply(c);
         }
@@ -2047,6 +2062,7 @@ pub unsafe fn device_created(device: *mut c_void) {
         xs_log!("title memory: a second PC device, the heaps of the first are not used for it");
     }
     bump_mapping_gen();
+    bump_unmap_gen();
     LAST_JOURNAL_SEQ.store(u64::MAX, Ordering::Release);
     let id = NEXT_STATE.fetch_add(1, Ordering::Relaxed);
     ACTIVE_STATE_ID.store(id, Ordering::Release);
@@ -2132,6 +2148,7 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
             xs_log!("title memory: the journal of xmem.dll overran, starting again from a snapshot of {} records", cursor.records.len());
             st.mirror.reset();
             bump_mapping_gen();
+            bump_unmap_gen();
             for c in &cursor.records {
                 st.apply(c);
             }
