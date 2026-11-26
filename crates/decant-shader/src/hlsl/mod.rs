@@ -14,6 +14,7 @@ mod bvh;
 pub mod expr;
 mod image;
 pub(crate) mod simplify;
+pub mod wave_emu;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;

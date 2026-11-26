@@ -13,6 +13,7 @@
 //! | `--sample N` `--seed S` | a random sample of N of the programs the filters keep, the same seed gives the same sample |
 //! | `--threads N` | worker threads (default: every core) |
 //! | `--quiet` | print only the counts, the first blockers and the lifter gaps |
+//! | `--wave32` | `--show` translates as for a host whose waves have 32 lanes: a 64 lane wave is emulated through group shared memory or refused (`hlsl::wave_emu`) |
 //! | `--ab DIR` | write the translated HLSL of the selected programs and the batch list `DIR/pairs.tsv` for `decant-shader-ab` (A = the old override `<hash>.dxil` from the `--override-dir` folders, B = the new HLSL) |
 //! | `--override-dir DIR` | folder of old overrides, repeatable, the first one that has the hash wins |
 //! | `--ab-run EXE` | then run `EXE batch` on that list on WARP only (`--ab-jobs N`, `--ab-timeout S`) and print its table |
@@ -35,7 +36,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use decant_shader::api::{CountingHost, Options, RootSignature, Stage, StageProgram};
+use decant_shader::api::{CountingHost, Options, RootSignature, Stage, StageProgram, WaveMode};
+
+/// `--wave32`: `--show` translates as for a host whose waves have 32 lanes (`WaveMode::Emulated`).
+static WAVE32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 use decant_shader::census::ab::{self, Emitted};
 use decant_shader::census::pipeline::{self, PipelineCensus, PipelineLists};
 use decant_shader::census::{Census, Report};
@@ -103,7 +107,7 @@ fn show(e: &Entry) -> String {
     match decant_shader::translate_probe(
         std::slice::from_ref(p),
         &RootSignature::default(),
-        &Options::default(),
+        &Options { wave: if WAVE32.load(std::sync::atomic::Ordering::Relaxed) { WaveMode::Emulated } else { WaveMode::Scalar }, ..Options::default() },
         &CountingHost::default(),
     ) {
         Ok(t) => {
@@ -276,6 +280,7 @@ fn run() -> Result<(), String> {
             "--sample" => sample = Some(number::<usize>(&mut args, "--sample")?),
             "--seed" => seed = number(&mut args, "--seed")?,
             "--quiet" => quiet = true,
+            "--wave32" => WAVE32.store(true, std::sync::atomic::Ordering::Relaxed),
             "--line" => line = Some(args.next().ok_or("--line needs a label")?),
             "--bin" => bins.push(PathBuf::from(args.next().ok_or("--bin needs a file")?)),
             "--ab" => ab_dir = Some(PathBuf::from(args.next().ok_or("--ab needs a folder")?)),

@@ -815,6 +815,15 @@ mod offline_pso {
         }
     }
 
+    /// Tells the translator the wave size of the adapter the game will use, so that the cache keys
+    /// written here match the ones the layer asks for.
+    pub(super) fn note_waves() {
+        match device() {
+            Some(device) => d3d12_xs::direct_source::note_device_waves(&device),
+            None => log("decant_shader_warm: no D3D12 hardware adapter, translating for the native wave size"),
+        }
+    }
+
     pub(super) fn run(args: &Args, records: &[Record], manifest: &Manifest, containers: &Containers, service: &Service, threads: usize) -> PsoReport {
         let report = PsoReport::default();
         let Some(device) = device() else {
@@ -1009,6 +1018,8 @@ fn main() -> std::process::ExitCode {
     let threads = effective_threads(args.threads);
     let poll_wait = Duration::from_millis(args.poll_ms.max(1) * 600);
     let adapter_log: fn(&str) = if args.verbose { log } else { quiet_adapter_log };
+    #[cfg(windows)]
+    offline_pso::note_waves();
     let source = Arc::new(DirectSource::with_wait(Arc::new(RegistryHost), adapter_log, args.dxc_dump.clone(), poll_wait));
     let compiler = Arc::new(DxcCompiler(dxc));
     let settings = Settings { threads, cache: Some(DiskCache::new(&args.cache)), dump: args.dxc_dump.clone(), log: adapter_log };

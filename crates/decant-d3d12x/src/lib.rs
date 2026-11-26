@@ -126,6 +126,8 @@ mod view_raw;
 mod view_shadow;
 #[cfg(all(test, windows))]
 mod view_gpu_tests;
+#[cfg(all(test, windows))]
+mod wave_emu_gpu_tests;
 #[cfg(windows)]
 mod title_mirror;
 #[cfg(windows)]

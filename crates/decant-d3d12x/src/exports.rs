@@ -229,6 +229,13 @@ unsafe fn create_console_device(who: &str, min_level: u32, riid: *const GUID, ou
         crate::title_mem::device_created(dev);
         crate::mem_sample::start(dev);
         crate::proxy::note_mesh_support(dev);
+        {
+            use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+            use windows::core::Interface;
+            if let Some(device) = ID3D12Device::from_raw_borrowed(&dev) {
+                crate::direct_source::note_device_waves(device);
+            }
+        }
         if !riid.is_null() && crate::abi::note_device_iid(&std::ptr::read_unaligned(riid.cast::<[u8; 16]>())) {
             xs_log!("{who}: the title asks for ID3D12Device11, its runtime has the newer console layout");
         }

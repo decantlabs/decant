@@ -117,9 +117,47 @@ pub fn root_signature(layout: &RootLayout) -> sd::RootSignature {
     sd::RootSignature { params, static_samplers, flags: layout.flags }
 }
 
+/// The widest wave of the PC device, from `D3D12_OPTIONS1.WaveLaneCountMax` at device creation
+/// ([`note_device_waves`]); 0 until then.
+static HOST_WAVE_LANES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Reads and logs the widest wave of the PC device (`D3D12_OPTIONS1.WaveLaneCountMax`) and notes it
+/// for the options and the cache identity of the pipelines translated afterwards: a GPU whose waves
+/// have at most 32 lanes refuses `[WaveSize(64)]` (RTX 4080, debug layer message 622), so console
+/// 64 lane programs are emulated for it. Call it before the compile service is made.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn note_device_waves(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1};
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the structure is the one of this feature and its size is given.
+    let read = unsafe { device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut options).cast(), size_of_val(&options) as u32) };
+    let (min, max) = if read.is_ok() { (options.WaveLaneCountMin, options.WaveLaneCountMax) } else { (0, 0) };
+    HOST_WAVE_LANES.store(max, std::sync::atomic::Ordering::Relaxed);
+    crate::log::xs_log!(
+        "PC device: waves of {min} to {max} lanes (D3D12_OPTIONS1 read: {}){}",
+        read.is_ok(),
+        if host_wave_emulated() { ": console 64 lane programs are emulated through group shared memory" } else { "" }
+    );
+}
+
+/// Whether console 64 lane programs are emulated: the device is known and its waves have fewer
+/// than 64 lanes (an NVIDIA GPU: 32). `DECANT_D3D12X_WAVE_EMULATION=0` keeps the native form
+/// (`[WaveSize(64)]`, which such a device refuses), for comparison only.
+pub fn host_wave_emulated() -> bool {
+    wave_mode_for(HOST_WAVE_LANES.load(std::sync::atomic::Ordering::Relaxed), std::env::var_os("DECANT_D3D12X_WAVE_EMULATION").is_some_and(|v| v == "0")) == sd::WaveMode::Emulated
+}
+
+/// The wave mode for a device whose widest wave has `lanes` lanes (0: unknown), `off` when the
+/// emulation is switched off.
+fn wave_mode_for(lanes: u32, off: bool) -> sd::WaveMode {
+    if lanes != 0 && lanes < 64 && !off { sd::WaveMode::Emulated } else { sd::WaveMode::Scalar }
+}
+
 /// The options for a pipeline with the root signature `layout`: the mirror when the PC root
 /// signature has the mirror parameter, with the heap map and the view shadow when it has those
-/// root views too, one lane per invocation, shader model 6.6.
+/// root views too, one lane per invocation (a 64 lane wave emulated on a device with smaller
+/// waves, [`host_wave_emulated`]), shader model 6.6.
 pub fn options(layout: &RootLayout) -> sd::Options {
     let view = |register: u32| layout.descriptor_index(rts0::RegisterClass::Srv, register, rts0::MIRROR_SPACE).map(|_| register);
     sd::Options {
@@ -129,7 +167,7 @@ pub fn options(layout: &RootLayout) -> sd::Options {
             heap_map: view(HEAP_MAP_REGISTER),
             view_shadow: view(VIEW_SHADOW_REGISTER),
         }),
-        wave: sd::WaveMode::Scalar,
+        wave: if host_wave_emulated() { sd::WaveMode::Emulated } else { sd::WaveMode::Scalar },
         shader_model_minor: 6,
         listing: false,
     }
@@ -508,7 +546,13 @@ pub(crate) fn hlsl_key(s: &StageHlsl) -> u128 {
 
 impl ShaderSource for DirectSource {
     fn version(&self) -> String {
-        format!("decant-shader {} adapter {ADAPTER_VERSION}", decant_shader::TRANSLATOR_VERSION)
+        // The wave form is part of what a pipeline file names: a pipeline cached with
+        // `[WaveSize(64)]` stages must not be served to a device that refuses them.
+        format!(
+            "decant-shader {} adapter {ADAPTER_VERSION}{}",
+            decant_shader::TRANSLATOR_VERSION,
+            if host_wave_emulated() { " wave64-emulated" } else { "" }
+        )
     }
 
     fn accepts(&self, pipeline: &Pipeline) -> Result<(), Refusal> {
@@ -530,6 +574,21 @@ impl ShaderSource for DirectSource {
 
     fn translate(&self, pipeline: &Pipeline) -> Vec<Result<StageHlsl, Refusal>> {
         self.answer(pipeline, false).as_ref().clone()
+    }
+}
+
+#[cfg(test)]
+mod wave_mode_tests {
+    use super::*;
+
+    #[test]
+    fn a_device_with_32_lane_waves_gets_the_emulated_form() {
+        assert_eq!(wave_mode_for(32, false), sd::WaveMode::Emulated);
+        assert_eq!(wave_mode_for(64, false), sd::WaveMode::Scalar);
+        assert_eq!(wave_mode_for(128, false), sd::WaveMode::Scalar);
+        // unknown device, or the switch off: the native form, as before
+        assert_eq!(wave_mode_for(0, false), sd::WaveMode::Scalar);
+        assert_eq!(wave_mode_for(32, true), sd::WaveMode::Scalar);
     }
 }
 

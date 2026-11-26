@@ -1096,3 +1096,78 @@ fn merged_image_descriptor_after_many_diamonds_compiles_cs_6_6() {
     assert!(text.contains("ResourceDescriptorHeap"), "{text}");
     compiles(&p);
 }
+
+/// The options of a host whose waves have 32 lanes (an NVIDIA GPU): a 64 lane wave is emulated
+/// through group shared memory or refused (`hlsl::wave_emu`).
+fn wave32() -> Options {
+    Options { wave: WaveMode::Emulated, ..Options::default() }
+}
+
+#[test]
+fn a_64_lane_program_on_a_32_lane_host_is_emulated_and_compiles() {
+    let mut p = compute([64, 1, 1], Vec::new(), |a| {
+        a.push(sop1(Op::s_and_saveexec_b64, s(10), int(-1)));
+        a.push(sop1(Op::s_mov_b32, s(2), int(40)));
+        a.push(vop1(Op::v_mov_b32, v(4), v(0)));
+        a.push(vop3(Op::v_writelane_b32_e64, v(4), s(2), int(3), NONE));
+        a.push(vop3(Op::v_readlane_b32_e64, s(3), v(4), int(33), NONE));
+        a.push(vop3(Op::v_readlane_b32_e64, s(4), v(4), s(2), NONE));
+        a.push(vop1(Op::v_mov_b32, v(5), s(3)));
+        a.push(vop1(Op::v_mov_b32, v(6), s(4)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(5), NONE], 0, 0));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(6), NONE], 4, 0));
+    });
+    p.lds_bytes = 512;
+    // On the default host the program asks for 64 lane waves, which a 32 lane GPU refuses.
+    assert!(hlsl(&p).contains("[WaveSize(64)]"));
+    let t = translate(std::slice::from_ref(&p), &RootSignature::default(), &wave32(), &CountingHost::default())
+        .unwrap_or_else(|r| panic!("refused: {r}"));
+    let text = &t.stages[0].hlsl;
+    assert!(!text.contains("[WaveSize("), "{text}");
+    assert!(text.contains("return decant_emu_read(value, lane);"), "{text}");
+    assert!(text.contains("decant_emu_lane() == lane ? value : old"), "{text}");
+    assert!(text.contains("decant_emu_gi = "), "{text}");
+    assert!(!text.contains("WaveReadLaneAt(") && !text.contains("WaveGetLaneIndex("), "{text}");
+    let Some(dxc) = common::find_dxc() else {
+        eprintln!("dxc.exe not found, compile check skipped");
+        return;
+    };
+    if let Err(r) = translate_to_dxil(std::slice::from_ref(&p), &RootSignature::default(), &wave32(), &CountingHost::default(), &dxc) {
+        panic!("{r}\n{text}");
+    }
+}
+
+#[test]
+fn a_64_lane_lane_read_under_a_branch_is_refused_on_a_32_lane_host() {
+    // The same program as case 3 of `divergent_quad_and_bitmask_swizzles_across_shapes_compile_with_dxc`:
+    // a lane read and a swizzle under an exec branch keep `[WaveSize(64)]` on the default host.
+    let p = compute([64, 1, 1], Vec::new(), |a| {
+        let done = a.label();
+        a.push(sop1(Op::s_and_saveexec_b64, s(20), int(-1)));
+        a.push(vop3(Op::v_readlane_b32_e64, s(2), v(0), int(33), NONE));
+        a.push(vopc(Op::v_cmpx_gt_u32, s(2), v(0)));
+        a.branch(Op::s_cbranch_execz, done);
+        a.push(ds(Op::ds_swizzle_b32, v(4), [v(0), NONE, NONE], 31, 4));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(4), NONE], 0, 0));
+        a.bind(done);
+    });
+    assert!(hlsl(&p).contains("[WaveSize(64)]"));
+    let refusal = translate(std::slice::from_ref(&p), &RootSignature::default(), &wave32(), &CountingHost::default())
+        .expect_err("refused on a 32 lane host");
+    assert_eq!(refusal.key(), "stage:wave64-on-32-lane-host", "{refusal}");
+}
+
+#[test]
+fn a_32_lane_program_is_the_same_on_a_32_lane_host() {
+    let p = compute([32, 1, 1], Vec::new(), |a| {
+        a.push(sop1(Op::s_and_saveexec_b32, s(10), int(-1)));
+        a.push(vop3(Op::v_readlane_b32_e64, s(3), v(0), int(3), NONE));
+        a.push(vop1(Op::v_mov_b32, v(5), s(3)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(5), NONE], 0, 0));
+    });
+    let mut p = p;
+    p.lds_bytes = 128;
+    let t = translate(std::slice::from_ref(&p), &RootSignature::default(), &wave32(), &CountingHost::default())
+        .unwrap_or_else(|r| panic!("refused: {r}"));
+    assert_eq!(t.stages[0].hlsl, hlsl(&p));
+}

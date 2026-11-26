@@ -145,6 +145,14 @@ fn translate_stage(
         ));
     }
     let text = stage::entry(program, &iface, text)?;
+    // A host whose waves have 32 lanes refuses `[WaveSize(64)]`: emulate the 64 lane wave through
+    // group shared memory, or refuse the program by name (`hlsl::wave_emu`).
+    let text = if options.wave == api::WaveMode::Emulated {
+        hlsl::wave_emu::emulate_wave64(&text)
+            .map_err(|why| Refusal::new(RefusalKind::Stage("wave64-on-32-lane-host"), why).in_stage(program.stage))?
+    } else {
+        text
+    };
     // A buffer of the mirror ABI is used when its name occurs after its declaration.
     let used = |name: &str| text.matches(name).count() > 1;
     let mut needs = needs;

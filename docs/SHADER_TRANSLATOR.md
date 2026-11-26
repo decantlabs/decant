@@ -13,6 +13,8 @@ Console GPU programs are precompiled RDNA2 (GFX10) machine code. A PC GPU cannot
 
 A program the translator cannot carry yet is refused with a stable key such as `op:v_sqrt_f32` or `resource:raw-address`, so a corpus can be counted by cause.
 
+A console compute program that works across a 64 lane wave is printed with `[WaveSize(64)]`. For a host whose waves have at most 32 lanes (`WaveMode::Emulated`, `hlsl/wave_emu.rs`) one console wave becomes 64 threads of the group in group index order, and lane reads and 64 lane ballots go through group shared memory between group barriers. The form is taken only when every thread reaches every such call. Otherwise the program is refused as `stage:wave64-on-32-lane-host`. The thread order is an assumption that was not measured on a console.
+
 ## Crates
 
 | Crate | Content |
