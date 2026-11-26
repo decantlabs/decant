@@ -140,6 +140,8 @@ impl Stage {
     }
 }
 
+const ZERO: Values = Values { control: 0, ends: [[[0; 2]; 4]; 3], index_bits: [0; 2], index: [[0; 16]; 2] };
+
 impl Blocks for Stage {
     fn block(&mut self, i: usize, s: &[u8], out: &mut [u8]) -> Result<bool, Error> {
         let (ep_ref, ix_ref) = references(s, true);
@@ -149,9 +151,8 @@ impl Blocks for Stage {
         }
         let control = Control::of(word);
         let precision = control.precision();
-        let zero = Values::default();
-        let base = reach(i, ep_ref, &self.history[..], &self.seeds[..], &zero);
-        let mut v = Values { control: word, index_bits: INDEX_BITS[control.mode], ..Values::default() };
+        let base = reach(i, ep_ref, &self.history[..], &self.seeds[..], &ZERO);
+        let mut v = Values { control: word, index_bits: INDEX_BITS[control.mode], ..ZERO };
         // Subsets the reference lacks build on its subset 0.
         let common = control.subsets.min(usize::from((base.control >> 6) & 3));
         for (c, &p) in precision.iter().enumerate() {
@@ -168,7 +169,7 @@ impl Blocks for Stage {
                 }
             }
         }
-        let base = reach(i, ix_ref, &self.history[..], &self.seeds[..], &zero);
+        let base = reach(i, ix_ref, &self.history[..], &self.seeds[..], &ZERO);
         for set in 0..2 {
             let bits = v.index_bits[set];
             if bits == 0 {
@@ -239,15 +240,15 @@ pub fn pack(v: &Values, out: &mut [u8]) -> bool {
             }
         }
     }
-    let anchors: &[u8] = match subsets {
-        2 => &[0, ANCHOR_2[control.partition]],
-        3 => &[0, ANCHOR_3[0][control.partition], ANCHOR_3[1][control.partition]],
-        _ => &[0],
+    let anchor_mask: u32 = match subsets {
+        2 => 1 | (1u32 << ANCHOR_2[control.partition]),
+        3 => 1 | (1u32 << ANCHOR_3[0][control.partition]) | (1u32 << ANCHOR_3[1][control.partition]),
+        _ => 1,
     };
     let mut indices = |set: usize, w: &mut Bits| {
         let bits = u32::from(v.index_bits[set]);
         for (p, &value) in v.index[set].iter().enumerate() {
-            let anchor = anchors.contains(&(p as u8));
+            let anchor = (anchor_mask >> p) & 1 != 0;
             let value = u64::from(value as u16) & ((1 << bits) - 1);
             if anchor {
                 fits &= value >> (bits - 1) == 0;

@@ -59,14 +59,15 @@ pub unsafe fn texture<'a>(this: *const TextureComputer) -> &'a TextureLayout {
 
 unsafe extern "system" fn add_ref(this: This) -> u32 {
     // SAFETY: a live computer.
-    unsafe { (*this).references.fetch_add(1, Ordering::SeqCst) + 1 }
+    unsafe { (*this).references.fetch_add(1, Ordering::Relaxed) + 1 }
 }
 
 unsafe extern "system" fn release(this: This) -> u32 {
     // SAFETY: a live computer. The last release frees the box `create` made.
     unsafe {
-        let left = (*this).references.fetch_sub(1, Ordering::SeqCst) - 1;
+        let left = (*this).references.fetch_sub(1, Ordering::Release) - 1;
         if left == 0 {
+            std::sync::atomic::fence(Ordering::Acquire);
             drop(Box::from_raw(this));
         }
         left
@@ -78,11 +79,7 @@ unsafe extern "system" fn get_resource_layout(this: This, out: *mut u8) -> Hresu
         return E_INVALIDARG;
     }
     // SAFETY: a live computer, and `out` points to an `XG_RESOURCE_LAYOUT` of 0x1B40 bytes.
-    unsafe {
-        let record = (*this).texture.layout.to_record();
-        std::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len());
-    }
-    S_OK
+    unsafe { crate::exports::write_record(out, &(*this).texture.layout) }
 }
 
 unsafe extern "system" fn get_resource_size_bytes(this: This) -> u64 {
@@ -204,30 +201,95 @@ enum Direction {
     From,
 }
 
+#[inline(always)]
+unsafe fn copy_elem(tiled: *mut u8, flat: *mut u8, bpe: usize, into: bool) {
+    // SAFETY: caller guarantees both pointers are valid for `bpe` non-overlapping bytes.
+    unsafe {
+        let (src, dst) = if into { (flat as *const u8, tiled) } else { (tiled as *const u8, flat) };
+        match bpe {
+            1 => dst.write(src.read()),
+            2 => dst.cast::<u16>().write_unaligned(src.cast::<u16>().read_unaligned()),
+            4 => dst.cast::<u32>().write_unaligned(src.cast::<u32>().read_unaligned()),
+            8 => dst.cast::<u64>().write_unaligned(src.cast::<u64>().read_unaligned()),
+            16 => dst.cast::<u128>().write_unaligned(src.cast::<u128>().read_unaligned()),
+            _ => std::ptr::copy_nonoverlapping(src, dst, bpe),
+        }
+    }
+}
+
+/// Moves the elements of one 2D slice of a level between the resource memory and linear rows.
+///
+/// # Safety
+/// `resource` and `linear` cover the whole resource and the rows of the level. Elements beyond the resource are skipped.
+unsafe fn copy_slice_dir<const INTO: bool>(t: &TextureLayout, resource: *mut u8, linear: *mut u8, row_pitch: usize, mip: u32, z: u32) {
+    let level = &t.plane0().levels[mip as usize];
+    let bpe = t.bytes_per_element() as usize;
+    let size = t.layout.size_bytes;
+    let Some(limit) = size.checked_sub(bpe as u64) else {
+        return;
+    };
+    let width = level.width_elements;
+    let height = level.height_elements;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    if level.swizzle_mode == 0 {
+        let row_bytes = width as usize * bpe;
+        for row in 0..height {
+            let row_flat = unsafe { linear.add(row as usize * row_pitch) };
+            if let Some(start_offset) = t.element_offset(mip, 0, row, z, 0)
+                && start_offset + row_bytes as u64 <= size
+            {
+                // SAFETY: linear row is contiguous in resource memory and fits within `size`.
+                unsafe {
+                    let tiled = resource.add(start_offset as usize);
+                    if INTO {
+                        std::ptr::copy_nonoverlapping(row_flat, tiled, row_bytes);
+                    } else {
+                        std::ptr::copy_nonoverlapping(tiled, row_flat, row_bytes);
+                    }
+                }
+                continue;
+            }
+            for column in 0..width {
+                let Some(offset) = t.element_offset(mip, u64::from(column), row, z, 0) else { continue };
+                if offset > limit {
+                    continue;
+                }
+                // SAFETY: the element is inside the resource, and the linear row holds the element.
+                unsafe { copy_elem(resource.add(offset as usize), row_flat.add(column as usize * bpe), bpe, INTO) };
+            }
+        }
+        return;
+    }
+
+    for row in 0..height {
+        // SAFETY: `linear` covers all rows of the level.
+        let mut flat = unsafe { linear.add(row as usize * row_pitch) };
+        for column in 0..width {
+            if let Some(offset) = t.element_offset(mip, u64::from(column), row, z, 0)
+                && offset <= limit
+            {
+                // SAFETY: the element is inside the resource, and the linear row holds the element.
+                unsafe { copy_elem(resource.add(offset as usize), flat, bpe, INTO) };
+            }
+            // SAFETY: advancing within the current linear row.
+            flat = unsafe { flat.add(bpe) };
+        }
+    }
+}
+
 /// Moves the elements of one 2D slice of a level between the resource memory and linear rows.
 ///
 /// # Safety
 /// `resource` and `linear` cover the whole resource and the rows of the level. Elements beyond the resource are skipped.
 unsafe fn copy_slice(t: &TextureLayout, resource: *mut u8, linear: *mut u8, row_pitch: usize, mip: u32, z: u32, direction: Direction) {
-    let level = &t.plane0().levels[mip as usize];
-    let bpe = t.bytes_per_element() as usize;
-    let size = t.layout.size_bytes;
-    for row in 0..level.height_elements {
-        for column in 0..level.width_elements {
-            let Some(offset) = t.element_offset(mip, u64::from(column), row, z, 0) else { continue };
-            if offset + bpe as u64 > size {
-                continue;
-            }
-            // SAFETY: the element is inside the resource, and the linear row holds the element.
-            unsafe {
-                let tiled = resource.add(offset as usize);
-                let flat = linear.add(row as usize * row_pitch + column as usize * bpe);
-                if direction == Direction::Into {
-                    std::ptr::copy_nonoverlapping(flat, tiled, bpe);
-                } else {
-                    std::ptr::copy_nonoverlapping(tiled, flat, bpe);
-                }
-            }
+    // SAFETY: invariants forwarded from caller.
+    unsafe {
+        match direction {
+            Direction::Into => copy_slice_dir::<true>(t, resource, linear, row_pitch, mip, z),
+            Direction::From => copy_slice_dir::<false>(t, resource, linear, row_pitch, mip, z),
         }
     }
 }

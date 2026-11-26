@@ -389,3 +389,21 @@ fn throughput() {
         println!("{format:?}: {:.1} MiB/s out, the lanes alone {:.1} MiB/s", mib / seconds, mib / lanes);
     }
 }
+
+#[test]
+fn bit_spread_and_index_pair_tables_match_reference() {
+    for a in 0..=15u8 {
+        for b in 0..=15u8 {
+            let expected = (0..4).fold(0u8, |acc, k| acc | ((a >> k) & 1) << (2 * k) | ((b >> k) & 1) << (2 * k + 1));
+            assert_eq!(crate::interleave(a, b), expected);
+        }
+    }
+    for byte in 0..=255u8 {
+        let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | ((v >> (2 * k)) & 1) << k);
+        let signed = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
+        let (even, odd) = (signed(half(byte)), signed(half(byte >> 1)));
+        assert_eq!(crate::index_pair(byte, false), [even, odd]);
+        assert_eq!(crate::index_pair(byte, true), [odd, even]);
+        assert_eq!(crate::bc6::spread8(byte), (0..8).fold(0u16, |acc, k| acc | u16::from((byte >> k) & 1) << (2 * k)));
+    }
+}

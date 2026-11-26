@@ -177,18 +177,28 @@ fn bc5_residual(s: &[u8]) -> Values {
 pub const BC1_CODE: [u8; 4] = [0, 2, 3, 1];
 pub const BC4_CODE: [u8; 8] = [0, 2, 3, 4, 5, 6, 7, 1];
 
+#[inline(always)]
 fn colour(ep: &[u8], ix: &[u8], out: &mut [u8]) {
     let c0 = u16::from(ep[0]) << 11 | u16::from(ep[1]) << 5 | u16::from(ep[2]);
     let c1 = u16::from(ep[3]) << 11 | u16::from(ep[4]) << 5 | u16::from(ep[5]);
-    let codes = (0..16).fold(0u32, |acc, p| acc | u32::from(BC1_CODE[usize::from(ix[p] & 3)]) << (2 * p));
+    let ix = &ix[..16];
+    let mut codes = 0u32;
+    for (p, &idx) in ix.iter().enumerate() {
+        codes |= u32::from(BC1_CODE[usize::from(idx & 3)]) << (2 * p);
+    }
     out[..2].copy_from_slice(&c0.to_le_bytes());
     out[2..4].copy_from_slice(&c1.to_le_bytes());
     out[4..8].copy_from_slice(&codes.to_le_bytes());
 }
 
 /// A BC4 half. The endpoints are kept 128 below their stored value.
+#[inline(always)]
 fn single(e0: u8, e1: u8, ix: &[u8], out: &mut [u8]) {
-    let codes = (0..16).fold(0u64, |acc, p| acc | u64::from(BC4_CODE[usize::from(ix[p] & 7)]) << (16 + 3 * p));
+    let ix = &ix[..16];
+    let mut codes = 0u64;
+    for (p, &idx) in ix.iter().enumerate() {
+        codes |= u64::from(BC4_CODE[usize::from(idx & 7)]) << (16 + 3 * p);
+    }
     let v = u64::from(e0 ^ 0x80) | u64::from(e1 ^ 0x80) << 8 | codes;
     out[..8].copy_from_slice(&v.to_le_bytes());
 }
@@ -224,18 +234,20 @@ impl Stage {
     }
 }
 
+const ZERO: Values = Values { ep: [0; 8], ix: [0; 32] };
+
 impl Blocks for Stage {
     fn block(&mut self, i: usize, record: &[u8], out: &mut [u8]) -> Result<bool, Error> {
         let spec = self.spec;
         let (ep_ref, ix_ref) = references(record, spec.paired);
-        let zero = Values::default();
-        let ep_base = reach(i, ep_ref, &self.history[..], &self.seeds[..], &zero).ep;
-        let ix_base = reach(i, ix_ref, &self.history[..], &self.seeds[..], &zero).ix;
+        let ep_base = &reach(i, ep_ref, &self.history[..], &self.seeds[..], &ZERO).ep;
+        let ix_base = &reach(i, ix_ref, &self.history[..], &self.seeds[..], &ZERO).ix;
         let mut v = (spec.residual)(record);
-        for ((value, base), bits) in v.ep.iter_mut().zip(ep_base).zip(spec.ep_bits) {
-            *value = (u16::from(value.wrapping_add(base)) & ((1u16 << bits) - 1)) as u8;
+        for ((value, &base), &bits) in v.ep.iter_mut().zip(ep_base).zip(&spec.ep_bits) {
+            let mask = ((1u16 << bits) - 1) as u8;
+            *value = value.wrapping_add(base) & mask;
         }
-        for ((value, base), bits) in v.ix.iter_mut().zip(ix_base).zip(spec.ix_bits) {
+        for ((value, &base), &bits) in v.ix.iter_mut().zip(ix_base).zip(&spec.ix_bits) {
             *value = value.wrapping_add(base) & ((1u8 << bits) - 1);
         }
         self.history[i % HISTORY] = v;

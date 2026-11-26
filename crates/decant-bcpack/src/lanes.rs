@@ -80,14 +80,16 @@ impl Feed for SliceFeed<'_> {
         Some(byte)
     }
 
-    /// Without a branch: whether a lane asks is hard to predict.
+    /// Without a branch on `ask`: whether a lane asks is hard to predict.
     #[inline(always)]
     fn take(&mut self, _lane: usize, ask: bool) -> (bool, u8) {
-        let len = self.data.len();
-        let got = ask & (self.at < len);
-        let byte = self.data.get(self.at.min(len.wrapping_sub(1))).copied().unwrap_or(0);
-        self.at += usize::from(got);
-        (got, byte)
+        if self.at < self.data.len() {
+            let byte = self.data[self.at];
+            self.at += usize::from(ask);
+            (ask, byte)
+        } else {
+            (false, 0)
+        }
     }
 }
 
@@ -212,6 +214,70 @@ impl Lanes {
 
     /// Decodes whole records into `records` (a multiple of the layout's stride).
     pub fn run<F: Feed>(&mut self, feed: &mut F, records: &mut [u8]) -> Result<(), Error> {
+        match (self.layout.groups.len(), self.layout.per) {
+            (12, 1) => self.run_const::<12, 1, F>(feed, records),
+            (12, 2) => self.run_const::<12, 2, F>(feed, records),
+            (16, 2) => self.run_const::<16, 2, F>(feed, records),
+            _ => self.run_generic(feed, records),
+        }
+    }
+
+    fn run_const<const COUNT: usize, const PER: usize, F: Feed>(&mut self, feed: &mut F, records: &mut [u8]) -> Result<(), Error> {
+        let stride = COUNT * PER;
+        let all = (1u32 << COUNT) - 1;
+        let blocks = records.len() / stride;
+        let mut idle = 0;
+        let mut given = self.given;
+        for out_block in records[..blocks * stride].chunks_exact_mut(stride) {
+            loop {
+                let mut taken = 0u32;
+                let mut moved = false;
+                let pos = if PER == 1 { 0 } else { self.position & 1 };
+                for (j, (lane, slots)) in self.lanes[..COUNT].iter_mut().zip(out_block.as_chunks_mut::<PER>().0).enumerate() {
+                    let bit = 1u32 << j;
+                    let before = taken;
+                    if !lane.paused {
+                        lane.step(self.models);
+                    }
+                    let waiting = lane.holding & (given & bit != 0);
+                    // Past the end nothing arrives; in a whole stream only finished lanes ask there.
+                    let (got, byte) = feed.take(j, lane.wants & !waiting & (taken < ROUND_BYTES));
+                    lane.byte = if got { byte } else { lane.byte };
+                    lane.latched |= got;
+                    taken += u32::from(got);
+                    lane.paused = (lane.wants & (before >= ROUND_BYTES)) | waiting;
+                    // Hand the symbol over, without a branch.
+                    let hand = !lane.paused & lane.holding;
+                    let slot = &mut slots[pos];
+                    *slot = if hand { lane.symbol } else { *slot };
+                    lane.holding &= !hand;
+                    given |= u32::from(hand) << j;
+                    moved |= hand;
+                }
+                if given == all {
+                    given = 0;
+                    if PER == 1 {
+                        break;
+                    }
+                    self.position += 1;
+                    if self.position == PER {
+                        self.position = 0;
+                        break;
+                    }
+                    moved = true;
+                }
+                // A few rounds with no byte taken and no symbol given: no lane can go on.
+                idle = if taken > 0 || moved { 0 } else { idle + 1 };
+                if idle > 3 {
+                    return Err(Error::Truncated);
+                }
+            }
+        }
+        self.given = given;
+        Ok(())
+    }
+
+    fn run_generic<F: Feed>(&mut self, feed: &mut F, records: &mut [u8]) -> Result<(), Error> {
         let stride = self.layout.stride();
         let per = self.layout.per;
         let count = self.layout.groups.len();
@@ -231,13 +297,11 @@ impl Lanes {
                     lane.step(self.models);
                 }
                 let waiting = lane.holding & (given & bit != 0);
-                // Past the end nothing arrives; in a whole stream only finished lanes ask there.
                 let (got, byte) = feed.take(j, lane.wants & !waiting & (taken < ROUND_BYTES));
                 lane.byte = if got { byte } else { lane.byte };
                 lane.latched |= got;
                 taken += u32::from(got);
                 lane.paused = (lane.wants & (before >= ROUND_BYTES)) | waiting;
-                // Hand the symbol over, without a branch.
                 let hand = !lane.paused & lane.holding;
                 let slot = &mut records[base + j * per];
                 *slot = if hand { lane.symbol } else { *slot };
@@ -254,7 +318,6 @@ impl Lanes {
                 }
                 moved = true;
             }
-            // A few rounds with no byte taken and no symbol given: no lane can go on.
             idle = if taken > 0 || moved { 0 } else { idle + 1 };
             if idle > 3 {
                 return Err(Error::Truncated);

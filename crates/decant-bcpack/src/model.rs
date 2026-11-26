@@ -48,8 +48,8 @@ impl Model {
     /// The bucket that holds `slot`.
     #[inline(always)]
     fn bucket(&self, slot: u32) -> usize {
-        let mut b = usize::from(self.coarse[(slot >> 8) as usize]);
-        while self.start[b + 1] <= slot {
+        let mut b = usize::from(self.coarse[(slot >> 8) as usize]).min(8);
+        while b < 8 && self.start[b + 1] <= slot {
             b += 1;
         }
         b

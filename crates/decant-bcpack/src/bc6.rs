@@ -118,11 +118,22 @@ fn seeds() -> &'static [Values; SEEDS] {
     })
 }
 
-/// Two symbols interleaved bit by bit (the first on the even bits) to 16 bits.
-fn wide(even: u8, odd: u8) -> u16 {
-    (0..8).fold(0u16, |acc, k| acc | u16::from((even >> k) & 1) << (2 * k) | u16::from((odd >> k) & 1) << (2 * k + 1))
+/// Spreads 8 bits onto the even bits (0, 2, ..., 14) of a 16-bit integer.
+#[inline(always)]
+pub(crate) fn spread8(v: u8) -> u16 {
+    let mut x = u16::from(v);
+    x = (x | (x << 4)) & 0x0F0F;
+    x = (x | (x << 2)) & 0x3333;
+    (x | (x << 1)) & 0x5555
 }
 
+/// Two symbols interleaved bit by bit (the first on the even bits) to 16 bits.
+#[inline(always)]
+fn wide(even: u8, odd: u8) -> u16 {
+    spread8(even) | (spread8(odd) << 1)
+}
+
+#[inline(always)]
 fn unzigzag16(v: u16) -> u16 {
     (v >> 1) ^ (v & 1).wrapping_neg()
 }
@@ -196,9 +207,10 @@ pub fn pack(v: &Values, partition: u8, out: &mut [u8]) -> bool {
     }
     let ibits = index_bits(v.mode);
     let anchor = if v.mode <= 10 { ANCHOR_2[usize::from(partition)] } else { 0 };
+    let anchor_mask: u32 = 1 | (1u32 << anchor);
     let mut fits = true;
     for (p, &value) in v.index.iter().enumerate() {
-        let short = p == 0 || p == usize::from(anchor);
+        let short = (anchor_mask >> p) & 1 != 0;
         let biased = u64::from((value as u16).wrapping_add(1 << (ibits - 1))) & ((1 << ibits) - 1);
         if short {
             fits &= biased >> (ibits - 1) == 0;

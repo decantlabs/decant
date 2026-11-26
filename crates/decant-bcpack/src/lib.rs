@@ -125,12 +125,15 @@ trait Blocks {
 
 /// Blocks decoded per batch of records (keeps the records in the cache).
 const BATCH: usize = 512;
+/// Maximum record stride across all formats (16 lanes * 2 symbols per block).
+const MAX_STRIDE: usize = 32;
 
 fn run(layout: Layout, block_bytes: usize, stage: &mut impl Blocks, src: &[u8], dst: &mut [u8]) -> Result<Report, Error> {
     let stride = layout.stride();
+    assert!(stride <= MAX_STRIDE);
     let mut lanes = Lanes::new(layout);
     let mut feed = SliceFeed::new(src);
-    let mut records = vec![0u8; BATCH * stride];
+    let mut records = [0u8; BATCH * MAX_STRIDE];
     let mut report = Report::default();
     for (batch, out) in dst.chunks_mut(BATCH * block_bytes).enumerate() {
         let blocks = out.len() / block_bytes;
@@ -177,13 +180,22 @@ const HISTORY: usize = 256;
 /// Seed entries per format.
 const SEEDS: usize = 255;
 
+/// Spreads the low 4 bits of `v` onto the even bits (0, 2, 4, 6).
+#[inline(always)]
+fn spread4(v: u8) -> u8 {
+    let mut x = v & 0x0F;
+    x = (x | (x << 2)) & 0x33;
+    (x | (x << 1)) & 0x55
+}
+
 /// Two 4-bit symbols as one byte: the first on the even bits, the second on the odd bits.
+#[inline(always)]
 fn interleave(even: u8, odd: u8) -> u8 {
-    let spread = |v: u8| (0..4).fold(0u8, |acc, k| acc | ((v >> k) & 1) << (2 * k));
-    spread(even) | spread(odd) << 1
+    spread4(even) | (spread4(odd) << 1)
 }
 
 /// Zigzag code to a signed byte: 0, 1, 2, 3 -> 0, -1, 1, -2.
+#[inline(always)]
 fn unzigzag(v: u8) -> u8 {
     (v >> 1) ^ (v & 1).wrapping_neg()
 }
@@ -191,12 +203,14 @@ fn unzigzag(v: u8) -> u8 {
 /// The endpoint and index references of a record. Paired layouts carry each as two 4-bit symbols
 /// (lanes 0 and 1, two symbols each), the others as one symbol (lanes 0 and 1). The index
 /// reference is direct; the endpoint reference is the index reference plus a zigzag offset.
+#[inline(always)]
 fn references(record: &[u8], paired: bool) -> (usize, usize) {
     let (offset, index) = if paired { (interleave(record[0], record[1]), interleave(record[2], record[3])) } else { (record[0], record[1]) };
     (usize::from(index.wrapping_add(unzigzag(offset))), usize::from(index))
 }
 
 /// What reference `r` of block `i` reads: nothing (0), an earlier block, or a seed entry.
+#[inline(always)]
 fn reach<'a, T>(i: usize, r: usize, history: &'a [T], seeds: &'a [T], zero: &'a T) -> &'a T {
     if r == 0 {
         zero
@@ -215,6 +229,7 @@ struct Bits {
 }
 
 impl Bits {
+    #[inline(always)]
     fn put(&mut self, value: u64, n: u32) {
         if n > 0 && self.at < 128 {
             self.value |= (u128::from(value) & ((1u128 << n) - 1)) << self.at;
@@ -223,17 +238,38 @@ impl Bits {
     }
 }
 
+/// Precomputed `[even, odd]` zigzag-decoded 4-bit residuals for every byte value.
+const INDEX_PAIRS: [[i16; 2]; 256] = {
+    let mut table = [[0i16; 2]; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut even = 0u8;
+        let mut odd = 0u8;
+        let mut k = 0;
+        while k < 4 {
+            even |= (((b as u8) >> (2 * k)) & 1) << k;
+            odd |= (((b as u8) >> (2 * k + 1)) & 1) << k;
+            k += 1;
+        }
+        let se = (even >> 1) as i16 ^ -((even & 1) as i16);
+        let so = (odd >> 1) as i16 ^ -((odd & 1) as i16);
+        table[b] = [se, so];
+        b += 1;
+    }
+    table
+};
+
 /// A byte's even and odd bits as two zigzag coded 4-bit residuals, in pixel order: the odd half
 /// first for rows 0 to 2 of an index set, the even half first for row 3.
+#[inline(always)]
 fn index_pair(byte: u8, odd_first: bool) -> [i16; 2] {
-    let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | ((v >> (2 * k)) & 1) << k);
-    let signed = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
-    let (even, odd) = (signed(half(byte)), signed(half(byte >> 1)));
+    let [even, odd] = INDEX_PAIRS[usize::from(byte)];
     if odd_first { [odd, even] } else { [even, odd] }
 }
 
 /// Index residual plus reference: both left aligned at their own widths, summed, and brought back
 /// to `bits` bits with the sign.
+#[inline(always)]
 fn add_index(residual: i16, bits: u8, reference: i16, reference_bits: u8) -> i16 {
     let up = |v: i16, b: u8| if b == 0 || b > 16 { 0 } else { (v as u16) << (16 - b) };
     let sum = up(residual, bits).wrapping_add(up(reference, reference_bits)) as i16;

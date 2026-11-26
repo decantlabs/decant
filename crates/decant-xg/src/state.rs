@@ -21,13 +21,14 @@ pub fn terminate() -> i32 {
 
 /// `XGSetHardwareVersion`: version 4 selects the other address equations. Then it behaves like `initialize`.
 pub fn set_hardware_version(version: u32) -> i32 {
-    HARDWARE_V4.store(version == 4, Ordering::SeqCst);
+    HARDWARE_V4.store(version == 4, Ordering::Release);
     initialize()
 }
 
 /// Whether version 4 equations are in use.
+#[inline]
 pub fn hardware_v4() -> bool {
-    HARDWARE_V4.load(Ordering::SeqCst)
+    HARDWARE_V4.load(Ordering::Acquire)
 }
 
 /// A critical section: entered again by the thread that owns it.
@@ -72,12 +73,12 @@ impl CriticalSection {
 
 /// `XGEnableExclusiveLocking`.
 pub fn enable_locking(enable: bool) {
-    LOCKING.store(enable, Ordering::SeqCst);
+    LOCKING.store(enable, Ordering::Release);
 }
 
 /// `XGEnterExclusiveLock`: 1 after entering the critical section, 0 without waiting when locking is off.
 pub fn enter_lock() -> i32 {
-    if LOCKING.load(Ordering::SeqCst) {
+    if LOCKING.load(Ordering::Acquire) {
         SECTION.enter();
         1
     } else {
@@ -87,7 +88,7 @@ pub fn enter_lock() -> i32 {
 
 /// `XGLeaveExclusiveLock`.
 pub fn leave_lock() {
-    if LOCKING.load(Ordering::SeqCst) {
+    if LOCKING.load(Ordering::Acquire) {
         SECTION.leave();
     }
 }
@@ -96,8 +97,9 @@ pub fn leave_lock() {
 pub struct Guard(bool);
 
 impl Guard {
+    #[inline]
     pub fn new() -> Guard {
-        if LOCKING.load(Ordering::SeqCst) {
+        if LOCKING.load(Ordering::Acquire) {
             SECTION.enter();
             Guard(true)
         } else {

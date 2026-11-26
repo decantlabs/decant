@@ -177,12 +177,75 @@ pub unsafe extern "system" fn XGComputeBufferLayout(desc: *const XgBufferDesc, l
     }
 }
 
+const RECORD_BYTES: usize = 0x1B40;
+const PLANE_BYTES: usize = 0x6C8;
+const LEVEL_BYTES: usize = 0x70;
+const MAX_LEVELS: usize = 15;
+
+#[inline(always)]
+fn reduce_size(v: u64) -> u64 {
+    if v < 256 { v } else { ((v / 256 - 1) % (1 << 24) + 1) * 256 }
+}
+
+#[inline(always)]
+fn reduce_dim(v: u64) -> u64 {
+    if v == 0 { 0 } else { (v - 1) % 16384 + 1 }
+}
+
+/// Writes `layout` directly into `out` (`XG_RESOURCE_LAYOUT`, 0x1B40 bytes) without heap allocation.
+///
 /// # Safety
-/// `out` points to a writable `XG_RESOURCE_LAYOUT`.
-unsafe fn write_record(out: *mut u8, layout: &decant_texture::xg::ResourceLayout) -> Hresult {
-    let record = layout.to_record();
-    // SAFETY: the record is 0x1B40 bytes and `out` holds that many.
-    unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len()) };
+/// `out` points to a writable `XG_RESOURCE_LAYOUT` of `0x1B40` bytes.
+pub(crate) unsafe fn write_record(out: *mut u8, layout: &decant_texture::xg::ResourceLayout) -> Hresult {
+    // SAFETY: `out` is a writable 0x1B40-byte buffer.
+    unsafe {
+        std::ptr::write_bytes(out, 0, RECORD_BYTES);
+        let put32 = |at: usize, v: u32| std::ptr::write_unaligned(out.add(at).cast::<u32>(), v.to_le());
+        let put64 = |at: usize, v: u64| std::ptr::write_unaligned(out.add(at).cast::<u64>(), v.to_le());
+        put64(0, layout.size_bytes);
+        put64(8, layout.base_alignment_bytes);
+        put32(0x10, layout.mip_levels);
+        put32(0x14, layout.planes.len() as u32);
+        for (p, plane) in layout.planes.iter().take(4).enumerate() {
+            let base = 0x18 + p * PLANE_BYTES;
+            put32(base, plane.usage);
+            put64(base + 0x08, plane.size_bytes);
+            put64(base + 0x10, plane.slice_size_bytes);
+            put64(base + 0x18, plane.base_offset_bytes);
+            put64(base + 0x20, plane.base_alignment_bytes);
+            put32(base + 0x28, plane.bytes_per_element);
+            put32(base + 0x2C, plane.first_mip_in_tail);
+            put32(base + 0x30, plane.mip_levels_in_tail);
+            for (i, l) in plane.levels.iter().take(MAX_LEVELS).enumerate() {
+                let at = base + 0x38 + i * LEVEL_BYTES;
+                let (padded_w, padded_h) = (reduce_dim(u64::from(l.padded_width)), reduce_dim(u64::from(l.padded_height)));
+                let per_element = |pitch: u32| u64::from(pitch / l.padded_width.max(1));
+                let (blk, bpe) = (per_element(l.pitch_pixels), per_element(l.pitch_bytes));
+                put64(at, reduce_size(l.size_bytes));
+                put64(at + 0x08, l.offset_bytes);
+                put64(at + 0x10, reduce_size(l.slice2d_size_bytes));
+                put32(at + 0x18, (padded_w * blk) as u32);
+                put32(at + 0x1C, (padded_w * bpe) as u32);
+                put32(at + 0x20, l.alignment_bytes);
+                put32(at + 0x24, padded_w as u32);
+                put32(at + 0x28, padded_h as u32);
+                put32(at + 0x2C, l.padded_depth_or_array);
+                put32(at + 0x30, l.width_elements);
+                put32(at + 0x34, l.height_elements);
+                put32(at + 0x38, l.width_texels);
+                put32(at + 0x3C, l.height_texels);
+                put32(at + 0x40, l.depth_or_array);
+                put32(at + 0x44, l.sample_count);
+                put32(at + 0x48, l.swizzle_mode);
+                put32(at + 0x50, l.constant_50);
+                put32(at + 0x58, l.constant_58);
+                put32(at + 0x60, l.block_depth);
+                put32(at + 0x64, u32::from(l.in_tail));
+                put32(at + 0x68, l.tail_position);
+            }
+        }
+        put32(0x1B38, layout.dimension);
+    }
     S_OK
 }
 
@@ -406,4 +469,27 @@ pub unsafe extern "system" fn XGCreateBVHComputer(_out: *mut *mut c_void) -> Hre
     decant_log::calls::not_implemented("XGCreateBVHComputer");
     trace("xg_xs: XGCreateBVHComputer not implemented");
     E_NOTIMPL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_record_matches_to_record_for_all_dimensions() {
+        let layouts = [
+            buffer_layout(4096, 0, 0).unwrap(),
+            compute_layout(&TextureDesc { dim: Dim::D1, width: 512, height: 1, depth_or_array: 2, mip_levels: 0, format: 28, sample_count: 1, usage: 0, bind_flags: 8, misc_flags: 0, swizzle_mode: 0, pitch: 0 }, false).unwrap().layout,
+            compute_layout(&TextureDesc { dim: Dim::D2, width: 256, height: 128, depth_or_array: 1, mip_levels: 0, format: 71, sample_count: 1, usage: 0, bind_flags: 8, misc_flags: 0, swizzle_mode: 10, pitch: 0 }, false).unwrap().layout,
+            compute_layout(&TextureDesc { dim: Dim::D3, width: 64, height: 64, depth_or_array: 16, mip_levels: 0, format: 28, sample_count: 1, usage: 0, bind_flags: 8, misc_flags: 0, swizzle_mode: 9, pitch: 0 }, true).unwrap().layout,
+        ];
+        let mut buf = [0xAAu8; RECORD_BYTES];
+        for layout in &layouts {
+            let expected = layout.to_record();
+            // SAFETY: `buf` is a writable `RECORD_BYTES`-byte array.
+            let hr = unsafe { write_record(buf.as_mut_ptr(), layout) };
+            assert_eq!(hr, S_OK);
+            assert_eq!(&buf[..], &expected[..]);
+        }
+    }
 }
