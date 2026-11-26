@@ -409,6 +409,8 @@ struct Lazy {
     /// A job that makes the PC pipeline is queued or running.
     making: AtomicBool,
     pending_logged: AtomicBool,
+    /// Number of transient `E_OUTOFMEMORY` (`0x8007000E`) failures retried so far.
+    oom_retries: AtomicU8,
 }
 const _: () = assert!(std::mem::offset_of!(Lazy, packet) == 0x10);
 // SAFETY: `vtbl` points to the immutable static `VTBL`, every other field of `Lazy` is `Sync`.
@@ -768,31 +770,52 @@ fn submit(job: MakeJob, is_compute: bool) {
     wake.notify_one();
 }
 
-/// Makes the PC pipeline of `lazy` once, drops the retained description and shader references,
-/// and tells the waiters.
+/// Makes the PC pipeline of `lazy` once, drops the retained description and shader references
+/// once settled, and tells the waiters. Transient `E_OUTOFMEMORY` leaves `made` unset so a later
+/// bind can retry.
 fn run_job(lazy: &Lazy, source: MakeSource, service: Option<&'static crate::compile_service::Service>) {
-    lazy.made.get_or_init(|| {
-        let guard = lazy.recipe.owned.read().unwrap_or_else(|e| e.into_inner());
-        let Some(owned) = guard.as_ref() else {
-            return 0;
+    let settled = if lazy.made.get().is_some() {
+        true
+    } else {
+        let outcome = {
+            let guard = lazy.recipe.owned.read().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                None => Some(0),
+                Some(owned) => match source {
+                    MakeSource::Direct(patched) => match make(lazy, owned, patched.desc(), true, service) {
+                        MakeOutcome::Made(direct) => {
+                            crate::direct_pso::kind_made(direct, owned);
+                            Some(direct)
+                        }
+                        MakeOutcome::RetryOom => None,
+                        MakeOutcome::Refused => match make(lazy, owned, owned.desc(), false, service) {
+                            MakeOutcome::Made(orig) => Some(orig),
+                            MakeOutcome::RetryOom => None,
+                            MakeOutcome::Refused => Some(0),
+                        },
+                    },
+                    MakeSource::Original => {
+                        crate::direct_pso::pipeline_done_for(service, owned, None);
+                        match make(lazy, owned, owned.desc(), false, service) {
+                            MakeOutcome::Made(orig) => Some(orig),
+                            MakeOutcome::RetryOom => None,
+                            MakeOutcome::Refused => Some(0),
+                        }
+                    }
+                },
+            }
         };
-        match source {
-            MakeSource::Direct(patched) => {
-                let direct = make(lazy, owned, patched.desc(), true, service);
-                if direct == 0 {
-                    // The PC runtime refused the compiled shaders: use the title's own.
-                    return make(lazy, owned, owned.desc(), false, service);
-                }
-                crate::direct_pso::kind_made(direct, owned);
-                direct
-            }
-            MakeSource::Original => {
-                crate::direct_pso::pipeline_done_for(service, owned, None);
-                make(lazy, owned, owned.desc(), false, service)
-            }
+        if let Some(made) = outcome {
+            let _ = lazy.made.set(made);
+            true
+        } else {
+            lazy.making.store(false, Ordering::Release);
+            false
         }
-    });
-    *lazy.recipe.owned.write().unwrap_or_else(|e| e.into_inner()) = None;
+    };
+    if settled {
+        *lazy.recipe.owned.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
     let (lock, finished) = &MAKER_FINISHED;
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     finished.notify_all();
@@ -809,7 +832,7 @@ fn wait_for_made(lazy: &Lazy, timeout: Duration) -> Option<usize> {
     let begun = Instant::now();
     let (lock, finished) = &MAKER_FINISHED;
     let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while lazy.made.get().is_none() {
+    while lazy.made.get().is_none() && lazy.making.load(Ordering::Acquire) {
         let left = timeout.saturating_sub(begun.elapsed());
         if left.is_zero() {
             break;
@@ -856,6 +879,7 @@ pub unsafe fn defer(device: usize, owned: Owned, riid: *const GUID, out: *mut *m
         late: AtomicBool::new(false),
         making: AtomicBool::new(false),
         pending_logged: AtomicBool::new(false),
+        oom_retries: AtomicU8::new(0),
     });
     let raw = Box::into_raw(object);
     // SAFETY: by the contract above. The object is never freed, see `release`.
@@ -975,9 +999,17 @@ fn resolve_within(object: usize, lazy: &'static Lazy, is_compute: bool, apply_as
     arrived(wait_for_made(lazy, allowed.saturating_sub(begun.elapsed())))
 }
 
-/// Calls the creation path for `lazy` with `desc`. Returns the PC pipeline, or 0 when the PC
-/// runtime refused it or only gave a stand in.
-fn make(lazy: &Lazy, owned: &Owned, desc: &[u8], direct: bool, service: Option<&'static crate::compile_service::Service>) -> usize {
+const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
+const MAX_OOM_RETRIES: u8 = 3;
+
+enum MakeOutcome {
+    Made(usize),
+    RetryOom,
+    Refused,
+}
+
+/// Calls the creation path for `lazy` with `desc`.
+fn make(lazy: &Lazy, owned: &Owned, desc: &[u8], direct: bool, service: Option<&'static crate::compile_service::Service>) -> MakeOutcome {
     let recipe = &lazy.recipe;
     let begun = Instant::now();
     let mut out: *mut c_void = std::ptr::null_mut();
@@ -995,12 +1027,35 @@ fn make(lazy: &Lazy, owned: &Owned, desc: &[u8], direct: bool, service: Option<&
     if direct {
         crate::direct_pso::pipeline_done_for(service, owned, Some((made != 0, took)));
     }
+    if made != 0 {
+        let nth = MADE.fetch_add(1, Ordering::Relaxed);
+        let ms = took.as_millis();
+        if nth < 32 || ms >= 1000 || nth.is_power_of_two() {
+            let how = if direct { " with direct shaders" } else { "" };
+            xs_log!(
+                "pipeline {} made{how} on first bind in {ms} ms, hr=0x{:08X} ({} deferred, {} made, {} refused so far)",
+                lazy.number,
+                hr as u32,
+                DEFERRED.load(Ordering::Relaxed),
+                MADE.load(Ordering::Relaxed),
+                REFUSED.load(Ordering::Relaxed)
+            );
+        }
+        return MakeOutcome::Made(made);
+    }
+    if hr == E_OUTOFMEMORY {
+        let attempt = lazy.oom_retries.fetch_add(1, Ordering::Relaxed);
+        if attempt < MAX_OOM_RETRIES {
+            xs_log!("pipeline {} hit transient 0x8007000E (retry {}/{})", lazy.number, attempt + 1, MAX_OOM_RETRIES);
+            return MakeOutcome::RetryOom;
+        }
+    }
+    let nth = REFUSED.fetch_add(1, Ordering::Relaxed);
     let ms = took.as_millis();
-    let (nth, outcome) = if made != 0 { (MADE.fetch_add(1, Ordering::Relaxed), "made") } else { (REFUSED.fetch_add(1, Ordering::Relaxed), "refused") };
     if nth < 32 || ms >= 1000 || nth.is_power_of_two() {
         let how = if direct { " with direct shaders" } else { "" };
         xs_log!(
-            "pipeline {} {outcome}{how} on first bind in {ms} ms, hr=0x{:08X} ({} deferred, {} made, {} refused so far)",
+            "pipeline {} refused{how} on first bind in {ms} ms, hr=0x{:08X} ({} deferred, {} made, {} refused so far)",
             lazy.number,
             hr as u32,
             DEFERRED.load(Ordering::Relaxed),
@@ -1008,7 +1063,7 @@ fn make(lazy: &Lazy, owned: &Owned, desc: &[u8], direct: bool, service: Option<&
             REFUSED.load(Ordering::Relaxed)
         );
     }
-    made
+    MakeOutcome::Refused
 }
 
 // The COM object. Slots 0 to 2 are IUnknown, 3 to 6 ID3D12Object (GetPrivateData, SetPrivateData,
@@ -1606,7 +1661,7 @@ mod tests {
                 scope.spawn(move || {
                     let guard = lazy.recipe.owned.read().unwrap();
                     let owned = guard.as_ref().unwrap();
-                    assert_ne!(make(lazy, owned, owned.desc(), false, None), 0);
+                    assert!(matches!(make(lazy, owned, owned.desc(), false, None), MakeOutcome::Made(_)));
                 });
             }
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -1622,12 +1677,12 @@ mod tests {
             {
                 let guard = small_job.recipe.owned.read().unwrap();
                 let owned = guard.as_ref().unwrap();
-                assert_ne!(make(small_job, owned, owned.desc(), false, None), 0);
+                assert!(matches!(make(small_job, owned, owned.desc(), false, None), MakeOutcome::Made(_)));
             }
             {
                 let guard = g_lazy.recipe.owned.read().unwrap();
                 let owned = guard.as_ref().unwrap();
-                assert_ne!(make(g_lazy, owned, owned.desc(), false, None), 0);
+                assert!(matches!(make(g_lazy, owned, owned.desc(), false, None), MakeOutcome::Made(_)));
             }
             assert_eq!(SMALL_COUNT.load(Ordering::SeqCst), 2);
 
@@ -1635,5 +1690,76 @@ mod tests {
             RELEASE.1.notify_all();
         });
         assert_eq!(LARGE_PEAK.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn transient_oom_retries_up_to_limit_while_invalid_arg_refuses_immediately() {
+        static CALLS_RETRY: AtomicUsize = AtomicUsize::new(0);
+        static CALLS_EXHAUST: AtomicUsize = AtomicUsize::new(0);
+        static CALLS_INVALID: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe fn create_oom_then_ok(_device: usize, _desc: *const c_void, _riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+            let n = CALLS_RETRY.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                return E_OUTOFMEMORY;
+            }
+            // SAFETY: `out` is writable.
+            unsafe { *out = 0xCAFE_0001usize as *mut c_void };
+            0
+        }
+
+        unsafe fn create_always_oom(_device: usize, _desc: *const c_void, _riid: *const GUID, _out: *mut *mut c_void) -> HRESULT {
+            CALLS_EXHAUST.fetch_add(1, Ordering::SeqCst);
+            E_OUTOFMEMORY
+        }
+
+        unsafe fn create_invalid_arg(_device: usize, _desc: *const c_void, _riid: *const GUID, _out: *mut *mut c_void) -> HRESULT {
+            CALLS_INVALID.fetch_add(1, Ordering::SeqCst);
+            0x8007_0057_u32 as i32
+        }
+
+        let cs = b"DXBC_oom_retry_test_shader";
+        let make_lazy = |create: Create| -> &'static Lazy {
+            let desc = compute_desc(cs);
+            // SAFETY: `desc` and `cs` are live.
+            let owned = unsafe { copy_compute(desc.as_ptr().cast()) };
+            let mut out = std::ptr::null_mut();
+            // SAFETY: `out` is writable.
+            assert_eq!(unsafe { defer(0x1234, owned, std::ptr::null(), &mut out, create) }, 0);
+            // SAFETY: `defer` returns a leaked `Lazy` pointer.
+            unsafe { &*out.cast::<Lazy>() }
+        };
+
+        // 1. Fails twice with E_OUTOFMEMORY, succeeds on 3rd attempt (within MAX_OOM_RETRIES).
+        let retry_lazy = make_lazy(create_oom_then_ok);
+        run_job(retry_lazy, MakeSource::Original, None);
+        assert_eq!(retry_lazy.made.get(), None);
+        assert!(!retry_lazy.making.load(Ordering::Acquire));
+        assert!(retry_lazy.recipe.owned.read().unwrap().is_some());
+
+        run_job(retry_lazy, MakeSource::Original, None);
+        assert_eq!(retry_lazy.made.get(), None);
+        assert!(!retry_lazy.making.load(Ordering::Acquire));
+
+        run_job(retry_lazy, MakeSource::Original, None);
+        assert_eq!(retry_lazy.made.get().copied(), Some(0xCAFE_0001));
+        assert!(retry_lazy.recipe.owned.read().unwrap().is_none());
+        assert_eq!(CALLS_RETRY.load(Ordering::SeqCst), 3);
+
+        // 2. Exhausting MAX_OOM_RETRIES (3 retries -> 4th failure) latches 0.
+        let exhaust_lazy = make_lazy(create_always_oom);
+        for _ in 0..MAX_OOM_RETRIES {
+            run_job(exhaust_lazy, MakeSource::Original, None);
+            assert_eq!(exhaust_lazy.made.get(), None);
+        }
+        run_job(exhaust_lazy, MakeSource::Original, None);
+        assert_eq!(exhaust_lazy.made.get().copied(), Some(0));
+        assert_eq!(CALLS_EXHAUST.load(Ordering::SeqCst), usize::from(MAX_OOM_RETRIES) + 1);
+
+        // 3. Non-OOM failure (0x80070057) latches 0 immediately on first attempt.
+        let invalid_lazy = make_lazy(create_invalid_arg);
+        run_job(invalid_lazy, MakeSource::Original, None);
+        assert_eq!(invalid_lazy.made.get().copied(), Some(0));
+        assert_eq!(CALLS_INVALID.load(Ordering::SeqCst), 1);
     }
 }
