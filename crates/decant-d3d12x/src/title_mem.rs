@@ -47,7 +47,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -506,6 +506,7 @@ type GuardFn = unsafe extern "system" fn();
 type WritableFn = unsafe extern "system" fn(usize, usize) -> i32;
 type UseFn = unsafe extern "system" fn(usize, usize) -> u32;
 type ShowFn = unsafe extern "system" fn(usize, usize, usize) -> i32;
+type JournalSeqFn = unsafe extern "system" fn() -> u64;
 
 /// The exports of `xmem.dll` this module uses.
 struct Api {
@@ -519,6 +520,8 @@ struct Api {
     gpu_use: UseFn,
     /// `DecantXmemShowPages`, which an older `xmem.dll` does not have.
     show: Option<ShowFn>,
+    /// `DecantXmemJournalSeq`, which an older `xmem.dll` does not have.
+    journal_seq: Option<JournalSeqFn>,
 }
 
 /// One pool heap: the buffer over it and where its memory is mapped.
@@ -567,6 +570,8 @@ struct State {
     mirror: Mirror,
     /// The sequence number of the last journal record applied.
     seq: u64,
+    /// Last `DecantXmemJournalSeq` observed before draining `xmem.dll`.
+    last_journal_seq: Option<u64>,
     /// Pool heaps by index. A heap that cannot be made is `None` and is not tried again.
     heaps: Vec<Option<Heap>>,
     /// The heaps that could not be made.
@@ -615,10 +620,16 @@ impl Drop for State {
     }
 }
 
-static STATE: Mutex<Option<State>> = Mutex::new(None);
+static STATE: RwLock<Option<State>> = RwLock::new(None);
+/// Last `DecantXmemJournalSeq` drained into `STATE` (`u64::MAX` when unknown).
+static LAST_JOURNAL_SEQ: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Serializes `sync` and `device_created` across queues so `execute_copies` runs without holding `STATE`,
 /// and reuses the `CopyJob` buffer across syncs.
 static SYNC_LOCK: Mutex<Vec<CopyJob>> = Mutex::new(Vec::new());
+
+fn should_skip_drain(last_seq: Option<u64>, current_seq: Option<u64>) -> bool {
+    matches!((last_seq, current_seq), (Some(a), Some(b)) if a == b)
+}
 /// Pages of commits on demand given to the GPU so far (`State::give`).
 static GIVEN_PAGES: AtomicU64 = AtomicU64::new(0);
 
@@ -686,6 +697,7 @@ fn api() -> Option<&'static Api> {
                     writable: std::mem::transmute::<unsafe extern "system" fn() -> isize, WritableFn>(g),
                     gpu_use: std::mem::transmute::<unsafe extern "system" fn() -> isize, UseFn>(h),
                     show: get(c"DecantXmemShowPages").map(|f| std::mem::transmute::<unsafe extern "system" fn() -> isize, ShowFn>(f)),
+                    journal_seq: get(c"DecantXmemJournalSeq").map(|f| std::mem::transmute::<unsafe extern "system" fn() -> isize, JournalSeqFn>(f)),
                 }),
                 _ => None,
             }
@@ -877,6 +889,13 @@ impl State {
     /// Reads what `xmem.dll` changed since the last time into the mirror, or starts again from a snapshot
     /// when its ring no longer holds it.
     fn drain(&mut self, api: &Api) {
+        let cur_seq = api.journal_seq.map(|f| {
+            // SAFETY: `DecantXmemJournalSeq` is a lock-free atomic load returning `u64`.
+            unsafe { f() }
+        });
+        if should_skip_drain(self.last_journal_seq, cur_seq) {
+            return;
+        }
         let _trace = decant_trace::span("title_mem", "drain");
         loop {
             let mut written = 0u32;
@@ -898,6 +917,10 @@ impl State {
             }
         }
         self.make_windows();
+        self.last_journal_seq = cur_seq;
+        if let Some(seq) = cur_seq {
+            LAST_JOURNAL_SEQ.store(seq, Ordering::Release);
+        }
     }
 
     fn resync(&mut self, api: &Api) {
@@ -1053,11 +1076,12 @@ pub unsafe fn device_created(device: *mut c_void) {
         return;
     };
     let _sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut st = STATE.write().unwrap_or_else(PoisonError::into_inner);
     if st.is_some() {
         xs_log!("title memory: a second PC device, the heaps of the first are not used for it");
     }
     bump_mapping_gen();
+    LAST_JOURNAL_SEQ.store(u64::MAX, Ordering::Release);
     *st = Some(State {
         id: NEXT_STATE.fetch_add(1, Ordering::Relaxed),
         device,
@@ -1066,6 +1090,7 @@ pub unsafe fn device_created(device: *mut c_void) {
         fence_value: 0,
         mirror: Mirror::new(window_bytes()),
         seq: 0,
+        last_journal_seq: None,
         heaps: Vec::new(),
         failed: HashSet::new(),
         windows: Vec::new(),
@@ -1089,7 +1114,7 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
         return None;
     }
     let api = api()?;
-    let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
     let st = guard.as_mut()?;
     if !st.tracking {
         st.tracking = true;
@@ -1099,6 +1124,25 @@ fn with_state<R>(f: impl FnOnce(&mut State, &Api) -> R) -> Option<R> {
     }
     st.drain(api);
     Some(f(st, api))
+}
+
+/// Runs `f` under a shared read lock when tracking is already active and the journal sequence is
+/// unchanged since the last drain. Returns `None` if an exclusive drain or mutation is needed.
+fn with_state_read<R>(f: impl FnOnce(&State) -> Option<R>) -> Option<R> {
+    if !enabled() {
+        return None;
+    }
+    let api = api()?;
+    let cur_seq = api.journal_seq.map(|g| {
+        // SAFETY: `DecantXmemJournalSeq` is a lock-free atomic load returning `u64`.
+        unsafe { g() }
+    });
+    let guard = decant_trace::timed_lock("title_mem::STATE_READ", || STATE.read().unwrap_or_else(PoisonError::into_inner));
+    let st = guard.as_ref()?;
+    if !st.tracking || !should_skip_drain(st.last_journal_seq, cur_seq) {
+        return None;
+    }
+    f(st)
 }
 
 /// Samples the mirror footprint and one rotating part of its title pages for the memory sampler. Only
@@ -1111,13 +1155,13 @@ pub fn sample() -> Option<MirrorSample> {
     }
     let api = api();
     let chunk = {
-        let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = STATE.write().unwrap_or_else(PoisonError::into_inner);
         guard.as_mut()?.zero_page_chunk(api)
     };
     let state = chunk.state;
     let results = chunk.read();
     let scanned = results.len() as u32;
-    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = STATE.write().unwrap_or_else(PoisonError::into_inner);
     let st = guard.as_mut()?;
     if st.id != state {
         return None;
@@ -1133,7 +1177,7 @@ pub fn sample() -> Option<MirrorSample> {
 
 /// The PC device the mirror is made on, one more reference (`None` before the first device).
 pub fn device() -> Option<ID3D12Device> {
-    STATE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.device.clone())
+    STATE.read().unwrap_or_else(PoisonError::into_inner).as_ref().map(|s| s.device.clone())
 }
 
 /// The generation of the window slots now: it changes when a slot is given or freed, not when a page
@@ -1187,6 +1231,13 @@ fn span_of(va: u64, len: u64, give: bool) -> Option<Span> {
 }
 
 impl State {
+    fn translate_span_read(&self, va: u64, len: u64) -> Option<(Span, bool)> {
+        let placed = self.mirror.translate(va, len)?;
+        let w = self.windows.get(placed.buffer)?.as_ref()?;
+        let is_fresh = self.mirror.pending_in(placed.buffer, placed.offset, len);
+        Some((Span { resource: w.resource.as_raw() as usize, gpu: w.gpu + placed.offset, offset: placed.offset, left: placed.left }, is_fresh))
+    }
+
     fn translate_span(&mut self, api: &Api, va: u64, len: u64, give: bool) -> Option<(Span, bool)> {
         if give {
             self.give(api, va, len.max(ADDRESS_REACH));
@@ -1223,7 +1274,12 @@ pub fn translate_fresh_batch(spans: &[(u64, u64)], out: &mut Vec<Option<(Span, b
 fn span_of_with(va: u64, len: u64, give: bool, fresh: &mut bool) -> Option<Span> {
     static SEEN: AtomicI32 = AtomicI32::new(0);
     static NEAR: AtomicI32 = AtomicI32::new(0);
-    let (span, is_fresh) = with_state(|st, api| st.translate_span(api, va, len, give))??;
+    let (span, is_fresh) = if !give {
+        with_state_read(|st| st.translate_span_read(va, len))
+            .or_else(|| with_state(|st, api| st.translate_span(api, va, len, false)).flatten())?
+    } else {
+        with_state(|st, api| st.translate_span(api, va, len, true)).flatten()?
+    };
     *fresh = is_fresh;
     if SEEN.fetch_add(1, Ordering::Relaxed) < 3 {
         xs_log!("title memory: title address {va:#x} ({len} bytes) is at offset {:#x} of a window buffer, GPU address {:#x}", span.offset, span.gpu);
@@ -1388,7 +1444,7 @@ pub unsafe fn sync(queue: *mut c_void) {
 
     let mut ranges_updated = 0u64;
     if let Some(api) = api() {
-        let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut guard = decant_trace::timed_lock("title_mem::STATE", || STATE.write().unwrap_or_else(PoisonError::into_inner));
         if let Some(st) = guard.as_mut().filter(|st| st.id == phase1_id) {
             st.stats.copy_micros += copy_micros;
             let tiles = Instant::now();
@@ -1635,5 +1691,18 @@ mod tests {
         let _sync_guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let done = std::thread::spawn(|| translate(0x1000, 64)).join().unwrap();
         assert!(done.is_none());
+    }
+
+    #[test]
+    fn journal_seq_skip_logic_and_rwlock_allow_concurrent_reads() {
+        assert!(!should_skip_drain(None, None));
+        assert!(!should_skip_drain(None, Some(0)));
+        assert!(!should_skip_drain(Some(5), None));
+        assert!(!should_skip_drain(Some(5), Some(6)));
+        assert!(should_skip_drain(Some(5), Some(5)));
+
+        let r1 = STATE.read().unwrap_or_else(PoisonError::into_inner);
+        let r2 = std::thread::spawn(|| STATE.read().unwrap_or_else(PoisonError::into_inner).is_some()).join().unwrap();
+        assert_eq!(r2, r1.is_some());
     }
 }

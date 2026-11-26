@@ -40,7 +40,38 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::ManuallyDrop;
+
+#[derive(Default)]
+struct FastIntHasher(u64);
+
+impl Hasher for FastIntHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.wrapping_mul(0x517c_c1b7_2722_0a95).wrapping_add(u64::from(b));
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastIntHasher>>;
+type FastSet<K> = HashSet<K, BuildHasherDefault<FastIntHasher>>;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -953,7 +984,7 @@ struct Registry {
     textures: BTreeMap<usize, Placed>,
     /// Resources that currently want a fill (`Placed::wants_fill`), so a flush visits only dirty
     /// textures instead of scanning the whole table.
-    pending: HashSet<usize>,
+    pending: FastSet<usize>,
     /// Transitions noted per PC command list as `(resource, subresource, state after)`.
     noted: HashMap<usize, Vec<(usize, u32, u32)>>,
     /// Kinds of textures and refusal reasons logged so far, to log each once.
@@ -971,9 +1002,9 @@ struct Registry {
     /// Cached reverse index from mirror tile index to placed texture resources, maintained
     /// incrementally on insert and remove and rebuilt only when `title_mem::mapping_generation()`
     /// changes structurally.
-    tile_to_textures: HashMap<u32, Vec<usize>>,
-    unmapped_textures: HashSet<usize>,
-    pending_index: HashSet<usize>,
+    tile_to_textures: FastMap<u32, Vec<usize>>,
+    unmapped_textures: FastSet<usize>,
+    pending_index: FastSet<usize>,
     layout_gen: u64,
     last_tile_gen: u64,
     scratch: RegistryScratch,
@@ -1134,6 +1165,9 @@ impl Registry {
 
     /// Marks textures whose mirror tiles appear in `tiles` using the cached reverse index.
     fn mark_tiles_from_index(&mut self, tiles: &[u32], report: bool) -> u32 {
+        if self.tile_to_textures.is_empty() && !report {
+            return 0;
+        }
         let mut hit = std::mem::take(&mut self.scratch.overlapping);
         hit.clear();
         for &tile in tiles {
@@ -1141,8 +1175,10 @@ impl Registry {
                 hit.extend_from_slice(list);
             }
         }
-        hit.sort_unstable();
-        hit.dedup();
+        if hit.len() > 1 {
+            hit.sort_unstable();
+            hit.dedup();
+        }
         let mut marked = 0u32;
         for &res in &hit {
             if let Some(texture) = self.textures.get_mut(&res) {
@@ -2002,5 +2038,15 @@ mod tests {
         let count = std::thread::spawn(|| with_registry(|r| r.textures.len())).join().unwrap();
         assert_eq!(count, with_registry(|r| r.textures.len()));
         assert!(!summary().is_empty());
+    }
+
+    #[test]
+    fn fast_tile_index_handles_empty_and_deduplicates_multi_tile_hits() {
+        let mut r = Registry::default();
+        assert_eq!(r.mark_tiles_from_index(&[1, 2, 3], false), 0);
+        r.insert(1, placed(0x1000, 0x2000));
+        r.apply_incremental_index(&[(1, 0x1000, 0x2000)], &[Some(vec![40, 41, 42])], 1, true);
+        assert_eq!(r.mark_tiles_from_index(&[40, 41, 41, 42], false), 1);
+        assert!(r.pending.contains(&1));
     }
 }
