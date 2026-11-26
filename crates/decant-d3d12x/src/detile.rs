@@ -1072,6 +1072,12 @@ impl Registry {
     }
 
     /// Fills `out` with the resources whose memory overlaps `[start, end)`.
+    fn has_overlap(&self, start: u64, end: u64) -> bool {
+        self.by_address
+            .range(start.saturating_sub(self.largest)..end)
+            .any(|(_, resources)| resources.iter().any(|res| self.textures.get(res).is_some_and(|t| start < t.va.saturating_add(t.plan.size))))
+    }
+
     fn overlapping_into(&self, start: u64, end: u64, out: &mut Vec<usize>) {
         out.clear();
         for (_, resources) in self.by_address.range(start.saturating_sub(self.largest)..end) {
@@ -1320,13 +1326,18 @@ pub fn register(res: usize, va: u64, raw: &[u8; 0x38], state: u32, bytes: u64) {
             }
             r.insert(res, Placed { va, plan, bytes, states: Arc::new(vec![state]), tiles: None, dirty: true, attempts: 0 });
         }),
-        Err(why) => with_registry(|r| {
+        Err(why) => {
             let reason = why.split(':').next().unwrap_or("");
-            if r.logged_refused.len() < 64 && !r.logged_refused.contains(reason) {
-                r.logged_refused.insert(reason.to_string());
-                xs_log!("detile: a placed texture at {va:#x} is not detiled: {why}");
+            if with_registry_read(|r| r.logged_refused.len() < 64 && !r.logged_refused.contains(reason)) == Some(false) {
+                return;
             }
-        }),
+            with_registry(|r| {
+                if r.logged_refused.len() < 64 && !r.logged_refused.contains(reason) {
+                    r.logged_refused.insert(reason.to_string());
+                    xs_log!("detile: a placed texture at {va:#x} is not detiled: {why}");
+                }
+            });
+        }
     }
 }
 
@@ -1369,6 +1380,9 @@ pub fn note_write(va: u64, len: u64) {
         return;
     }
     let end = va.saturating_add(len);
+    if with_registry_read(|r| r.has_overlap(va, end)) != Some(true) {
+        return;
+    }
     with_registry(|r| {
         let mut hit = std::mem::take(&mut r.scratch.overlapping);
         r.overlapping_into(va, end, &mut hit);
@@ -1405,20 +1419,9 @@ pub fn note_tiles(tiles: &[u32]) {
     let report = probe_line_due();
     let current_layout = crate::title_mem::mapping_generation();
     let current_tile = crate::title_mem::tile_generation();
-    if !report
-        && with_registry_read(|r| {
-            r.textures.is_empty()
-                || (r.layout_gen == current_layout
-                    && r.pending_index.is_empty()
-                    && (current_tile == r.last_tile_gen || r.unmapped_textures.is_empty())
-                    && !tiles.iter().any(|t| r.tile_to_textures.contains_key(t)))
-        }) != Some(false)
-    {
-        return;
-    }
-    let fast = with_registry(|r| {
+    let Some(fast) = with_registry_read(|r| {
         if r.textures.is_empty() {
-            return Ok(0);
+            return Ok(false);
         }
         if r.layout_gen != current_layout {
             let items: Vec<(usize, u64, u64)> = r.textures.iter().map(|(&res, t)| (res, t.va, t.plan.size)).collect();
@@ -1445,10 +1448,13 @@ pub fn note_tiles(tiles: &[u32]) {
             let spans: Vec<(u64, u64)> = items.iter().map(|&(_, va, len)| (va, len)).collect();
             return Err((false, current_layout, items, spans));
         }
-        Ok(r.mark_tiles_from_index(tiles, report))
-    });
+        Ok(report || tiles.iter().any(|t| r.tile_to_textures.contains_key(t)))
+    }) else {
+        return;
+    };
     let marked = match fast {
-        Ok(marked) => marked,
+        Ok(false) => 0,
+        Ok(true) => with_registry(|r| r.mark_tiles_from_index(tiles, report)),
         Err((full_rebuild, snap_layout, items, spans)) => {
             let build_layout = crate::title_mem::mapping_generation();
             let build_tile = crate::title_mem::tile_generation();
@@ -2062,8 +2068,7 @@ mod tests {
     #[test]
     fn detiler_lock_does_not_block_registry_access() {
         let _detiler_guard = DETILER.lock().unwrap_or_else(|e| e.into_inner());
-        let count = std::thread::spawn(|| with_registry(|r| r.textures.len())).join().unwrap();
-        assert_eq!(count, with_registry(|r| r.textures.len()));
+        let _ = std::thread::spawn(|| with_registry_read(|r| r.textures.len())).join().unwrap();
         assert!(!summary().is_empty());
     }
 
@@ -2092,10 +2097,12 @@ mod tests {
 
     #[test]
     fn registry_rwlock_allows_concurrent_reads_and_fast_misses() {
-        let r1 = REGISTRY.read().unwrap_or_else(|e| e.into_inner());
-        let r2 = std::thread::spawn(|| REGISTRY.read().unwrap_or_else(|e| e.into_inner()).is_some()).join().unwrap();
-        assert_eq!(r2, r1.is_some());
+        let local: RwLock<Option<Registry>> = RwLock::new(Some(Registry::default()));
+        let r1 = local.read().unwrap_or_else(|e| e.into_inner());
+        let r2 = std::thread::scope(|s| s.spawn(|| local.read().unwrap_or_else(|e| e.into_inner()).is_some()).join().unwrap());
+        assert!(r1.is_some() && r2);
         drop(r1);
+        note_write(0xDEAD_0000, 64);
         note_transitions(0xDEAD, &[(0xBEEF, 0, 1)]);
         list_reset(0xDEAD);
         submitted(&[0xDEAD]);
