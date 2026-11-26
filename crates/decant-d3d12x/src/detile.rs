@@ -925,11 +925,48 @@ fn select_staging_to_trim(frames: impl Iterator<Item = (usize, u64, u64)>, compl
 
 // ==== the registry of placed textures ====
 
+impl Drop for Registry {
+    fn drop(&mut self) {
+        for &res in self.textures.keys() {
+            placed_remove(res);
+        }
+    }
+}
+
 /// Fast path flag indicating whether at least one registered texture may want a fill.
 static HAS_PENDING_FILLS: AtomicBool = AtomicBool::new(false);
 /// Fast path counters to skip `REGISTRY_READ` when no textures or noted transitions exist.
 static TEXTURE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NOTED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+const PLACED_SHARDS: usize = 16;
+
+static PLACED_SET: [Mutex<FastSet<usize>>; PLACED_SHARDS] = [const { Mutex::new(HashSet::with_hasher(BuildHasherDefault::new())) }; PLACED_SHARDS];
+
+#[inline]
+fn placed_shard(res: usize) -> usize {
+    (res >> 4) & (PLACED_SHARDS - 1)
+}
+
+#[inline]
+fn placed_insert(res: usize) {
+    PLACED_SET[placed_shard(res)].lock().unwrap_or_else(|e| e.into_inner()).insert(res);
+}
+
+#[inline]
+fn placed_remove(res: usize) {
+    PLACED_SET[placed_shard(res)].lock().unwrap_or_else(|e| e.into_inner()).remove(&res);
+}
+
+#[inline]
+fn is_placed(res: usize) -> bool {
+    PLACED_SET[placed_shard(res)].lock().unwrap_or_else(|e| e.into_inner()).contains(&res)
+}
+
+#[inline]
+fn any_placed(transitions: &[(usize, u32, u32)]) -> bool {
+    transitions.iter().any(|&(res, _, _)| is_placed(res))
+}
 
 struct OwnedJob {
     texture: ID3D12Resource,
@@ -1031,12 +1068,14 @@ impl Registry {
         crate::mem_owners::add(crate::mem_owners::Kind::DetileTexture, crate::mem_owners::Segment::Local, 1, texture.bytes);
         self.textures.insert(res, texture);
         TEXTURE_COUNT.store(self.textures.len(), Ordering::Release);
+        placed_insert(res);
     }
 
     /// Drops `res`. Whether it was held.
     fn remove(&mut self, res: usize) -> bool {
         let Some(texture) = self.textures.remove(&res) else { return false };
         TEXTURE_COUNT.store(self.textures.len(), Ordering::Release);
+        placed_remove(res);
         self.pending.remove(&res);
         self.pending_index.remove(&res);
         self.unmapped_textures.remove(&res);
@@ -1401,7 +1440,7 @@ pub fn describe(res: usize) -> Option<String> {
 
 /// The resource was released.
 pub fn forget(res: usize) {
-    if TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
+    if TEXTURE_COUNT.load(Ordering::Acquire) == 0 || !is_placed(res) {
         return;
     }
     if with_registry_read(|r| r.textures.contains_key(&res)) != Some(true) {
@@ -1414,7 +1453,7 @@ pub fn forget(res: usize) {
 
 /// Removes a batch of released resources under a single `REGISTRY` lock acquisition.
 pub fn forget_many(resources: &[usize]) {
-    if resources.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
+    if resources.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 || !resources.iter().any(|&res| is_placed(res)) {
         return;
     }
     with_registry(|r| {
@@ -1557,7 +1596,7 @@ pub fn note_tiles(tiles: &[u32]) {
 /// The title's GPU work writes into the texture (a copy). The CPU view is stale from then on, so
 /// the texture is not detiled any more.
 pub fn note_gpu_write(res: usize) {
-    if TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
+    if TEXTURE_COUNT.load(Ordering::Acquire) == 0 || !is_placed(res) {
         return;
     }
     if with_registry_read(|r| r.textures.contains_key(&res)) != Some(true) {
@@ -1575,7 +1614,7 @@ pub fn note_gpu_write(res: usize) {
 
 /// The title recorded `transitions` (resource, subresource, state after) on PC list `list`.
 pub fn note_transitions(list: usize, transitions: &[(usize, u32, u32)]) {
-    if !enabled() || transitions.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 {
+    if !enabled() || transitions.is_empty() || TEXTURE_COUNT.load(Ordering::Acquire) == 0 || !any_placed(transitions) {
         return;
     }
     let filtered: Vec<(usize, u32, u32)> = with_registry_read(|r| {
@@ -2285,5 +2324,34 @@ mod tests {
         });
         list_reset(0xABCD);
         assert!(with_noted(|n| n.lists.get(&0xABCD).is_some_and(Vec::is_empty)));
+    }
+
+    #[test]
+    fn placed_set_tracks_insert_remove_forget_many_and_skips_registry_for_non_placed() {
+        let _guard = REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+        drop(_guard);
+
+        with_registry(|r| {
+            r.insert(0x2010, placed(0x1000, 0x1000));
+            r.insert(0x2020, placed(0x2000, 0x1000));
+            r.insert(0x2030, placed(0x3000, 0x1000));
+        });
+        assert!(is_placed(0x2010) && is_placed(0x2020) && is_placed(0x2030));
+        assert!(!is_placed(0x9990));
+
+        // Hold REGISTRY exclusive write lock: non-placed callers must return without blocking.
+        let write_guard = REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+        forget(0x9990);
+        note_gpu_write(0x9990);
+        note_transitions(0x7777, &[(0x9990, 0, 1), (0x99A0, 0, 2)]);
+        forget_many(&[0x9990, 0x99A0]);
+        drop(write_guard);
+
+        with_registry(|r| assert!(r.remove(0x2010)));
+        assert!(!is_placed(0x2010));
+        assert!(is_placed(0x2020) && is_placed(0x2030));
+
+        forget_many(&[0x2020, 0x2030]);
+        assert!(!is_placed(0x2020) && !is_placed(0x2030));
     }
 }
