@@ -877,27 +877,148 @@ struct UploadRun {
     bytes: u64,
 }
 
+fn has_avx2() -> bool {
+    static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVX2.get_or_init(|| {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            std::arch::is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            false
+        }
+    })
+}
+
+#[inline]
+fn fmix64(mut k: u64) -> u64 {
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    k ^ (k >> 33)
+}
+
+#[inline]
+fn fold_lanes_to_u128(lanes: [u64; 8]) -> u128 {
+    let mut h1 = 0x243F_6A88_85A3_08D3u64;
+    let mut h2 = 0x1319_8A2E_0370_7344u64;
+    let mut i = 0usize;
+    while i < 8 {
+        h1 = h1.wrapping_add(lanes[i]).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h1 = h1.rotate_left(27) ^ lanes[i + 1];
+        h2 = h2.wrapping_add(lanes[i + 1]).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h2 = h2.rotate_left(31) ^ lanes[i];
+        i += 2;
+    }
+    h1 = fmix64(h1 ^ h2.rotate_left(17));
+    h2 = fmix64(h2 ^ h1.rotate_left(29));
+    (u128::from(h2) << 64) | u128::from(h1)
+}
+
+/// Scalar 4-way unrolled 128-bit fingerprint of `SUBPAGE_BYTES`.
+///
+/// # Safety
+/// `src` must be readable for `SUBPAGE_BYTES` bytes.
+unsafe fn hash_subpage_scalar(src: *const u8) -> u128 {
+    const CHUNKS: usize = SUBPAGE_BYTES / 32;
+    let mut a0 = 0x243F_6A88_85A3_08D3u64;
+    let mut a1 = 0x1319_8A2E_0370_7344u64;
+    let mut a2 = 0xA409_3822_299F_31D0u64;
+    let mut a3 = 0x082E_FA98_EC4E_6C89u64;
+    let words = src.cast::<u64>();
+    for i in 0..CHUNKS {
+        let base = i * 4;
+        // SAFETY: `(base + 3) * 8 + 8 <= SUBPAGE_BYTES`.
+        let w0 = unsafe { words.add(base).read_unaligned() };
+        let w1 = unsafe { words.add(base + 1).read_unaligned() };
+        let w2 = unsafe { words.add(base + 2).read_unaligned() };
+        let w3 = unsafe { words.add(base + 3).read_unaligned() };
+        a0 = a0.wrapping_add(w0).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
+        a1 = (a1 ^ w1).wrapping_mul(0xBF58_476D_1CE4_E5B9).rotate_left(29);
+        a2 = a2.wrapping_add(w2).wrapping_mul(0x94D0_49BB_1331_11EB).rotate_left(31);
+        a3 = (a3 ^ w3).wrapping_mul(0xD6E8_FEB8_6659_FD93).rotate_left(19);
+    }
+    let h1 = fmix64(a0 ^ a2.rotate_left(13) ^ a1.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let h2 = fmix64(a1 ^ a3.rotate_left(17) ^ a0.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    (u128::from(h2) << 64) | u128::from(h1)
+}
+
+/// AVX2 256-bit vectorized 128-bit fingerprint of `SUBPAGE_BYTES` processing 64 bytes per step.
+///
+/// # Safety
+/// Caller must ensure AVX2 is supported and `src` is readable for `SUBPAGE_BYTES` bytes.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn hash_subpage_avx2(src: *const u8) -> u128 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    const ITERS: usize = SUBPAGE_BYTES / 64;
+    let mut acc0 = _mm256_set_epi64x(
+        0x243F_6A88_85A3_08D3u64 as i64,
+        0x1319_8A2E_0370_7344u64 as i64,
+        0xA409_3822_299F_31D0u64 as i64,
+        0x082E_FA98_EC4E_6C89u64 as i64,
+    );
+    let mut acc1 = _mm256_set_epi64x(
+        0x4528_21E6_38D0_1377u64 as i64,
+        0xBE54_66CF_34E9_0C6Cu64 as i64,
+        0xC0AC_29B7_C97C_50DDu64 as i64,
+        0x3F84_D5B5_B547_0917u64 as i64,
+    );
+    let mul0 = _mm256_set_epi64x(
+        0x9E37_79B9_7F4A_7C15u64 as i64,
+        0xBF58_476D_1CE4_E5B9u64 as i64,
+        0x94D0_49BB_1331_11EBu64 as i64,
+        0xD6E8_FEB8_6659_FD93u64 as i64,
+    );
+    let mul1 = _mm256_set_epi64x(
+        0xFF51_AFD7_ED55_8CCDu64 as i64,
+        0xC4CE_B9FE_1A85_EC53u64 as i64,
+        0x2545_F491_4F6C_DD1Du64 as i64,
+        0x9E37_79B1_85EB_CA87u64 as i64,
+    );
+
+    for i in 0..ITERS {
+        let ptr = unsafe { src.add(i * 64) };
+        let v0 = unsafe { _mm256_loadu_si256(ptr.cast::<__m256i>()) };
+        let v1 = unsafe { _mm256_loadu_si256(ptr.add(32).cast::<__m256i>()) };
+
+        acc0 = _mm256_add_epi64(acc0, v0);
+        acc0 = _mm256_xor_si256(acc0, _mm256_srli_epi64(acc0, 32));
+        acc0 = _mm256_mul_epu32(acc0, mul0);
+        acc0 = _mm256_xor_si256(acc0, _mm256_srli_epi64(acc0, 29));
+
+        acc1 = _mm256_add_epi64(acc1, v1);
+        acc1 = _mm256_xor_si256(acc1, _mm256_srli_epi64(acc1, 32));
+        acc1 = _mm256_mul_epu32(acc1, mul1);
+        acc1 = _mm256_xor_si256(acc1, _mm256_srli_epi64(acc1, 31));
+    }
+
+    let mut lanes = [0u64; 8];
+    unsafe {
+        _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), acc0);
+        _mm256_storeu_si256(lanes.as_mut_ptr().add(4).cast::<__m256i>(), acc1);
+    }
+    fold_lanes_to_u128(lanes)
+}
+
 /// Deterministic 128-bit fingerprint of a 4 KiB sub-page (`SUBPAGE_BYTES`).
 ///
 /// # Safety
 /// `src` must be readable for `SUBPAGE_BYTES` bytes.
 unsafe fn hash_subpage(src: *const u8) -> u128 {
-    const WORDS: usize = SUBPAGE_BYTES / 8;
-    let mut h1 = 0x243F_6A88_85A3_08D3u64;
-    let mut h2 = 0x1319_8A2E_0370_7344u64;
-    for i in 0..WORDS {
-        // SAFETY: `i * 8 < SUBPAGE_BYTES`.
-        let w = unsafe { src.cast::<u64>().add(i).read_unaligned() };
-        h1 = h1.wrapping_add(w).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h1 ^= h1 >> 30;
-        h2 = (h2 ^ w).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        h2 = h2.rotate_left(27);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if has_avx2() {
+        // SAFETY: `has_avx2()` verified AVX2 support and caller guarantees `SUBPAGE_BYTES` readable.
+        return unsafe { hash_subpage_avx2(src) };
     }
-    h1 ^= h1 >> 27;
-    h1 = h1.wrapping_mul(0x94D0_49BB_1331_11EB);
-    h2 ^= h2 >> 31;
-    h2 = h2.wrapping_mul(0xD6E8_FEB8_6659_FD93);
-    (u128::from(h2) << 64) | u128::from(h1)
+    // SAFETY: caller guarantees `src` is readable for `SUBPAGE_BYTES` bytes.
+    unsafe { hash_subpage_scalar(src) }
 }
 
 #[derive(Default)]
@@ -941,67 +1062,175 @@ impl L1Fingerprints {
     }
 }
 
-/// Filters staged L1 `runs` to contiguous changed 4 KiB sub-page runs using `prints` when
-/// `diff_enabled` is true, appending staged `CopyJob`s to `jobs` and returning
-/// `(staged_bytes, skipped_bytes)`. Hashes sub-pages in parallel when `>= 16` pages are staged.
-///
-/// # Safety
-/// Every `UploadRun` in `runs` must have a live readable `source` for `bytes` bytes.
-unsafe fn filter_staged_runs(
-    runs: &mut Vec<UploadRun>,
-    prints: &mut L1Fingerprints,
-    jobs: &mut Vec<CopyJob>,
-    diff_enabled: bool,
-    cores: usize,
-) -> (usize, u64) {
-    if runs.is_empty() {
-        return (0, 0);
-    }
-    let _trace = decant_trace::span("title_mem", "subpage_diff");
-    if !diff_enabled {
-        let mut staged_bytes = 0usize;
-        for run in runs.iter_mut() {
-            run.staging_offset = staged_bytes as u64;
-            let pages = (run.bytes / PAGE) as usize;
-            plan_copy(jobs, run.source, staged_bytes, pages, true);
-            staged_bytes += run.bytes as usize;
+const DIFF_PARALLEL_MIN_TILES: usize = 64;
+
+#[derive(Default)]
+struct DiffScratch {
+    tile_srcs: Vec<usize>,
+    computed: Vec<[u128; SUBPAGES_PER_PAGE]>,
+}
+
+struct DiffState {
+    srcs_ptr: usize,
+    out_ptr: usize,
+    total_tiles: usize,
+    workers_to_take: usize,
+    active_workers: usize,
+    epoch: u64,
+}
+
+struct DiffShared {
+    state: Mutex<DiffState>,
+    next: std::sync::atomic::AtomicUsize,
+    cv_work: Condvar,
+    cv_done: Condvar,
+}
+
+struct DiffPool {
+    workers: usize,
+    scratch: Mutex<DiffScratch>,
+    shared: Arc<DiffShared>,
+}
+
+impl DiffPool {
+    fn new(workers: usize) -> Self {
+        let shared = Arc::new(DiffShared {
+            state: Mutex::new(DiffState {
+                srcs_ptr: 0,
+                out_ptr: 0,
+                total_tiles: 0,
+                workers_to_take: 0,
+                active_workers: 0,
+                epoch: 0,
+            }),
+            next: std::sync::atomic::AtomicUsize::new(0),
+            cv_work: Condvar::new(),
+            cv_done: Condvar::new(),
+        });
+        for i in 0..workers {
+            let shared = Arc::clone(&shared);
+            let _ = std::thread::Builder::new().name(format!("title-mem-diff-{i}")).spawn(move || {
+                let mut seen_gen = 0u64;
+                loop {
+                    let (srcs_ptr, out_ptr, total_tiles) = {
+                        let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                        while st.epoch == seen_gen || st.workers_to_take == 0 {
+                            st = shared.cv_work.wait(st).unwrap_or_else(|e| e.into_inner());
+                        }
+                        seen_gen = st.epoch;
+                        st.workers_to_take -= 1;
+                        (
+                            st.srcs_ptr as *const usize,
+                            st.out_ptr as *mut [u128; SUBPAGES_PER_PAGE],
+                            st.total_tiles,
+                        )
+                    };
+                    loop {
+                        let idx = shared.next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= total_tiles {
+                            break;
+                        }
+                        // SAFETY: `hash_and_consume` keeps `tile_srcs` and `computed` alive until `active_workers` is 0.
+                        unsafe { hash_tile_slot(*srcs_ptr.add(idx), &mut *out_ptr.add(idx)) };
+                    }
+                    let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.active_workers -= 1;
+                    if st.active_workers == 0 {
+                        shared.cv_done.notify_one();
+                    }
+                }
+            });
         }
-        return (staged_bytes, 0);
+        Self { workers, scratch: Mutex::new(DiffScratch::default()), shared }
     }
-    let raw = std::mem::take(runs);
-    let total_tiles: usize = raw.iter().map(|r| (r.bytes / PAGE) as usize).sum();
-    let parallel_hashes = if total_tiles >= 16 && cores > 1 {
-        let mut tile_srcs = Vec::with_capacity(total_tiles);
-        for run in &raw {
+
+    /// # Safety
+    /// Every `UploadRun` in `raw` must have a live readable `source` for `bytes` bytes.
+    unsafe fn hash_and_consume<R>(
+        &self,
+        raw: &[UploadRun],
+        total_tiles: usize,
+        cores: usize,
+        consume: impl FnOnce(&[[u128; SUBPAGES_PER_PAGE]]) -> R,
+    ) -> R {
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        scratch.tile_srcs.clear();
+        scratch.tile_srcs.reserve(total_tiles);
+        for run in raw {
             let tile_count = (run.bytes / PAGE) as usize;
             for t in 0..tile_count {
-                tile_srcs.push(run.source + t * PAGE as usize);
+                scratch.tile_srcs.push(run.source + t * PAGE as usize);
             }
         }
-        let mut computed = vec![[0u128; SUBPAGES_PER_PAGE]; total_tiles];
-        let threads = (total_tiles / 8).clamp(2, cores.min(16)).min(total_tiles);
-        let chunk_len = total_tiles.div_ceil(threads);
-        std::thread::scope(|scope| {
-            for (src_chunk, out_chunk) in tile_srcs.chunks(chunk_len).zip(computed.chunks_mut(chunk_len)) {
-                scope.spawn(move || {
-                    for (&tile_src, out_tile) in src_chunk.iter().zip(out_chunk.iter_mut()) {
-                        for (sp, slot) in out_tile.iter_mut().enumerate() {
-                            // SAFETY: caller guarantees `run.source..run.source + run.bytes` is readable.
-                            *slot = unsafe { hash_subpage((tile_src + sp * SUBPAGE_BYTES) as *const u8) };
-                        }
-                    }
-                });
+        if scratch.computed.len() < total_tiles {
+            scratch.computed.resize(total_tiles, [0u128; SUBPAGES_PER_PAGE]);
+        }
+        let threads = (total_tiles / 16).clamp(2, cores).min(total_tiles);
+        let worker_count = threads.saturating_sub(1).min(self.workers);
+        let srcs_ptr = scratch.tile_srcs.as_ptr();
+        let out_ptr = scratch.computed.as_mut_ptr();
+        if worker_count > 0 {
+            {
+                let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.srcs_ptr = srcs_ptr as usize;
+                st.out_ptr = out_ptr as usize;
+                st.total_tiles = total_tiles;
+                self.shared.next.store(0, Ordering::Relaxed);
+                st.workers_to_take = worker_count;
+                st.active_workers = worker_count;
+                st.epoch += 1;
+                self.shared.cv_work.notify_all();
             }
-        });
-        Some(computed)
-    } else {
-        None
-    };
+            loop {
+                let idx = self.shared.next.fetch_add(1, Ordering::Relaxed);
+                if idx >= total_tiles {
+                    break;
+                }
+                // SAFETY: `idx < total_tiles` is unique to this thread and `scratch` stays locked.
+                unsafe { hash_tile_slot(*srcs_ptr.add(idx), &mut *out_ptr.add(idx)) };
+            }
+            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            while st.active_workers > 0 {
+                st = self.shared.cv_done.wait(st).unwrap_or_else(|e| e.into_inner());
+            }
+        } else {
+            for idx in 0..total_tiles {
+                // SAFETY: `idx < total_tiles` and `scratch` stays locked.
+                unsafe { hash_tile_slot(*srcs_ptr.add(idx), &mut *out_ptr.add(idx)) };
+            }
+        }
+        consume(&scratch.computed[..total_tiles])
+    }
+}
 
+/// # Safety
+/// `tile_src` must be readable for `PAGE` bytes.
+#[inline]
+unsafe fn hash_tile_slot(tile_src: usize, out_tile: &mut [u128; SUBPAGES_PER_PAGE]) {
+    for (sp, slot) in out_tile.iter_mut().enumerate() {
+        // SAFETY: `sp * SUBPAGE_BYTES + SUBPAGE_BYTES <= PAGE`.
+        *slot = unsafe { hash_subpage((tile_src + sp * SUBPAGE_BYTES) as *const u8) };
+    }
+}
+
+fn diff_pool(cores: usize) -> &'static DiffPool {
+    static POOL: std::sync::OnceLock<DiffPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| DiffPool::new((cores / 2).clamp(2, 6)))
+}
+
+/// # Safety
+/// Every `UploadRun` in `raw` must have a live readable `source` for `bytes` bytes.
+unsafe fn apply_staged_runs(
+    raw: &[UploadRun],
+    prints: &mut L1Fingerprints,
+    runs: &mut Vec<UploadRun>,
+    jobs: &mut Vec<CopyJob>,
+    parallel_hashes: Option<&[[u128; SUBPAGES_PER_PAGE]]>,
+) -> (usize, u64) {
     let mut staged_bytes = 0usize;
     let mut skipped_bytes = 0u64;
     let mut hash_cursor = 0usize;
-    for run in raw {
+    for &run in raw {
         let hp = prints.heap_mut(run.heap as usize);
         let first_tile = (run.heap_offset / PAGE) as usize;
         let tile_count = (run.bytes / PAGE) as usize;
@@ -1030,7 +1259,7 @@ unsafe fn filter_staged_runs(
             let was_valid = hp.is_valid(tile);
             let hashes = hp.ensure_hashes();
             let tile_hashes = &mut hashes[tile];
-            let precomputed = parallel_hashes.as_ref().map(|v| &v[hash_cursor + t]);
+            let precomputed = parallel_hashes.map(|v| &v[hash_cursor + t]);
             for (sp, slot) in tile_hashes.iter_mut().enumerate() {
                 let sp_src = tile_src + sp * SUBPAGE_BYTES;
                 let h = match precomputed {
@@ -1064,6 +1293,49 @@ unsafe fn filter_staged_runs(
         flush_run(runs, jobs, &mut staged_bytes, run_src, run_heap_off, run_bytes);
     }
     (staged_bytes, skipped_bytes)
+}
+
+/// Filters staged L1 `runs` to contiguous changed 4 KiB sub-page runs using `prints` when
+/// `diff_enabled` is true, appending staged `CopyJob`s to `jobs` and returning
+/// `(staged_bytes, skipped_bytes)`. Hashes sub-pages on a persistent worker pool when
+/// `>= DIFF_PARALLEL_MIN_TILES` pages are staged.
+///
+/// # Safety
+/// Every `UploadRun` in `runs` must have a live readable `source` for `bytes` bytes.
+unsafe fn filter_staged_runs(
+    runs: &mut Vec<UploadRun>,
+    prints: &mut L1Fingerprints,
+    jobs: &mut Vec<CopyJob>,
+    diff_enabled: bool,
+    cores: usize,
+) -> (usize, u64) {
+    if runs.is_empty() {
+        return (0, 0);
+    }
+    let _trace = decant_trace::span("title_mem", "subpage_diff");
+    if !diff_enabled {
+        let mut staged_bytes = 0usize;
+        for run in runs.iter_mut() {
+            run.staging_offset = staged_bytes as u64;
+            let pages = (run.bytes / PAGE) as usize;
+            plan_copy(jobs, run.source, staged_bytes, pages, true);
+            staged_bytes += run.bytes as usize;
+        }
+        return (staged_bytes, 0);
+    }
+    let raw = std::mem::take(runs);
+    let total_tiles: usize = raw.iter().map(|r| (r.bytes / PAGE) as usize).sum();
+    if total_tiles >= DIFF_PARALLEL_MIN_TILES && cores > 1 {
+        // SAFETY: caller guarantees every `UploadRun` in `raw` has a live readable `source`.
+        unsafe {
+            diff_pool(cores).hash_and_consume(&raw, total_tiles, cores, |precomputed| {
+                apply_staged_runs(&raw, prints, runs, jobs, Some(precomputed))
+            })
+        }
+    } else {
+        // SAFETY: caller guarantees every `UploadRun` in `raw` has a live readable `source`.
+        unsafe { apply_staged_runs(&raw, prints, runs, jobs, None) }
+    }
 }
 
 fn collect_changed_l1_tiles(runs: &[UploadRun], out: &mut Vec<u32>) {
@@ -3343,5 +3615,70 @@ mod tests {
         assert_eq!(staging_ring_bytes(32_768 << 20), 32 << 20);
         assert_eq!(staging_ring_bytes(65_536 << 20), 64 << 20);
         assert_eq!(staging_ring_bytes(0), 64 << 20);
+    }
+
+    #[test]
+    fn hash_subpage_avalanche_and_repeatability_over_all_4k_bytes() {
+        // Use an unaligned buffer (+3 bytes) to verify unaligned loads work safely.
+        let mut backing = vec![0x3Cu8; SUBPAGE_BYTES + 16];
+        for (i, b) in backing[3..3 + SUBPAGE_BYTES].iter_mut().enumerate() {
+            *b = (i.wrapping_mul(37) ^ (i >> 3)) as u8;
+        }
+        let ptr = unsafe { backing.as_ptr().add(3) };
+        let base_hash = unsafe { hash_subpage(ptr) };
+        assert_eq!(base_hash, unsafe { hash_subpage(ptr) });
+        let base_scalar = unsafe { hash_subpage_scalar(ptr) };
+        assert_eq!(base_scalar, unsafe { hash_subpage_scalar(ptr) });
+
+        // Flip every byte position across all 4096 bytes and verify both paths detect every change.
+        for byte_idx in 0..SUBPAGE_BYTES {
+            let bit = 1u8 << (byte_idx & 7);
+            backing[3 + byte_idx] ^= bit;
+            let h = unsafe { hash_subpage(ptr) };
+            let hs = unsafe { hash_subpage_scalar(ptr) };
+            assert_ne!(h, base_hash, "hash_subpage missed bit flip at byte {byte_idx}");
+            assert_ne!(hs, base_scalar, "hash_subpage_scalar missed bit flip at byte {byte_idx}");
+            backing[3 + byte_idx] ^= bit;
+        }
+        assert_eq!(unsafe { hash_subpage(ptr) }, base_hash);
+    }
+
+    #[test]
+    fn parallel_diff_pool_matches_single_threaded_output_over_64_tiles() {
+        const PAGES: usize = 80;
+        let mut src_seq = vec![0x29u8; PAGES * PAGE as usize];
+        let mut src_par = src_seq.clone();
+        let mut prints_seq = L1Fingerprints::default();
+        let mut prints_par = L1Fingerprints::default();
+
+        let mut runs_seq = vec![UploadRun { source: src_seq.as_ptr() as usize, heap: 0, heap_offset: 0, staging_offset: 0, bytes: PAGES as u64 * PAGE }];
+        let mut runs_par = vec![UploadRun { source: src_par.as_ptr() as usize, heap: 0, heap_offset: 0, staging_offset: 0, bytes: PAGES as u64 * PAGE }];
+        let (mut jobs_seq, mut jobs_par) = (Vec::new(), Vec::new());
+        let res1_seq = unsafe { filter_staged_runs(&mut runs_seq, &mut prints_seq, &mut jobs_seq, true, 1) };
+        let res1_par = unsafe { filter_staged_runs(&mut runs_par, &mut prints_par, &mut jobs_par, true, 4) };
+        assert_eq!(res1_seq, res1_par);
+        assert_eq!(runs_seq, runs_par);
+
+        for &(tile, sp, val) in &[(0usize, 1usize, 0xA1u8), (19, 15, 0xB2), (48, 0, 0xC3), (79, 8, 0xD4)] {
+            let off = tile * PAGE as usize + sp * SUBPAGE_BYTES + 23;
+            src_seq[off] = val;
+            src_par[off] = val;
+        }
+        runs_seq = vec![
+            UploadRun { source: src_seq.as_ptr() as usize, heap: 0, heap_offset: 0, staging_offset: 0, bytes: 48 * PAGE },
+            UploadRun { source: unsafe { src_seq.as_ptr().add(48 * PAGE as usize) } as usize, heap: 0, heap_offset: 48 * PAGE, staging_offset: 0, bytes: 32 * PAGE },
+        ];
+        runs_par = vec![
+            UploadRun { source: src_par.as_ptr() as usize, heap: 0, heap_offset: 0, staging_offset: 0, bytes: 48 * PAGE },
+            UploadRun { source: unsafe { src_par.as_ptr().add(48 * PAGE as usize) } as usize, heap: 0, heap_offset: 48 * PAGE, staging_offset: 0, bytes: 32 * PAGE },
+        ];
+        jobs_seq.clear();
+        jobs_par.clear();
+        let res2_seq = unsafe { filter_staged_runs(&mut runs_seq, &mut prints_seq, &mut jobs_seq, true, 1) };
+        let res2_par = unsafe { filter_staged_runs(&mut runs_par, &mut prints_par, &mut jobs_par, true, 4) };
+        assert_eq!(res2_seq, res2_par);
+        assert_eq!(res2_par, (4 * SUBPAGE_BYTES, (PAGES * SUBPAGES_PER_PAGE - 4) as u64 * SUBPAGE_BYTES as u64));
+        assert_eq!(runs_seq, runs_par);
+        assert_eq!(jobs_seq.len(), jobs_par.len());
     }
 }
