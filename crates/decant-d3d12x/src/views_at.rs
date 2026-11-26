@@ -213,7 +213,7 @@ pub fn view_texture_cap(device: &windows::Win32::Graphics::Direct3D12::ID3D12Dev
 }
 
 /// Default LRU eviction budget for placed and committed view textures (MiB).
-pub const DEFAULT_VIEW_TEX_BUDGET_MIB: u64 = 2048;
+pub const DEFAULT_VIEW_TEX_BUDGET_MIB: u64 = 3072;
 
 /// The LRU eviction budget in bytes from `DECANT_D3D12X_VIEW_TEX_BUDGET_MIB` (0 disables eviction).
 pub fn budget_from(over_ride: Option<&str>) -> u64 {
@@ -221,7 +221,7 @@ pub fn budget_from(over_ride: Option<&str>) -> u64 {
 }
 
 /// The LRU eviction budget of view textures in bytes (`DECANT_D3D12X_VIEW_TEX_BUDGET_MIB`, default
-/// 2048 MiB, 0 disables eviction). Read once.
+/// 3072 MiB, 0 disables eviction). Read once.
 #[cfg(windows)]
 pub fn view_texture_budget() -> u64 {
     static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -239,6 +239,21 @@ impl ViewTextures {
     pub fn lookup(&self, va: u64, desc: &[u8; 0x38]) -> ViewTexture {
         match self.made.get(&va) {
             Some(e) if &e.desc == desc => ViewTexture::Same(e.res),
+            Some(e) => ViewTexture::Changed(e.res),
+            None => ViewTexture::New,
+        }
+    }
+
+    /// Looks up `va` and updates its last use timestamps in one lock acquisition on a hit.
+    pub fn lookup_and_touch(&mut self, va: u64, desc: &[u8; 0x38], present: u64, ms: u64) -> ViewTexture {
+        match self.made.get_mut(&va) {
+            Some(e) if &e.desc == desc => {
+                self.use_seq += 1;
+                e.last_present = present;
+                e.last_ms = ms;
+                e.last_use = self.use_seq;
+                ViewTexture::Same(e.res)
+            }
             Some(e) => ViewTexture::Changed(e.res),
             None => ViewTexture::New,
         }
@@ -381,23 +396,27 @@ impl ViewTextures {
         pass
     }
 
-    /// Evicts the least recently used unreferenced textures when [`live_bytes`] exceeds `budget`
-    /// (`budget` 0 disables eviction), up to [`MAX_PER_PASS`] textures per pass.
-    pub fn collect_budget(&mut self, budget: u64, heap_bytes: u64, referenced: &std::collections::HashSet<usize>) -> Pass {
+    /// Evicts the least recently used idle and unreferenced textures when [`live_bytes`] exceeds
+    /// `budget` (`budget` 0 disables eviction), enforcing [`MIN_IDLE_PRESENTS`] and [`MIN_IDLE_MS`]
+    /// up to [`MAX_PER_PASS`] textures per pass.
+    pub fn collect_budget(&mut self, budget: u64, heap_bytes: u64, present: u64, ms: u64, referenced: &std::collections::HashSet<usize>) -> Pass {
         let held_before = self.held_bytes(heap_bytes);
         let mut pass = Pass { held_before, held_after: held_before, ..Pass::default() };
         if budget == 0 || self.live_bytes <= budget {
             return pass;
         }
+        let free = |e: &ViewEntry| {
+            present.saturating_sub(e.last_present) >= MIN_IDLE_PRESENTS && ms.saturating_sub(e.last_ms) >= MIN_IDLE_MS && !referenced.contains(&e.res)
+        };
         // `(last_use, kind, key)` where kind 0 is `stale` (res) and kind 1 is `made` (va).
         let mut order: Vec<(u64, u8, u64)> = Vec::new();
         for e in &self.stale {
-            if !referenced.contains(&e.res) {
+            if free(e) {
                 order.push((e.last_use, 0, e.res as u64));
             }
         }
         for (&va, e) in &self.made {
-            if !referenced.contains(&e.res) {
+            if free(e) {
                 order.push((e.last_use, 1, va));
             }
         }
@@ -754,7 +773,7 @@ mod tests {
 
     #[test]
     fn lru_budget_evicts_oldest_unused_textures_and_reclaims_empty_heaps() {
-        use super::{DEFAULT_VIEW_TEX_BUDGET_MIB, budget_from};
+        use super::{DEFAULT_VIEW_TEX_BUDGET_MIB, MIN_IDLE_MS, MIN_IDLE_PRESENTS, budget_from};
         assert_eq!(budget_from(None), DEFAULT_VIEW_TEX_BUDGET_MIB << 20);
         assert_eq!(budget_from(Some("0")), 0);
         assert_eq!(budget_from(Some(" 512 ")), 512 << 20);
@@ -763,21 +782,29 @@ mod tests {
         t.note(0x1000, ViewEntry::new(desc3(), 1, Some(0), 500, 0, 0));
         t.note(0x2000, ViewEntry::new(desc3(), 2, Some(0), 500, 0, 0));
         t.note(0x3000, ViewEntry::new(desc3(), 3, Some(1), 500, 0, 0));
-        // Touch 0x1000 so 0x2000 and 0x3000 are older.
-        t.touch(0x1000, 1, 10);
 
         let held: std::collections::HashSet<usize> = [2].into_iter().collect();
-        // Budget 600: live_bytes is 1500. Res 2 is referenced, so 3 (oldest unreferenced) goes first,
-        // freeing heap 1 completely, then 1 (newer) goes so live_bytes drops to 500 <= 600.
-        let pass = t.collect_budget(600, 1000, &held);
+        // Before MIN_IDLE_PRESENTS and MIN_IDLE_MS have passed, nothing is evicted.
+        assert!(t.collect_budget(600, 1000, MIN_IDLE_PRESENTS - 1, MIN_IDLE_MS, &held).freed.is_empty());
+        assert!(t.collect_budget(600, 1000, MIN_IDLE_PRESENTS, MIN_IDLE_MS - 1, &held).freed.is_empty());
+
+        // Touch 0x1000 via lookup_and_touch at present 10, ms 10 so 0x1000 is newer and not idle yet.
+        assert_eq!(t.lookup_and_touch(0x1000, &desc3(), 10, 10), ViewTexture::Same(1));
+        let (p, ms) = (MIN_IDLE_PRESENTS, MIN_IDLE_MS);
+        let pass = t.collect_budget(600, 1000, p, ms, &held);
         let freed: Vec<usize> = pass.freed.iter().map(|e| e.res).collect();
-        assert_eq!(freed, vec![3, 1]);
+        assert_eq!(freed, vec![3], "only idle unreferenced 3 goes; touched 1 is still active");
         assert_eq!(pass.heaps_freed, 1, "heap 1 became empty and was reclaimed");
+        assert_eq!(t.live_bytes(), 1000);
+
+        // Once 0x1000 also reaches idle age, it is evicted to bring live_bytes <= 600.
+        let pass2 = t.collect_budget(600, 1000, p + 10, ms + 10, &held);
+        assert_eq!(pass2.freed.iter().map(|e| e.res).collect::<Vec<_>>(), vec![1]);
         assert_eq!(t.live_bytes(), 500);
         assert_eq!(t.held_bytes(1000), 1000);
-        assert!(!pass.stuck);
+        assert!(!pass2.stuck);
 
         // Budget 0 disables eviction.
-        assert!(t.collect_budget(0, 1000, &held).freed.is_empty());
+        assert!(t.collect_budget(0, 1000, p + 10, ms + 10, &held).freed.is_empty());
     }
 }
