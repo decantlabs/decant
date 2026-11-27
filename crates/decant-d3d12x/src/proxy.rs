@@ -3338,36 +3338,168 @@ extern "system" fn dev_create_placed_resource(this: *mut Proxy, heap: Object, of
     }
 }
 
+/// Size of `D3D12_COMMAND_SIGNATURE_DESC` on x64 (`ByteStride`, `NumArgumentDescs`,
+/// `pArgumentDescs`, `NodeMask`).
+const CMD_SIG_DESC_BYTES: usize = 24;
+/// Size of `D3D12_INDIRECT_ARGUMENT_DESC` on x64 (`Type` plus 12-byte union).
+const INDIRECT_ARG_DESC_BYTES: usize = 16;
+
 /// The `D3D12_INDIRECT_ARGUMENT_TYPE` of the console only `DispatchX` argument, which has no PC
 /// equivalent.
 const INDIRECT_ARGUMENT_DISPATCH_X: u32 = 105;
 
-/// The PC `D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH` that a `DispatchX` argument is made.
+/// PC `D3D12_INDIRECT_ARGUMENT_TYPE` enum values.
 const PC_INDIRECT_ARGUMENT_DISPATCH: u32 = 2;
+const PC_INDIRECT_ARGUMENT_CONSTANT: u32 = 5;
+const PC_INDIRECT_ARGUMENT_CBV: u32 = 6;
+const PC_INDIRECT_ARGUMENT_SRV: u32 = 7;
+const PC_INDIRECT_ARGUMENT_UAV: u32 = 8;
+const PC_INDIRECT_ARGUMENT_MAX_KNOWN: u32 = 11;
 
-/// Console slot 41: CreateCommandSignature. The console only `DispatchX` indirect argument type
-/// (105) is rewritten in the title's description to the PC `Dispatch` type (2), then the PC call
-/// is made with the root signature unwrapped.
+fn indirect_arg_type_name(ty: u32) -> &'static str {
+    match ty {
+        0 => "Draw",
+        1 => "DrawIndexed",
+        2 => "Dispatch",
+        3 => "VertexBufferView",
+        4 => "IndexBufferView",
+        5 => "Constant",
+        6 => "CBV",
+        7 => "SRV",
+        8 => "UAV",
+        9 => "DispatchRays",
+        10 => "DispatchMesh",
+        11 => "IncrementingConstant",
+        INDIRECT_ARGUMENT_DISPATCH_X => "DispatchX",
+        _ => "Unknown",
+    }
+}
+
+struct PreparedCommandSignature {
+    byte_stride: u32,
+    node_mask: u32,
+    args: Vec<[u8; INDIRECT_ARG_DESC_BYTES]>,
+    unknown_types: Vec<u32>,
+    /// `(type, root_param_index, dest_offset_32bit, num_32bit_values)` for root-binding args.
+    root_args: Vec<(u32, u32, u32, u32)>,
+    summary: String,
+}
+
+impl PreparedCommandSignature {
+    /// Builds a `D3D12_COMMAND_SIGNATURE_DESC` pointing into `self.args`. Callers must keep
+    /// `self` pinned (not move or reallocate `self.args`) while the returned desc is read.
+    fn build_desc(&self) -> [u8; CMD_SIG_DESC_BYTES] {
+        let mut out = [0u8; CMD_SIG_DESC_BYTES];
+        out[0..4].copy_from_slice(&self.byte_stride.to_le_bytes());
+        out[4..8].copy_from_slice(&(self.args.len() as u32).to_le_bytes());
+        let ptr = if self.args.is_empty() { 0u64 } else { self.args.as_ptr() as u64 };
+        out[8..16].copy_from_slice(&ptr.to_le_bytes());
+        out[16..20].copy_from_slice(&self.node_mask.to_le_bytes());
+        out
+    }
+}
+
+/// Copies and sanitizes a `D3D12_COMMAND_SIGNATURE_DESC` argument array without mutating caller
+/// memory, rewriting every console `DispatchX` (`105`) entry to PC `Dispatch` (`2`).
+fn prepare_command_signature_args(
+    byte_stride: u32,
+    node_mask: u32,
+    raw_args: &[[u8; INDIRECT_ARG_DESC_BYTES]],
+) -> PreparedCommandSignature {
+    let mut args = raw_args.to_vec();
+    let mut unknown_types = Vec::new();
+    let mut root_args = Vec::new();
+    let mut parts = Vec::with_capacity(args.len());
+    for arg in &mut args {
+        let orig_ty = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]);
+        let p0 = u32::from_le_bytes([arg[4], arg[5], arg[6], arg[7]]);
+        let p1 = u32::from_le_bytes([arg[8], arg[9], arg[10], arg[11]]);
+        let p2 = u32::from_le_bytes([arg[12], arg[13], arg[14], arg[15]]);
+        if orig_ty == INDIRECT_ARGUMENT_DISPATCH_X {
+            arg[0..4].copy_from_slice(&PC_INDIRECT_ARGUMENT_DISPATCH.to_le_bytes());
+            parts.push(String::from("DispatchX->Dispatch"));
+        } else if orig_ty > PC_INDIRECT_ARGUMENT_MAX_KNOWN {
+            unknown_types.push(orig_ty);
+            parts.push(format!("Unknown({orig_ty}, {p0:#x}, {p1:#x}, {p2:#x})"));
+        } else if matches!(
+            orig_ty,
+            PC_INDIRECT_ARGUMENT_CONSTANT
+                | PC_INDIRECT_ARGUMENT_CBV
+                | PC_INDIRECT_ARGUMENT_SRV
+                | PC_INDIRECT_ARGUMENT_UAV
+                | PC_INDIRECT_ARGUMENT_MAX_KNOWN
+        ) {
+            root_args.push((orig_ty, p0, p1, p2));
+            if orig_ty == PC_INDIRECT_ARGUMENT_CONSTANT {
+                parts.push(format!("Constant(param={p0}, off={p1}, count={p2})"));
+            } else {
+                parts.push(format!("{}(param={p0})", indirect_arg_type_name(orig_ty)));
+            }
+        } else {
+            parts.push(indirect_arg_type_name(orig_ty).to_owned());
+        }
+    }
+    let summary = format!("stride={byte_stride} node={node_mask} args=[{}]", parts.join(", "));
+    PreparedCommandSignature { byte_stride, node_mask, args, unknown_types, root_args, summary }
+}
+
+static LOGGED_CMD_SIGS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+/// Console slot 41: CreateCommandSignature. Copies `D3D12_COMMAND_SIGNATURE_DESC` (`ByteStride` at
+/// +0, `NumArgumentDescs` at +4, `pArgumentDescs` at +8, `NodeMask` at +16) and its 16-byte
+/// `D3D12_INDIRECT_ARGUMENT_DESC` array locally without mutating caller memory, rewrites every
+/// console `DispatchX` (`105`) entry to PC `Dispatch` (`2`), and logs each distinct signature.
 extern "system" fn dev_create_command_signature(this: *mut Proxy, desc: *const u8, root_sig: Object, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
-    // SAFETY: `this` is a live proxy; `desc` is {NumArgumentDescs: u32, ArgumentDescs: *const
-    // ArgDesc, ByteStride: u32} by the console calling convention, each ArgDesc at least 4 bytes.
+    // SAFETY: `out` is non null and writable by the COM contract.
+    unsafe { *out = std::ptr::null_mut() };
+    if desc.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: `this` is a live proxy, `desc` is a 24-byte `D3D12_COMMAND_SIGNATURE_DESC`, and
+    // `pArgumentDescs` holds `num_args` 16-byte `D3D12_INDIRECT_ARGUMENT_DESC` structs when
+    // `num_args > 0`.
     unsafe {
         let pc = (*this).pc;
-        let count = std::ptr::read_unaligned::<u32>(desc.cast()) as usize;
-        let first: *mut u8 = std::ptr::read_unaligned(desc.add(8).cast());
-        let step = std::ptr::read_unaligned::<u32>(desc.add(16).cast()) as usize;
-        for index in 0..count {
-            let type_field = first.add(index * step).cast::<u32>();
-            if std::ptr::read_unaligned(type_field) == INDIRECT_ARGUMENT_DISPATCH_X {
-                std::ptr::write_unaligned(type_field, PC_INDIRECT_ARGUMENT_DISPATCH);
-            }
+        let byte_stride = std::ptr::read_unaligned::<u32>(desc.cast());
+        let num_args = std::ptr::read_unaligned::<u32>(desc.add(4).cast()) as usize;
+        let raw_ptr: *const [u8; INDIRECT_ARG_DESC_BYTES] = std::ptr::read_unaligned(desc.add(8).cast());
+        let node_mask = std::ptr::read_unaligned::<u32>(desc.add(16).cast());
+        if num_args > 0 && raw_ptr.is_null() {
+            return E_INVALIDARG;
         }
-        let mut made: Object = std::ptr::null_mut();
-        let hr = method::<CreateCommandSignature>(pc, 41)(pc, desc.cast(), unwrap(root_sig), riid, &mut made);
-        *out = if hr >= 0 { made } else { std::ptr::null_mut() };
+        let mut raw_args = Vec::with_capacity(num_args);
+        for index in 0..num_args {
+            raw_args.push(std::ptr::read_unaligned(raw_ptr.add(index)));
+        }
+        let prepared = prepare_command_signature_args(byte_stride, node_mask, &raw_args);
+        let pc_root_sig = unwrap(root_sig);
+        let pc_desc = prepared.build_desc();
+        let hr = method::<CreateCommandSignature>(pc, 41)(pc, pc_desc.as_ptr().cast(), pc_root_sig, riid, out);
+        let root_check = if !prepared.root_args.is_empty() && !pc_root_sig.is_null() {
+            if let Some(layout) = crate::dxil_override::root_layout(pc_root_sig as usize) {
+                let title_params = layout.without_layer_params().params.len();
+                let oob = prepared.root_args.iter().any(|&(_, idx, _, _)| idx as usize >= title_params);
+                format!(", title_root_params={title_params}{}", if oob { " (OUT OF RANGE)" } else { "" })
+            } else {
+                String::from(", root_layout=unknown")
+            }
+        } else {
+            String::new()
+        };
+        let key = format!("{} root_sig={} hr=0x{:08X}", prepared.summary, !pc_root_sig.is_null(), hr as u32);
+        let log_it = hr < 0
+            || !prepared.unknown_types.is_empty()
+            || LOGGED_CMD_SIGS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(std::collections::HashSet::new)
+                .insert(key.clone());
+        if log_it {
+            xs_log!("console device slot 41 (CreateCommandSignature): {key}{root_check}");
+        }
         hr
     }
 }
@@ -5490,13 +5622,18 @@ extern "system" fn list_set_pipeline_state(this: *mut Proxy, pso: Object) {
 }
 
 struct StackBarriers {
-    buf: [[u8; BARRIER_BYTES]; 2],
+    buf: [[u8; BARRIER_BYTES]; 4],
     len: usize,
 }
 
 impl StackBarriers {
     const fn empty() -> Self {
-        Self { buf: [[0u8; BARRIER_BYTES]; 2], len: 0 }
+        Self { buf: [[0u8; BARRIER_BYTES]; 4], len: 0 }
+    }
+
+    fn push(&mut self, barrier: [u8; BARRIER_BYTES]) {
+        self.buf[self.len] = barrier;
+        self.len += 1;
     }
 }
 
@@ -5508,17 +5645,74 @@ impl std::ops::Deref for StackBarriers {
     }
 }
 
-/// Builds the `COMMON -> INDIRECT_ARGUMENT` (before) and `INDIRECT_ARGUMENT -> COMMON` (after)
-/// transition barriers for an `ExecuteIndirect` on the argument buffer `arg` and the count buffer
-/// `count`. A buffer is left out when it is null, when it may not be transitioned
-/// (`*_needs_barrier` false, as an upload heap buffer), and the count buffer also when it is the
-/// argument buffer, which already has its barrier.
-fn indirect_argument_barriers(arg: u64, arg_needs_barrier: bool, count: u64, count_needs_barrier: bool) -> (StackBarriers, StackBarriers) {
+/// Barrier requirement for an `ExecuteIndirect` argument or count buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndirectBarrierKind {
+    /// Null resource or an UPLOAD / READBACK heap (fixed state, cannot transition).
+    None,
+    /// Non-upload committed or placed resource: needs global UAV plus COMMON <-> INDIRECT_ARGUMENT.
+    TransitionOnly,
+    /// Reserved resource (`title_mem` buffers where `GetHeapProperties` returns `E_INVALIDARG`):
+    /// needs global UAV plus ALIASING(NULL, res) plus COMMON <-> INDIRECT_ARGUMENT.
+    AliasingAndTransition,
+}
+
+fn classify_indirect_barrier_props(hr: HRESULT, heap_type: u32) -> IndirectBarrierKind {
+    const D3D12_HEAP_TYPE_UPLOAD: u32 = 2;
+    const D3D12_HEAP_TYPE_READBACK: u32 = 3;
+    if hr < 0 {
+        // `ID3D12Resource::GetHeapProperties` always returns `E_INVALIDARG` on
+        // `CreateReservedResource`, including every `title_mem` placed buffer and window buffer.
+        IndirectBarrierKind::AliasingAndTransition
+    } else if matches!(heap_type, D3D12_HEAP_TYPE_UPLOAD | D3D12_HEAP_TYPE_READBACK) {
+        IndirectBarrierKind::None
+    } else {
+        IndirectBarrierKind::TransitionOnly
+    }
+}
+
+/// Returns the barrier classification of `pc_res` for `ExecuteIndirect`.
+///
+/// # Safety
+/// `pc_res` is null or a live PC `ID3D12Resource`.
+unsafe fn indirect_barrier_kind(pc_res: Object) -> IndirectBarrierKind {
+    type GetHeapProperties = unsafe extern "system" fn(Object, *mut u32, *mut u32) -> HRESULT;
+    if pc_res.is_null() {
+        return IndirectBarrierKind::None;
+    }
+    let mut props = [0u32; 5];
+    // SAFETY: `pc_res` is a live PC `ID3D12Resource`, slot 14 is `GetHeapProperties`.
+    let hr = unsafe { method::<GetHeapProperties>(pc_res, 14)(pc_res, props.as_mut_ptr(), std::ptr::null_mut()) };
+    classify_indirect_barrier_props(hr, props[0])
+}
+
+/// True when `pc_res` is non-null and requires indirect-argument barriers (including reserved
+/// `title_mem` buffers, excluding fixed-state UPLOAD and READBACK heaps).
+///
+/// # Safety
+/// `pc_res` is null or a live PC `ID3D12Resource`.
+#[cfg(test)]
+unsafe fn needs_indirect_barrier(pc_res: Object) -> bool {
+    // SAFETY: by the contract above.
+    unsafe { indirect_barrier_kind(pc_res) != IndirectBarrierKind::None }
+}
+
+/// Builds the pre-sync (`UAV(NULL)` plus `ALIASING(NULL, res)` for reserved resources),
+/// pre-transition (`COMMON -> INDIRECT_ARGUMENT`), and post-transition
+/// (`INDIRECT_ARGUMENT -> COMMON`) barriers for `ExecuteIndirect`. Splitting `before_sync` from
+/// `before_transition` keeps aliasing and transition barriers on the same resource in separate
+/// `ResourceBarrier` calls.
+fn indirect_argument_barriers(
+    arg: u64,
+    arg_kind: IndirectBarrierKind,
+    count: u64,
+    count_kind: IndirectBarrierKind,
+) -> (StackBarriers, StackBarriers, StackBarriers) {
+    const BARRIER_TYPE_ALIASING: u32 = 1;
     const ALL_SUBRESOURCES: u32 = 0xFFFF_FFFF;
     const STATE_COMMON: u32 = 0;
     const STATE_INDIRECT_ARGUMENT: u32 = 0x200;
 
-    // a `D3D12_RESOURCE_BARRIER` of the transition type: resource at 8, subresource at 16, states at 20 and 24
     let transition = |resource: u64, from: u32, to: u32| -> [u8; BARRIER_BYTES] {
         let mut barrier = [0u8; BARRIER_BYTES];
         barrier[8..16].copy_from_slice(&resource.to_le_bytes());
@@ -5527,44 +5721,89 @@ fn indirect_argument_barriers(arg: u64, arg_needs_barrier: bool, count: u64, cou
         }
         barrier
     };
+    let aliasing = |resource_after: u64| -> [u8; BARRIER_BYTES] {
+        let mut barrier = [0u8; BARRIER_BYTES];
+        barrier[0..4].copy_from_slice(&BARRIER_TYPE_ALIASING.to_le_bytes());
+        // `pResourceBefore` at +8 stays 0 (NULL: any aliasing resource such as a `title_mem` window).
+        barrier[16..24].copy_from_slice(&resource_after.to_le_bytes());
+        barrier
+    };
 
-    let mut before = StackBarriers::empty();
-    let mut after = StackBarriers::empty();
-    for (resource, allowed) in [(arg, arg_needs_barrier), (count, count_needs_barrier && count != arg)] {
-        if resource != 0 && allowed {
-            before.buf[before.len] = transition(resource, STATE_COMMON, STATE_INDIRECT_ARGUMENT);
-            before.len += 1;
-            after.buf[after.len] = transition(resource, STATE_INDIRECT_ARGUMENT, STATE_COMMON);
-            after.len += 1;
-        }
+    let mut before_sync = StackBarriers::empty();
+    let mut before_trans = StackBarriers::empty();
+    let mut after_trans = StackBarriers::empty();
+    let count_distinct = count != 0 && count != arg && count_kind != IndirectBarrierKind::None;
+    let arg_active = arg != 0 && arg_kind != IndirectBarrierKind::None;
+    if arg_active || count_distinct {
+        before_sync.push(crate::list_sync::global_uav_barrier());
     }
-    (before, after)
+    for (resource, kind, active) in [(arg, arg_kind, arg_active), (count, count_kind, count_distinct)] {
+        if !active {
+            continue;
+        }
+        if kind == IndirectBarrierKind::AliasingAndTransition {
+            before_sync.push(aliasing(resource));
+        }
+        before_trans.push(transition(resource, STATE_COMMON, STATE_INDIRECT_ARGUMENT));
+        after_trans.push(transition(resource, STATE_INDIRECT_ARGUMENT, STATE_COMMON));
+    }
+    (before_sync, before_trans, after_trans)
 }
 
-/// True when `pc_res` is non-null and not on an upload or readback heap (those heaps have fixed
-/// `GENERIC_READ` / `COPY_DEST` states and cannot be transitioned).
+/// Returns the title virtual address recorded on a placed `Kind::Resource` proxy, if any.
 ///
 /// # Safety
-/// `pc_res` is null or a live PC `ID3D12Resource`.
-unsafe fn needs_indirect_barrier(pc_res: Object) -> bool {
-    const D3D12_HEAP_TYPE_UPLOAD: u32 = 2;
-    const D3D12_HEAP_TYPE_READBACK: u32 = 3;
-    type GetHeapProperties = unsafe extern "system" fn(Object, *mut u32, *mut u32) -> HRESULT;
-
-    if pc_res.is_null() {
-        return false;
+/// `object` is null or points to a live COM object.
+unsafe fn placed_resource_va(object: Object) -> Option<u64> {
+    if object.is_null() {
+        return None;
     }
-    let mut props = [0u32; 5];
-    // SAFETY: `pc_res` is a live PC `ID3D12Resource`; slot 14 is `GetHeapProperties`.
-    let hr = unsafe { method::<GetHeapProperties>(pc_res, 14)(pc_res, props.as_mut_ptr(), std::ptr::null_mut()) };
-    hr >= 0 && !matches!(props[0], D3D12_HEAP_TYPE_UPLOAD | D3D12_HEAP_TYPE_READBACK)
+    let tables = TABLES.get()?.as_ref()?;
+    // SAFETY: `object` is non null and starts with a vtable pointer.
+    let vtbl = unsafe { *(object as *const *const usize) };
+    if !std::ptr::eq(tables.vtbls[Kind::Resource as usize].as_ptr(), vtbl) {
+        return None;
+    }
+    // SAFETY: `Kind::Resource` proxies are allocated as `ResProxy`.
+    let va = unsafe { (*(object as *const ResProxy)).placed_va };
+    (va != 0).then_some(va)
+}
+
+/// Unwraps an `ExecuteIndirect` argument or count buffer and classifies its barrier needs.
+/// Reserved `title_mem` buffers stay on their own per-buffer PC resource (sharing pool heap tiles
+/// with `title_mem` windows without mutating the shared window resource state across queues) and
+/// receive `UAV(NULL)` plus `ALIASING(NULL, res)` plus `COMMON <-> INDIRECT_ARGUMENT`. Committed
+/// fallback proxies for placed buffers are logged so any decoupled stand-in is visible.
+///
+/// # Safety
+/// `obj` is null or a live resource proxy or PC `ID3D12Resource`.
+unsafe fn resolve_indirect_buffer(obj: Object, off: u64, role: &str) -> (Object, IndirectBarrierKind) {
+    // SAFETY: by the contract above.
+    let pc_res = unsafe { unwrap(obj) };
+    if pc_res.is_null() {
+        return (std::ptr::null_mut(), IndirectBarrierKind::None);
+    }
+    // SAFETY: `pc_res` is a live PC `ID3D12Resource`.
+    let kind = unsafe { indirect_barrier_kind(pc_res) };
+    // SAFETY: `obj` is live by the contract above.
+    if kind == IndirectBarrierKind::TransitionOnly
+        && let Some(va) = unsafe { placed_resource_va(obj) }
+    {
+        static FALLBACK: AtomicI32 = AtomicI32::new(0);
+        if log_due(&FALLBACK) {
+            xs_log!(
+                "console list ExecuteIndirect: placed {role} VA {va:#x} (+{off:#x}) is a committed fallback resource"
+            );
+        }
+    }
+    (pc_res, kind)
 }
 
 /// Console list slot 59 (ExecuteIndirect, PC 59): the argument and count buffers unwrapped, with
-/// `COMMON -> INDIRECT_ARGUMENT` / `INDIRECT_ARGUMENT -> COMMON` barriers around the call on
-/// non-bundle lists for non-upload buffers.
+/// global UAV, aliasing (for reserved buffers), and `COMMON <-> INDIRECT_ARGUMENT` barriers around
+/// the call on non-bundle lists for non-upload buffers.
 extern "system" fn list_execute_indirect(this: *mut Proxy, sig: Object, max: u32, arg: Object, arg_off: u64, count: Object, count_off: u64) {
-    // SAFETY: `this` is a live command list proxy; the objects are proxies or PC objects.
+    // SAFETY: `this` is a live command list proxy, the objects are proxies or PC objects.
     unsafe {
         let pc = (*this).pc;
         // The signature decides what runs, so both pipeline kinds get their mirror.
@@ -5574,25 +5813,29 @@ extern "system" fn list_execute_indirect(this: *mut Proxy, sig: Object, max: u32
         list_mirror::prepare(this, crate::user_mirror::Bind::Graphics);
         list_mirror::prepare(this, crate::user_mirror::Bind::Compute);
         crate::rt_diag::count(&crate::rt_diag::INDIRECT);
-        let pc_arg = unwrap(arg);
-        let pc_count = unwrap(count);
+        let pc_sig = unwrap(sig);
+        let (pc_arg, arg_kind) = resolve_indirect_buffer(arg, arg_off, "arg");
+        let (pc_count, count_kind) = resolve_indirect_buffer(count, count_off, "count");
         type GetListType = unsafe extern "system" fn(Object) -> u32;
         const D3D12_COMMAND_LIST_TYPE_BUNDLE: u32 = 1;
         let record_barriers = method::<GetListType>(pc, 8)(pc) != D3D12_COMMAND_LIST_TYPE_BUNDLE;
-        let (before, after) = if record_barriers {
-            indirect_argument_barriers(pc_arg as u64, needs_indirect_barrier(pc_arg), pc_count as u64, needs_indirect_barrier(pc_count))
+        let (before_sync, before_trans, after_trans) = if record_barriers {
+            indirect_argument_barriers(pc_arg as u64, arg_kind, pc_count as u64, count_kind)
         } else {
-            (StackBarriers::empty(), StackBarriers::empty())
+            (StackBarriers::empty(), StackBarriers::empty(), StackBarriers::empty())
         };
-        if !before.is_empty() {
-            method::<Barriers>(pc, 26)(pc, before.len() as u32, before.as_ptr().cast());
+        if !before_sync.is_empty() {
+            method::<Barriers>(pc, 26)(pc, before_sync.len() as u32, before_sync.as_ptr().cast());
+        }
+        if !before_trans.is_empty() {
+            method::<Barriers>(pc, 26)(pc, before_trans.len() as u32, before_trans.as_ptr().cast());
         }
         crate::pso_diag::record_op(this as usize, pc as usize, crate::pso_diag::RecordedOpKind::ExecuteIndirect, || {
             format!("(max={max}, arg_off={arg_off:#x})")
         });
-        method::<ExecuteIndirect>(pc, 59)(pc, unwrap(sig), max, pc_arg, arg_off, pc_count, count_off);
-        if !after.is_empty() {
-            method::<Barriers>(pc, 26)(pc, after.len() as u32, after.as_ptr().cast());
+        method::<ExecuteIndirect>(pc, 59)(pc, pc_sig, max, pc_arg, arg_off, pc_count, count_off);
+        if !after_trans.is_empty() {
+            method::<Barriers>(pc, 26)(pc, after_trans.len() as u32, after_trans.as_ptr().cast());
         }
     }
 }
@@ -6187,13 +6430,16 @@ mod tests {
     }
 
     #[test]
-    fn execute_indirect_barriers_emit_for_non_upload_and_skip_upload_or_null() {
-        use super::BARRIER_BYTES;
+    fn execute_indirect_barriers_emit_uav_aliasing_and_transitions() {
+        use super::{BARRIER_BYTES, IndirectBarrierKind};
         let u32_at = |b: &[u8; BARRIER_BYTES], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
         let u64_at = |b: &[u8; BARRIER_BYTES], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
 
-        // arg non-upload, count null -> 1 before (COMMON -> INDIRECT_ARGUMENT), 1 after (INDIRECT_ARGUMENT -> COMMON)
-        let (before, after) = super::indirect_argument_barriers(0x1000, true, 0, false);
+        // Default committed arg, null count -> UAV(NULL) in sync, COMMON <-> INDIRECT_ARGUMENT in trans.
+        let (sync, before, after) = super::indirect_argument_barriers(0x1000, IndirectBarrierKind::TransitionOnly, 0, IndirectBarrierKind::None);
+        assert_eq!(sync.len(), 1);
+        assert_eq!(u32_at(&sync[0], 0), 2);
+        assert_eq!(u64_at(&sync[0], 8), 0);
         assert_eq!(before.len(), 1);
         assert_eq!(after.len(), 1);
         assert_eq!(u32_at(&before[0], 0), 0);
@@ -6204,28 +6450,94 @@ mod tests {
         assert_eq!(u32_at(&after[0], 20), 0x200);
         assert_eq!(u32_at(&after[0], 24), 0);
 
-        // arg + distinct count both non-upload -> 2 barriers each
-        let (before2, after2) = super::indirect_argument_barriers(0x1000, true, 0x2000, true);
+        // Reserved arg + distinct reserved count -> UAV(NULL) + 2 ALIASING(NULL, res), 2 transitions each.
+        let (sync2, before2, after2) = super::indirect_argument_barriers(
+            0x1000,
+            IndirectBarrierKind::AliasingAndTransition,
+            0x2000,
+            IndirectBarrierKind::AliasingAndTransition,
+        );
+        assert_eq!(sync2.len(), 3);
+        assert_eq!(u32_at(&sync2[0], 0), 2);
+        assert_eq!(u32_at(&sync2[1], 0), 1);
+        assert_eq!(u64_at(&sync2[1], 8), 0);
+        assert_eq!(u64_at(&sync2[1], 16), 0x1000);
+        assert_eq!(u32_at(&sync2[2], 0), 1);
+        assert_eq!(u64_at(&sync2[2], 8), 0);
+        assert_eq!(u64_at(&sync2[2], 16), 0x2000);
         assert_eq!(before2.len(), 2);
         assert_eq!(after2.len(), 2);
         assert_eq!(u64_at(&before2[1], 8), 0x2000);
         assert_eq!(u64_at(&after2[1], 8), 0x2000);
 
-        // arg == count -> deduplicated to 1 barrier each
-        let (before_dup, after_dup) = super::indirect_argument_barriers(0x1000, true, 0x1000, true);
+        // arg == count -> deduplicated to 1 aliasing + 1 transition.
+        let (sync_dup, before_dup, after_dup) = super::indirect_argument_barriers(
+            0x1000,
+            IndirectBarrierKind::AliasingAndTransition,
+            0x1000,
+            IndirectBarrierKind::AliasingAndTransition,
+        );
+        assert_eq!(sync_dup.len(), 2);
         assert_eq!(before_dup.len(), 1);
         assert_eq!(after_dup.len(), 1);
 
-        // upload-heap arg skipped, non-upload count still barriered
-        let (before_up, after_up) = super::indirect_argument_barriers(0x1000, false, 0x2000, true);
+        // upload-heap arg skipped, non-upload count still barriered.
+        let (sync_up, before_up, after_up) = super::indirect_argument_barriers(
+            0x1000,
+            IndirectBarrierKind::None,
+            0x2000,
+            IndirectBarrierKind::TransitionOnly,
+        );
+        assert_eq!(sync_up.len(), 1);
         assert_eq!(before_up.len(), 1);
         assert_eq!(after_up.len(), 1);
         assert_eq!(u64_at(&before_up[0], 8), 0x2000);
 
-        // both upload-heap -> no barriers
-        let (before_none, after_none) = super::indirect_argument_barriers(0x1000, false, 0x2000, false);
+        // both upload-heap -> no barriers.
+        let (sync_none, before_none, after_none) = super::indirect_argument_barriers(
+            0x1000,
+            IndirectBarrierKind::None,
+            0x2000,
+            IndirectBarrierKind::None,
+        );
+        assert!(sync_none.is_empty());
         assert!(before_none.is_empty());
         assert!(after_none.is_empty());
+
+        // Classification handles E_INVALIDARG (reserved resources), DEFAULT, UPLOAD, READBACK.
+        assert_eq!(super::classify_indirect_barrier_props(super::E_INVALIDARG, 0), IndirectBarrierKind::AliasingAndTransition);
+        assert_eq!(super::classify_indirect_barrier_props(0, 1), IndirectBarrierKind::TransitionOnly);
+        assert_eq!(super::classify_indirect_barrier_props(0, 4), IndirectBarrierKind::TransitionOnly);
+        assert_eq!(super::classify_indirect_barrier_props(0, 2), IndirectBarrierKind::None);
+        assert_eq!(super::classify_indirect_barrier_props(0, 3), IndirectBarrierKind::None);
+    }
+
+    #[test]
+    fn command_signature_prep_rewrites_multi_arg_dispatch_x_without_mutating_caller() {
+        let mut arg0 = [0u8; super::INDIRECT_ARG_DESC_BYTES];
+        arg0[0..4].copy_from_slice(&super::PC_INDIRECT_ARGUMENT_CONSTANT.to_le_bytes());
+        arg0[4..8].copy_from_slice(&2u32.to_le_bytes());
+        arg0[8..12].copy_from_slice(&1u32.to_le_bytes());
+        arg0[12..16].copy_from_slice(&4u32.to_le_bytes());
+        let mut arg1 = [0u8; super::INDIRECT_ARG_DESC_BYTES];
+        arg1[0..4].copy_from_slice(&super::INDIRECT_ARGUMENT_DISPATCH_X.to_le_bytes());
+        let caller_args = [arg0, arg1];
+
+        let prepared = super::prepare_command_signature_args(28, 1, &caller_args);
+        // Caller memory stays untouched.
+        assert_eq!(u32::from_le_bytes(caller_args[1][0..4].try_into().unwrap()), super::INDIRECT_ARGUMENT_DISPATCH_X);
+        // Local copy rewrites index 1 DispatchX (105) -> Dispatch (2) and keeps Constant at index 0.
+        assert_eq!(prepared.args.len(), 2);
+        assert_eq!(u32::from_le_bytes(prepared.args[0][0..4].try_into().unwrap()), super::PC_INDIRECT_ARGUMENT_CONSTANT);
+        assert_eq!(u32::from_le_bytes(prepared.args[1][0..4].try_into().unwrap()), super::PC_INDIRECT_ARGUMENT_DISPATCH);
+        assert_eq!(prepared.root_args, vec![(super::PC_INDIRECT_ARGUMENT_CONSTANT, 2, 1, 4)]);
+        assert!(prepared.unknown_types.is_empty());
+
+        let desc = prepared.build_desc();
+        assert_eq!(u32::from_le_bytes(desc[0..4].try_into().unwrap()), 28);
+        assert_eq!(u32::from_le_bytes(desc[4..8].try_into().unwrap()), 2);
+        assert_eq!(u64::from_le_bytes(desc[8..16].try_into().unwrap()), prepared.args.as_ptr() as u64);
+        assert_eq!(u32::from_le_bytes(desc[16..20].try_into().unwrap()), 1);
     }
 
     #[test]
@@ -6275,12 +6587,343 @@ mod tests {
     #[test]
     fn execute_indirect_barrier_layout_matches_d3d12() {
         use windows::Win32::Graphics::Direct3D12::*;
-        let (before, _) = super::indirect_argument_barriers(0x1234, true, 0, false);
+        assert_eq!(std::mem::size_of::<D3D12_COMMAND_SIGNATURE_DESC>(), super::CMD_SIG_DESC_BYTES);
+        assert_eq!(std::mem::size_of::<D3D12_INDIRECT_ARGUMENT_DESC>(), super::INDIRECT_ARG_DESC_BYTES);
+        assert_eq!(std::mem::size_of::<D3D12_RESOURCE_BARRIER>(), super::BARRIER_BYTES);
+
+        let (sync, before, _) = super::indirect_argument_barriers(
+            0x1234,
+            super::IndirectBarrierKind::AliasingAndTransition,
+            0,
+            super::IndirectBarrierKind::None,
+        );
+        assert_eq!(sync.len(), 2);
+        assert_eq!(u32::from_le_bytes(sync[0][0..4].try_into().unwrap()), D3D12_RESOURCE_BARRIER_TYPE_UAV.0 as u32);
+        assert_eq!(u64::from_le_bytes(sync[0][8..16].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(sync[1][0..4].try_into().unwrap()), D3D12_RESOURCE_BARRIER_TYPE_ALIASING.0 as u32);
+        assert_eq!(u64::from_le_bytes(sync[1][8..16].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(sync[1][16..24].try_into().unwrap()), 0x1234);
+
         let b = &before[0];
         assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), D3D12_RESOURCE_BARRIER_TYPE_TRANSITION.0 as u32);
         assert_eq!(u32::from_le_bytes(b[16..20].try_into().unwrap()), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
         assert_eq!(u32::from_le_bytes(b[20..24].try_into().unwrap()), D3D12_RESOURCE_STATE_COMMON.0 as u32);
         assert_eq!(u32::from_le_bytes(b[24..28].try_into().unwrap()), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0 as u32);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_gpu_aliased_reserved_execute_indirect_sees_uav_writes_on_compute_queue() {
+        use std::ffi::c_void;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::core::{Interface, PCWSTR};
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        type CreateDeviceFn = unsafe extern "system" fn(*mut c_void, i32, *const windows::core::GUID, *mut *mut c_void) -> i32;
+        type SerializeRootSigFn = unsafe extern "system" fn(
+            *const D3D12_ROOT_SIGNATURE_DESC,
+            D3D_ROOT_SIGNATURE_VERSION,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> i32;
+
+        // SAFETY: load system `d3d12.dll` dynamically so unit tests do not collide with this
+        // crate's exported `D3D12CreateDevice` symbol.
+        let (dev, serialize_rs): (ID3D12Device, SerializeRootSigFn) = unsafe {
+            let module = LoadLibraryW(windows_sys::w!("d3d12.dll"));
+            if module.is_null() {
+                return;
+            }
+            let Some(create_proc) = GetProcAddress(module, c"D3D12CreateDevice".as_ptr().cast()) else {
+                return;
+            };
+            let Some(ser_proc) = GetProcAddress(module, c"D3D12SerializeRootSignature".as_ptr().cast()) else {
+                return;
+            };
+            let create: CreateDeviceFn = std::mem::transmute::<unsafe extern "system" fn() -> isize, CreateDeviceFn>(create_proc);
+            let serialize: SerializeRootSigFn = std::mem::transmute::<unsafe extern "system" fn() -> isize, SerializeRootSigFn>(ser_proc);
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            let hr = create(std::ptr::null_mut(), D3D_FEATURE_LEVEL_12_0.0, &ID3D12Device::IID, &mut raw);
+            if hr < 0 || raw.is_null() {
+                return;
+            }
+            (ID3D12Device::from_raw(raw), serialize)
+        };
+
+        let buf_desc = |width: u64, flags: D3D12_RESOURCE_FLAGS| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: width,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+
+        // SAFETY: all D3D12 objects below belong to `dev` and stay alive across the test.
+        unsafe {
+            let mut pool_heap: Option<ID3D12Heap> = None;
+            let heap_desc = D3D12_HEAP_DESC {
+                SizeInBytes: 65536,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+            };
+            if dev.CreateHeap(&heap_desc, &mut pool_heap).is_err() {
+                return;
+            }
+            let pool_heap = pool_heap.expect("pool heap");
+
+            let mut window_buf: Option<ID3D12Resource> = None;
+            let mut placed_arg_buf: Option<ID3D12Resource> = None;
+            let mut default_buf: Option<ID3D12Resource> = None;
+            let mut upload_buf: Option<ID3D12Resource> = None;
+            let mut readback_buf: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&buf_desc(65536, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut window_buf)
+                .expect("window reserved buffer");
+            dev.CreateReservedResource(&buf_desc(65536, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut placed_arg_buf)
+                .expect("placed reserved buffer");
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &buf_desc(256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut default_buf,
+            )
+            .expect("default counter buffer");
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &buf_desc(256, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut upload_buf,
+            )
+            .expect("upload buffer");
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &buf_desc(256, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut readback_buf,
+            )
+            .expect("readback buffer");
+
+            let window_buf = window_buf.expect("window");
+            let placed_arg_buf = placed_arg_buf.expect("placed_arg");
+            let counter_buf = default_buf.expect("counter");
+            let upload_buf = upload_buf.expect("upload");
+            let readback_buf = readback_buf.expect("readback");
+
+            // Verify `needs_indirect_barrier` / `indirect_barrier_kind` on real D3D12 resources.
+            assert_eq!(super::indirect_barrier_kind(window_buf.as_raw()), super::IndirectBarrierKind::AliasingAndTransition);
+            assert_eq!(super::indirect_barrier_kind(placed_arg_buf.as_raw()), super::IndirectBarrierKind::AliasingAndTransition);
+            assert_eq!(super::indirect_barrier_kind(counter_buf.as_raw()), super::IndirectBarrierKind::TransitionOnly);
+            assert_eq!(super::indirect_barrier_kind(upload_buf.as_raw()), super::IndirectBarrierKind::None);
+            assert_eq!(super::indirect_barrier_kind(readback_buf.as_raw()), super::IndirectBarrierKind::None);
+            assert!(super::needs_indirect_barrier(window_buf.as_raw()));
+            assert!(super::needs_indirect_barrier(placed_arg_buf.as_raw()));
+            assert!(super::needs_indirect_barrier(counter_buf.as_raw()));
+            assert!(!super::needs_indirect_barrier(upload_buf.as_raw()));
+            assert!(!super::needs_indirect_barrier(readback_buf.as_raw()));
+
+            let Ok(dxc) = decant_dxc::Dxc::load() else {
+                return;
+            };
+            let writer_hlsl = "cbuffer Args : register(b0) { uint3 dims; };
+                RWByteAddressBuffer dst : register(u0);
+                [numthreads(1, 1, 1)]
+                void main() { dst.Store(0, dims.x); dst.Store(4, dims.y); dst.Store(8, dims.z); }";
+            let worker_hlsl = "RWByteAddressBuffer ctr : register(u1);
+                [numthreads(1, 1, 1)]
+                void main() { uint old; ctr.InterlockedAdd(0, 1, old); }";
+            let Ok(writer_dxil) = dxc.compile(writer_hlsl, "main", "cs_6_0", &[]) else {
+                return;
+            };
+            let Ok(worker_dxil) = dxc.compile(worker_hlsl, "main", "cs_6_0", &[]) else {
+                return;
+            };
+
+            let params = [
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 3 },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 1, RegisterSpace: 0 },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+            ];
+            let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            };
+            let mut blob_raw: *mut c_void = std::ptr::null_mut();
+            let mut err_raw: *mut c_void = std::ptr::null_mut();
+            assert!(serialize_rs(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &mut blob_raw, &mut err_raw) >= 0);
+            assert!(!blob_raw.is_null());
+            let blob = windows::Win32::Graphics::Direct3D::ID3DBlob::from_raw(blob_raw);
+            let rs_slice = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+            let root_sig: ID3D12RootSignature = dev.CreateRootSignature(0, rs_slice).expect("root sig");
+
+            let make_pso = |dxil: &[u8]| -> ID3D12PipelineState {
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(root_sig.clone())),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+                    ..Default::default()
+                };
+                let pso = dev.CreateComputePipelineState(&desc).expect("compute pso");
+                let _ = std::mem::ManuallyDrop::into_inner(desc.pRootSignature);
+                pso
+            };
+            let writer_pso = make_pso(&writer_dxil);
+            let worker_pso = make_pso(&worker_dxil);
+
+            // Create command signature via our DispatchX -> Dispatch sanitizer.
+            let mut raw_arg = [0u8; super::INDIRECT_ARG_DESC_BYTES];
+            raw_arg[0..4].copy_from_slice(&super::INDIRECT_ARGUMENT_DISPATCH_X.to_le_bytes());
+            let prepared = super::prepare_command_signature_args(12, 0, &[raw_arg]);
+            let pc_sig_desc = prepared.build_desc();
+            let mut cmd_sig: Option<ID3D12CommandSignature> = None;
+            dev.CreateCommandSignature(pc_sig_desc.as_ptr().cast::<D3D12_COMMAND_SIGNATURE_DESC>(), None, &mut cmd_sig)
+                .expect("command signature");
+            let cmd_sig = cmd_sig.expect("command signature");
+
+            let comp_q: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() })
+                .expect("compute queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let event = CreateEventW(std::ptr::null(), 0, 0, PCWSTR::null().as_ptr());
+            assert!(!event.is_null());
+
+            // Map both reserved buffers onto the same 64 KiB backing pool heap tile.
+            let coord = D3D12_TILED_RESOURCE_COORDINATE { X: 0, Y: 0, Z: 0, Subresource: 0 };
+            let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, ..Default::default() };
+            let flag = D3D12_TILE_RANGE_FLAG_NONE;
+            let heap_off = 0u32;
+            let tile_count = 1u32;
+            for res in [&window_buf, &placed_arg_buf] {
+                comp_q.UpdateTileMappings(
+                    res,
+                    1,
+                    Some(&coord),
+                    Some(&region),
+                    &pool_heap,
+                    1,
+                    Some(&flag),
+                    Some(&heap_off),
+                    Some(&tile_count),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).expect("alloc");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).expect("list");
+            let list_raw = list.as_raw();
+            type BarriersFn = unsafe extern "system" fn(super::Object, u32, *const c_void);
+
+            let transition = |res: &ID3D12Resource, from: D3D12_RESOURCE_STATES, to: D3D12_RESOURCE_STATES| {
+                let mut b = [0u8; super::BARRIER_BYTES];
+                b[8..16].copy_from_slice(&(res.as_raw() as u64).to_le_bytes());
+                b[16..20].copy_from_slice(&D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES.to_le_bytes());
+                b[20..24].copy_from_slice(&(from.0 as u32).to_le_bytes());
+                b[24..28].copy_from_slice(&(to.0 as u32).to_le_bytes());
+                super::method::<BarriersFn>(list_raw, 26)(list_raw, 1, b.as_ptr().cast());
+            };
+
+            let run_case = |write_via_window: bool, seed_dims: [u32; 3], final_dims: [u32; 3], fence_target: u64| -> u32 {
+                // Zero counter via upload buffer.
+                let mut up_ptr = std::ptr::null_mut();
+                upload_buf.Map(0, None, Some(&mut up_ptr)).expect("map upload");
+                std::ptr::write_bytes(up_ptr.cast::<u8>(), 0, 16);
+                upload_buf.Unmap(0, None);
+
+                list.CopyBufferRegion(&counter_buf, 0, &upload_buf, 0, 16);
+                transition(&counter_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                list.SetComputeRootSignature(&root_sig);
+                let write_gpu = if write_via_window {
+                    window_buf.GetGPUVirtualAddress()
+                } else {
+                    placed_arg_buf.GetGPUVirtualAddress()
+                };
+                list.SetComputeRootUnorderedAccessView(1, write_gpu);
+                list.SetComputeRootUnorderedAccessView(2, counter_buf.GetGPUVirtualAddress());
+
+                // Pre-seed indirect args with stale dims, then overwrite with `final_dims`.
+                let global_uav = crate::list_sync::global_uav_barrier();
+                list.SetPipelineState(&writer_pso);
+                list.SetComputeRoot32BitConstants(0, 3, seed_dims.as_ptr().cast(), 0);
+                list.Dispatch(1, 1, 1);
+                super::method::<BarriersFn>(list_raw, 26)(list_raw, 1, global_uav.as_ptr().cast());
+                list.SetComputeRoot32BitConstants(0, 3, final_dims.as_ptr().cast(), 0);
+                list.Dispatch(1, 1, 1);
+
+                // Emit our exact ExecuteIndirect barriers against `placed_arg_buf`.
+                let arg_kind = super::indirect_barrier_kind(placed_arg_buf.as_raw());
+                let (sync, before_t, after_t) = super::indirect_argument_barriers(
+                    placed_arg_buf.as_raw() as u64,
+                    arg_kind,
+                    0,
+                    super::IndirectBarrierKind::None,
+                );
+                super::method::<BarriersFn>(list_raw, 26)(list_raw, sync.len() as u32, sync.as_ptr().cast());
+                super::method::<BarriersFn>(list_raw, 26)(list_raw, before_t.len() as u32, before_t.as_ptr().cast());
+                list.SetPipelineState(&worker_pso);
+                list.ExecuteIndirect(&cmd_sig, 1, &placed_arg_buf, 0, None, 0);
+                super::method::<BarriersFn>(list_raw, 26)(list_raw, after_t.len() as u32, after_t.as_ptr().cast());
+
+                transition(&counter_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list.CopyBufferRegion(&readback_buf, 0, &counter_buf, 0, 16);
+                transition(&counter_buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+                list.Close().expect("close");
+                let cmd: ID3D12CommandList = list.cast().expect("cast cmd");
+                comp_q.ExecuteCommandLists(&[Some(cmd)]);
+                comp_q.Signal(&fence, fence_target).expect("signal");
+                if fence.GetCompletedValue() < fence_target {
+                    fence.SetEventOnCompletion(fence_target, windows::Win32::Foundation::HANDLE(event)).expect("set event");
+                    assert_eq!(WaitForSingleObject(event, 5000), 0, "compute queue timed out");
+                }
+                let mut rb_ptr = std::ptr::null_mut();
+                readback_buf.Map(0, None, Some(&mut rb_ptr)).expect("map readback");
+                let val = std::ptr::read_unaligned(rb_ptr.cast::<u32>());
+                readback_buf.Unmap(0, None);
+                alloc.Reset().expect("reset alloc");
+                list.Reset(&alloc, None).expect("reset list");
+                val
+            };
+
+            // Aliased write through `window_buf` -> `placed_arg_buf` runs 0 then 4 groups.
+            assert_eq!(run_case(true, [64, 1, 1], [0, 1, 1], 1), 0);
+            assert_eq!(run_case(true, [0, 1, 1], [4, 1, 1], 2), 4);
+            // Direct UAV write through `placed_arg_buf` itself -> runs 3 groups.
+            assert_eq!(run_case(false, [64, 1, 1], [3, 1, 1], 3), 3);
+            let _ = list.Close();
+            windows_sys::Win32::Foundation::CloseHandle(event);
+        }
     }
 
     #[test]
