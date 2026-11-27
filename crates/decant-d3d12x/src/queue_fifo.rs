@@ -44,8 +44,10 @@ pub(crate) enum HoldKey {
 struct State {
     /// Queued work with its monotonic per-queue sequence number, oldest first.
     items: VecDeque<(u64, Job)>,
-    /// Last sequence number assigned to a queued item on this queue.
+    /// Last sequence number assigned to a queued item or inline gate on this queue.
     next_seq: u64,
+    /// Highest sequence number whose inline gate or worker job has finished executing.
+    done_seq: u64,
     /// Someone runs work of this queue now: its worker, or a caller holding a [`Gate`].
     busy: bool,
     /// The worker of this queue is parked inside a memory wait (`cpu_writes::wait_all_until`).
@@ -92,6 +94,17 @@ impl Fifo {
 
     fn is_urgent(&self, seq: u64) -> bool {
         self.urgent_until.load(Ordering::Acquire) >= seq
+    }
+
+    /// Snapshot of work currently executing or queued when this queue is not idle.
+    fn pending(&self, queue: usize, arc: &Arc<Self>) -> Option<PendingWork> {
+        let st = self.lock();
+        (!st.idle()).then(|| PendingWork { queue, fifo: Arc::clone(arc), target_seq: st.next_seq })
+    }
+
+    /// Whether this queue currently has a caller inside an inline [`Gate`] or queued work.
+    fn is_active(&self) -> bool {
+        !self.lock().idle()
     }
 
     /// Waits until nothing is queued or running, for at most `timeout`. True when idle.
@@ -173,11 +186,14 @@ fn find_or_make(queue: usize) -> Arc<Fifo> {
 }
 
 /// The right to run work of one queue on the calling thread. Dropping it lets queued work go on.
-pub(crate) struct Gate(Arc<Fifo>);
+pub(crate) struct Gate(Arc<Fifo>, u64);
 
 impl Drop for Gate {
     fn drop(&mut self) {
-        self.0.lock().busy = false;
+        let mut st = self.0.lock();
+        st.busy = false;
+        st.done_seq = st.done_seq.max(self.1);
+        drop(st);
         self.0.changed.notify_all();
     }
 }
@@ -194,9 +210,11 @@ pub(crate) fn inline_gate(queue: usize, ready: impl FnOnce() -> bool) -> Option<
     if !st.idle() || !ready() {
         return None;
     }
+    st.next_seq += 1;
+    let seq = st.next_seq;
     st.busy = true;
     drop(st);
-    Some(Gate(fifo))
+    Some(Gate(fifo, seq))
 }
 
 /// Queues `job` behind the work of `queue`. The worker of the queue runs it and the caller goes on.
@@ -265,6 +283,7 @@ fn run_one(fifo: &Arc<Fifo>, seq: u64, job: Job) {
     let mut st = fifo.lock();
     st.busy = false;
     st.waiting = false;
+    st.done_seq = st.done_seq.max(seq);
     drop(st);
     fifo.changed.notify_all();
 }
@@ -287,6 +306,42 @@ fn run_queued_here(fifo: &Arc<Fifo>) {
 /// Never called by a holder of that queue's [`Gate`] or from its worker.
 pub(crate) fn drain(queue: usize, timeout: Duration) -> bool {
     find(queue).is_none_or(|fifo| fifo.wait_idle(timeout))
+}
+
+/// Snapshot of in-flight or queued work on one queue in `queue_fifo` at the moment an object is
+/// retired. [`PendingWork::is_finished`] turns `true` once all inline gates and queued items created
+/// on that queue up to snapshot time have finished running.
+#[derive(Clone)]
+pub(crate) struct PendingWork {
+    queue: usize,
+    fifo: Arc<Fifo>,
+    target_seq: u64,
+}
+
+impl PendingWork {
+    pub(crate) fn queue(&self) -> usize {
+        self.queue
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.fifo.lock().done_seq >= self.target_seq
+    }
+}
+
+/// Returns snapshots for all queues currently running an inline [`Gate`] or holding queued work.
+pub(crate) fn pending_all() -> Vec<PendingWork> {
+    fifos()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(&queue, fifo)| fifo.pending(queue, fifo))
+        .collect()
+}
+
+/// Whether `queue` currently holds a [`Gate`] or has queued work in `queue_fifo`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn has_active(queue: usize) -> bool {
+    find(queue).is_some_and(|fifo| fifo.is_active())
 }
 
 /// Waits until every queue is idle, for at most `timeout` in all.
@@ -910,5 +965,36 @@ mod tests {
         assert_eq!(*events.lock().unwrap(), ["producer_write", "consumer_exec", "pc1_recycled"]);
         assert!(begun.elapsed() < Duration::from_millis(200), "completed in {:?}", begun.elapsed());
         drop(label);
+    }
+
+    #[test]
+    fn pending_all_tracks_inline_gate_and_deferred_items_until_completion() {
+        let q_inline = 0x7100_0020;
+        let q_deferred = 0x7100_0021;
+        assert!(!has_active(q_inline));
+        assert!(!has_active(q_deferred));
+
+        let gate = inline_gate(q_inline, || true).expect("inline queue idle");
+        assert!(has_active(q_inline));
+        let inline_snap = pending_all().into_iter().find(|p| p.queue() == q_inline).expect("inline gate tracked");
+        assert!(!inline_snap.is_finished());
+        drop(gate);
+        assert!(inline_snap.is_finished());
+        assert!(!has_active(q_inline));
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        defer(q_deferred, Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = rx.recv();
+        }));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(has_active(q_deferred));
+        let def_snap = pending_all().into_iter().find(|p| p.queue() == q_deferred).expect("deferred item tracked");
+        assert!(!def_snap.is_finished());
+        let _ = tx.send(());
+        assert!(drain(q_deferred, Duration::from_secs(5)));
+        assert!(def_snap.is_finished());
+        assert!(!has_active(q_deferred));
     }
 }

@@ -54,10 +54,20 @@ const SUMMARY_EVERY: u64 = 600;
 /// that fence must reach.
 type Target = (usize, u64);
 
+/// Queue-order work active in `queue_fifo` when an object was parked, paired with the queue's last
+/// signalled fence value at snapshot time so any GPU work submitted before that queue-order item
+/// finishes is also waited on before release.
+#[derive(Clone)]
+struct FifoWait {
+    work: crate::queue_fifo::PendingWork,
+    snapshot_signal: u64,
+}
+
 /// An object kept back and the targets it waits for.
 struct Parked<T> {
     item: Option<T>,
     targets: Vec<Target>,
+    fifo_waits: Vec<FifoWait>,
 }
 
 /// The parked objects in the order they were parked. It makes no GPU call, so tests run it on
@@ -76,24 +86,31 @@ impl<T> Default for Parking<T> {
 impl<T> Parking<T> {
     /// Keeps `item` back until all `targets` are reached. When there are none nothing in flight can
     /// use it, so it is handed back at once.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn park(&mut self, item: T, targets: Vec<Target>) -> Option<T> {
-        if targets.is_empty() {
+        self.park_with_waits(item, targets, Vec::new())
+    }
+
+    /// Keeps `item` back until all `targets` and queue-order `fifo_waits` are finished. When both
+    /// are empty nothing in flight can use it, so it is handed back at once.
+    fn park_with_waits(&mut self, item: T, targets: Vec<Target>, fifo_waits: Vec<FifoWait>) -> Option<T> {
+        if targets.is_empty() && fifo_waits.is_empty() {
             return Some(item);
         }
-        self.entries.push(Parked { item: Some(item), targets });
+        self.entries.push(Parked { item: Some(item), targets, fifo_waits });
         self.most = self.most.max(self.entries.len());
         None
     }
 
     /// Splits off every entry for which `ready` says that it can go. `ready` may change what the
     /// entry waits for.
-    fn extract(&mut self, mut ready: impl FnMut(&mut Vec<Target>) -> bool) -> Vec<T> {
+    fn extract(&mut self, mut ready: impl FnMut(&mut Vec<Target>, &mut Vec<FifoWait>) -> bool) -> Vec<T> {
         if self.entries.is_empty() {
             return Vec::new();
         }
         let mut out = Vec::new();
         self.entries.retain_mut(|entry| {
-            if ready(&mut entry.targets) {
+            if ready(&mut entry.targets, &mut entry.fifo_waits) {
                 if let Some(item) = entry.item.take() {
                     out.push(item);
                 }
@@ -107,16 +124,36 @@ impl<T> Parking<T> {
 
     /// Hands out every item whose targets are all reached. `reached(key)` is the value the fence
     /// `key` has got to.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn release_reached(&mut self, mut reached: impl FnMut(usize) -> u64) -> Vec<T> {
-        self.extract(|targets| targets.iter().all(|&(key, value)| reached(key) >= value))
+        self.extract(|targets, _| targets.iter().all(|&(key, value)| reached(key) >= value))
+    }
+
+    /// Hands out every item whose queue-order waits have finished (promoting any new GPU signals
+    /// produced by those items into `targets`) and whose fence targets are all reached.
+    fn release_reached_with(
+        &mut self,
+        mut reached: impl FnMut(usize) -> u64,
+        mut resolve_waits: impl FnMut(&mut Vec<FifoWait>, &mut Vec<Target>) -> bool,
+    ) -> Vec<T> {
+        self.extract(|targets, waits| resolve_waits(waits, targets) && targets.iter().all(|&(key, value)| reached(key) >= value))
     }
 
     /// The queues behind `keys` are gone (their device was torn down after waiting for them). Their
     /// targets are dropped and the items that waited for nothing else are handed out.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn drop_keys(&mut self, keys: &[usize]) -> Vec<T> {
-        self.extract(|targets| {
+        self.drop_keys_and_queues(keys, &[])
+    }
+
+    /// Same as [`drop_keys`], also dropping finished queue-order waits for `torn_down_queues`.
+    fn drop_keys_and_queues(&mut self, keys: &[usize], torn_down_queues: &[usize]) -> Vec<T> {
+        self.extract(|targets, waits| {
             targets.retain(|(key, _)| !keys.contains(key));
-            targets.is_empty()
+            if !torn_down_queues.is_empty() {
+                waits.retain(|fw| !(torn_down_queues.contains(&fw.work.queue()) && fw.work.is_finished()));
+            }
+            targets.is_empty() && waits.is_empty()
         })
     }
 
@@ -187,6 +224,9 @@ impl QueueTrack {
     /// Closes one submission on `fence` when no other submission is open, or on `exec_fence` when
     /// other submissions remain queued on the same queue.
     fn close_with_exec(&mut self, send_main: impl FnOnce(u64) -> bool, send_exec: impl FnOnce(u64) -> bool) {
+        if self.open == 0 {
+            return;
+        }
         self.open -= 1;
         if self.open == 0 {
             if send_main(self.last_signal + 1) {
@@ -474,6 +514,36 @@ fn targets_from_snapshot(queues: &FastMap<QueueTrack>, snapshot: &[(usize, u64)]
         .collect()
 }
 
+fn collect_fifo_waits(queues: &FastMap<QueueTrack>, pending: &[crate::queue_fifo::PendingWork]) -> Vec<FifoWait> {
+    pending
+        .iter()
+        .map(|work| FifoWait {
+            work: work.clone(),
+            snapshot_signal: queues.get(&work.queue()).map_or(0, |t| t.last_signal),
+        })
+        .collect()
+}
+
+fn resolve_fifo_waits(queues: &FastMap<QueueTrack>, snapshot: &[(usize, u64)], waits: &mut Vec<FifoWait>, targets: &mut Vec<Target>) -> bool {
+    waits.retain(|fw| {
+        if !fw.work.is_finished() {
+            return true;
+        }
+        if let Some(track) = queues.get(&fw.work.queue())
+            && (track.unsignalled || track.last_signal > fw.snapshot_signal)
+        {
+            let key = track.key(fw.work.queue());
+            if let Some(target) = wait_target(reached_in(snapshot, key), track.last_signal, track.unsignalled)
+                && !targets.contains(&(key, target))
+            {
+                targets.push((key, target));
+            }
+        }
+        false
+    });
+    waits.is_empty()
+}
+
 /// The last reference of the PC object `object` goes. The object is released once the GPU is past
 /// the work that is in flight now. `what` tells what it is (title texture, upload buffer, ...).
 ///
@@ -498,18 +568,29 @@ fn retire(object: *mut c_void, what: &'static str, charge: Option<Charge>) {
     }
     let ready = {
         let mut st = state();
+        let st = &mut *st;
         let snapshot = snapshot_reached(&st.queues);
         let targets = targets_from_snapshot(&st.queues, &snapshot);
-        if !targets.is_empty() {
+        let pending = crate::queue_fifo::pending_all();
+        let fifo_waits = collect_fifo_waits(&st.queues, &pending);
+        if !targets.is_empty() || !fifo_waits.is_empty() {
             let count = HELD_BACK.fetch_add(1, Ordering::Relaxed) + 1;
             if count <= 20 || count.is_multiple_of(1000) {
                 let label = describe(object, what).2;
-                xs_log!("deferred release {count}: {label} goes while {} queues still have work in flight, held until it finishes", targets.len());
+                xs_log!(
+                    "deferred release {count}: {label} goes while {} queues and {} fifo items still have work in flight, held until it finishes",
+                    targets.len(),
+                    fifo_waits.len()
+                );
             }
         }
-        let mut ready: Vec<Retired> = st.parked.park(Retired { object: object as usize, what, charge }, targets).into_iter().collect();
+        let queues = &st.queues;
+        let mut ready: Vec<Retired> = st.parked.park_with_waits(Retired { object: object as usize, what, charge }, targets, fifo_waits).into_iter().collect();
         if !st.parked.is_empty() {
-            ready.extend(st.parked.release_reached(|key| reached_in(&snapshot, key)));
+            ready.extend(st.parked.release_reached_with(
+                |key| reached_in(&snapshot, key),
+                |waits, tgts| resolve_fifo_waits(queues, &snapshot, waits, tgts),
+            ));
         }
         ready
     };
@@ -617,8 +698,13 @@ pub(crate) fn present() {
             }
             return;
         }
+        let st = &mut *st;
         let snapshot = snapshot_reached(&st.queues);
-        st.parked.release_reached(|key| reached_in(&snapshot, key))
+        let queues = &st.queues;
+        st.parked.release_reached_with(
+            |key| reached_in(&snapshot, key),
+            |waits, tgts| resolve_fifo_waits(queues, &snapshot, waits, tgts),
+        )
     };
     if !ready.is_empty() {
         // SAFETY: each item is released once outside the lock.
@@ -653,13 +739,14 @@ pub(crate) unsafe fn flush(device: *mut c_void) {
     let device_id = unsafe { IUnknown::from_raw_borrowed(&device) }.map_or(0, device_identity);
     let ready = {
         let mut st = state();
-        let teardown = Teardown::of(&st.queues, device_id);
+        let active_queues: Vec<usize> = crate::queue_fifo::pending_all().into_iter().map(|w| w.queue()).collect();
+        let teardown = Teardown::of_with_active(&st.queues, device_id, &active_queues);
         if !teardown.kept.is_empty() {
             xs_log!("deferred release: the device goes while {} of its queues are inside a submission or have no fence, what they hold back stays held", teardown.kept.len());
         }
         // SAFETY: the fences in the table are live.
         unsafe { wait_for(&teardown.to_wait_for) };
-        let ready = st.parked.drop_keys(&teardown.keys);
+        let ready = st.parked.drop_keys_and_queues(&teardown.keys, &teardown.queues);
         for queue in teardown.queues {
             let Some(track) = st.queues.remove(&queue) else { continue };
             if track.fence != 0 {
@@ -698,10 +785,15 @@ struct Teardown {
 }
 
 impl Teardown {
+    #[cfg(test)]
     fn of(queues: &FastMap<QueueTrack>, device: usize) -> Self {
+        Self::of_with_active(queues, device, &[])
+    }
+
+    fn of_with_active(queues: &FastMap<QueueTrack>, device: usize, active_queues: &[usize]) -> Self {
         let mut own: Vec<(usize, QueueTrack)> = queues.iter().filter(|(_, t)| t.device == device).map(|(&q, &t)| (q, t)).collect();
         own.sort_by_key(|&(queue, _)| queue);
-        let (going, kept): (Vec<_>, Vec<_>) = own.into_iter().partition(|(_, t)| t.open == 0 && t.fence != 0);
+        let (going, kept): (Vec<_>, Vec<_>) = own.into_iter().partition(|(q, t)| t.open == 0 && t.fence != 0 && !active_queues.contains(q));
         Self {
             queues: going.iter().map(|&(q, _)| q).collect(),
             kept: kept.iter().map(|&(q, _)| q).collect(),
@@ -912,5 +1004,64 @@ mod tests {
         // A queue without a fence cannot prove its executed work is idle.
         let unfenced: FastMap<QueueTrack> = [(4, QueueTrack { open: 1, unsignalled: true, ..track(0, 0xA, 0) })].into_iter().collect();
         assert_eq!(submitted_targets(&unfenced), None);
+    }
+
+    #[test]
+    fn queue_fifo_pending_work_holds_release_until_execution_and_fence_signal() {
+        let q_inline = 0x7200_0001usize;
+        let q_tile = 0x7200_0002usize;
+        let fence_inline = 0x9901usize;
+
+        let gate = crate::queue_fifo::inline_gate(q_inline, || true).expect("queue idle");
+        let (tile_done_tx, tile_done_rx) = std::sync::mpsc::channel::<()>();
+        let (tile_go_tx, tile_go_rx) = std::sync::mpsc::channel::<()>();
+        crate::queue_fifo::defer(q_tile, Box::new(move || {
+            let _ = tile_done_tx.send(());
+            let _ = tile_go_rx.recv();
+        }));
+        tile_done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let pending = crate::queue_fifo::pending_all();
+        let mut queues: FastMap<QueueTrack> = [(q_inline, track(fence_inline, 0xA, 4)), (q_tile, track(0x9902, 0xA, 7))].into_iter().collect();
+        let waits_all = collect_fifo_waits(&queues, &pending);
+        let inline_wait: Vec<_> = waits_all.iter().filter(|w| w.work.queue() == q_inline).cloned().collect();
+        let tile_wait: Vec<_> = waits_all.iter().filter(|w| w.work.queue() == q_tile).cloned().collect();
+        assert_eq!(inline_wait.len(), 1);
+        assert_eq!(tile_wait.len(), 1);
+
+        let mut p = Parking::default();
+        assert!(p.park_with_waits("inline-op", vec![], inline_wait).is_none());
+        assert!(p.park_with_waits("tile-op", vec![], tile_wait).is_none());
+
+        let snap_before = [(fence_inline, 4u64), (0x9902, 7u64)];
+        assert!(p.release_reached_with(|k| reached_in(&snap_before, k), |w, t| resolve_fifo_waits(&queues, &snap_before, w, t)).is_empty());
+
+        // Simulate inline submission advancing `last_signal` to 5 before dropping `Gate`.
+        queues.get_mut(&q_inline).unwrap().last_signal = 5;
+        drop(gate);
+        let _ = tile_go_tx.send(());
+        assert!(crate::queue_fifo::drain(q_tile, Duration::from_secs(5)));
+
+        // At fence 4, tile-op (no new signal) releases, while inline-op promoted fence 5 and stays held.
+        let released = p.release_reached_with(|k| reached_in(&snap_before, k), |w, t| resolve_fifo_waits(&queues, &snap_before, w, t));
+        assert_eq!(released, ["tile-op"]);
+        assert_eq!(p.len(), 1);
+
+        // Once fence reaches 5, inline-op is released cleanly.
+        let snap_after = [(fence_inline, 5u64), (0x9902, 7u64)];
+        let released2 = p.release_reached_with(|k| reached_in(&snap_after, k), |w, t| resolve_fifo_waits(&queues, &snap_after, w, t));
+        assert_eq!(released2, ["inline-op"]);
+        assert_eq!(p.len(), 0);
+    }
+
+    #[test]
+    fn teardown_with_active_keeps_fifo_busy_queue_and_close_never_underflows() {
+        let mut t = track(10, 0xA, 3);
+        t.close(|_| panic!("close when open == 0 must be a no-op"));
+        assert_eq!((t.open, t.last_signal), (0, 3));
+
+        let queues: FastMap<QueueTrack> = [(100, track(10, 0xA, 3)), (200, track(20, 0xA, 5))].into_iter().collect();
+        let td = Teardown::of_with_active(&queues, 0xA, &[100]);
+        assert_eq!(td, Teardown { queues: vec![200], kept: vec![100], keys: vec![20], to_wait_for: vec![(20, 5)] });
     }
 }

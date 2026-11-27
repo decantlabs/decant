@@ -156,8 +156,21 @@ pub fn with<R>(f: impl FnOnce(&mut UploadMem) -> R) -> R {
     let mem = g.get_or_insert_with(UploadMem::default);
     let out = f(mem);
     let (lo, hi) = mem.bounds();
-    BOUND_LO.store(lo, Ordering::Release);
-    BOUND_HI.store(hi, Ordering::Release);
+    let old_hi = BOUND_HI.load(Ordering::Relaxed);
+    if lo == usize::MAX {
+        BOUND_LO.store(lo, Ordering::Release);
+        BOUND_HI.store(hi, Ordering::Release);
+    } else {
+        // Widen the upper bound before lowering the lower bound, and lower first before
+        // shrinking the upper bound, so lock-free readers never miss live chunks.
+        if hi > old_hi {
+            BOUND_HI.store(hi, Ordering::Release);
+        }
+        BOUND_LO.store(lo, Ordering::Release);
+        if hi < old_hi {
+            BOUND_HI.store(hi, Ordering::Release);
+        }
+    }
     out
 }
 
@@ -361,5 +374,29 @@ mod tests {
         let r1 = MEM.read().unwrap_or_else(|e| e.into_inner());
         let r2 = std::thread::spawn(|| MEM.read().unwrap_or_else(|e| e.into_inner()).is_some()).join().unwrap();
         assert_eq!(r2, r1.is_some());
+    }
+
+    #[test]
+    fn global_bounds_remain_covering_across_expand_and_shrink() {
+        let (o1, o2) = (0x8800_0001usize, 0x8800_0002usize);
+        with(|m| {
+            m.add_chunk(o1, chunk(0xA1, 0x40_0000, 0xD000_0000, 0x1000));
+        });
+        note_used();
+        assert_eq!(translate(0x40_0100), 0xD000_0100);
+        with(|m| {
+            m.add_chunk(o2, chunk(0xA2, 0x20_0000, 0xC000_0000, 0x1000));
+        });
+        assert_eq!(translate(0x20_0100), 0xC000_0100);
+        assert_eq!(locate(0x40_0200, 0x100), Some((0xA1, 0x200)));
+        with(|m| {
+            m.free_owner(o2);
+        });
+        assert_eq!(translate(0x40_0100), 0xD000_0100);
+        assert_eq!(translate(0x20_0100), 0x20_0100);
+        with(|m| {
+            m.free_owner(o1);
+        });
+        assert_eq!(translate(0x40_0100), 0x40_0100);
     }
 }

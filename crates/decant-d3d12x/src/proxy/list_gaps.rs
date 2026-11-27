@@ -232,10 +232,10 @@ pub(super) fn draw_rects(this: *mut Proxy, vb: crate::rect_list::Vb0, vertices: 
     type DrawInstanced = unsafe extern "system" fn(Object, u32, u32, u32, u32);
     static N: AtomicI32 = AtomicI32::new(0);
     let stride = vb.stride as usize;
-    let first = start_vertex as usize * stride;
-    let len = vertices as usize * stride;
-    let va = vb.va as usize + first;
-    if vb.va == 0 || first + len > vb.size as usize {
+    let Some(first) = (start_vertex as usize).checked_mul(stride) else { return false };
+    let Some(len) = (vertices as usize).checked_mul(stride) else { return false };
+    let Some(va) = (vb.va as usize).checked_add(first) else { return false };
+    if vb.va == 0 || first.checked_add(len).is_none_or(|end| end > vb.size as usize) {
         return false;
     }
     // Title memory the CPU reads: xmem pages, a descriptor heap's memory or upload memory of slot 148.
@@ -287,6 +287,7 @@ pub(super) extern "system" fn allocator_reset(this: *mut Proxy) -> HRESULT {
     // SAFETY: `this` is a live allocator proxy.
     unsafe {
         let pc = (*this).pc;
+        crate::queue_fifo::wait_allocator_idle(pc as usize, crate::list_sync::wait_limits().idle);
         let hr = method::<AllocReset>(pc, 8)(pc);
         if hr >= 0 {
             for (res, bytes) in crate::upload_mem::with(|m| m.free_owner(pc as usize)) {
