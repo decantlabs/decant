@@ -85,8 +85,8 @@ pub struct PageTarget {
     array: usize,
 }
 
-/// Frame 0 is no frame: `xmem.dll` never hands it out.
-const NO_FRAME: u64 = 0;
+/// Frame 0 is no frame: `xmem.dll` never hands it out and unmaps physical pages with it.
+pub const NO_FRAME: u64 = 0;
 
 /// Frames kept on the stack up to this many (a destination of 1 MiB), so the common write needs no allocation.
 const INLINE_FRAMES: usize = 16;
@@ -116,27 +116,57 @@ impl AsRef<[u64]> for Frames<'_> {
 }
 
 impl PageTarget {
+    /// Captures any newly populated non-zero frame numbers from `self.array` while it is still
+    /// readable (called at `Submit` so arrays on the stack or unmapped later keep valid entries).
+    pub fn snapshot_if_missing(&mut self) {
+        if !self.frames.contains(&NO_FRAME) {
+            return;
+        }
+        let Some(bytes) = self.frames.len().checked_mul(8) else { return };
+        if !readable(self.array, bytes) {
+            return;
+        }
+        let array = self.array as *const u64;
+        for (k, slot) in self.frames.iter_mut().enumerate() {
+            if *slot == NO_FRAME {
+                // SAFETY: `[self.array, self.array + count * 8)` was just verified readable, and the array may be unaligned.
+                let val = unsafe { array.add(k).read_unaligned() };
+                if val != NO_FRAME {
+                    *slot = val;
+                }
+            }
+        }
+    }
+
     /// The frames to write to now, borrowing the snapshot when every entry is already resolved.
-    /// Otherwise the array is read once after a single readability check (one `VirtualQuery` for an
-    /// array inside one region) into an inline buffer, or a `Vec` for more than `INLINE_FRAMES`.
+    /// Otherwise any remaining `NO_FRAME` entries are read once after a single readability check
+    /// (one `VirtualQuery` for an array inside one region) into an inline buffer, or a `Vec` for
+    /// more than `INLINE_FRAMES`, preserving any valid frames already snapshotted.
     pub fn frames_now_cow(&self) -> Frames<'_> {
         if !self.frames.contains(&NO_FRAME) {
             return Frames::Borrowed(&self.frames);
         }
         let count = self.frames.len();
-        if !readable(self.array, count * 8) {
+        let Some(bytes) = count.checked_mul(8) else {
+            return Frames::Borrowed(&self.frames);
+        };
+        if !readable(self.array, bytes) {
             return Frames::Borrowed(&self.frames);
         }
         let array = self.array as *const u64;
         // SAFETY (both reads): the range is committed readable memory (checked just above), and the array may be unaligned.
+        let read_entry = |k: usize| -> u64 {
+            let snap = self.frames[k];
+            if snap != NO_FRAME { snap } else { unsafe { array.add(k).read_unaligned() } }
+        };
         if count <= INLINE_FRAMES {
             let mut frames = [0u64; INLINE_FRAMES];
             for (k, slot) in frames.iter_mut().enumerate().take(count) {
-                *slot = unsafe { array.add(k).read_unaligned() };
+                *slot = read_entry(k);
             }
             return Frames::Inline { frames, len: count };
         }
-        Frames::Heap((0..count).map(|k| unsafe { array.add(k).read_unaligned() }).collect())
+        Frames::Heap((0..count).map(read_entry).collect())
     }
     /// The frames to write to now: the snapshot of the enqueue, or, when it holds no frame for a
     /// page, the title's array as it is now, if that memory is still readable. Then the snapshot is
@@ -166,7 +196,7 @@ impl PageTarget {
 /// Whether `[address, address + len)` is committed memory that can be read.
 fn readable(address: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
-    let end = address.saturating_add(len);
+    let Some(end) = address.checked_add(len) else { return false };
     let mut at = address;
     while at < end {
         // SAFETY: a query of this process's address space into a local.
@@ -177,7 +207,10 @@ fn readable(address: usize, len: usize) -> bool {
         if info.State != MEM_COMMIT || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 || info.Protect == 0 {
             return false;
         }
-        at = info.BaseAddress as usize + info.RegionSize;
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize).filter(|&n| n > at) else {
+            return false;
+        };
+        at = next;
     }
     true
 }
@@ -268,5 +301,25 @@ mod tests {
         std::hint::black_box(&deferred);
         assert!(matches!(target_deferred.frames_now_cow(), Frames::Inline { .. }));
         assert_eq!(target_deferred.frames_now_cow().as_ref(), &[64, 128]);
+    }
+
+    #[test]
+    fn snapshot_if_missing_captures_frames_at_submit_before_array_becomes_unreadable() {
+        let mut heap_arr = Box::new([0u64, 0u64]);
+        // SAFETY: `heap_arr` holds two entries for `2 * PAGE_BYTES`.
+        let mut target = unsafe { PageTarget::read(heap_arr.as_ptr().cast(), 0, 2 * PAGE_BYTES as u32).unwrap() };
+        // Simulate partial fill before submit, then free/zero the backing array before writeback.
+        heap_arr[0] = 160;
+        target.snapshot_if_missing();
+        assert_eq!(target.frames, [160, 0]);
+        heap_arr[0] = 0;
+        heap_arr[1] = 176;
+        assert_eq!(target.frames_now(), [160, 176], "already-captured frame is preserved when array clears slot 0 while filling slot 1");
+
+        target.snapshot_if_missing();
+        assert_eq!(target.frames, [160, 176]);
+        drop(heap_arr);
+        assert!(matches!(target.frames_now_cow(), Frames::Borrowed(_)));
+        assert_eq!(target.frames_now(), [160, 176], "snapshot captured at Submit survives freed array");
     }
 }

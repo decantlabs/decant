@@ -391,3 +391,69 @@ fn write_hooks_stay_no_op_when_xmem_is_not_loaded() {
     finish_written(scratch.as_mut_ptr().cast(), scratch.len() as u32);
     note_written(scratch.as_mut_ptr().cast(), scratch.len() as u32);
 }
+
+#[test]
+fn frame_zero_unmapped_pages_skip_cleanly_without_failing_status() {
+    let pool = TestPool::new(&[0x30, 0x40]);
+    let (factory, queue, status) = queue_over(pool.clone());
+    let plain = pattern(3 * P + 0x2000);
+    let on_disk = TempFile::new("frame_zero_holes", &plain);
+    let file = factory.open_file(on_disk.wide().as_ptr()).expect("the file opens");
+
+    // 1) All-zero frames (`NO_FRAME`) skip cleanly and return `S_OK` without touching pool pages.
+    let zero_frames = [0u64, 0u64];
+    assert_eq!(queue.enqueue_console(&request(&file, PAGES, &zero_frames, 0, P + 0x2000, 0, P + 0x2000)), S_OK);
+    assert_eq!(finish(&queue, &status, 0), S_OK);
+    assert!(pool.page(0x30).iter().all(|&b| b == 0));
+    assert!(pool.page(0x40).iter().all(|&b| b == 0));
+
+    // 2) Mixed `[0, 0x30, 0, 0x40]` with non-zero offset writes ONLY the mapped runs accurately.
+    let offset = 0x1000usize;
+    let total = 3 * P;
+    let mixed = [0u64, 0x30, 0, 0x40];
+    assert_eq!(queue.enqueue_console(&request(&file, PAGES, &mixed, offset as u64, total, 0, total)), S_OK);
+    assert_eq!(finish(&queue, &status, 1), S_OK);
+    let p0_end = P - offset; // bytes skipped in frame[0]=0
+    assert_eq!(&pool.page(0x30)[..], &plain[p0_end..p0_end + P]);
+    let p2_end = p0_end + 2 * P; // bytes skipped across frame[2]=0
+    let tail = total - p2_end;
+    assert_eq!(&pool.page(0x40)[..tail], &plain[p2_end..total]);
+    assert!(pool.page(0x40)[tail..].iter().all(|&b| b == 0));
+
+    // 3) Mixed `[0, 0x99]` where a non-zero frame is missing in the pool STILL fails with `E_INVALIDARG`.
+    let bad = [0u64, 0x99];
+    assert_eq!(queue.enqueue_console(&request(&file, PAGES, &bad, 0, P + 0x100, 0, P + 0x100)), S_OK);
+    assert_eq!(finish(&queue, &status, 2), E_INVALIDARG);
+}
+
+#[test]
+fn frames_populated_before_submit_survive_array_overwrite_after_submit() {
+    let pool = TestPool::new(&[0x10, 0x20]);
+    let (factory, queue, status) = queue_over(pool.clone());
+    let plain = pattern(2 * P);
+    let on_disk = TempFile::new("submit_snapshot", &plain);
+    let file = factory.open_file(on_disk.wide().as_ptr()).expect("the file opens");
+
+    // Enqueue with `[0, 0]`, populate before `submit()`, then wipe & free the backing array
+    // immediately after `submit()` while worker I/O runs asynchronously.
+    let mut frames = vec![0u64, 0u64];
+    assert_eq!(queue.enqueue_console(&request(&file, PAGES, &frames, 0, plain.len(), 0, plain.len())), S_OK);
+    frames[0] = 0x10;
+    frames[1] = 0x20;
+    // SAFETY: `status` is a live `Status` COM object.
+    unsafe { assert_eq!(queue.enqueue_status(status.as_ptr().cast(), 0), S_OK) };
+    assert_eq!(queue.submit(), S_OK);
+    frames.fill(0);
+    drop(frames);
+
+    // SAFETY: `status` is a live `Status` COM object.
+    unsafe {
+        let raw_status = status.as_ptr().cast();
+        while (vtable::<StatusVtbl>(raw_status).result)(raw_status, 0) == E_PENDING {
+            std::thread::yield_now();
+        }
+        assert_eq!((vtable::<StatusVtbl>(raw_status).result)(raw_status, 0), S_OK);
+    }
+    assert_eq!(pool.page(0x10), &plain[..P]);
+    assert_eq!(pool.page(0x20), &plain[P..]);
+}

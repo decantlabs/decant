@@ -899,46 +899,108 @@ impl Staged {
                     return hr;
                 }
                 let write_started = Instant::now();
-                let frames = target.frames_now_cow();
-                let result = match pool.write(&frames, target.offset, output_slice) {
-                    Ok(views) => {
-                        static WRITTEN: AtomicU64 = AtomicU64::new(0);
-                        let n = WRITTEN.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n == 1 || n.is_multiple_of(1000) {
-                            storage_log(&format!("page destination: {n} reads written into physical pages so far\n"));
-                        }
-                        note_views(&views);
-                        S_OK
-                    }
-                    Err(error) => {
-                        storage_log(&format!("page destination frames={:x?} (at enqueue {:x?}) offset={:#x} bytes={} hr={:08x}\n", frames.as_ref(), target.frames, target.offset, output_slice.len(), error as u32));
-                        error
-                    }
-                };
+                let result = write_to_pages(pool, &target, output_slice);
                 self.core_timing.record_and_log(self.source_bytes, self.destination_size, self.read_time, decode_time, write_started.elapsed());
                 result
             });
         }
         let write_started = Instant::now();
-        let frames = target.frames_now_cow();
-        let result = match pool.write(&frames, target.offset, input_slice) {
-            Ok(views) => {
-                static WRITTEN: AtomicU64 = AtomicU64::new(0);
-                let n = WRITTEN.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n.is_multiple_of(1000) {
-                    storage_log(&format!("page destination: {n} reads written into physical pages so far\n"));
-                }
-                note_views(&views);
-                S_OK
-            }
-            Err(error) => {
-                storage_log(&format!("page destination frames={:x?} (at enqueue {:x?}) offset={:#x} bytes={} hr={:08x}\n", frames.as_ref(), target.frames, target.offset, input_slice.len(), error as u32));
-                error
-            }
-        };
+        let result = write_to_pages(pool, &target, input_slice);
         self.core_timing.record_and_log(self.source_bytes, input_slice.len() as u32, self.read_time, Duration::ZERO, write_started.elapsed());
         result
     }
+}
+
+/// Logs one successful page-destination write every 1000 completions and notifies `d3d12_xs`.
+fn record_page_write(views: &[(usize, usize)], count_write: bool) {
+    if !views.is_empty() {
+        note_views(views);
+    }
+    if count_write {
+        static WRITTEN: AtomicU64 = AtomicU64::new(0);
+        let n = WRITTEN.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(1000) {
+            storage_log(&format!("page destination: {n} reads written into physical pages so far\n"));
+        }
+    }
+}
+
+/// Writes `bytes` into the physical pages of `target`, skipping unmapped `NO_FRAME` (`0`) entries
+/// cleanly without failing the batch when the title unmaps or omits target pages.
+fn write_to_pages(pool: &dyn PagePool, target: &PageTarget, bytes: &[u8]) -> HRESULT {
+    if target.offset >= crate::pages::PAGE_BYTES {
+        return E_INVALIDARG;
+    }
+    if bytes.is_empty() {
+        return S_OK;
+    }
+    let frames = target.frames_now_cow();
+    let needed = (target.offset + bytes.len()).div_ceil(crate::pages::PAGE_BYTES);
+    let Some(active) = frames.get(..needed) else {
+        storage_log(&format!("page destination frames={:x?} (at enqueue {:x?}) offset={:#x} bytes={} hr={:08x}\n", frames.as_ref(), target.frames, target.offset, bytes.len(), E_INVALIDARG as u32));
+        return E_INVALIDARG;
+    };
+    if !active.contains(&crate::pages::NO_FRAME) {
+        return match pool.write(active, target.offset, bytes) {
+            Ok(views) => {
+                record_page_write(&views, true);
+                S_OK
+            }
+            Err(error) => {
+                storage_log(&format!("page destination frames={:x?} (at enqueue {:x?}) offset={:#x} bytes={} hr={:08x}\n", frames.as_ref(), target.frames, target.offset, bytes.len(), error as u32));
+                error
+            }
+        };
+    }
+    let mut at = 0usize;
+    let mut idx = 0usize;
+    let mut skipped_pages = 0usize;
+    let mut wrote_any = false;
+    while idx < active.len() {
+        if active[idx] == crate::pages::NO_FRAME {
+            let start_in_page = if idx == 0 { target.offset } else { 0 };
+            let page_bytes = (crate::pages::PAGE_BYTES - start_in_page).min(bytes.len() - at);
+            at += page_bytes;
+            idx += 1;
+            skipped_pages += 1;
+            continue;
+        }
+        let run_start_idx = idx;
+        let run_offset = if run_start_idx == 0 { target.offset } else { 0 };
+        let run_byte_start = at;
+        while idx < active.len() && active[idx] != crate::pages::NO_FRAME {
+            let start_in_page = if idx == 0 { target.offset } else { 0 };
+            let page_bytes = (crate::pages::PAGE_BYTES - start_in_page).min(bytes.len() - at);
+            at += page_bytes;
+            idx += 1;
+        }
+        match pool.write(&active[run_start_idx..idx], run_offset, &bytes[run_byte_start..at]) {
+            Ok(views) => {
+                note_views(&views);
+                wrote_any = true;
+            }
+            Err(error) => {
+                storage_log(&format!("page destination frames={:x?} (at enqueue {:x?}) offset={:#x} bytes={} hr={:08x}\n", frames.as_ref(), target.frames, target.offset, bytes.len(), error as u32));
+                return error;
+            }
+        }
+    }
+    if skipped_pages > 0 {
+        static SKIPPED: AtomicU64 = AtomicU64::new(0);
+        let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            storage_log(&format!(
+                "page destination: skipped {skipped_pages} unmapped frame=0 page(s) out of {} (offset={:#x} bytes={}; {n} skipped writes so far)\n",
+                active.len(),
+                target.offset,
+                bytes.len()
+            ));
+        }
+    }
+    if wrote_any {
+        record_page_write(&[], true);
+    }
+    S_OK
 }
 
 /// Logs a read that failed.
@@ -1706,6 +1768,13 @@ impl Queue {
     fn submit_locked(&self, pending: &mut VecDeque<QueueOp>) -> HRESULT {
         if pending.is_empty() {
             return S_OK;
+        }
+        for operation in pending.iter_mut() {
+            if let QueueOp::Read(op) = operation
+                && let Some(pages) = &mut op.pages
+            {
+                pages.snapshot_if_missing();
+            }
         }
         let mut batch = std::mem::take(pending);
         let mut state = lock(&self.work.state);
