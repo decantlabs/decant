@@ -535,6 +535,9 @@ enum MakeSource {
     Direct(crate::direct_pso::Patched),
     /// The description as the title created it.
     Original,
+    /// Direct translation was refused and the original shaders are raw console containers with no
+    /// DXIL override directory: latch null without calling PC pipeline creation.
+    Refused,
 }
 
 struct MakeJob {
@@ -749,6 +752,7 @@ fn run_prewarm(job: PrewarmJob) {
             }
             crate::direct_pso::Choice::Direct(patched) => MakeSource::Direct(patched),
             crate::direct_pso::Choice::Original => MakeSource::Original,
+            crate::direct_pso::Choice::Refused => MakeSource::Refused,
         }
     };
     run_job(lazy, source, Some(service));
@@ -781,6 +785,18 @@ fn submit(job: MakeJob, is_compute: bool) {
     wake.notify_one();
 }
 
+/// Logs (bounded) that PC pipeline creation with raw console shaders was skipped after direct
+/// creation failed.
+fn note_skipped_console_fallback(number: u32) {
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    let total = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    if total <= 32 || total.is_power_of_two() {
+        xs_log!(
+            "pipeline {number} skipped raw console fallback after direct refusal (no override dir; {total} skipped so far)"
+        );
+    }
+}
+
 /// Makes the PC pipeline of `lazy` once, drops the retained description and shader references
 /// once settled, and tells the waiters. Transient `E_OUTOFMEMORY` leaves `made` unset so a later
 /// bind can retry.
@@ -796,23 +812,30 @@ fn run_job(lazy: &Lazy, source: MakeSource, service: Option<&'static crate::comp
                     MakeSource::Direct(mut patched) => {
                         crate::direct_pso::prepare_patched(owned, &mut patched);
                         match make(lazy, owned, patched.desc(), true, service) {
-                        MakeOutcome::Made(direct) => {
-                            crate::direct_pso::kind_made(direct, owned);
-                            let summary = crate::direct_pso::describe_owned(owned, true);
-                            crate::pso_diag::register_pipeline_summary(lazy as *const Lazy as usize, direct, Some(lazy.number), summary);
-                            Some(direct)
-                        }
-                        MakeOutcome::RetryOom => None,
-                        MakeOutcome::Refused => match make(lazy, owned, owned.desc(), false, service) {
-                            MakeOutcome::Made(orig) => {
-                                let summary = crate::direct_pso::describe_owned(owned, false);
-                                crate::pso_diag::register_pipeline_summary(lazy as *const Lazy as usize, orig, Some(lazy.number), summary);
-                                Some(orig)
+                            MakeOutcome::Made(direct) => {
+                                crate::direct_pso::kind_made(direct, owned);
+                                let summary = crate::direct_pso::describe_owned(owned, true);
+                                crate::pso_diag::register_pipeline_summary(lazy as *const Lazy as usize, direct, Some(lazy.number), summary);
+                                Some(direct)
                             }
                             MakeOutcome::RetryOom => None,
-                            MakeOutcome::Refused => Some(0),
-                        },
-                    }
+                            MakeOutcome::Refused => {
+                                if crate::direct_pso::should_skip_original_fallback(owned, service.is_some()) {
+                                    note_skipped_console_fallback(lazy.number);
+                                    Some(0)
+                                } else {
+                                    match make(lazy, owned, owned.desc(), false, service) {
+                                        MakeOutcome::Made(orig) => {
+                                            let summary = crate::direct_pso::describe_owned(owned, false);
+                                            crate::pso_diag::register_pipeline_summary(lazy as *const Lazy as usize, orig, Some(lazy.number), summary);
+                                            Some(orig)
+                                        }
+                                        MakeOutcome::RetryOom => None,
+                                        MakeOutcome::Refused => Some(0),
+                                    }
+                                }
+                            }
+                        }
                     }
                     MakeSource::Original => {
                         crate::direct_pso::pipeline_done_for(service, owned, None);
@@ -825,6 +848,20 @@ fn run_job(lazy: &Lazy, source: MakeSource, service: Option<&'static crate::comp
                             MakeOutcome::RetryOom => None,
                             MakeOutcome::Refused => Some(0),
                         }
+                    }
+                    MakeSource::Refused => {
+                        crate::direct_pso::pipeline_done_for(service, owned, None);
+                        let nth = REFUSED.fetch_add(1, Ordering::Relaxed);
+                        if nth < 32 || nth.is_power_of_two() {
+                            xs_log!(
+                                "pipeline {} skipped raw console fallback on first bind (direct translation refused, no override dir; {} deferred, {} made, {} refused so far)",
+                                lazy.number,
+                                DEFERRED.load(Ordering::Relaxed),
+                                MADE.load(Ordering::Relaxed),
+                                REFUSED.load(Ordering::Relaxed)
+                            );
+                        }
+                        Some(0)
                     }
                 },
             }
@@ -1007,8 +1044,19 @@ fn resolve_within(object: usize, lazy: &'static Lazy, is_compute: bool, apply_as
             crate::direct_pso::Choice::Pending => return not_in_time(),
             crate::direct_pso::Choice::Direct(patched) => MakeSource::Direct(patched),
             crate::direct_pso::Choice::Original => MakeSource::Original,
+            crate::direct_pso::Choice::Refused => MakeSource::Refused,
         }
     };
+
+    if matches!(source, MakeSource::Refused) {
+        if !lazy.making.swap(true, Ordering::AcqRel) {
+            run_job(lazy, MakeSource::Refused, service);
+        } else {
+            let _ = wait_for_made(lazy, allowed.saturating_sub(begun.elapsed()));
+        }
+        charge_frame();
+        return lazy.made.get().copied().unwrap_or(0) as *mut c_void;
+    }
 
     if !async_make_enabled() {
         let _call = crate::watchdog_hold::pc_call();
@@ -1880,5 +1928,24 @@ mod tests {
             assert_eq!(GetThreadPriority(GetCurrentThread()), THREAD_PRIORITY_BELOW_NORMAL);
             SetThreadPriority(GetCurrentThread(), prev);
         }
+    }
+
+    #[test]
+    fn make_source_refused_latches_zero_and_drops_owned_without_calling_create() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe fn must_not_run(_device: usize, _desc: *const c_void, _riid: *const GUID, _out: *mut *mut c_void) -> HRESULT {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+
+        let object = defer_compute(0x7100_0001, b"DXBC_refused_skip_test_0001", must_not_run);
+        // SAFETY: `object` is a `Lazy` returned by `defer_compute`.
+        let lazy: &'static Lazy = unsafe { &*object.cast::<Lazy>() };
+        run_job(lazy, MakeSource::Refused, None);
+
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(lazy.made.get().copied(), Some(0));
+        assert!(lazy.recipe.owned.read().unwrap().is_none());
     }
 }

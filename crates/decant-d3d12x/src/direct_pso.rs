@@ -6,7 +6,10 @@
 //! Order per pipeline:
 //! 1. the direct path, when every stage translates and compiles,
 //! 2. else the pipeline as the title created it, which takes the DXIL override files
-//!    (`dxil_override`) as before,
+//!    (`dxil_override`) as before — except when the direct path is active with no override
+//!    directory and the original description holds a raw console shader container, in which case
+//!    PC creation is skipped directly instead of handing untranslated console bytecode to the PC
+//!    runtime,
 //! 3. else the refusal behaviour of `lazy_pso` and `pso_diag`.
 //!
 //! Waiting is limited so that a burst of cold pipelines cannot freeze the recording thread.
@@ -541,6 +544,41 @@ pub enum Choice {
     Pending,
     /// A copy of the description with the compiled shaders.
     Direct(Patched),
+    /// Direct translation was refused and the original description holds a raw console shader
+    /// container with no DXIL override directory, so PC creation is skipped.
+    Refused,
+}
+
+/// Whether `bytes` parses as a raw console shader container (`XDAT`/`FSSM` GPU code, not PC DXIL).
+/// Panics inside the container parser are caught and treated as `false`.
+pub(crate) fn is_console_shader_container(bytes: &[u8]) -> bool {
+    std::panic::catch_unwind(|| decant_shader::container::program(bytes, "").is_ok()).unwrap_or(false)
+}
+
+/// Whether any shader stage in `owned` is a raw console shader container.
+pub(crate) fn has_console_shader_container(owned: &Owned) -> bool {
+    owned.shaders().iter().any(|bytes| is_console_shader_container(bytes))
+}
+
+/// Policy for skipping the `Original` fallback to PC pipeline creation after direct translation or
+/// direct PSO creation was refused: skip only when the direct shader path is active, no DXIL
+/// override directory is configured, and at least one stage is a raw console shader container that
+/// the PC runtime cannot accept untranslated.
+pub(crate) fn should_skip_original_fallback_with(
+    direct_on: bool,
+    has_override_dir: bool,
+    has_console_container: bool,
+) -> bool {
+    direct_on && !has_override_dir && has_console_container
+}
+
+/// Whether `owned` must skip falling back to PC pipeline creation with its original shaders.
+pub(crate) fn should_skip_original_fallback(owned: &Owned, service_active: bool) -> bool {
+    let direct_on = crate::compile_service::direct_enabled() || (cfg!(test) && service_active);
+    if !direct_on || crate::dxil_override::configured_dir().is_some() {
+        return false;
+    }
+    should_skip_original_fallback_with(direct_on, false, has_console_shader_container(owned))
 }
 
 /// A description pointing at compiled shaders, and at a stored driver blob when the pipeline
@@ -827,7 +865,7 @@ fn maybe_dump_matching_hlsl(owned: &Owned, dxil: Option<&[Arc<[u8]>]>) {
         });
 }
 
-/// The choice that follows a poll answer.
+/// The choice that follows a poll answer (called only when the direct service is active).
 fn choice_from(owned: &Owned, verdict: Poll) -> Choice {
     match verdict {
         Poll::Ready(dxil) => {
@@ -836,7 +874,11 @@ fn choice_from(owned: &Owned, verdict: Poll) -> Choice {
         }
         Poll::Refused(_) => {
             maybe_dump_matching_hlsl(owned, None);
-            Choice::Original
+            if should_skip_original_fallback(owned, true) {
+                Choice::Refused
+            } else {
+                Choice::Original
+            }
         }
         Poll::Pending => Choice::Pending,
     }
@@ -1073,13 +1115,13 @@ mod tests {
     }
 
     /// The PC creation for the tests: notes the compute shader and answers the device address as
-    /// the pipeline, except for a compiled shader on device 0xBAD0, which it refuses.
+    /// the pipeline, except for a compiled shader on devices `0xBAD0..=0xBADF`, which it refuses.
     unsafe fn create(device: usize, desc: *const c_void, _riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
         // SAFETY: the tests pass compute descriptions, their shader pointers live.
         let d = unsafe { std::slice::from_raw_parts(desc.cast::<u8>(), COMPUTE_DESC_SIZE) };
         // SAFETY: as above.
         let cs = unsafe { std::slice::from_raw_parts(read_u64(d, 8) as *const u8, read_u64(d, 16) as usize) }.to_vec();
-        let refuse = device == 0xBAD0 && cs.starts_with(b"DXBCcs");
+        let refuse = (device & !0xF) == 0xBAD0 && cs.starts_with(b"DXBCcs");
         SEEN.lock().unwrap_or_else(|e| e.into_inner()).push((device, cs));
         if refuse {
             return 0x8007_0057_u32 as i32;
@@ -1519,5 +1561,134 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(format!("{hash:016x}.dxil"))).unwrap(), b"DXBCfake");
         assert!(dir.join(format!("{hash:016x}.refused.txt")).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct TestServiceReset(Option<&'static Service>);
+
+    impl Drop for TestServiceReset {
+        fn drop(&mut self) {
+            TEST_SERVICE.set(self.0);
+        }
+    }
+
+    fn scoped_test_service(source: FixedSource) -> (&'static Service, TestServiceReset) {
+        let prev = TEST_SERVICE.get();
+        let service = with_test_service(source);
+        (service, TestServiceReset(prev))
+    }
+
+    /// A minimal synthetic raw console compute shader container accepted by `container::program`.
+    fn console_compute_container() -> Vec<u8> {
+        use decant_shader::api::{Stage, StageProgram};
+        use decant_shader::asm::{sopp, Asm};
+        use decant_shader::tables::Op;
+
+        let mut code = Asm::new();
+        code.push(sopp(Op::s_endpgm, 0));
+        let prog = StageProgram::new(Stage::Compute, code.finish());
+        let blob = crate::direct_fixture::container(&prog);
+        assert!(decant_shader::container::program(&blob, "").is_ok(), "fixture must parse as a console container");
+        blob
+    }
+
+    /// A genuine-shaped PC DXIL container (DXBC + DXIL part with no console `XDAT`/`FSSM` block).
+    fn pc_dxil_container() -> Vec<u8> {
+        let blob = crate::dxil_override::wrap_bare_dxil(b"PC_DXIL_BITCODE_NOT_CONSOLE_FSSM");
+        assert!(decant_shader::container::program(&blob, "").is_err(), "PC DXIL must not parse as a console container");
+        blob
+    }
+
+    #[test]
+    fn console_shader_container_detection_and_fallback_policy_truth_table() {
+        let console_cs = console_compute_container();
+        let console_vs = crate::direct_fixture::container(&crate::direct_fixture::ui_vertex());
+        let pc_dxil = pc_dxil_container();
+
+        assert!(is_console_shader_container(&console_cs));
+        assert!(is_console_shader_container(&console_vs));
+        assert!(!is_console_shader_container(&pc_dxil));
+        assert!(!is_console_shader_container(b"plain bytes"));
+        assert!(!is_console_shader_container(&[]));
+
+        // Only `(direct_on=true, has_override_dir=false, has_console_container=true)` skips fallback.
+        for direct_on in [false, true] {
+            for has_override_dir in [false, true] {
+                for has_console_container in [false, true] {
+                    let expected = direct_on && !has_override_dir && has_console_container;
+                    assert_eq!(
+                        should_skip_original_fallback_with(direct_on, has_override_dir, has_console_container),
+                        expected,
+                        "direct_on={direct_on}, has_override_dir={has_override_dir}, has_console_container={has_console_container}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refused_translation_of_console_container_skips_pc_original_fallback() {
+        let (_service, _reset) = scoped_test_service(FixedSource::default());
+        let console_cs = console_compute_container();
+        let object = lazy_compute(0xD401, &console_cs);
+        // SAFETY: `object` is a pipeline of `lazy_pso`.
+        unsafe {
+            assert_eq!(crate::lazy_pso::resolve(object), Some(std::ptr::null_mut()));
+            assert_eq!(crate::lazy_pso::resolve(object), Some(std::ptr::null_mut()));
+        }
+        assert!(seen(0xD401).is_empty(), "raw console bytecode must never reach PC pipeline creation");
+    }
+
+    #[test]
+    fn refused_direct_pso_of_console_container_skips_pc_original_fallback() {
+        let (service, _reset) = scoped_test_service(FixedSource::simple());
+        let console_cs = console_compute_container();
+        let object = lazy_compute(0xBAD1, &console_cs);
+        // SAFETY: `object` is a pipeline of `lazy_pso`.
+        unsafe {
+            if crate::lazy_pso::resolve(object) == Some(std::ptr::null_mut()) {
+                let _ = service.wait(object as usize, Duration::from_secs(1));
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while seen(0xBAD1).is_empty() && Instant::now() < deadline {
+                assert_eq!(crate::lazy_pso::resolve(object), Some(std::ptr::null_mut()));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(crate::lazy_pso::resolve(object), Some(std::ptr::null_mut()));
+        }
+        assert_eq!(
+            seen(0xBAD1),
+            [b"DXBCcs_6_0".to_vec()],
+            "PC creation must run only once with the direct DXIL and skip raw console fallback"
+        );
+    }
+
+    #[test]
+    fn refused_translation_and_direct_pso_of_pc_dxil_preserve_original_fallback() {
+        let pc_dxil = pc_dxil_container();
+
+        // 1. Translation refused (Poll::Refused) -> falls back to PC DXIL original.
+        {
+            let (_service, _reset) = scoped_test_service(FixedSource::default());
+            let object = lazy_compute(0xD402, &pc_dxil);
+            // SAFETY: `object` is a pipeline of `lazy_pso`.
+            unsafe {
+                assert_eq!(crate::lazy_pso::resolve(object), Some(0xD402 as *mut c_void));
+            }
+            assert_eq!(seen(0xD402).as_slice(), std::slice::from_ref(&pc_dxil));
+        }
+
+        // 2. Direct PSO creation refused (MakeOutcome::Refused) -> falls back to PC DXIL original.
+        {
+            let (service, _reset) = scoped_test_service(FixedSource::simple());
+            let object = lazy_compute(0xBAD2, &pc_dxil);
+            // SAFETY: `object` is a pipeline of `lazy_pso`.
+            unsafe {
+                if crate::lazy_pso::resolve(object) == Some(std::ptr::null_mut()) {
+                    assert!(service.wait(object as usize, Duration::from_secs(1)));
+                }
+                assert_eq!(crate::lazy_pso::resolve(object), Some(0xBAD2 as *mut c_void));
+            }
+            assert_eq!(seen(0xBAD2), [b"DXBCcs_6_0".to_vec(), pc_dxil]);
+        }
     }
 }
