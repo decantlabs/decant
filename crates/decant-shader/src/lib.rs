@@ -44,7 +44,7 @@ pub use api::*;
 pub use refusal::{Refusal, RefusalKind};
 
 /// Changes whenever the translation of any program can change. Part of the cache key.
-pub const TRANSLATOR_VERSION: u32 = 6;
+pub const TRANSLATOR_VERSION: u32 = 7;
 
 /// The program of the stage that feeds the pixel stage, when the pipeline has one.
 fn before_pixel(stages: &[StageProgram]) -> Option<&StageProgram> {
@@ -113,12 +113,23 @@ fn translate_stage(
         return Err(Refusal::new(RefusalKind::Resource("raw-address"), "a global load").at(pc));
     }
     let mut iface = stage::interface(program, before)?;
+    let emulate_wave64 = program.stage == Stage::Compute
+        && func.lanes == 64
+        && matches!(
+            options.wave,
+            WaveMode::Emulated | WaveMode::Native { lanes: 0..=63 }
+        );
     // A stage that takes the group index (compute) numbers its lanes by it unless it says otherwise.
     if iface.lane_index.is_none() && iface.threads.is_some() {
         iface.lane_index = Some(format!("(decant_gi % {}u)", func.lanes.max(1)));
     }
     stage::finish(program, &iface, &mut func)?;
     resource::dce(&mut func);
+    if emulate_wave64 {
+        lift::wave::lower_emulated_wave64(&mut func)?;
+        stage::compute::sync_lds_for_narrow_waves(program, &mut func);
+        resource::dce(&mut func);
+    }
     let needs = resource::place(&mut func, program, root, options, host)?;
     let mut header = vec![format!(
         "decant-shader {TRANSLATOR_VERSION}: {}",

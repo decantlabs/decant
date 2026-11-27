@@ -81,6 +81,8 @@
 //! this file can refuse: a constant used as a lane pattern, a cross-lane access outside
 //! compute, or a permutation of lanes.
 
+use std::collections::BTreeSet;
+
 use super::operand::{bits, form, set_vdst, var};
 use super::{Lifter, valu_cmp, valu_float, valu_int};
 use crate::api::Stage;
@@ -89,7 +91,7 @@ use crate::exec::{
     Logic, MaskOp, Parked, Reduction, VCC, WaveReduce, WaveReducePart, WaveScan, mask_number,
     mask_op, zero_test,
 };
-use crate::ir::{Bin, Expr, Guard, Helper, Input, Node, Stmt, Ty, Un, Var};
+use crate::ir::{Bin, Expr, Function, Guard, Helper, Input, Node, Stmt, Ty, Un, Var};
 use crate::refusal::{Refusal, RefusalKind};
 use crate::tables::{Format, Op};
 
@@ -138,7 +140,7 @@ static QUAD_AT: Helper = Helper {
 pub(crate) static READ_LANE: Helper = Helper {
     name: "decant_read_lane",
     result: Ty::U32,
-    text: "uint decant_read_lane(uint value, uint lane) { return WaveReadLaneAt(value, lane); }",
+    text: "uint decant_read_lane(uint value, uint lane) { lane = lane < WaveGetLaneCount() ? lane : WaveGetLaneIndex(); return WaveReadLaneAt(value, lane); }",
     needs: &[],
 };
 
@@ -275,6 +277,20 @@ static WAVE_BCNT1_B64: Helper = Helper {
     needs: &[],
 };
 
+static WAVE_BCNT0_B32: Helper = Helper {
+    name: "decant_wave_bcnt0_b32",
+    result: Ty::U32,
+    text: "uint decant_wave_bcnt0_b32(bool v) { return WaveGetLaneCount() - countbits(WaveActiveBallot(v).x); }",
+    needs: &[],
+};
+
+static WAVE_BCNT0_B64: Helper = Helper {
+    name: "decant_wave_bcnt0_b64",
+    result: Ty::U32,
+    text: "uint decant_wave_bcnt0_b64(bool v) { uint4 b = WaveActiveBallot(v); return WaveGetLaneCount() - (countbits(b.x) + countbits(b.y)); }",
+    needs: &[],
+};
+
 static WAVE_FF1_B32: Helper = Helper {
     name: "decant_wave_ff1_b32",
     result: Ty::U32,
@@ -299,7 +315,7 @@ static WAVE_FF0_B32: Helper = Helper {
 static WAVE_FF0_B64: Helper = Helper {
     name: "decant_wave_ff0_b64",
     result: Ty::U32,
-    text: "uint decant_wave_ff0_b64(bool v) { uint4 b = WaveActiveBallot(v); uint lo = ~b.x; uint hi = ~b.y; return lo != 0u ? firstbitlow(lo) : (hi != 0u ? (32u + firstbitlow(hi)) : 0xffffffffu); }",
+    text: "uint decant_wave_ff0_b64(bool v) { uint4 b = WaveActiveBallot(v); uint lo = ~b.x; uint hi = WaveGetLaneCount() > 32u ? ~b.y : 0u; return lo != 0u ? firstbitlow(lo) : (hi != 0u ? (32u + firstbitlow(hi)) : 0xffffffffu); }",
     needs: &[],
 };
 
@@ -313,7 +329,7 @@ static WAVE_FLBIT_B32: Helper = Helper {
 static WAVE_FLBIT_B64: Helper = Helper {
     name: "decant_wave_flbit_b64",
     result: Ty::U32,
-    text: "uint decant_wave_flbit_b64(bool v) { uint4 b = WaveActiveBallot(v); return b.y != 0u ? (31u - firstbithigh(b.y)) : (b.x != 0u ? (63u - firstbithigh(b.x)) : 0xffffffffu); }",
+    text: "uint decant_wave_flbit_b64(bool v) { uint4 b = WaveActiveBallot(v); return b.y != 0u ? (31u - firstbithigh(b.y)) : (b.x != 0u ? ((WaveGetLaneCount() - 1u) - firstbithigh(b.x)) : 0xffffffffu); }",
     needs: &[],
 };
 
@@ -562,11 +578,8 @@ fn mask_number_instruction(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal
             }
             Op::s_bcnt0_i32_b32 | Op::s_bcnt0_i32_b64 => {
                 let c = cx.tmp();
-                let h = if wide { &WAVE_BCNT1_B64 } else { &WAVE_BCNT1_B32 };
-                cx.set(
-                    c,
-                    Expr::bin(Bin::Sub, number(u32::from(lanes)), Expr::Call(h, vec![bit])),
-                );
+                let h = if wide { &WAVE_BCNT0_B64 } else { &WAVE_BCNT0_B32 };
+                cx.set(c, Expr::Call(h, vec![bit]));
                 (Expr::Var(c), Some(Expr::bin(Bin::Ne, Expr::Var(c), number(0))))
             }
             Op::s_ff1_i32_b32 | Op::s_ff1_i32_b64 => {
@@ -1098,8 +1111,9 @@ pub(crate) static DPP_ADD: Helper = Helper {
     }
     // EXEC is tracked separately from HLSL control flow. Both masks matter for a read.
     uint4 active = WaveActiveBallot(exec);
-    uint safeSource = inRange ? source : lane;
-    bool valid = inRange && ((active[safeSource >> 5u] >> (safeSource & 31u)) & 1u) != 0u;
+    bool inWave = inRange && source < WaveGetLaneCount();
+    uint safeSource = inWave ? source : lane;
+    bool valid = inWave && ((active[safeSource >> 5u] >> (safeSource & 31u)) & 1u) != 0u;
     uint selected = WaveReadLaneAt(a, valid ? safeSource : lane);
     bool write = ((rows >> (lane >> 4u)) & (banks >> (col >> 2u)) & 1u) != 0u;
     uint operand = valid ? selected : 0u;
@@ -1710,6 +1724,1181 @@ pub fn lift(cx: &mut Lifter, insn: &Insn) -> Result<bool, Refusal> {
         }
         _ => Ok(false),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Wave64 emulation on narrow (Wave32) hardware (`WaveMode::Emulated`).
+//
+// Group I helpers operate strictly within a 32-lane half-wave or on virtual
+// lane index `(decant_gi & 63u)` and require no workgroup barriers, so they
+// remain safe even in divergent control flow.
+//
+// Group II helpers emulate cross-64-lane operations (lane reads, ballots,
+// reductions, prefix scans, bpermute) via dedicated `groupshared` scratch
+// (`decant_wave_lds`, `decant_wave_mask`) and `GroupMemoryBarrierWithGroupSync()`,
+// omitting `[WaveSize(64)]`.
+// ---------------------------------------------------------------------------
+
+static EMUL_WRITE_LANE: Helper = Helper {
+    name: "decant_emul_write_lane",
+    result: Ty::U32,
+    text: "uint decant_emul_write_lane(uint gi, uint value, uint lane, uint old) { return (gi & 63u) == lane ? value : old; }",
+    needs: &[],
+};
+
+static EMUL_WAVE_LANE_INDEX: Helper = Helper {
+    name: "decant_emul_wave_lane_index",
+    result: Ty::U32,
+    text: "uint decant_emul_wave_lane_index(uint gi) { return gi & 63u; }",
+    needs: &[],
+};
+
+static EMUL_DPP_MOV: Helper = Helper {
+    name: "decant_emul_dpp_mov",
+    result: Ty::U32,
+    text: "uint decant_emul_dpp_mov(uint gi, uint a, uint old, bool exec, uint ctrl, bool fi, bool bound, uint rows, uint banks) {
+    uint lane = WaveGetLaneIndex();
+    uint col = lane & 15u;
+    uint row = lane & ~15u;
+    uint delta = ctrl & 15u;
+    uint source = lane;
+    bool inRange = true;
+    if (ctrl < 256u) {
+        source = (lane & ~3u) | ((ctrl >> (2u * (lane & 3u))) & 3u);
+    } else if (ctrl < 272u) {
+        inRange = col + delta < 16u;
+        source = lane + delta;
+    } else if (ctrl < 288u) {
+        inRange = col >= delta;
+        source = lane - delta;
+    } else if (ctrl < 304u) {
+        source = row | ((col - delta) & 15u);
+    } else if (ctrl == 320u) {
+        source = lane ^ 15u;
+    } else if (ctrl == 321u) {
+        source = lane ^ 7u;
+    } else if (ctrl < 352u) {
+        source = row | delta;
+    } else {
+        source = lane ^ delta;
+    }
+    uint4 active = WaveActiveBallot(exec || fi);
+    bool inWave = inRange && source < WaveGetLaneCount();
+    uint safeSource = inWave ? source : lane;
+    bool valid = inWave && ((active[safeSource >> 5u] >> (safeSource & 31u)) & 1u) != 0u;
+    uint selected = WaveReadLaneAt(a, valid ? safeSource : lane);
+    uint vrow = (gi & 63u) >> 4u;
+    bool write = ((rows >> vrow) & (banks >> (col >> 2u)) & 1u) != 0u;
+    return write && (valid || bound) ? (valid ? selected : 0u) : old;
+}",
+    needs: &[],
+};
+
+static EMUL_DPP_ADD: Helper = Helper {
+    name: "decant_emul_dpp_add",
+    result: Ty::U32,
+    text: "uint decant_emul_dpp_add(uint gi, uint a, uint b, uint old, bool exec, uint ctrl, bool bound, uint rows, uint banks, bool halfOp) {
+    uint lane = WaveGetLaneIndex();
+    uint col = lane & 15u;
+    uint row = lane & ~15u;
+    uint delta = ctrl & 15u;
+    uint source = lane;
+    bool inRange = true;
+    if (ctrl < 256u) {
+        source = (lane & ~3u) | ((ctrl >> (2u * (lane & 3u))) & 3u);
+    } else if (ctrl < 272u) {
+        inRange = col + delta < 16u;
+        source = lane + delta;
+    } else if (ctrl < 288u) {
+        inRange = col >= delta;
+        source = lane - delta;
+    } else if (ctrl < 304u) {
+        source = row | ((col - delta) & 15u);
+    } else if (ctrl == 320u) {
+        source = lane ^ 15u;
+    } else if (ctrl == 321u) {
+        source = lane ^ 7u;
+    } else if (ctrl < 352u) {
+        source = row | delta;
+    } else {
+        source = lane ^ delta;
+    }
+    uint4 active = WaveActiveBallot(exec);
+    bool inWave = inRange && source < WaveGetLaneCount();
+    uint safeSource = inWave ? source : lane;
+    bool valid = inWave && ((active[safeSource >> 5u] >> (safeSource & 31u)) & 1u) != 0u;
+    uint selected = WaveReadLaneAt(a, valid ? safeSource : lane);
+    uint vrow = (gi & 63u) >> 4u;
+    bool write = ((rows >> vrow) & (banks >> (col >> 2u)) & 1u) != 0u;
+    uint operand = valid ? selected : 0u;
+    uint sum = halfOp ? ((old & 0xffff0000u) | f32tof16(f16tof32(b) + f16tof32(operand))) : b + operand;
+    return write && (valid || bound) ? sum : old;
+}",
+    needs: &[],
+};
+
+static EMUL_DPP8_MOV: Helper = Helper {
+    name: "decant_emul_dpp8_mov",
+    result: Ty::U32,
+    text: "uint decant_emul_dpp8_mov(uint value, uint selects, bool exec, bool fi) {
+    uint lane = WaveGetLaneIndex();
+    uint source = (lane & ~7u) | ((selects >> (3u * (lane & 7u))) & 7u);
+    uint4 active = WaveActiveBallot(exec || fi);
+    bool valid = source < WaveGetLaneCount() && ((active[source >> 5u] >> (source & 31u)) & 1u) != 0u;
+    uint selected = WaveReadLaneAt(value, valid ? source : lane);
+    return valid ? selected : 0u;
+}",
+    needs: &[],
+};
+
+static EMUL_PERMLANE: Helper = Helper {
+    name: "decant_emul_permlane",
+    result: Ty::U32,
+    text: "uint decant_emul_permlane(uint a, uint lo, uint hi, uint old, bool exec, bool crossRow, bool fi, bool bound) {
+    uint lane = WaveGetLaneIndex();
+    uint col = lane & 15u;
+    uint selects = col < 8u ? lo : hi;
+    uint source = ((lane & ~15u) ^ (crossRow ? 16u : 0u)) | ((selects >> ((col & 7u) * 4u)) & 15u);
+    uint4 active = WaveActiveBallot(exec || fi);
+    bool valid = source < WaveGetLaneCount() && ((active[source >> 5u] >> (source & 31u)) & 1u) != 0u;
+    uint selected = WaveReadLaneAt(a, valid ? source : lane);
+    return valid ? selected : (bound ? 0u : old);
+}",
+    needs: &[],
+};
+
+static EMUL_BALLOT64: Helper = Helper {
+    name: "decant_emul_ballot64",
+    result: Ty::U32,
+    text: "uint2 decant_emul_ballot64(uint gi, bool cond) {
+    uint w = (gi >> 6u) * 2u;
+    uint lane = gi & 63u;
+    if (lane == 0u) {
+        decant_wave_mask[w] = 0u;
+        decant_wave_mask[w + 1u] = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (cond) {
+        InterlockedOr(decant_wave_mask[w + (lane >> 5u)], 1u << (lane & 31u));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint2 res = uint2(decant_wave_mask[w], decant_wave_mask[w + 1u]);
+    GroupMemoryBarrierWithGroupSync();
+    return res;
+}",
+    needs: &[],
+};
+
+static EMUL_READ_LANE: Helper = Helper {
+    name: "decant_emul_read_lane",
+    result: Ty::U32,
+    text: "uint decant_emul_read_lane(uint gi, uint value, uint lane) {
+    uint base = gi & ~63u;
+    decant_wave_lds[gi] = value;
+    GroupMemoryBarrierWithGroupSync();
+    uint idx = base + (lane & 63u);
+    uint res = idx < decant_wave_threads ? decant_wave_lds[idx] : 0u;
+    GroupMemoryBarrierWithGroupSync();
+    return res;
+}",
+    needs: &[],
+};
+
+static EMUL_READ_FIRST_LANE: Helper = Helper {
+    name: "decant_emul_read_first_lane",
+    result: Ty::U32,
+    text: "uint decant_emul_read_first_lane(uint gi, uint value, bool exec) {
+    uint base = gi & ~63u;
+    decant_wave_lds[gi] = value;
+    uint2 b = decant_emul_ballot64(gi, exec);
+    uint lane = b.x != 0u ? firstbitlow(b.x) : (b.y != 0u ? (32u + firstbitlow(b.y)) : (gi & 63u));
+    uint idx = base + lane;
+    uint res = idx < decant_wave_threads ? decant_wave_lds[idx] : value;
+    GroupMemoryBarrierWithGroupSync();
+    return res;
+}",
+    needs: &[&EMUL_BALLOT64],
+};
+
+static EMUL_MASK_WORD: Helper = Helper {
+    name: "decant_emul_mask_word",
+    result: Ty::U32,
+    text: "uint decant_emul_mask_word(uint gi, bool value, uint word) {
+    uint2 b = decant_emul_ballot64(gi, value);
+    return word == 0u ? b.x : (word == 1u ? b.y : 0u);
+}",
+    needs: &[&EMUL_BALLOT64],
+};
+
+static EMUL_BPERMUTE: Helper = Helper {
+    name: "decant_emul_bpermute",
+    result: Ty::U32,
+    text: "uint decant_emul_bpermute(uint gi, uint value, uint address, uint offset, bool exec) {
+    uint base = gi & ~63u;
+    uint src = ((address + offset) >> 2u) & 63u;
+    decant_wave_lds[gi] = exec ? value : 0u;
+    GroupMemoryBarrierWithGroupSync();
+    uint idx = base + src;
+    uint res = idx < decant_wave_threads ? decant_wave_lds[idx] : 0u;
+    GroupMemoryBarrierWithGroupSync();
+    return res;
+}",
+    needs: &[],
+};
+
+static EMUL_WAVE_BCNT1_B64: Helper = Helper {
+    name: "decant_emul_wave_bcnt1_b64",
+    result: Ty::U32,
+    text: "uint decant_emul_wave_bcnt1_b64(uint gi, bool v) { uint2 b = decant_emul_ballot64(gi, v); return countbits(b.x) + countbits(b.y); }",
+    needs: &[&EMUL_BALLOT64],
+};
+
+static EMUL_WAVE_BCNT0_B64: Helper = Helper {
+    name: "decant_emul_wave_bcnt0_b64",
+    result: Ty::U32,
+    text: "uint decant_emul_wave_bcnt0_b64(uint gi, bool v) { uint2 b = decant_emul_ballot64(gi, v); return 64u - (countbits(b.x) + countbits(b.y)); }",
+    needs: &[&EMUL_BALLOT64],
+};
+
+static EMUL_WAVE_FF1_B64: Helper = Helper {
+    name: "decant_emul_wave_ff1_b64",
+    result: Ty::U32,
+    text: "uint decant_emul_wave_ff1_b64(uint gi, bool v) { uint2 b = decant_emul_ballot64(gi, v); return b.x != 0u ? firstbitlow(b.x) : (b.y != 0u ? (32u + firstbitlow(b.y)) : 0xffffffffu); }",
+    needs: &[&EMUL_BALLOT64],
+};
+
+static EMUL_WAVE_FF0_B64: Helper = Helper {
+    name: "decant_emul_wave_ff0_b64",
+    result: Ty::U32,
+    text: "uint decant_emul_wave_ff0_b64(uint gi, bool v) { uint2 b = decant_emul_ballot64(gi, v); uint lo = ~b.x; uint hi = ~b.y; return lo != 0u ? firstbitlow(lo) : (hi != 0u ? (32u + firstbitlow(hi)) : 0xffffffffu); }",
+    needs: &[&EMUL_BALLOT64],
+};
+
+static EMUL_WAVE_FLBIT_B64: Helper = Helper {
+    name: "decant_emul_wave_flbit_b64",
+    result: Ty::U32,
+    text: "uint decant_emul_wave_flbit_b64(uint gi, bool v) { uint2 b = decant_emul_ballot64(gi, v); return b.y != 0u ? (31u - firstbithigh(b.y)) : (b.x != 0u ? (63u - firstbithigh(b.x)) : 0xffffffffu); }",
+    needs: &[&EMUL_BALLOT64],
+};
+
+static EMUL_WAVE_BITCMP_B64: Helper = Helper {
+    name: "decant_emul_wave_bitcmp_b64",
+    result: Ty::Bool,
+    text: "bool decant_emul_wave_bitcmp_b64(uint gi, bool v, uint bit) { uint2 b = decant_emul_ballot64(gi, v); uint idx = bit & 63u; return (((idx < 32u ? b.x : b.y) >> (idx & 31u)) & 1u) != 0u; }",
+    needs: &[&EMUL_BALLOT64],
+};
+
+static EMUL_WAVE_PREFIX_SUM_U32: Helper = Helper {
+    name: "decant_emul_wave_prefix_sum_u32",
+    result: Ty::U32,
+    text: "uint decant_emul_wave_prefix_sum_u32(uint gi, uint a, bool active) {
+    uint lane = gi & 63u;
+    uint own = active ? a : 0u;
+    decant_wave_lds[gi] = own;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 1u; s < 64u; s <<= 1u) {
+        uint v = decant_wave_lds[gi];
+        if (lane >= s) v += decant_wave_lds[gi - s];
+        GroupMemoryBarrierWithGroupSync();
+        decant_wave_lds[gi] = v;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    uint res = decant_wave_lds[gi] - own;
+    GroupMemoryBarrierWithGroupSync();
+    return res;
+}",
+    needs: &[],
+};
+
+macro_rules! emul_reduce {
+    ($id:ident, $name:literal, $identity:literal, $combine:literal) => {
+        static $id: Helper = Helper {
+            name: $name,
+            result: Ty::U32,
+            text: concat!(
+                "uint ",
+                $name,
+                "(uint gi, uint a, bool active) {\n",
+                "    uint base = gi & ~63u;\n",
+                "    uint lane = gi & 63u;\n",
+                "    decant_wave_lds[gi] = active ? a : ",
+                $identity,
+                ";\n",
+                "    GroupMemoryBarrierWithGroupSync();\n",
+                "    [unroll] for (uint s = 32u; s > 0u; s >>= 1u) {\n",
+                "        if (lane < s && (base + lane + s) < decant_wave_threads) {\n",
+                "            uint x = decant_wave_lds[gi];\n",
+                "            uint y = decant_wave_lds[gi + s];\n",
+                "            decant_wave_lds[gi] = ",
+                $combine,
+                ";\n",
+                "        }\n",
+                "        GroupMemoryBarrierWithGroupSync();\n",
+                "    }\n",
+                "    uint res = decant_wave_lds[base];\n",
+                "    GroupMemoryBarrierWithGroupSync();\n",
+                "    return res;\n",
+                "}"
+            ),
+            needs: &[],
+        };
+    };
+}
+
+emul_reduce!(EMUL_WAVE_SUM_U32, "decant_emul_wave_sum_u32", "0u", "x + y");
+emul_reduce!(EMUL_WAVE_SUM_F32, "decant_emul_wave_sum_f32", "0u", "asuint(asfloat(x) + asfloat(y))");
+emul_reduce!(EMUL_WAVE_MUL_U32, "decant_emul_wave_mul_u32", "1u", "x * y");
+emul_reduce!(EMUL_WAVE_MUL_F32, "decant_emul_wave_mul_f32", "0x3f800000u", "asuint(asfloat(x) * asfloat(y))");
+emul_reduce!(EMUL_WAVE_MIN_U32, "decant_emul_wave_min_u32", "0xffffffffu", "min(x, y)");
+emul_reduce!(EMUL_WAVE_MAX_U32, "decant_emul_wave_max_u32", "0u", "max(x, y)");
+emul_reduce!(EMUL_WAVE_MIN_I32, "decant_emul_wave_min_i32", "0x7fffffffu", "asuint(min(asint(x), asint(y)))");
+emul_reduce!(EMUL_WAVE_MAX_I32, "decant_emul_wave_max_i32", "0x80000000u", "asuint(max(asint(x), asint(y)))");
+emul_reduce!(EMUL_WAVE_MIN_F32, "decant_emul_wave_min_f32", "0x7f800000u", "asuint(min(asfloat(x), asfloat(y)))");
+emul_reduce!(EMUL_WAVE_MAX_F32, "decant_emul_wave_max_f32", "0xff800000u", "asuint(max(asfloat(x), asfloat(y)))");
+emul_reduce!(EMUL_WAVE_OR_U32, "decant_emul_wave_or_u32", "0u", "x | y");
+emul_reduce!(EMUL_WAVE_AND_U32, "decant_emul_wave_and_u32", "0xffffffffu", "x & y");
+emul_reduce!(EMUL_WAVE_XOR_U32, "decant_emul_wave_xor_u32", "0u", "x ^ y");
+
+/// Whether `h` uses the `groupshared uint decant_wave_lds[...]` scratch array.
+pub(crate) fn uses_emul_wave_lds(h: &Helper) -> bool {
+    matches!(
+        h.name,
+        "decant_emul_read_lane"
+            | "decant_emul_read_first_lane"
+            | "decant_emul_bpermute"
+            | "decant_emul_wave_prefix_sum_u32"
+            | "decant_emul_wave_sum_u32"
+            | "decant_emul_wave_sum_f32"
+            | "decant_emul_wave_mul_u32"
+            | "decant_emul_wave_mul_f32"
+            | "decant_emul_wave_min_u32"
+            | "decant_emul_wave_max_u32"
+            | "decant_emul_wave_min_i32"
+            | "decant_emul_wave_max_i32"
+            | "decant_emul_wave_min_f32"
+            | "decant_emul_wave_max_f32"
+            | "decant_emul_wave_or_u32"
+            | "decant_emul_wave_and_u32"
+            | "decant_emul_wave_xor_u32"
+    )
+}
+
+/// Whether `h` uses the `groupshared uint decant_wave_mask[...]` scratch array.
+pub(crate) fn uses_emul_wave_mask(h: &Helper) -> bool {
+    h.name == EMUL_BALLOT64.name
+}
+
+/// Whether `h` is an emulated Wave64 intra-32-lane helper that requires `[WaveSize(32)]`.
+pub(crate) fn uses_emul_wave32(h: &Helper) -> bool {
+    matches!(
+        h.name,
+        "decant_emul_dpp_mov"
+            | "decant_emul_dpp_add"
+            | "decant_emul_dpp8_mov"
+            | "decant_emul_permlane"
+    )
+}
+
+/// Whether `h` executes `GroupMemoryBarrierWithGroupSync()` across the workgroup.
+pub(crate) fn has_group_barrier(h: &Helper) -> bool {
+    h.name == SWIZZLE.name
+        || uses_emul_wave_lds(h)
+        || uses_emul_wave_mask(h)
+        || matches!(
+            h.name,
+            "decant_emul_mask_word"
+                | "decant_emul_wave_bcnt1_b64"
+                | "decant_emul_wave_bcnt0_b64"
+                | "decant_emul_wave_ff1_b64"
+                | "decant_emul_wave_ff0_b64"
+                | "decant_emul_wave_flbit_b64"
+                | "decant_emul_wave_bitcmp_b64"
+        )
+}
+
+fn is_emul_barrier_source(h: &Helper) -> bool {
+    matches!(
+        h.name,
+        "decant_read_lane"
+            | "decant_read_first_lane"
+            | "decant_mask_word"
+            | "decant_bpermute"
+            | "decant_wave_bcnt1_b64"
+            | "decant_wave_bcnt0_b64"
+            | "decant_wave_ff1_b64"
+            | "decant_wave_ff0_b64"
+            | "decant_wave_flbit_b64"
+            | "decant_wave_bitcmp_b64"
+            | "decant_wave_prefix_sum_u32"
+            | "decant_wave_sum_u32"
+            | "decant_wave_sum_f32"
+            | "decant_wave_mul_u32"
+            | "decant_wave_mul_f32"
+            | "decant_wave_min_u32"
+            | "decant_wave_max_u32"
+            | "decant_wave_min_i32"
+            | "decant_wave_max_i32"
+            | "decant_wave_min_f32"
+            | "decant_wave_max_f32"
+            | "decant_wave_or_u32"
+            | "decant_wave_and_u32"
+            | "decant_wave_xor_u32"
+    )
+}
+
+fn emul_reduce_target(name: &str) -> Option<&'static Helper> {
+    Some(match name {
+        "decant_wave_prefix_sum_u32" => &EMUL_WAVE_PREFIX_SUM_U32,
+        "decant_wave_sum_u32" => &EMUL_WAVE_SUM_U32,
+        "decant_wave_sum_f32" => &EMUL_WAVE_SUM_F32,
+        "decant_wave_mul_u32" => &EMUL_WAVE_MUL_U32,
+        "decant_wave_mul_f32" => &EMUL_WAVE_MUL_F32,
+        "decant_wave_min_u32" => &EMUL_WAVE_MIN_U32,
+        "decant_wave_max_u32" => &EMUL_WAVE_MAX_U32,
+        "decant_wave_min_i32" => &EMUL_WAVE_MIN_I32,
+        "decant_wave_max_i32" => &EMUL_WAVE_MAX_I32,
+        "decant_wave_min_f32" => &EMUL_WAVE_MIN_F32,
+        "decant_wave_max_f32" => &EMUL_WAVE_MAX_F32,
+        "decant_wave_or_u32" => &EMUL_WAVE_OR_U32,
+        "decant_wave_and_u32" => &EMUL_WAVE_AND_U32,
+        "decant_wave_xor_u32" => &EMUL_WAVE_XOR_U32,
+        _ => return None,
+    })
+}
+
+fn emul_ballot_target(name: &str) -> Option<&'static Helper> {
+    Some(match name {
+        "decant_wave_bcnt1_b64" => &EMUL_WAVE_BCNT1_B64,
+        "decant_wave_bcnt0_b64" => &EMUL_WAVE_BCNT0_B64,
+        "decant_wave_ff1_b64" => &EMUL_WAVE_FF1_B64,
+        "decant_wave_ff0_b64" => &EMUL_WAVE_FF0_B64,
+        "decant_wave_flbit_b64" => &EMUL_WAVE_FLBIT_B64,
+        "decant_wave_bitcmp_b64" => &EMUL_WAVE_BITCMP_B64,
+        _ => return None,
+    })
+}
+
+fn expr_has_emul_barrier_source(e: &Expr) -> bool {
+    match e {
+        Expr::Call(h, args) => {
+            is_emul_barrier_source(h) || args.iter().any(expr_has_emul_barrier_source)
+        }
+        Expr::Un(_, a) | Expr::CodeWord(a) => expr_has_emul_barrier_source(a),
+        Expr::Bin(_, a, b) => expr_has_emul_barrier_source(a) || expr_has_emul_barrier_source(b),
+        Expr::Select(c, a, b) => {
+            expr_has_emul_barrier_source(c)
+                || expr_has_emul_barrier_source(a)
+                || expr_has_emul_barrier_source(b)
+        }
+        Expr::BufferWord { offset, .. } | Expr::VectorLoad { offset, .. } => {
+            expr_has_emul_barrier_source(offset)
+        }
+        Expr::Load(l) => expr_has_emul_barrier_source(&l.offset),
+        Expr::BvhWord(b, _) => {
+            b.descriptor.iter().any(expr_has_emul_barrier_source)
+                || b.address.iter().any(expr_has_emul_barrier_source)
+        }
+        _ => false,
+    }
+}
+
+fn stmt_has_emul_barrier_source(s: &Stmt) -> bool {
+    match s {
+        Stmt::Set { value, .. } => expr_has_emul_barrier_source(value),
+        Stmt::Effect { call, .. } => expr_has_emul_barrier_source(call),
+        Stmt::Buffer(op, _) => {
+            op.index.as_ref().is_some_and(expr_has_emul_barrier_source)
+                || expr_has_emul_barrier_source(&op.offset)
+        }
+        Stmt::Image(op, _) => op.address.iter().any(expr_has_emul_barrier_source),
+        Stmt::Output { value, .. } => expr_has_emul_barrier_source(value),
+        Stmt::Discard { cond } => expr_has_emul_barrier_source(cond),
+        Stmt::Export(_) | Stmt::Message { .. } | Stmt::Barrier { .. } | Stmt::Comment(_) => false,
+    }
+}
+
+fn nodes_have_emul_barrier_source(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Block(stmts) => stmts.iter().any(stmt_has_emul_barrier_source),
+        Node::If { cond, then, els } => {
+            expr_has_emul_barrier_source(cond)
+                || nodes_have_emul_barrier_source(then)
+                || nodes_have_emul_barrier_source(els)
+        }
+        Node::Loop(inner) | Node::Once(inner) => nodes_have_emul_barrier_source(inner),
+        Node::Return | Node::Break | Node::Continue => false,
+    })
+}
+
+fn nodes_can_flatten(nodes: &[Node]) -> bool {
+    nodes.iter().all(|n| match n {
+        Node::Block(_) => true,
+        Node::If { then, els, .. } => nodes_can_flatten(then) && nodes_can_flatten(els),
+        Node::Loop(_) | Node::Once(_) | Node::Return | Node::Break | Node::Continue => false,
+    })
+}
+
+fn expr_is_uniform(
+    e: &Expr,
+    non_uniform: &BTreeSet<Var>,
+    resources: &[crate::ir::Resource],
+) -> bool {
+    match e {
+        Expr::U32(_)
+        | Expr::U64(_)
+        | Expr::Bool(_)
+        | Expr::UserData(_)
+        | Expr::Mirror(_)
+        | Expr::CodeAddress(_) => true,
+        Expr::Input(Input::GroupId { .. }) => true,
+        Expr::Input(_) => false,
+        Expr::Var(v) => {
+            !matches!(v, Var::V(_) | Var::Exec | Var::Vcc | Var::Mask(_))
+                && !non_uniform.contains(v)
+        }
+        Expr::Un(_, a) | Expr::CodeWord(a) => expr_is_uniform(a, non_uniform, resources),
+        Expr::Bin(_, a, b) => {
+            expr_is_uniform(a, non_uniform, resources)
+                && expr_is_uniform(b, non_uniform, resources)
+        }
+        Expr::Select(c, a, b) => {
+            expr_is_uniform(c, non_uniform, resources)
+                && expr_is_uniform(a, non_uniform, resources)
+                && expr_is_uniform(b, non_uniform, resources)
+        }
+        Expr::BufferWord { res, offset } => {
+            let Some(r) = resources.get(res.0 as usize) else {
+                return false;
+            };
+            if matches!(r.usage, crate::ir::ResourceUse::Words { written: true }) {
+                return false;
+            }
+            if let crate::ir::Origin::HeapIndex { index, .. } = r.origin
+                && !expr_is_uniform(&Expr::Var(index), non_uniform, resources)
+            {
+                return false;
+            }
+            expr_is_uniform(offset, non_uniform, resources)
+        }
+        Expr::Call(h, args) => {
+            !h.name.starts_with("decant_lds_")
+                && !h.name.starts_with("decant_dpp")
+                && !h.name.starts_with("decant_emul_")
+                && !h.name.starts_with("decant_swizzle")
+                && !h.name.starts_with("decant_wave_")
+                && !h.name.starts_with("decant_mbcnt_")
+                && h.name != PERMLANE.name
+                && h.name != BPERMUTE.name
+                && h.name != READ_LANE.name
+                && h.name != READ_FIRST_LANE.name
+                && h.name != MASK_WORD.name
+                && h.name != WRITE_LANE.name
+                && h.name != WAVE_LANE_INDEX.name
+                && args
+                    .iter()
+                    .all(|a| expr_is_uniform(a, non_uniform, resources))
+        }
+        Expr::Load(_) | Expr::VectorLoad { .. } | Expr::BvhWord(..) => false,
+    }
+}
+
+pub(crate) fn expr_is_workgroup_uniform(
+    e: &Expr,
+    non_uniform: &BTreeSet<Var>,
+    resources: &[crate::ir::Resource],
+) -> bool {
+    expr_is_uniform(e, non_uniform, resources)
+}
+
+pub(crate) fn compute_non_uniform_vars(
+    body: &[Node],
+    resources: &[crate::ir::Resource],
+) -> BTreeSet<Var> {
+    fn mark_all_writes(nodes: &[Node], out: &mut BTreeSet<Var>, changed: &mut bool) {
+        for n in nodes {
+            match n {
+                Node::Block(stmts) => {
+                    for s in stmts {
+                        match s {
+                            Stmt::Set { dst, .. } => *changed |= out.insert(*dst),
+                            Stmt::Effect { dst: Some(dst), .. } => *changed |= out.insert(*dst),
+                            _ => {}
+                        }
+                    }
+                }
+                Node::If { then, els, .. } => {
+                    mark_all_writes(then, out, changed);
+                    mark_all_writes(els, out, changed);
+                }
+                Node::Loop(inner) | Node::Once(inner) => mark_all_writes(inner, out, changed),
+                Node::Return | Node::Break | Node::Continue => {}
+            }
+        }
+    }
+
+    fn has_exit_jump(nodes: &[Node], include_loop_ctrl: bool) -> bool {
+        nodes.iter().any(|n| match n {
+            Node::Return => true,
+            Node::Break | Node::Continue => include_loop_ctrl,
+            Node::If { then, els, .. } => {
+                has_exit_jump(then, include_loop_ctrl) || has_exit_jump(els, include_loop_ctrl)
+            }
+            Node::Once(inner) => has_exit_jump(inner, include_loop_ctrl),
+            Node::Loop(inner) => has_exit_jump(inner, false),
+            Node::Block(_) => false,
+        })
+    }
+
+    fn walk(
+        nodes: &[Node],
+        mut in_divergent: bool,
+        in_loop: bool,
+        resources: &[crate::ir::Resource],
+        out: &mut BTreeSet<Var>,
+        changed: &mut bool,
+    ) {
+        for n in nodes {
+            match n {
+                Node::Block(stmts) => {
+                    for s in stmts {
+                        match s {
+                            Stmt::Set { dst, value, guard }
+                                if in_divergent
+                                    || matches!(guard, Guard::Exec)
+                                    || !expr_is_uniform(value, out, resources) =>
+                            {
+                                *changed |= out.insert(*dst);
+                            }
+                            Stmt::Effect {
+                                dst: Some(dst),
+                                call,
+                                guard,
+                            } if in_divergent
+                                || matches!(guard, Guard::Exec)
+                                || !expr_is_uniform(call, out, resources) =>
+                            {
+                                *changed |= out.insert(*dst);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Node::If { cond, then, els } => {
+                    let div = in_divergent || !expr_is_uniform(cond, out, resources);
+                    if div {
+                        mark_all_writes(then, out, changed);
+                        mark_all_writes(els, out, changed);
+                        if has_exit_jump(then, in_loop) || has_exit_jump(els, in_loop) {
+                            in_divergent = true;
+                        }
+                    } else {
+                        walk(then, false, in_loop, resources, out, changed);
+                        walk(els, false, in_loop, resources, out, changed);
+                    }
+                }
+                Node::Loop(inner) => {
+                    let div = in_divergent || !loop_breaks_uniform(inner, out, resources);
+                    if div {
+                        mark_all_writes(inner, out, changed);
+                        if has_exit_jump(inner, false) {
+                            in_divergent = true;
+                        }
+                    } else {
+                        walk(inner, false, true, resources, out, changed);
+                    }
+                }
+                Node::Once(inner) => {
+                    let div = in_divergent || !loop_breaks_uniform(inner, out, resources);
+                    if div {
+                        mark_all_writes(inner, out, changed);
+                        if has_exit_jump(inner, in_loop) {
+                            in_divergent = true;
+                        }
+                    } else {
+                        walk(inner, false, in_loop, resources, out, changed);
+                    }
+                }
+                Node::Return | Node::Break | Node::Continue => {}
+            }
+        }
+    }
+
+    let mut non_uniform = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        walk(body, false, false, resources, &mut non_uniform, &mut changed);
+        if !changed {
+            break;
+        }
+    }
+    non_uniform
+}
+
+pub(crate) fn loop_breaks_uniform(
+    nodes: &[Node],
+    non_uniform: &BTreeSet<Var>,
+    resources: &[crate::ir::Resource],
+) -> bool {
+    fn check(
+        nodes: &[Node],
+        cond_uniform: bool,
+        non_uniform: &BTreeSet<Var>,
+        resources: &[crate::ir::Resource],
+    ) -> bool {
+        for n in nodes {
+            match n {
+                Node::Break | Node::Continue | Node::Return => {
+                    if !cond_uniform {
+                        return false;
+                    }
+                }
+                Node::If { cond, then, els } => {
+                    let u = cond_uniform && expr_is_uniform(cond, non_uniform, resources);
+                    if !check(then, u, non_uniform, resources)
+                        || !check(els, u, non_uniform, resources)
+                    {
+                        return false;
+                    }
+                }
+                Node::Once(inner) => {
+                    if !check(inner, cond_uniform, non_uniform, resources) {
+                        return false;
+                    }
+                }
+                Node::Loop(_) | Node::Block(_) => {}
+            }
+        }
+        true
+    }
+    check(nodes, true, non_uniform, resources)
+}
+
+struct EmulLower<'a> {
+    next_tmp: u16,
+    next_flag: u16,
+    non_uniform: BTreeSet<Var>,
+    resources: &'a [crate::ir::Resource],
+}
+
+impl<'a> EmulLower<'a> {
+    fn from_parts(
+        next_tmp: u16,
+        next_flag: u16,
+        non_uniform: BTreeSet<Var>,
+        resources: &'a [crate::ir::Resource],
+    ) -> Self {
+        Self {
+            next_tmp,
+            next_flag,
+            non_uniform,
+            resources,
+        }
+    }
+
+    fn scan(func: &Function) -> (u16, u16, BTreeSet<Var>) {
+        let mut max_tmp = 0u16;
+        let mut max_flag = 0u16;
+        let mut note_var = |v: Var| match v {
+            Var::Tmp(n) => max_tmp = max_tmp.max(n.saturating_add(1)),
+            Var::Flag(n) => max_flag = max_flag.max(n.saturating_add(1)),
+            _ => {}
+        };
+        func.for_each_stmt(&mut |s| match s {
+            Stmt::Set { dst, .. } => note_var(*dst),
+            Stmt::Effect { dst: Some(dst), .. } => note_var(*dst),
+            _ => {}
+        });
+        crate::hlsl::expr::for_each_expr(func, &mut |e| {
+            if let Expr::Var(v) = e {
+                note_var(*v);
+            }
+        });
+        let non_uniform = compute_non_uniform_vars(&func.body, &func.resources);
+        (max_tmp, max_flag, non_uniform)
+    }
+
+    fn fresh_tmp(&mut self) -> Var {
+        let v = Var::Tmp(self.next_tmp);
+        self.next_tmp = self.next_tmp.saturating_add(1);
+        v
+    }
+
+    fn fresh_flag(&mut self) -> Var {
+        let v = Var::Flag(self.next_flag);
+        self.next_flag = self.next_flag.saturating_add(1);
+        v
+    }
+
+    fn combine_and(a: Option<&Expr>, b: Expr) -> Expr {
+        match a {
+            Some(prev) => Expr::bin(Bin::LAnd, prev.clone(), b),
+            None => b,
+        }
+    }
+
+    fn rewrite_group1_expr(e: &mut Expr) {
+        match e {
+            Expr::Call(h, args) => {
+                for a in args.iter_mut() {
+                    Self::rewrite_group1_expr(a);
+                }
+                match h.name {
+                    "decant_write_lane" => {
+                        *h = &EMUL_WRITE_LANE;
+                        args.insert(0, Expr::Input(Input::GroupIndex));
+                    }
+                    "decant_wave_lane_index" => {
+                        *h = &EMUL_WAVE_LANE_INDEX;
+                        args.insert(0, Expr::Input(Input::GroupIndex));
+                    }
+                    "decant_dpp_mov" => {
+                        *h = &EMUL_DPP_MOV;
+                        args.insert(0, Expr::Input(Input::GroupIndex));
+                    }
+                    "decant_dpp_add" => {
+                        *h = &EMUL_DPP_ADD;
+                        args.insert(0, Expr::Input(Input::GroupIndex));
+                    }
+                    "decant_dpp8_mov" => *h = &EMUL_DPP8_MOV,
+                    "decant_permlane" => *h = &EMUL_PERMLANE,
+                    _ => {}
+                }
+            }
+            Expr::Un(_, a) | Expr::CodeWord(a) => Self::rewrite_group1_expr(a),
+            Expr::Bin(_, a, b) => {
+                Self::rewrite_group1_expr(a);
+                Self::rewrite_group1_expr(b);
+            }
+            Expr::Select(c, a, b) => {
+                Self::rewrite_group1_expr(c);
+                Self::rewrite_group1_expr(a);
+                Self::rewrite_group1_expr(b);
+            }
+            Expr::BufferWord { offset, .. } | Expr::VectorLoad { offset, .. } => {
+                Self::rewrite_group1_expr(offset);
+            }
+            Expr::Load(l) => Self::rewrite_group1_expr(&mut l.offset),
+            Expr::BvhWord(b, _) => {
+                for d in &mut b.descriptor {
+                    Self::rewrite_group1_expr(d);
+                }
+                for a in &mut b.address {
+                    Self::rewrite_group1_expr(a);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn rewrite_group1_nodes(nodes: &mut [Node]) {
+        for n in nodes {
+            match n {
+                Node::Block(stmts) => {
+                    for s in stmts {
+                        match s {
+                            Stmt::Set { value, .. } => Self::rewrite_group1_expr(value),
+                            Stmt::Effect { call, .. } => Self::rewrite_group1_expr(call),
+                            Stmt::Buffer(op, _) => {
+                                if let Some(idx) = &mut op.index {
+                                    Self::rewrite_group1_expr(idx);
+                                }
+                                Self::rewrite_group1_expr(&mut op.offset);
+                            }
+                            Stmt::Image(op, _) => {
+                                for a in &mut op.address {
+                                    Self::rewrite_group1_expr(a);
+                                }
+                            }
+                            Stmt::Output { value, .. } => Self::rewrite_group1_expr(value),
+                            Stmt::Discard { cond } => Self::rewrite_group1_expr(cond),
+                            Stmt::Export(_)
+                            | Stmt::Message { .. }
+                            | Stmt::Barrier { .. }
+                            | Stmt::Comment(_) => {}
+                        }
+                    }
+                }
+                Node::If { cond, then, els } => {
+                    Self::rewrite_group1_expr(cond);
+                    Self::rewrite_group1_nodes(then);
+                    Self::rewrite_group1_nodes(els);
+                }
+                Node::Loop(inner) | Node::Once(inner) => Self::rewrite_group1_nodes(inner),
+                Node::Return | Node::Break | Node::Continue => {}
+            }
+        }
+    }
+
+    /// Rewrites Group II calls in `e` into `EMUL_*` calls, optionally hoisting them into
+    /// unconditional `Guard::Always` statements in `pre` so they never sit under `if (exec)`
+    /// or inside a predicated `Select`.
+    fn rewrite_group2_expr(
+        &mut self,
+        e: &mut Expr,
+        active: Option<&Expr>,
+        hoist: bool,
+        pre: &mut Vec<Stmt>,
+    ) {
+        match e {
+            Expr::Call(h, args) => {
+                for a in args.iter_mut() {
+                    self.rewrite_group2_expr(a, active, hoist, pre);
+                }
+                let gi = Expr::Input(Input::GroupIndex);
+                let active_expr = active.cloned().unwrap_or(Expr::Bool(true));
+                let rewritten = if h.name == READ_LANE.name {
+                    *h = &EMUL_READ_LANE;
+                    args.insert(0, gi);
+                    true
+                } else if h.name == READ_FIRST_LANE.name && args.len() == 2 {
+                    *h = &EMUL_READ_FIRST_LANE;
+                    if let Some(act) = active {
+                        let old_exec = std::mem::replace(&mut args[1], Expr::Bool(false));
+                        args[1] = Expr::bin(Bin::LAnd, act.clone(), old_exec);
+                    }
+                    args.insert(0, gi);
+                    true
+                } else if h.name == MASK_WORD.name && args.len() == 2 {
+                    *h = &EMUL_MASK_WORD;
+                    if let Some(act) = active {
+                        let old_v = std::mem::replace(&mut args[0], Expr::Bool(false));
+                        args[0] = Expr::bin(Bin::LAnd, act.clone(), old_v);
+                    }
+                    args.insert(0, gi);
+                    true
+                } else if h.name == BPERMUTE.name && args.len() == 4 {
+                    *h = &EMUL_BPERMUTE;
+                    if let Some(act) = active {
+                        let old_exec = std::mem::replace(&mut args[3], Expr::Bool(false));
+                        args[3] = Expr::bin(Bin::LAnd, act.clone(), old_exec);
+                    }
+                    args.insert(0, gi);
+                    true
+                } else if let Some(target) = emul_ballot_target(h.name) {
+                    *h = target;
+                    if let Some(act) = active
+                        && !args.is_empty()
+                    {
+                        let old_v = std::mem::replace(&mut args[0], Expr::Bool(false));
+                        args[0] = Expr::bin(Bin::LAnd, act.clone(), old_v);
+                    }
+                    args.insert(0, gi);
+                    true
+                } else if let Some(target) = emul_reduce_target(h.name) {
+                    *h = target;
+                    args.insert(0, gi);
+                    args.push(active_expr);
+                    true
+                } else {
+                    false
+                };
+                if rewritten && hoist {
+                    let dst = if h.result == Ty::Bool {
+                        self.fresh_flag()
+                    } else {
+                        self.fresh_tmp()
+                    };
+                    let call_expr = std::mem::replace(e, Expr::Var(dst));
+                    pre.push(Stmt::Set {
+                        dst,
+                        value: call_expr,
+                        guard: Guard::Always,
+                    });
+                }
+            }
+            Expr::Un(_, a) | Expr::CodeWord(a) => self.rewrite_group2_expr(a, active, hoist, pre),
+            Expr::Bin(_, a, b) => {
+                self.rewrite_group2_expr(a, active, hoist, pre);
+                self.rewrite_group2_expr(b, active, hoist, pre);
+            }
+            Expr::Select(c, a, b) => {
+                self.rewrite_group2_expr(c, active, hoist, pre);
+                self.rewrite_group2_expr(a, active, hoist, pre);
+                self.rewrite_group2_expr(b, active, hoist, pre);
+            }
+            Expr::BufferWord { offset, .. } | Expr::VectorLoad { offset, .. } => {
+                self.rewrite_group2_expr(offset, active, hoist, pre);
+            }
+            Expr::Load(l) => self.rewrite_group2_expr(&mut l.offset, active, hoist, pre),
+            Expr::BvhWord(b, _) => {
+                for d in &mut b.descriptor {
+                    self.rewrite_group2_expr(d, active, hoist, pre);
+                }
+                for a in &mut b.address {
+                    self.rewrite_group2_expr(a, active, hoist, pre);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn lower_block(&mut self, stmts: Vec<Stmt>, active: Option<&Expr>, out: &mut Vec<Node>) {
+        let mut cur_stmts = Vec::new();
+        let flush = |cur: &mut Vec<Stmt>, out: &mut Vec<Node>| {
+            if !cur.is_empty() {
+                out.push(Node::Block(std::mem::take(cur)));
+            }
+        };
+        for mut s in stmts {
+            let mut pre = Vec::new();
+            let stmt_is_exec = match &s {
+                Stmt::Set { guard, .. } | Stmt::Effect { guard, .. } => {
+                    matches!(guard, Guard::Exec)
+                }
+                _ => false,
+            };
+            let hoist = active.is_some() || stmt_is_exec;
+            let eff_active = if stmt_is_exec {
+                Some(Self::combine_and(active, Expr::Var(Var::Exec)))
+            } else {
+                active.cloned()
+            };
+            match &mut s {
+                Stmt::Set { value, .. } => {
+                    self.rewrite_group2_expr(value, eff_active.as_ref(), hoist, &mut pre);
+                }
+                Stmt::Effect { call, .. } => {
+                    self.rewrite_group2_expr(call, eff_active.as_ref(), hoist, &mut pre);
+                }
+                Stmt::Buffer(op, _) => {
+                    if let Some(idx) = &mut op.index {
+                        self.rewrite_group2_expr(idx, eff_active.as_ref(), hoist, &mut pre);
+                    }
+                    self.rewrite_group2_expr(&mut op.offset, eff_active.as_ref(), hoist, &mut pre);
+                }
+                Stmt::Image(op, _) => {
+                    for a in &mut op.address {
+                        self.rewrite_group2_expr(a, eff_active.as_ref(), hoist, &mut pre);
+                    }
+                }
+                Stmt::Output { value, .. } => {
+                    self.rewrite_group2_expr(value, eff_active.as_ref(), hoist, &mut pre);
+                }
+                Stmt::Discard { cond } => {
+                    self.rewrite_group2_expr(cond, eff_active.as_ref(), hoist, &mut pre);
+                }
+                Stmt::Export(_)
+                | Stmt::Message { .. }
+                | Stmt::Barrier { .. }
+                | Stmt::Comment(_) => {}
+            }
+            cur_stmts.extend(pre);
+            match active {
+                None => cur_stmts.push(s),
+                Some(act) => match s {
+                    Stmt::Set { dst, value, guard }
+                        if !matches!(value, Expr::BufferWord { .. } | Expr::BvhWord(..)) =>
+                    {
+                        let cond = if matches!(guard, Guard::Exec) {
+                            Expr::bin(Bin::LAnd, act.clone(), Expr::Var(Var::Exec))
+                        } else {
+                            act.clone()
+                        };
+                        cur_stmts.push(Stmt::Set {
+                            dst,
+                            value: Expr::select(cond, value, Expr::Var(dst)),
+                            guard: Guard::Always,
+                        });
+                    }
+                    Stmt::Effect {
+                        call: Expr::Call(h, _),
+                        ..
+                    } if h.name == crate::lift::ds::BARRIER.name || has_group_barrier(h) => {
+                        cur_stmts.push(s);
+                    }
+                    Stmt::Barrier { .. } => cur_stmts.push(s),
+                    other => {
+                        flush(&mut cur_stmts, out);
+                        out.push(Node::If {
+                            cond: act.clone(),
+                            then: vec![Node::Block(vec![other])],
+                            els: Vec::new(),
+                        });
+                    }
+                },
+            }
+        }
+        flush(&mut cur_stmts, out);
+    }
+
+    fn lower_nodes(&mut self, nodes: Vec<Node>, active: Option<&Expr>, out: &mut Vec<Node>) {
+        for node in nodes {
+            match node {
+                Node::Block(stmts) => self.lower_block(stmts, active, out),
+                Node::If {
+                    mut cond,
+                    then,
+                    els,
+                } => {
+                    let mut pre = Vec::new();
+                    self.rewrite_group2_expr(&mut cond, active, true, &mut pre);
+                    if !pre.is_empty() {
+                        out.push(Node::Block(pre));
+                    }
+                    let needs_flatten = active.is_some()
+                        || (!expr_is_uniform(&cond, &self.non_uniform, self.resources)
+                            && (nodes_have_emul_barrier_source(&then)
+                                || nodes_have_emul_barrier_source(&els))
+                            && nodes_can_flatten(&then)
+                            && nodes_can_flatten(&els));
+                    if needs_flatten && nodes_can_flatten(&then) && nodes_can_flatten(&els) {
+                        let cvar = self.fresh_flag();
+                        out.push(Node::Block(vec![Stmt::Set {
+                            dst: cvar,
+                            value: cond,
+                            guard: Guard::Always,
+                        }]));
+                        if !then.is_empty() {
+                            let then_act = Self::combine_and(active, Expr::Var(cvar));
+                            self.lower_nodes(then, Some(&then_act), out);
+                        }
+                        if !els.is_empty() {
+                            let else_act =
+                                Self::combine_and(active, Expr::un(Un::LNot, Expr::Var(cvar)));
+                            self.lower_nodes(els, Some(&else_act), out);
+                        }
+                    } else {
+                        let mut new_then = Vec::new();
+                        let mut new_els = Vec::new();
+                        self.lower_nodes(then, active, &mut new_then);
+                        self.lower_nodes(els, active, &mut new_els);
+                        out.push(Node::If {
+                            cond,
+                            then: new_then,
+                            els: new_els,
+                        });
+                    }
+                }
+                Node::Loop(inner) => {
+                    let mut new_inner = Vec::new();
+                    self.lower_nodes(inner, active, &mut new_inner);
+                    out.push(Node::Loop(new_inner));
+                }
+                Node::Once(inner) => {
+                    let mut new_inner = Vec::new();
+                    self.lower_nodes(inner, active, &mut new_inner);
+                    out.push(Node::Once(new_inner));
+                }
+                other @ (Node::Return | Node::Break | Node::Continue) => out.push(other),
+            }
+        }
+    }
+}
+
+/// Lowers 64-lane compute wave operations to narrow-wave / `groupshared` emulation so the shader
+/// runs without `[WaveSize(64)]` on Wave32 hardware.
+pub(crate) fn lower_emulated_wave64(func: &mut Function) -> Result<(), Refusal> {
+    if func.lanes != 64 {
+        return Ok(());
+    }
+    EmulLower::rewrite_group1_nodes(&mut func.body);
+    let (next_tmp, next_flag, non_uniform) = EmulLower::scan(func);
+    let old_body = std::mem::take(&mut func.body);
+    let mut new_body = Vec::with_capacity(old_body.len());
+    let mut lower = EmulLower::from_parts(next_tmp, next_flag, non_uniform, &func.resources);
+    lower.lower_nodes(old_body, None, &mut new_body);
+    func.body = new_body;
+    Ok(())
 }
 
 #[cfg(test)]

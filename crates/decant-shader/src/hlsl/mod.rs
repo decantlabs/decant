@@ -819,15 +819,24 @@ pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
     let uses_wave_swizzle = helpers
         .iter()
         .any(|h| h.name == crate::lift::wave::SWIZZLE_WAVE.name);
+    let uses_emul_wave32 = helpers
+        .iter()
+        .any(|h| crate::lift::wave::uses_emul_wave32(h));
+    let emul_wave_lds = helpers
+        .iter()
+        .any(|h| crate::lift::wave::uses_emul_wave_lds(h));
+    let emul_wave_mask = helpers
+        .iter()
+        .any(|h| crate::lift::wave::uses_emul_wave_mask(h));
+    let group_threads = cx
+        .iface
+        .threads
+        .and_then(|dims| dims.into_iter().try_fold(1u32, u32::checked_mul));
     let swizzle_threads = if helpers
         .iter()
         .any(|h| h.name == crate::lift::wave::SWIZZLE.name)
     {
-        let threads = cx
-            .iface
-            .threads
-            .and_then(|dims| dims.into_iter().try_fold(1u32, u32::checked_mul));
-        let Some(threads @ 1..=1024) = threads else {
+        let Some(threads @ 1..=1024) = group_threads else {
             return Err(Refusal::new(
                 RefusalKind::Exec("cross-lane"),
                 "invalid swizzle group size",
@@ -839,11 +848,32 @@ pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
     } else {
         0
     };
+    let (wave_lds_words, wave_mask_words) = if emul_wave_lds || emul_wave_mask {
+        let Some(threads @ 1..=1024) = group_threads else {
+            return Err(Refusal::new(
+                RefusalKind::Exec("cross-lane"),
+                "invalid wave emulation group size",
+            ));
+        };
+        (
+            if emul_wave_lds { threads } else { 0 },
+            if emul_wave_mask {
+                threads.div_ceil(64) * 2
+            } else {
+                0
+            },
+        )
+    } else {
+        (0, 0)
+    };
     let shared_words = func.groupshared_dwords + swizzle_threads;
-    if swizzle_threads != 0 && shared_words > cx.iface.groupshared_limit {
+    let total_shared = shared_words + wave_lds_words + wave_mask_words;
+    if (swizzle_threads != 0 || wave_lds_words != 0 || wave_mask_words != 0)
+        && total_shared > cx.iface.groupshared_limit
+    {
         return Err(Refusal::new(
             RefusalKind::Exec("cross-lane"),
-            "swizzle scratch exceeds group shared memory limit",
+            "swizzle or wave emulation scratch exceeds group shared memory limit",
         ));
     }
     if shared_words != 0 {
@@ -853,6 +883,17 @@ pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
             func.groupshared_dwords
         )
         .expect("writing to a string");
+    }
+    if wave_lds_words != 0 {
+        writeln!(
+            out,
+            "static const uint decant_wave_threads = {wave_lds_words}u;\ngroupshared uint decant_wave_lds[{wave_lds_words}];"
+        )
+        .expect("writing to a string");
+    }
+    if wave_mask_words != 0 {
+        writeln!(out, "groupshared uint decant_wave_mask[{wave_mask_words}];")
+            .expect("writing to a string");
     }
     let dpp = helpers.iter().any(|h| {
         h.name == crate::lift::wave::DPP_ADD.name || h.name == crate::lift::wave::PERMLANE.name
@@ -1034,9 +1075,11 @@ pub fn print(func: &Function, cx: &Context) -> Result<String, Refusal> {
     // A compute entry takes the thread id in the group and the group id as parameters.
     let params = match cx.iface.threads {
         Some([x, y, z]) => {
-            if uses_wave_lanes || dpp || dpp_mov_needs_full_wave {
+            if (uses_wave_lanes || dpp || dpp_mov_needs_full_wave) && cx.iface.outputs.is_empty() {
                 writeln!(out, "[WaveSize({})]", func.lanes).expect("writing to a string");
-            } else if (uses_wave_swizzle || uses_dpp_mov) && cx.iface.outputs.is_empty() {
+            } else if (uses_wave_swizzle || uses_dpp_mov || uses_emul_wave32)
+                && cx.iface.outputs.is_empty()
+            {
                 writeln!(out, "[WaveSize(32)]").expect("writing to a string");
             }
             writeln!(

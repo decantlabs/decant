@@ -52,7 +52,7 @@ use crate::rts0::{self, RootLayout};
 use crate::shader_source::{Pipeline, Refusal, ShaderSource, StageHlsl, StageKind};
 
 /// Bumped when this file changes what the translator is asked or what a pipeline is refused for.
-pub const ADAPTER_VERSION: u32 = 2;
+pub const ADAPTER_VERSION: u32 = 3;
 
 /// The `t` register of the heap map in the mirror's space (`decant_shader::api::MirrorAbi`).
 pub const HEAP_MAP_REGISTER: u32 = 0;
@@ -117,10 +117,118 @@ pub fn root_signature(layout: &RootLayout) -> sd::RootSignature {
     sd::RootSignature { params, static_samplers, flags: layout.flags }
 }
 
-/// The options for a pipeline with the root signature `layout`: the mirror when the PC root
-/// signature has the mirror parameter, with the heap map and the view shadow when it has those
-/// root views too, one lane per invocation, shader model 6.6.
-pub fn options(layout: &RootLayout) -> sd::Options {
+/// Selects the translator wave mode for a device whose `D3D12_FEATURE_DATA_D3D12_OPTIONS1`
+/// reports `max_wave_lanes`: native 64-lane waves when the hardware supports 64-lane waves,
+/// otherwise groupshared 64-lane wave emulation so `[WaveSize(64)]` is never emitted on
+/// Wave32-only GPUs.
+pub fn wave_mode_for_max_lanes(max_wave_lanes: u32) -> sd::WaveMode {
+    if max_wave_lanes >= 64 {
+        sd::WaveMode::Native { lanes: 64 }
+    } else {
+        sd::WaveMode::Emulated
+    }
+}
+
+/// Queries `D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMax` from `device`. Returns `32`
+/// when wave ops are unavailable or the query fails.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn query_device_max_wave_lanes(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: `opts` is a valid out-buffer matching `D3D12_FEATURE_D3D12_OPTIONS1`.
+    let res = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut opts).cast(),
+            std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>() as u32,
+        )
+    };
+    if res.is_ok() && opts.WaveOps.as_bool() && opts.WaveLaneCountMax >= 32 {
+        opts.WaveLaneCountMax
+    } else {
+        32
+    }
+}
+
+/// Queries the PC adapter's `WaveLaneCountMax` once (honouring `DECANT_D3D12X_MAX_WAVE_SIZE`
+/// when set). Prefers the active PC device recorded by `title_mem`, falling back to a temporary
+/// PC device from `%SystemRoot%\System32\d3d12.dll` so offline warmup sees the same device caps.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn detect_max_wave_lanes() -> u32 {
+    use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_12_0};
+    use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+    use windows::core::Interface;
+
+    if let Some(forced) = std::env::var("DECANT_D3D12X_MAX_WAVE_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&v| v >= 32)
+    {
+        return forced;
+    }
+    if let Some(dev) = crate::title_mem::device() {
+        return query_device_max_wave_lanes(&dev);
+    }
+    // Load the system d3d12.dll by full path: this crate exports `D3D12CreateDevice` itself.
+    let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()) + r"\System32\d3d12.dll";
+    let wide: Vec<u16> = system.encode_utf16().chain([0]).collect();
+    // SAFETY: valid NUL-terminated path and standard `D3D12CreateDevice` ABI.
+    unsafe {
+        let module = windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr());
+        if module.is_null() {
+            return 32;
+        }
+        let Some(proc) = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+            module,
+            c"D3D12CreateDevice".as_ptr().cast(),
+        ) else {
+            return 32;
+        };
+        let create: unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            i32,
+            *const windows::core::GUID,
+            *mut *mut std::ffi::c_void,
+        ) -> i32 = std::mem::transmute(proc);
+        for level in [D3D_FEATURE_LEVEL_12_0.0, D3D_FEATURE_LEVEL_11_0.0] {
+            let mut raw = std::ptr::null_mut();
+            if create(std::ptr::null_mut(), level, &ID3D12Device::IID, &mut raw) >= 0 && !raw.is_null() {
+                let dev = ID3D12Device::from_raw(raw);
+                return query_device_max_wave_lanes(&dev);
+            }
+        }
+    }
+    32
+}
+
+#[cfg(not(windows))]
+fn detect_max_wave_lanes() -> u32 {
+    std::env::var("DECANT_D3D12X_MAX_WAVE_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&v| v >= 32)
+        .unwrap_or(32)
+}
+
+/// The cached maximum wave lane count of the host PC D3D12 device.
+pub fn max_wave_lanes() -> u32 {
+    static MAX_LANES: OnceLock<u32> = OnceLock::new();
+    *MAX_LANES.get_or_init(detect_max_wave_lanes)
+}
+
+/// The default translator wave mode for the host PC D3D12 device.
+pub fn default_wave_mode() -> sd::WaveMode {
+    wave_mode_for_max_lanes(max_wave_lanes())
+}
+
+/// The options for a pipeline with the root signature `layout` and explicit `wave` mode: the
+/// mirror when the PC root signature has the mirror parameter, with the heap map and the view
+/// shadow when it has those root views too, shader model 6.6.
+pub fn options_for_wave(layout: &RootLayout, wave: sd::WaveMode) -> sd::Options {
     let view = |register: u32| layout.descriptor_index(rts0::RegisterClass::Srv, register, rts0::MIRROR_SPACE).map(|_| register);
     sd::Options {
         mirror: layout.mirror_index().map(|_| sd::MirrorAbi {
@@ -129,10 +237,17 @@ pub fn options(layout: &RootLayout) -> sd::Options {
             heap_map: view(HEAP_MAP_REGISTER),
             view_shadow: view(VIEW_SHADOW_REGISTER),
         }),
-        wave: sd::WaveMode::Scalar,
+        wave,
         shader_model_minor: 6,
         listing: false,
     }
+}
+
+/// The options for a pipeline with the root signature `layout`: the mirror when the PC root
+/// signature has the mirror parameter, with the heap map and the view shadow when it has those
+/// root views too, device-queried wave mode, shader model 6.6.
+pub fn options(layout: &RootLayout) -> sd::Options {
+    options_for_wave(layout, default_wave_mode())
 }
 
 /// The translator's stage of a stage of the layer. A mesh pipeline comes as its mesh and pixel
@@ -725,7 +840,17 @@ mod tests {
         assert_eq!(options(&with_views).mirror, Some(sd::MirrorAbi { register: 1, space: 15, heap_map: Some(0), view_shadow: Some(1) }));
         assert_eq!(root_signature(&with_views), root, "they are the layer's parameters, not the title's");
         l.params.pop();
-        assert_eq!(options(&l), sd::Options { mirror: None, wave: sd::WaveMode::Scalar, shader_model_minor: 6, listing: false });
+        assert_eq!(
+            options(&l),
+            sd::Options { mirror: None, wave: default_wave_mode(), shader_model_minor: 6, listing: false }
+        );
+        assert_eq!(wave_mode_for_max_lanes(32), sd::WaveMode::Emulated);
+        assert_eq!(wave_mode_for_max_lanes(64), sd::WaveMode::Native { lanes: 64 });
+        assert_eq!(
+            options_for_wave(&l, sd::WaveMode::Emulated),
+            sd::Options { mirror: None, wave: sd::WaveMode::Emulated, shader_model_minor: 6, listing: false }
+        );
+        assert!(max_wave_lanes() >= 32);
     }
 
     #[test]
@@ -924,5 +1049,17 @@ mod tests {
         assert_eq!(keys.len(), 2);
         let other_root = layout(vec![range(rts0::RegisterClass::Srv, 3, 0)]);
         assert_ne!(pipeline_input_key(&p), pipeline_input_key(&pipeline(&[ui_vertex(), ui_pixel()], other_root)));
+    }
+
+    #[test]
+    fn wave_mode_tracks_device_max_wave_lanes() {
+        assert_eq!(wave_mode_for_max_lanes(32), sd::WaveMode::Emulated);
+        assert_eq!(wave_mode_for_max_lanes(16), sd::WaveMode::Emulated);
+        assert_eq!(wave_mode_for_max_lanes(64), sd::WaveMode::Native { lanes: 64 });
+        assert_eq!(wave_mode_for_max_lanes(128), sd::WaveMode::Native { lanes: 64 });
+        assert!(max_wave_lanes() >= 32);
+        let l = layout(Vec::new());
+        assert_eq!(options_for_wave(&l, sd::WaveMode::Emulated).wave, sd::WaveMode::Emulated);
+        assert_eq!(options(&l).wave, default_wave_mode());
     }
 }

@@ -117,14 +117,18 @@ intrinsic!(
     "decant_lds_xchg",
     "InterlockedExchange(decant_lds[i], v, o)"
 );
-intrinsic!(
-    CMPST,
-    "decant_lds_cmpst",
-    "InterlockedCompareExchange(decant_lds[i], v, w, o)"
-);
+pub static CMPST: Helper = Helper {
+    name: "decant_lds_cmpst",
+    result: Ty::U32,
+    text: "uint decant_lds_cmpst(uint a, uint v, uint w) { uint i = a >> 2; uint o = v; if (i < decant_lds_words) { InterlockedCompareExchange(decant_lds[i], v, w, o); } return o; }",
+    needs: &[],
+};
 
-/// An atomic without an HLSL intrinsic: a compare and exchange loop. `$new` is the new value
-/// from the current one `c` and the operands `v` and `w`.
+/// Maximum compare-and-exchange retry iterations for emulated LDS atomics.
+pub const LDS_CAS_MAX_ITERS: u32 = 1024;
+
+/// An atomic without an HLSL intrinsic: a bounded compare and exchange loop. `$new` is the new
+/// value from the current one `c` and the operands `v` and `w`.
 macro_rules! cas {
     ($id:ident, $name:literal, $new:literal) => {
         pub static $id: Helper = Helper {
@@ -133,9 +137,9 @@ macro_rules! cas {
             text: concat!(
                 "uint ",
                 $name,
-                "(uint a, uint v, uint w) { uint i = a >> 2; uint o = 0u; if (i < decant_lds_words) { uint c = decant_lds[i]; [loop] for (;;) { uint n = ",
+                "(uint a, uint v, uint w) { uint i = a >> 2; uint o = 0u; if (i < decant_lds_words) { uint c = decant_lds[i]; o = c; [loop] for (uint decant_cas = 0u; decant_cas < 1024u; ++decant_cas) { uint n = ",
                 $new,
-                "; uint p; InterlockedCompareExchange(decant_lds[i], c, n, p); if (p == c) { o = c; break; } c = p; } } return o; }"
+                "; uint p; InterlockedCompareExchange(decant_lds[i], c, n, p); if (p == c) { o = c; break; } c = p; o = c; } } return o; }"
             ),
             needs: &[],
         };

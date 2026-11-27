@@ -862,7 +862,12 @@ impl Printer<'_> {
         let a = addr.at.clone();
         if let Some(kind) = sh.atomic {
             let lines = self.buf_atomic(op, kind, &name, &a);
-            let oob = op.glc.then(|| format!("v{} = 0u;", op.data));
+            let oob = op.glc.then(|| match kind {
+                // Returning the compare operand on out-of-bounds compare-and-exchange ensures
+                // title CAS retry loops exit cleanly instead of spinning forever on null/OOB views.
+                Atomic::CmpSwap | Atomic::FCmpSwap => format!("v{} = v{};", op.data, op.data + 1),
+                _ => format!("v{} = 0u;", op.data),
+            });
             return self.buf_finish_write(guard, &addr, lines, oob.as_deref());
         }
         if sh.store {
@@ -998,10 +1003,21 @@ impl Printer<'_> {
             Atomic::And => Some(call("InterlockedAnd", &format!("{v}, {old}"))),
             Atomic::Or => Some(call("InterlockedOr", &format!("{v}, {old}"))),
             Atomic::Xor => Some(call("InterlockedXor", &format!("{v}, {old}"))),
-            Atomic::CmpSwap => Some(call(
-                "InterlockedCompareExchange",
-                &format!("{w}, {v}, {old}"),
-            )),
+            Atomic::CmpSwap => {
+                // Guard raw/null buffer compare-and-exchange against out-of-bounds byte offsets,
+                // returning the compare operand so title CAS retry loops terminate cleanly.
+                lines[0] = format!("uint {old} = {w};");
+                lines.push(format!("uint decant_dim{u}; {name}.GetDimensions(decant_dim{u});"));
+                lines.push(format!(
+                    "if ({a} <= decant_dim{u} && decant_dim{u} - {a} >= 4u) {{"
+                ));
+                lines.push(format!(
+                    "    {}",
+                    call("InterlockedCompareExchange", &format!("{w}, {v}, {old}"))
+                ));
+                lines.push("}".to_owned());
+                Some(String::new())
+            }
             Atomic::SMin | Atomic::SMax => {
                 let f = if kind == Atomic::SMin {
                     "InterlockedMin"
@@ -1032,7 +1048,9 @@ impl Printer<'_> {
                     _ => unreachable!("handled by one call"),
                 };
                 lines.push(format!("{old} = {load};"));
-                lines.push("[loop] while (true) {".to_owned());
+                lines.push(format!(
+                    "[loop] for (uint decant_cas{u} = 0u; decant_cas{u} < 1024u; ++decant_cas{u}) {{"
+                ));
                 lines.push(format!("    uint decant_seen{u} = 0u;"));
                 lines.push(format!(
                     "    {}",
@@ -1673,6 +1691,22 @@ mod tests {
                     Stmt::Buffer(
                         BufferOp {
                             op: Op::buffer_atomic_add,
+                            glc: true,
+                            store: true,
+                            bytes: 4,
+                            count: 1,
+                            data: 7,
+                            index: Some(Expr::Var(Var::V(0))),
+                            offset: Expr::U32(0),
+                            format: 0,
+                            buffer: Desc::Res(ResId(0)),
+                            pc: 2,
+                        },
+                        Guard::Exec,
+                    ),
+                    Stmt::Buffer(
+                        BufferOp {
+                            op: Op::buffer_atomic_add,
                             glc: false,
                             store: true,
                             bytes: 4,
@@ -1703,12 +1737,17 @@ mod tests {
             },
         )
         .unwrap();
-        // Returning atomic writes zero when out of bounds, non-returning atomic has no else branch.
+        // Returning CmpSwap yields its compare operand (v6) on OOB so CAS loops terminate; other
+        // returning atomics write zero on OOB; non-returning atomics have no else branch.
         assert!(
-            text.contains("} else {\n            v5 = 0u;\n        }"),
+            text.contains("} else {\n            v5 = v6;\n        }"),
             "{text}"
         );
-        assert_eq!(text.matches("} else {").count(), 1, "{text}");
+        assert!(
+            text.contains("} else {\n            v7 = 0u;\n        }"),
+            "{text}"
+        );
+        assert_eq!(text.matches("} else {").count(), 2, "{text}");
         compile_cs(&text);
     }
 }
