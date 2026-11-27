@@ -6,6 +6,68 @@ use super::*;
 
 type SetPredicationAt = unsafe extern "system" fn(Object, Object, u64, u32);
 type DepthBias = unsafe extern "system" fn(Object, f32, f32, f32);
+type GetListType = unsafe extern "system" fn(Object) -> u32;
+
+const D3D12_COMMAND_LIST_TYPE_DIRECT: u32 = 0;
+const D3D12_COMMAND_LIST_TYPE_COMPUTE: u32 = 2;
+const D3D12_RESOURCE_BARRIER_TYPE_ALIASING: u32 = 1;
+
+/// True for PC command list types that accept UAV and aliasing barriers (`DIRECT` and `COMPUTE`).
+/// `BUNDLE` forbids `ResourceBarrier` altogether, and `COPY` forbids UAV and aliasing barriers.
+pub(super) fn supports_uav_and_aliasing_barriers(list_type: u32) -> bool {
+    matches!(list_type, D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE)
+}
+
+/// `[D3D12_RESOURCE_BARRIER_TYPE_UAV(NULL), D3D12_RESOURCE_BARRIER_TYPE_ALIASING(NULL, NULL)]`
+/// in the 32-byte public `D3D12_RESOURCE_BARRIER` layout.
+pub(super) fn global_uav_and_aliasing_barriers() -> [[u8; BARRIER_BYTES]; 2] {
+    let uav = crate::list_sync::global_uav_barrier();
+    let mut aliasing = [0u8; BARRIER_BYTES];
+    aliasing[0..4].copy_from_slice(&D3D12_RESOURCE_BARRIER_TYPE_ALIASING.to_le_bytes());
+    [uav, aliasing]
+}
+
+/// Records `[UAV(NULL), ALIASING(NULL, NULL)]` on PC command list `pc` when its type is
+/// `DIRECT` or `COMPUTE`. Returns whether the barriers were recorded.
+///
+/// # Safety
+/// `pc` is a live PC `ID3D12GraphicsCommandList`.
+pub(super) unsafe fn record_global_uav_and_aliasing_barriers(pc: Object) -> bool {
+    // SAFETY: by the contract above; PC slot 8 is `ID3D12CommandList::GetType` and slot 26 is `ResourceBarrier`.
+    unsafe {
+        if !supports_uav_and_aliasing_barriers(method::<GetListType>(pc, 8)(pc)) {
+            return false;
+        }
+        let barriers = global_uav_and_aliasing_barriers();
+        method::<Barriers>(pc, 26)(pc, barriers.len() as u32, barriers.as_ptr().cast());
+        true
+    }
+}
+
+/// Applies a resolved predication target to PC command list `pc`. On `DIRECT` and `COMPUTE` lists,
+/// enabling predication records `[UAV(NULL), ALIASING(NULL, NULL)]` first so prior UAV writes and
+/// `title_mem` reserved-buffer aliases are visible to subsequent predicated operations. `BUNDLE`
+/// and `COPY` lists do not support `SetPredication` in PC D3D12 (calling it poisons `Close` with
+/// `E_FAIL`), so they are skipped.
+///
+/// # Safety
+/// `pc` is a live PC `ID3D12GraphicsCommandList`, and any resource in `target` is a live PC buffer.
+unsafe fn apply_predication(pc: Object, target: Option<(Object, u64, u32)>) {
+    // SAFETY: by the contract above; PC slot 8 is `GetType`, 26 is `ResourceBarrier`, and 55 is `SetPredication`.
+    unsafe {
+        if !supports_uav_and_aliasing_barriers(method::<GetListType>(pc, 8)(pc)) {
+            return;
+        }
+        match target {
+            Some((res, at, op)) => {
+                let barriers = global_uav_and_aliasing_barriers();
+                method::<Barriers>(pc, 26)(pc, barriers.len() as u32, barriers.as_ptr().cast());
+                method::<SetPredicationAt>(pc, 55)(pc, res, at, op);
+            }
+            None => method::<SetPredicationAt>(pc, 55)(pc, std::ptr::null_mut(), 0, 0),
+        }
+    }
+}
 
 /// The IID of `ID3D12GraphicsCommandList9`, the interface that has `RSSetDepthBias`.
 pub(super) const IID_GRAPHICS_COMMAND_LIST9: GUID = GUID::from_u128(0x34ed2808_ffe6_4c2b_b11a_cabd2b0c59e1);
@@ -38,10 +100,12 @@ pub(super) extern "system" fn list_depth_order_x(this: *mut Proxy, enable: u32) 
 }
 
 /// Console list slot 87 (newer layout): `SetPredicationBufferX(desc)` with `desc` null or
-/// `{ u64 address; u32 operation }`. The 8 bytes at the address are the predicate. The PC predicates
-/// on the buffer where it is, so no barrier is recorded (the PC wants the buffer in the PREDICATION
-/// state, which the proxy does not track). An address the proxy does not know switches predication
-/// off, so that the draws are not lost.
+/// `{ u64 address; u32 operation }`. The 8 bytes at the address are the predicate. Before enabling
+/// predication on a Direct or Compute list, global `[UAV(NULL), ALIASING(NULL, NULL)]` barriers
+/// flush prior UAV writes and `title_mem` reserved-buffer aliases; predication itself is modal across
+/// subsequent commands, and buffers in `COMMON` (both `CreateReservedResource` and default-heap
+/// buffers) implicitly promote to `PREDICATION` while upload buffers stay in `GENERIC_READ`. An
+/// address the proxy does not know switches predication off, so that draws are not lost.
 pub(super) extern "system" fn list_set_predication_buffer_x(this: *mut Proxy, desc: *const u8) {
     static N: AtomicI32 = AtomicI32::new(0);
     if !newer_or_unknown(this, 87) {
@@ -50,9 +114,8 @@ pub(super) extern "system" fn list_set_predication_buffer_x(this: *mut Proxy, de
     // SAFETY: `this` is a live list proxy; `desc` is null or 12 readable bytes by the method's contract.
     unsafe {
         let pc = (*this).pc;
-        let set = |res: Object, at: u64, op: u32| method::<SetPredicationAt>(pc, 55)(pc, res, at, op);
         if desc.is_null() {
-            set(std::ptr::null_mut(), 0, 0);
+            apply_predication(pc, None);
             return;
         }
         let va = desc.cast::<u64>().read_unaligned();
@@ -63,13 +126,13 @@ pub(super) extern "system" fn list_set_predication_buffer_x(this: *mut Proxy, de
                 if log_due(&N) {
                     xs_log!("console list slot 87 (SetPredicationBufferX, newer layout): predicate at {va:#x}, operation {op}");
                 }
-                set(res, at, op);
+                apply_predication(pc, Some((res, at, op)));
             }
             None => {
                 if log_due(&N) {
                     xs_log!("console list slot 87 (SetPredicationBufferX): {va:#x} operation {op} is not a predicate in a known buffer, predication switched off");
                 }
-                set(std::ptr::null_mut(), 0, 0);
+                apply_predication(pc, None);
             }
         }
     }
@@ -153,24 +216,28 @@ pub(super) extern "system" fn list_shading_rate_x(this: *mut Proxy) {
 }
 
 /// Console list slots 131 (top of pipe) and 132 (bottom of pipe), newer layout:
-/// `PipelineSync(flags, control, address, size)`. The PC list runs its commands in order and every
-/// submission is waited for, so a sync without a memory address has nothing to do (like the texture
-/// cache flush, slot 67). Measured calls name address 0. A sync that does name memory is logged and
-/// not performed, because the write it asks for is not implemented.
+/// `PipelineSync(flags, control, address, size)`. Console titles use pipeline syncs to flush and
+/// serialize GPU caches between passes in place of PC `ResourceBarrier` calls, so on Direct and
+/// Compute lists this records global `[UAV(NULL), ALIASING(NULL, NULL)]` barriers (`BUNDLE` and
+/// `COPY` lists skip them). Measured calls name address 0; a sync that names memory still records
+/// the barriers while logging that its memory write is not implemented.
 fn pipeline_sync(this: *mut Proxy, slot: u32, flags: u32, control: u32, address: u64, size: u64) {
     static TOP_LOGS: AtomicI32 = AtomicI32::new(0);
     static BOTTOM_LOGS: AtomicI32 = AtomicI32::new(0);
     if !newer_or_unknown(this, slot) {
         return;
     }
+    // SAFETY: `this` is a live command list proxy whose PC list is live.
+    let recorded = unsafe { record_global_uav_and_aliasing_barriers((*this).pc) };
     let logs = if slot == 131 { &TOP_LOGS } else { &BOTTOM_LOGS };
     if !log_due(logs) {
         return;
     }
+    let action = if recorded { "global UAV and aliasing barriers recorded on PC list" } else { "skipped on non-direct/compute list" };
     if address == 0 {
-        xs_log!("console list slot {slot} (pipeline sync, flags {flags:#x}, control {control:#x}, size {size:#x}): no memory named, nothing to do on PC");
+        xs_log!("console list slot {slot} (pipeline sync, flags {flags:#x}, control {control:#x}, size {size:#x}): no memory named, {action}");
     } else {
-        xs_log!("console list slot {slot} (pipeline sync, flags {flags:#x}, control {control:#x}): names memory at {address:#x}, not performed");
+        xs_log!("console list slot {slot} (pipeline sync, flags {flags:#x}, control {control:#x}): names memory at {address:#x}, {action} (memory write not performed)");
     }
 }
 
@@ -214,5 +281,158 @@ mod tests {
         assert_eq!(finite_or_zero(f32::NAN), 0.0);
         assert_eq!(finite_or_zero(f32::INFINITY), 0.0);
         assert_eq!(finite_or_zero(-0.25), -0.25);
+    }
+
+    #[test]
+    fn uav_and_aliasing_barriers_match_d3d12_layout() {
+        let [uav, aliasing] = global_uav_and_aliasing_barriers();
+        assert_eq!(u32::from_le_bytes(uav[0..4].try_into().unwrap()), 2);
+        assert!(uav[4..].iter().all(|&b| b == 0));
+        assert_eq!(u32::from_le_bytes(aliasing[0..4].try_into().unwrap()), 1);
+        assert!(aliasing[4..].iter().all(|&b| b == 0));
+
+        #[cfg(windows)]
+        {
+            use windows::Win32::Graphics::Direct3D12::{D3D12_RESOURCE_BARRIER_TYPE_ALIASING, D3D12_RESOURCE_BARRIER_TYPE_UAV};
+            assert_eq!(u32::from_le_bytes(uav[0..4].try_into().unwrap()), D3D12_RESOURCE_BARRIER_TYPE_UAV.0 as u32);
+            assert_eq!(u32::from_le_bytes(aliasing[0..4].try_into().unwrap()), D3D12_RESOURCE_BARRIER_TYPE_ALIASING.0 as u32);
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ListEvent {
+        Barriers(Vec<[u8; BARRIER_BYTES]>),
+        Predication(usize, u64, u32),
+    }
+
+    #[repr(C)]
+    struct FakeList {
+        vtbl: *const usize,
+        list_type: u32,
+        events: Vec<ListEvent>,
+    }
+
+    unsafe extern "system" fn fake_get_type(this: Object) -> u32 {
+        // SAFETY: only `FakeList` objects carry this vtable.
+        unsafe { (*this.cast::<FakeList>()).list_type }
+    }
+
+    unsafe extern "system" fn fake_barriers(this: Object, n: u32, barriers: *const c_void) {
+        // SAFETY: only `FakeList` objects carry this vtable; `barriers` holds `n` barrier structs.
+        unsafe {
+            let list = &mut *this.cast::<FakeList>();
+            let mut recorded = Vec::with_capacity(n as usize);
+            for i in 0..n as usize {
+                recorded.push(barriers.cast::<[u8; BARRIER_BYTES]>().add(i).read_unaligned());
+            }
+            list.events.push(ListEvent::Barriers(recorded));
+        }
+    }
+
+    unsafe extern "system" fn fake_set_predication(this: Object, res: Object, off: u64, op: u32) {
+        // SAFETY: only `FakeList` objects carry this vtable.
+        unsafe {
+            (*this.cast::<FakeList>()).events.push(ListEvent::Predication(res as usize, off, op));
+        }
+    }
+
+    fn fake_list_vtable() -> [usize; 56] {
+        let mut vtbl = [0usize; 56];
+        vtbl[8] = fake_get_type as *const () as usize;
+        vtbl[26] = fake_barriers as *const () as usize;
+        vtbl[55] = fake_set_predication as *const () as usize;
+        vtbl
+    }
+
+    #[test]
+    fn pipeline_sync_records_uav_and_aliasing_barriers_on_direct_and_compute_only() {
+        let vtbl = fake_list_vtable();
+        let expected = global_uav_and_aliasing_barriers().to_vec();
+        for (list_type, should_record) in [(0u32, true), (1, false), (2, true), (3, false)] {
+            let mut fake = FakeList { vtbl: vtbl.as_ptr(), list_type, events: Vec::new() };
+            let pc = std::ptr::from_mut(&mut fake).cast::<c_void>();
+            // SAFETY: `fake` implements vtable slots 8 and 26.
+            let recorded = unsafe { record_global_uav_and_aliasing_barriers(pc) };
+            assert_eq!(recorded, should_record, "list_type {list_type}");
+            if should_record {
+                assert_eq!(fake.events, vec![ListEvent::Barriers(expected.clone())], "list_type {list_type}");
+            } else {
+                assert!(fake.events.is_empty(), "list_type {list_type}");
+            }
+        }
+    }
+
+    #[test]
+    fn predication_emits_barriers_before_enable_and_skips_on_clear_or_copy() {
+        let vtbl = fake_list_vtable();
+        let expected = global_uav_and_aliasing_barriers().to_vec();
+        let res = 0x1234_5000usize as Object;
+        for (list_type, supported) in [(0u32, true), (1, false), (2, true), (3, false)] {
+            let mut fake = FakeList { vtbl: vtbl.as_ptr(), list_type, events: Vec::new() };
+            let pc = std::ptr::from_mut(&mut fake).cast::<c_void>();
+            // SAFETY: `fake` implements vtable slots 8, 26 and 55.
+            unsafe {
+                apply_predication(pc, Some((res, 0x40, 1)));
+                apply_predication(pc, None);
+            }
+            let want = if supported {
+                vec![
+                    ListEvent::Barriers(expected.clone()),
+                    ListEvent::Predication(res as usize, 0x40, 1),
+                    ListEvent::Predication(0, 0, 0),
+                ]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(fake.events, want, "list_type {list_type}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipeline_sync_and_predication_close_cleanly_on_d3d12_lists() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::core::Interface;
+
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 65536,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        for (name, device) in crate::view_gpu_tests::devices() {
+            let mut reserved: Option<ID3D12Resource> = None;
+            // SAFETY: valid device and buffer description.
+            unsafe { device.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut reserved) }
+                .unwrap_or_else(|e| panic!("{name}: CreateReservedResource failed: {e}"));
+            let reserved = reserved.expect("reserved buffer");
+
+            for (list_type, expect_barriers) in [
+                (D3D12_COMMAND_LIST_TYPE_DIRECT, true),
+                (D3D12_COMMAND_LIST_TYPE_COMPUTE, true),
+                (D3D12_COMMAND_LIST_TYPE_COPY, false),
+            ] {
+                // SAFETY: standard D3D12 allocator and command list creation on a live device.
+                let (alloc, list): (ID3D12CommandAllocator, ID3D12GraphicsCommandList) = unsafe {
+                    let alloc = device.CreateCommandAllocator(list_type).expect("allocator");
+                    let list = device.CreateCommandList(0, list_type, &alloc, None).expect("command list");
+                    (alloc, list)
+                };
+                // SAFETY: `list` and `reserved` are live D3D12 objects for this device.
+                unsafe {
+                    assert_eq!(record_global_uav_and_aliasing_barriers(list.as_raw()), expect_barriers, "{name}: {list_type:?}");
+                    apply_predication(list.as_raw(), Some((reserved.as_raw(), 0, 0)));
+                    apply_predication(list.as_raw(), None);
+                    list.Close().unwrap_or_else(|e| panic!("{name}: Close failed for {list_type:?}: {e}"));
+                }
+                drop((list, alloc));
+            }
+        }
     }
 }
