@@ -1470,3 +1470,232 @@ fn single_lane_mask_ff1_readlane_avoids_wave_read_lane_and_spurious_wave_size() 
     assert_eq!(text_rw.matches("decant_read_lane(").count(), 3, "{text_rw}");
     compiles(&real_wave);
 }
+
+#[test]
+fn cross_block_scc_vcc_and_saved_mask_barrier_skips_hoist_and_compile() {
+    // 1. Cross-block SCC skip: block 0 narrows EXEC & sets SCC, unconditional jump to block 1
+    //    which performs unrelated scalar setup and skips a barrier on `s_cbranch_scc0`.
+    let mut cross_scc = compute([256, 1, 1], Vec::new(), |a| {
+        let check = a.label();
+        let end = a.label();
+        a.push(vopc(Op::v_cmp_gt_u32, s(4), v(0)));
+        a.push(sop1(Op::s_and_saveexec_b64, s(10), VCC));
+        a.branch(Op::s_branch, check);
+        a.bind(check);
+        a.push(sop1(Op::s_mov_b32, s(20), int(4)));
+        a.branch(Op::s_cbranch_scc0, end);
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+        a.bind(end);
+    });
+    cross_scc.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&cross_scc), [0]);
+    let text = hlsl(&cross_scc);
+    assert_eq!(text.matches("return;").count(), 1, "{text}");
+    compiles(&cross_scc);
+
+    // 2. `v_cmp` + `s_and_saveexec` followed by `s_cbranch_vccz` (VCC == EXEC).
+    let mut vcc_skip = compute([256, 1, 1], Vec::new(), |a| {
+        let end = a.label();
+        a.push(vopc(Op::v_cmp_gt_u32, s(4), v(0)));
+        a.push(sop1(Op::s_and_saveexec_b64, s(10), VCC));
+        a.branch(Op::s_cbranch_vccz, end);
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+        a.bind(end);
+    });
+    vcc_skip.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&vcc_skip), [0]);
+    compiles(&vcc_skip);
+
+    // 3. `s_and_b64` + `s_mov_b64 exec` + `s_cbranch_scc0` (SCC set before EXEC move).
+    let mut and_mov_scc = compute([256, 1, 1], Vec::new(), |a| {
+        let end = a.label();
+        a.push(vopc(Op::v_cmp_gt_u32, s(4), v(0)));
+        a.push(sop2(Op::s_and_b64, s(10), VCC, EXEC));
+        a.push(sop1(Op::s_mov_b64, EXEC, s(10)));
+        a.branch(Op::s_cbranch_scc0, end);
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+        a.bind(end);
+    });
+    and_mov_scc.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&and_mov_scc), [0]);
+    compiles(&and_mov_scc);
+
+    // 4. Saved EXEC mask tested via `s_cmp_eq_u64` + `s_cbranch_scc1`.
+    let mut saved_mask_cmp = compute([256, 1, 1], Vec::new(), |a| {
+        let end = a.label();
+        a.push(vopc(Op::v_cmpx_gt_u32, s(4), v(0)));
+        a.push(sop1(Op::s_mov_b64, s(10), EXEC));
+        a.push(sopc(Op::s_cmp_eq_u64, s(10), int(0)));
+        a.branch(Op::s_cbranch_scc1, end);
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+        a.bind(end);
+    });
+    saved_mask_cmp.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&saved_mask_cmp), [0]);
+    compiles(&saved_mask_cmp);
+}
+
+#[test]
+fn multiple_early_returns_before_barriers_convert_to_exec_false_and_compile() {
+    // 1. Multiple non-EXEC early returns (comparing LDS-derived values) skipping later barriers
+    //    in a [128, 1, 1] group converge at top-level `decant_barrier()`.
+    let mut multi_early = compute([128, 1, 1], Vec::new(), |a| {
+        let end = a.label();
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+        a.push(vop1(Op::v_readfirstlane_b32, s(12), v(2)));
+        a.push(sopc(Op::s_cmp_eq_u32, s(12), int(0)));
+        a.branch(Op::s_cbranch_scc1, end);
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_read_b32, v(3), [v(0), NONE, NONE], 4, 0));
+        a.push(vop1(Op::v_readfirstlane_b32, s(13), v(3)));
+        a.push(sopc(Op::s_cmp_eq_u32, s(13), int(1)));
+        a.branch(Op::s_cbranch_scc1, end);
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(3), NONE], 8, 0));
+        a.bind(end);
+    });
+    multi_early.lds_bytes = 4096;
+    assert_eq!(lifted_barrier_depths(&multi_early), [0, 0, 0]);
+    let text = hlsl(&multi_early);
+    assert_eq!(text.matches("decant_barrier();").count(), 3, "{text}");
+    assert_eq!(text.matches("return;").count(), 1, "{text}");
+    assert!(text.contains("exec = false;"), "{text}");
+    compiles(&multi_early);
+
+    // 2. Internal early `s_endpgm` inside a barrier region whose target is a non-empty epilogue
+    //    (a Guard::Exec write then `s_endpgm`) converts to `exec = false` and hoists the barrier.
+    let mut a = Asm::new();
+    let early_end = a.label();
+    let epilogue = a.label();
+    a.push(vopc(Op::v_cmpx_gt_u32, s(4), v(0)));
+    a.branch(Op::s_cbranch_execz, epilogue);
+    a.push(sopc(Op::s_cmp_eq_u32, s(5), int(0)));
+    a.branch(Op::s_cbranch_scc1, early_end);
+    a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+    a.push(sopp(Op::s_barrier, 0));
+    a.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+    a.branch(Op::s_branch, epilogue);
+    a.bind(early_end);
+    a.push(sopp(Op::s_endpgm, 0));
+    a.bind(epilogue);
+    a.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+    a.push(sopp(Op::s_endpgm, 0));
+    let internal_end = StageProgram {
+        threads: [128, 1, 1],
+        lds_bytes: 2048,
+        name: "internal early end".to_owned(),
+        ..StageProgram::new(Stage::Compute, a.finish())
+    };
+    assert_eq!(lifted_barrier_depths(&internal_end), [0]);
+    let text2 = hlsl(&internal_end);
+    assert_eq!(text2.matches("return;").count(), 1, "{text2}");
+    compiles(&internal_end);
+
+    // 2b. Internal early `s_endpgm` AFTER a barrier inside a barrier region whose target is a
+    //     non-empty epilogue converts via Phase 3 to `exec = false; jump epilogue`.
+    let mut a2 = Asm::new();
+    let early_after = a2.label();
+    let epilogue2 = a2.label();
+    a2.push(vopc(Op::v_cmpx_gt_u32, s(4), v(0)));
+    a2.branch(Op::s_cbranch_execz, epilogue2);
+    a2.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+    a2.push(sopp(Op::s_barrier, 0));
+    a2.push(sopc(Op::s_cmp_eq_u32, s(5), int(0)));
+    a2.branch(Op::s_cbranch_scc1, early_after);
+    a2.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+    a2.branch(Op::s_branch, epilogue2);
+    a2.bind(early_after);
+    a2.push(sopp(Op::s_endpgm, 0));
+    a2.bind(epilogue2);
+    a2.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+    a2.push(sopp(Op::s_endpgm, 0));
+    let internal_after = StageProgram {
+        threads: [128, 1, 1],
+        lds_bytes: 2048,
+        name: "internal early end after barrier".to_owned(),
+        ..StageProgram::new(Stage::Compute, a2.finish())
+    };
+    assert_eq!(lifted_barrier_depths(&internal_after), [0]);
+    let text2b = hlsl(&internal_after);
+    assert_eq!(text2b.matches("return;").count(), 1, "{text2b}");
+    compiles(&internal_after);
+
+    // 3. An early return before a barrier that is followed by an outer EXEC restore MUST NOT be
+    //    converted to `exec = false`, or dead lanes would be resurrected after the barrier.
+    let mut unsafe_restore = compute([128, 1, 1], Vec::new(), |a| {
+        let end = a.label();
+        a.push(sop1(Op::s_mov_b64, s(20), EXEC));
+        a.push(sopc(Op::s_cmp_eq_u32, s(4), int(0)));
+        a.branch(Op::s_cbranch_scc1, end);
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(sop1(Op::s_mov_b64, EXEC, s(20)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+        a.bind(end);
+    });
+    unsafe_restore.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&unsafe_restore), [1]);
+}
+
+#[test]
+fn mid_shader_barrier_skip_predicates_live_out_scalar_write_and_compiles() {
+    // 1. Live-out scalar `s(12)` written unconditionally inside a mid-shader barrier skip is
+    //    predicated with `if (exec)` so inactive lanes keep their pre-skip `s(12)` value.
+    let mut p = compute([256, 1, 1], Vec::new(), |a| {
+        let join = a.label();
+        a.push(sop1(Op::s_mov_b32, s(12), int(1)));
+        a.push(vopc(Op::v_cmp_gt_u32, s(4), v(0)));
+        a.push(sop1(Op::s_and_saveexec_b64, s(10), VCC));
+        a.branch(Op::s_cbranch_execz, join);
+        a.push(sop1(Op::s_mov_b32, s(12), int(2)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(1), NONE], 0, 0));
+        a.push(sopp(Op::s_barrier, 0));
+        a.push(ds(Op::ds_read_b32, v(2), [v(0), NONE, NONE], 0, 0));
+        a.bind(join);
+        a.push(sop1(Op::s_mov_b64, EXEC, s(10)));
+        a.push(vop2(Op::v_add_u32, v(2), s(12), v(2)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+    });
+    p.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&p), [0]);
+    let text = hlsl(&p);
+    assert!(text.contains("if (exec) s12 = 2u;"), "{text}");
+    assert!(text.contains("decant_barrier();"), "{text}");
+    compiles(&p);
+
+    // 2. If the live-out scalar write stands inside a nested EXEC narrowing (where outer-active
+    //    lanes may have `exec == false`), predicating it with `if (exec)` would skip it for
+    //    outer-active lanes, so the outer skip is kept.
+    let mut nested_narrow = compute([256, 1, 1], Vec::new(), |a| {
+        let join = a.label();
+        a.push(sop1(Op::s_mov_b32, s(12), int(1)));
+        a.push(vopc(Op::v_cmp_gt_u32, s(4), v(0)));
+        a.push(sop1(Op::s_and_saveexec_b64, s(10), VCC));
+        a.branch(Op::s_cbranch_execz, join);
+        a.push(vopc(Op::v_cmp_lt_u32, v(0), int(16)));
+        a.push(sop1(Op::s_and_saveexec_b64, s(14), VCC));
+        a.push(sop1(Op::s_mov_b32, s(12), int(2)));
+        a.push(sop1(Op::s_mov_b64, EXEC, s(14)));
+        a.push(sopp(Op::s_barrier, 0));
+        a.bind(join);
+        a.push(sop1(Op::s_mov_b64, EXEC, s(10)));
+        a.push(vop2(Op::v_add_u32, v(2), s(12), v(2)));
+        a.push(ds(Op::ds_write_b32, NONE, [v(0), v(2), NONE], 4, 0));
+    });
+    nested_narrow.lds_bytes = 2048;
+    assert_eq!(lifted_barrier_depths(&nested_narrow), [1]);
+}
