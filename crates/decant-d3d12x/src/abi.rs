@@ -135,11 +135,14 @@ pub fn pc_initial_state(desc: &[u8; 0x38], state: u32) -> u32 {
     allowed
 }
 
-/// The optimized clear value (`D3D12_CLEAR_VALUE`, 24 bytes, format first) for a resource whose
+/// Size of `D3D12_CLEAR_VALUE` in bytes (4-byte `DXGI_FORMAT` plus 16-byte color or depth union).
+pub const CLEAR_VALUE_BYTES: usize = 20;
+
+/// The optimized clear value (`D3D12_CLEAR_VALUE`, 20 bytes, format first) for a resource whose
 /// PC description is `desc` (after [`pc_resource_desc`]). There is none unless the resource is a
 /// render target (0x1) or depth target (0x2), because the PC refuses one otherwise. The format is
 /// the PC format of a console one, and for a depth target the depth member of a typeless family.
-pub fn pc_clear_value(desc: &[u8; 0x38], clear: &[u8; 24]) -> Option<[u8; 24]> {
+pub fn pc_clear_value(desc: &[u8; 0x38], clear: &[u8; CLEAR_VALUE_BYTES]) -> Option<[u8; CLEAR_VALUE_BYTES]> {
     let flags = word(desc, DESC_FLAGS);
     if flags & 0x3 == 0 {
         return None;
@@ -529,7 +532,8 @@ pub const RESOURCE_RULES: &[SlotRule] = &[
     custom(9, 9, "Unmap (PC order): skipped after a Map that answered the title address"),
     fwd(10, 10, 10, "GetDesc (PC order; returns a structure by value, console convention not measured)"),
     custom(11, 11, "GetGPUVirtualAddress (PC order): PC answers 0 for a texture, a placed resource answers its title address"),
-    fwd(12, 14, 12, "WriteToSubresource, ReadFromSubresource, GetHeapProperties (PC order)"),
+    fwd(12, 13, 12, "WriteToSubresource, ReadFromSubresource (PC order)"),
+    custom(14, 14, "GetHeapProperties (PC order): placed reserved buffers answer DEFAULT when PC returns E_INVALIDARG"),
     unknown(15, RESOURCE_SLOTS - 1, "console resource method"),
 ];
 
@@ -600,7 +604,7 @@ mod tests {
     #[test]
     fn a_clear_value_takes_the_depth_format_and_is_dropped_without_a_target() {
         let d = cube_depth_desc();
-        let mut clear = [0u8; 24];
+        let mut clear = [0u8; CLEAR_VALUE_BYTES];
         clear[0..4].copy_from_slice(&53u32.to_le_bytes());
         clear[4..8].copy_from_slice(&1.0f32.to_le_bytes());
         let c = pc_clear_value(&d, &clear).unwrap();
@@ -672,13 +676,14 @@ mod tests {
             let r = k.rule(s).unwrap();
             assert_eq!((r.kind, r.pc + (s as u16 - r.first)), (RuleKind::Fwd, s as u16), "slot {s}");
         }
-        for s in [10u32, 12, 13, 14] {
+        for s in [10u32, 12, 13] {
             let r = k.rule(s).unwrap();
             assert_eq!((r.kind, r.pc + (s as u16 - r.first)), (RuleKind::Fwd, s as u16), "slot {s}");
         }
         assert_eq!(k.rule(8).unwrap().kind, RuleKind::Custom, "Map is the placed fallback");
         assert_eq!(k.rule(9).unwrap().kind, RuleKind::Custom, "Unmap is skipped after the fallback");
         assert_eq!(k.rule(11).unwrap().kind, RuleKind::Custom, "GetGPUVirtualAddress is the placed fallback");
+        assert_eq!(k.rule(14).unwrap().kind, RuleKind::Custom, "GetHeapProperties answers DEFAULT for reserved buffers");
         assert_eq!(k.rule(15).unwrap().kind, RuleKind::Unknown);
     }
 

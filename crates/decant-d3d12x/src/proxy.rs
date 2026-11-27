@@ -44,10 +44,10 @@ use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, LUID, S_OK};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::core::{GUID, HRESULT};
 
-use crate::abi::{ALLOCATOR_SLOTS, DEVICE_SLOTS, HEAP_SLOTS, Kind, LIST_SLOTS, QUEUE_SLOTS, RESOURCE_SLOTS, RuleKind, pc_resource_desc};
+use crate::abi::{CLEAR_VALUE_BYTES, Kind, LIST_SLOTS, QUEUE_SLOTS, RuleKind, pc_resource_desc};
 use crate::dxil_override;
 use crate::frame;
 use crate::log::{guid_at, p, xs_log};
@@ -72,9 +72,17 @@ mod root_views;
 
 pub(crate) use mesh_pipeline::note_mesh_support;
 
-// The byte sizes the resource argument rewriting assumes (`resource_args`) are the public d3d12.h ones.
+// The byte sizes the resource argument rewriting assumes (`resource_args` and `abi`) are the public d3d12.h ones.
 const _: () = assert!(size_of::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER>() == BARRIER_BYTES);
 const _: () = assert!(size_of::<windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_LOCATION>() == COPY_LOCATION_BYTES);
+const _: () = assert!(size_of::<windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_VALUE>() == CLEAR_VALUE_BYTES);
+const _: () = assert!(size_of::<windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC>() == size_of::<ComputePsoDesc>());
+const _: () = assert!(std::mem::offset_of!(windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC, PrimitiveTopologyType) == 0x23C);
+const _: () = assert!(std::mem::offset_of!(windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC, NumRenderTargets) == 0x240);
+const _: () = assert!(std::mem::offset_of!(windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC, RTVFormats) == 0x244);
+const _: () = assert!(std::mem::offset_of!(windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC, DSVFormat) == 0x264);
+const _: () = assert!(std::mem::offset_of!(windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC, CachedPSO) == 0x278);
+const _: () = assert!(std::mem::offset_of!(windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC, Flags) == 0x288);
 
 /// A PC (or proxy) COM object: a pointer to a pointer to the vtable.
 type Object = *mut c_void;
@@ -100,7 +108,7 @@ type CreateHeap = unsafe extern "system" fn(Object, *const c_void, *const GUID, 
 type CreateCommittedResource = unsafe extern "system" fn(Object, *const c_void, u32, *const c_void, u32, *const c_void, *const GUID, *mut Object) -> HRESULT;
 type CreatePlacedResource = unsafe extern "system" fn(Object, Object, u64, *const c_void, u32, *const c_void, *const GUID, *mut Object) -> HRESULT;
 type CreateCommandSignature = unsafe extern "system" fn(Object, *const c_void, Object, *const GUID, *mut Object) -> HRESULT;
-type CreateSampler = unsafe extern "system" fn(Object, *const c_void, usize) -> HRESULT;
+type CreateSampler = unsafe extern "system" fn(Object, *const c_void, usize);
 type CreateRootSig = unsafe extern "system" fn(Object, u32, *const c_void, usize, *const GUID, *mut *mut c_void) -> HRESULT;
 type CreateComputePso = unsafe extern "system" fn(Object, *const ComputePsoDesc, *const GUID, *mut *mut c_void) -> HRESULT;
 
@@ -316,6 +324,8 @@ struct ResProxy {
     placed_va: u64,
     /// +0x20, the last Map returned the placed address (zeroed: false).
     map_fallback: AtomicBool,
+    /// +0x21, true when backed by a reserved buffer over `title_mem` pool tiles.
+    title_mem_backed: bool,
 }
 
 /// A command allocator proxy: the base, then what the title's slot 9 hands over.
@@ -661,7 +671,7 @@ unsafe fn give_charged(hr: HRESULT, obj: Object, kind: Kind, charge: Option<Char
 ///
 /// # Safety
 /// As [`give`].
-unsafe fn give_placed(hr: HRESULT, obj: Object, va: u64, charge: Option<Charge>, out: *mut *mut c_void) -> HRESULT {
+unsafe fn give_placed(hr: HRESULT, obj: Object, va: u64, title_mem_backed: bool, charge: Option<Charge>, out: *mut *mut c_void) -> HRESULT {
     // SAFETY: by the contract above.
     let hr = unsafe { give_charged(hr, obj, Kind::Resource, charge, out) };
     if hr >= 0 && unsafe { !(*out).is_null() } {
@@ -669,6 +679,7 @@ unsafe fn give_placed(hr: HRESULT, obj: Object, va: u64, charge: Option<Charge>,
         unsafe {
             let proxy = &mut *(*out).cast::<ResProxy>();
             proxy.placed_va = va;
+            proxy.title_mem_backed = title_mem_backed;
         }
     }
     hr
@@ -935,6 +946,12 @@ extern "system" fn dev_create_queue(this: *mut Proxy, desc: *const c_void, riid:
     }
 }
 
+/// Maps a console command list, allocator, or queue type to its PC `D3D12_COMMAND_LIST_TYPE`.
+/// Console DMA type `0x10` maps to PC `D3D12_COMMAND_LIST_TYPE_COPY` (`3`).
+fn host_list_type(kind: u32) -> u32 {
+    if kind == 0x10 { 3 } else { kind }
+}
+
 /// # Safety
 /// `this` is a live device proxy, `alloc` is an allocator proxy or a PC allocator, `pso` is a PC object or null, `riid` readable and
 /// `out` writable.
@@ -945,7 +962,7 @@ unsafe fn create_list(this: *mut Proxy, mask: u32, kind: u32, alloc: Object, pso
         let alloc = unwrap(alloc);
         // A pipeline made on first bind is made here (null when the PC runtime refused it).
         let pso = unwrap(pso);
-        let list_type = kind;
+        let list_type = host_list_type(kind);
         let mut l: Object = std::ptr::null_mut();
         let mut used_riid = if riid.is_null() { IID_GRAPHICS_COMMAND_LIST } else { *riid };
         let mut hr = method::<CreateList>(pc, 12)(pc, mask, list_type, alloc, pso, riid, &mut l);
@@ -982,11 +999,12 @@ extern "system" fn dev_create_allocator(this: *mut Proxy, kind: u32, riid: *cons
     // SAFETY: `this` is a live proxy, `riid` is the caller's, `out` is writable.
     unsafe {
         let pc = (*this).pc;
+        let list_type = host_list_type(kind);
         let mut a: Object = std::ptr::null_mut();
-        let mut hr = method::<CreateAllocator>(pc, 9)(pc, kind, riid, &mut a);
+        let mut hr = method::<CreateAllocator>(pc, 9)(pc, list_type, riid, &mut a);
         if hr == E_NOINTERFACE && !is_iid(riid, &IID_COMMAND_ALLOCATOR) {
             xs_log!("console device: allocator IID {{{}}} unknown to the PC runtime, created as ID3D12CommandAllocator", guid_at(riid));
-            hr = method::<CreateAllocator>(pc, 9)(pc, kind, &IID_COMMAND_ALLOCATOR, &mut a);
+            hr = method::<CreateAllocator>(pc, 9)(pc, list_type, &IID_COMMAND_ALLOCATOR, &mut a);
         }
         give(hr, a, Kind::Allocator, out)
     }
@@ -1027,6 +1045,45 @@ extern "system" fn dev_serialize_pso(_this: *mut Proxy, _pso: Object) -> HRESULT
     0x8007_0005_u32 as HRESULT // E_ACCESSDENIED
 }
 
+/// Public `ID3D12DeviceExt` interface exported by vkd3d-proton devices.
+const IID_VKD3D_DEVICE_EXT: GUID = GUID::from_u128(0x11ea7a1a_0f6a_49bf_b612_3e30f8e201dd);
+
+/// True when running under Wine or on a vkd3d-proton device, where shader-visible view heaps
+/// larger than 1,000,000 descriptors can be created unclamped without paging.
+///
+/// # Safety
+/// `pc` is null or a live PC `ID3D12Device`.
+unsafe fn is_vkd3d_or_wine(pc: Object) -> bool {
+    static UNDER_WINE: OnceLock<bool> = OnceLock::new();
+    let wine = *UNDER_WINE.get_or_init(|| {
+        // SAFETY: `ntdll.dll` is loaded in every Windows and Wine process.
+        unsafe {
+            let ntdll = GetModuleHandleW(windows_sys::w!("ntdll.dll"));
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    });
+    if wine || pc.is_null() {
+        return wine;
+    }
+    type Qi = unsafe extern "system" fn(Object, *const GUID, *mut Object) -> HRESULT;
+    let mut ext: Object = std::ptr::null_mut();
+    // SAFETY: `pc` is a live COM object whose slot 0 is `IUnknown::QueryInterface`.
+    let hr = unsafe { method::<Qi>(pc, 0)(pc, &IID_VKD3D_DEVICE_EXT, &mut ext) };
+    if hr >= 0 && !ext.is_null() {
+        // SAFETY: `QueryInterface` returned a fresh reference.
+        unsafe { method::<Release>(ext, 2)(ext) };
+        true
+    } else {
+        false
+    }
+}
+
+/// True when a shader-visible CBV/SRV/UAV heap should be clamped to the native PC D3D12 limit
+/// before the first `CreateDescriptorHeap` call instead of tripping a runtime error first.
+fn should_preclamp_view_heap(heap_type: u32, visible: bool, orig_num: u32, is_vkd3d: bool) -> bool {
+    !is_vkd3d && heap_type == 0 && visible && orig_num > crate::title_heap::PC_MAX_SHADER_VISIBLE_VIEW_DESCRIPTORS
+}
+
 extern "system" fn dev_create_heap(this: *mut Proxy, desc: *const c_void, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
@@ -1050,9 +1107,13 @@ extern "system" fn dev_create_heap(this: *mut Proxy, desc: *const c_void, riid: 
             }
             Some(d)
         };
-        let desc: *const c_void = mapped.as_ref().map_or(desc, |d| d.as_ptr().cast());
-        let mut h: Object = std::ptr::null_mut();
-        let mut hr = method::<CreateHeap>(pc, 14)(pc, desc, riid, &mut h);
+        let visible = mapped.is_some_and(|d| (d[2] & 1) != 0);
+        let preclamp = mapped.is_some_and(|d| {
+            d[0] == 0
+                && visible
+                && title_count > crate::title_heap::PC_MAX_SHADER_VISIBLE_VIEW_DESCRIPTORS
+                && should_preclamp_view_heap(d[0], visible, title_count, is_vkd3d_or_wine(pc))
+        });
         let (mut heap_type, mut orig_num, mut host_num) = (0u32, 0u32, 0u32);
         // MOVED_SLOTS extra host slots a shader-visible view heap that fit whole (unclamped) was
         // given past the title's own count, for the ring `title_heap::move_table` uses; 0 when
@@ -1062,13 +1123,34 @@ extern "system" fn dev_create_heap(this: *mut Proxy, desc: *const c_void, riid: 
         // slots in a CPU only heap of the full size (`heap_pages`).
         let mut backing: Option<(Object, usize, Charge)> = None;
         let mut backing_charge = None;
-        if !desc.is_null() {
-            let d: [u32; 4] = std::ptr::read_unaligned(desc.cast());
+        let mut h: Object = std::ptr::null_mut();
+        let mut hr = if let Some(d) = mapped {
             heap_type = d[0];
             orig_num = title_count;
             host_num = d[1];
-            let flags = d[2];
-            if hr < 0 && heap_type == 0 && (flags & 1) != 0 && orig_num > crate::title_heap::PC_MAX_SHADER_VISIBLE_VIEW_DESCRIPTORS {
+            if preclamp {
+                let mut clamped = d;
+                clamped[1] = crate::title_heap::PC_MAX_SHADER_VISIBLE_VIEW_DESCRIPTORS;
+                let hr = method::<CreateHeap>(pc, 14)(pc, clamped.as_ptr().cast(), riid, &mut h);
+                if hr >= 0 {
+                    host_num = clamped[1];
+                    backing = heap_pages::backing(pc, orig_num, d[3], riid);
+                    xs_log!(
+                        "console device slot 14 (CreateDescriptorHeap): clamped shader-visible view heap {orig_num} -> {host_num} (PC D3D12 limit), {}",
+                        if backing.is_some() { "paged over a CPU only heap of the full size" } else { "slots past the limit unreachable" }
+                    );
+                }
+                hr
+            } else {
+                method::<CreateHeap>(pc, 14)(pc, d.as_ptr().cast(), riid, &mut h)
+            }
+        } else {
+            method::<CreateHeap>(pc, 14)(pc, desc, riid, &mut h)
+        };
+        if let Some(d) = mapped
+            && !preclamp
+        {
+            if hr < 0 && heap_type == 0 && visible && orig_num > crate::title_heap::PC_MAX_SHADER_VISIBLE_VIEW_DESCRIPTORS {
                 let mut clamped = d;
                 clamped[1] = crate::title_heap::PC_MAX_SHADER_VISIBLE_VIEW_DESCRIPTORS;
                 h = std::ptr::null_mut();
@@ -1084,7 +1166,7 @@ extern "system" fn dev_create_heap(this: *mut Proxy, desc: *const c_void, riid: 
             } else if hr >= 0
                 && !h.is_null()
                 && heap_type == 0
-                && (flags & 1) != 0
+                && visible
                 && orig_num > 0
                 && host_num.checked_add(crate::title_heap::UNPAGED_MOVED_SLOTS).is_some()
             {
@@ -1117,13 +1199,13 @@ extern "system" fn dev_create_heap(this: *mut Proxy, desc: *const c_void, riid: 
                 }
                 None => crate::title_heap::heap_created(h as usize, heap_type, orig_num, host_num, inc, host_cpu as usize),
             }
-            if direct && heap_type == 1 {
+            if direct && visible && heap_type == 1 {
                 immediate_samplers::heap_made(pc, h, orig_num, host_num, inc, host_cpu as usize);
             }
             // The view shadow keeps rows for the host slots of the heap (a backing heap has its own).
             if heap_type == 0 {
                 let mut gpu = 0u64;
-                if (std::ptr::read_unaligned(desc.cast::<[u32; 4]>())[2] & 1) != 0 {
+                if visible {
                     method::<HeapStart>(h, 10)(h, &mut gpu);
                 }
                 // the rows cover the ring too: a translated shader reads the row of a moved table's slot
@@ -1171,7 +1253,7 @@ extern "system" fn dev_create_heap(this: *mut Proxy, desc: *const c_void, riid: 
         }
         // Every other shader visible view heap gets a page map with page p at p * PAGE, so a directly
         // translated shader reads any bound heap the same way.
-        let visible_views = mapped.is_some_and(|d| d[0] == 0 && d[2] & 1 != 0);
+        let visible_views = visible && mapped.is_some_and(|d| d[0] == 0);
         if hr >= 0 && !h.is_null() && host_num > 0 && visible_views && backing.is_none()
             && let Some((buffer, _, address, charge)) = heap_pages::page_map(pc, &crate::title_heap::identity_map(host_num + ring_slots))
         {
@@ -1191,14 +1273,13 @@ extern "system" fn dev_create_heap(this: *mut Proxy, desc: *const c_void, riid: 
             }
         };
         // A shader visible heap is what a table of the user data mirror is an index into.
-        if hr >= 0 && !h.is_null() && orig_num > 0 && matches!(heap_type, 0 | 1) && crate::user_mirror::wanted() {
+        if hr >= 0 && !h.is_null() && orig_num > 0 && visible && matches!(heap_type, 0 | 1) && crate::user_mirror::wanted() {
             let mut gpu = 0u64;
             method::<HeapStart>(h, 10)(h, &mut gpu);
             let inc = method::<GetIncSize>(pc, 15)(pc, heap_type);
             crate::user_mirror::heap_created(h as usize, heap_type == 1, gpu, inc);
         }
         // A shader visible heap with title memory: its tables get the views of the tagged slots.
-        let visible = !desc.is_null() && (std::ptr::read_unaligned(desc.cast::<[u32; 4]>())[2] & 1) != 0;
         if hr >= 0 && !h.is_null() && orig_num > 0 && visible && matches!(heap_type, 0 | 1)
             && let Some(title_base) = crate::title_heap::title_start_for_heap(h as usize)
         {
@@ -1219,7 +1300,7 @@ extern "system" fn dev_create_heap(this: *mut Proxy, desc: *const c_void, riid: 
                 ring_next: 0,
             });
         }
-        if hr >= 0 && !h.is_null() && orig_num > 0 && heap_type == 0 && crate::view_diag::enabled() {
+        if hr >= 0 && !h.is_null() && orig_num > 0 && visible && heap_type == 0 && crate::view_diag::enabled() {
             let mut gpu = 0u64;
             method::<HeapStart>(h, 10)(h, &mut gpu);
             let (cpu, count) = slots(h);
@@ -1244,6 +1325,15 @@ extern "system" fn dev_create_heap(this: *mut Proxy, desc: *const c_void, riid: 
         });
         give_charged(hr, h, Kind::Heap, heap_charge, out)
     }
+}
+
+/// Aligns a console CBV range `(va, title_size)` down to a 256-byte boundary and expands the byte
+/// size to cover both the alignment lead-in and the full title range, rounded up to 256 bytes.
+fn aligned_cbv_range(va: u64, title_size: u32) -> (u64, u32) {
+    let aligned = va & !255;
+    let lead = (va - aligned) as u32;
+    let size = lead.saturating_add(title_size).checked_next_multiple_of(256).unwrap_or(!255u32);
+    (aligned, size)
 }
 
 /// The PC GPU address behind a title GPU address, for views that take an address: upload memory
@@ -1274,18 +1364,17 @@ extern "system" fn dev_create_cbv(this: *mut Proxy, desc: *const c_void, cpu: us
         }
         let va = std::ptr::read_unaligned(desc.cast::<u64>());
         let title_size = std::ptr::read_unaligned(desc.cast::<u8>().add(8).cast::<u32>());
-        let size = title_size.next_multiple_of(256);
         // A view that does not start on 256 bytes is made again at each draw that reads it, over a
         // copy of its bytes in upload memory (`list_mirror::sync_tables`).
         crate::title_heap::note_cbv(host_cpu, (va & 255 != 0).then_some((va, title_size)));
-        // PC constant buffers start on 256 bytes; the console allows less. The view starts at the
-        // 256 byte boundary below (the shader then reads from that earlier start; the bytes are
-        // still the title's), as an unaligned start is an invalid call that removes the device.
-        let aligned = va & !255;
+        // PC constant buffers start on 256 bytes, while the console allows less. The view starts
+        // at the 256-byte boundary below and expands its size to include the lead-in so the tail
+        // of the console range is never truncated.
+        let (aligned, size) = aligned_cbv_range(va, title_size);
         if aligned != va {
             static UNALIGNED: AtomicI32 = AtomicI32::new(0);
             if log_due(&UNALIGNED) {
-                xs_log!("console device slot 17 (CreateConstantBufferView): title address {va:#x} is not on 256 bytes, the view starts at {aligned:#x}");
+                xs_log!("console device slot 17 (CreateConstantBufferView): title address {va:#x} is not on 256 bytes, the view starts at {aligned:#x} ({size} bytes)");
             }
         }
         let va = aligned;
@@ -1928,11 +2017,54 @@ extern "system" fn dev_create_root_signature(this: *mut Proxy, node_mask: u32, b
 /// of `desc` pointing at it plus the override buffer (kept alive by the caller until after the
 /// host call). `None` on a miss: the caller uses `desc` unchanged.
 ///
+/// Sanitizes a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC` for PC D3D12 by clearing any console
+/// `CachedPSO` blob and unsupported pipeline flags. Returns `true` when any field changed.
+fn sanitize_compute_pso_desc(desc: &mut ComputePsoDesc) -> bool {
+    let had_cache = !desc.cached_pso.ptr.is_null() || desc.cached_pso.len != 0;
+    let had_flags = desc.flags != 0;
+    desc.cached_pso = ShaderBytecode { ptr: std::ptr::null(), len: 0 };
+    desc.flags = 0;
+    had_cache || had_flags
+}
+
+/// Sanitizes a plain `D3D12_GRAPHICS_PIPELINE_STATE_DESC` for PC D3D12: clears console
+/// `CachedPSO`, remaps console depth formats (`117..=120` to `44..=47`) on `RTVFormats` and
+/// `DSVFormat`, maps console primitive topology types outside `1..=4`, masks `Flags` to PC
+/// hardware bits (`4 | 8`), and normalizes blend, rasterizer, and depth-stencil enums.
+fn sanitize_graphics_pso_desc(g: &mut [u8; crate::stream_pso::GRAPHICS_DESC_SIZE]) {
+    const HS: usize = 0x038;
+    const TOPOLOGY: usize = 0x23C;
+    const RT_FORMATS: usize = 0x244;
+    const DEPTH_FORMAT: usize = 0x264;
+    const CACHED_PSO: usize = 0x278;
+    const FLAGS: usize = 0x288;
+    const PC_HW_PSO_FLAGS: u32 = 0x4 | 0x8;
+
+    let topo = le_u32(g, TOPOLOGY);
+    if !(1..=4).contains(&topo) {
+        let has_hs = g[HS..HS + 8].iter().any(|&b| b != 0) && g[HS + 8..HS + 16].iter().any(|&b| b != 0);
+        let mapped = if has_hs { 4u32 } else { 3u32 };
+        g[TOPOLOGY..TOPOLOGY + 4].copy_from_slice(&mapped.to_le_bytes());
+    }
+    for i in 0..8 {
+        let at = RT_FORMATS + i * 4;
+        let fmt = crate::abi::pc_dxgi_format(le_u32(g, at));
+        g[at..at + 4].copy_from_slice(&fmt.to_le_bytes());
+    }
+    let dsv = crate::abi::pc_dxgi_format(le_u32(g, DEPTH_FORMAT));
+    g[DEPTH_FORMAT..DEPTH_FORMAT + 4].copy_from_slice(&dsv.to_le_bytes());
+    g[CACHED_PSO..CACHED_PSO + 16].fill(0);
+    let flags = le_u32(g, FLAGS) & PC_HW_PSO_FLAGS;
+    g[FLAGS..FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+    crate::stream_pso::valid_states(g);
+}
+
 /// # Safety
 /// `desc` is a live, readable `ComputePsoDesc`.
 unsafe fn overridden_compute_desc(desc: *const ComputePsoDesc) -> (Option<(ComputePsoDesc, Vec<u8>)>, Vec<crate::pso_diag::Stage>) {
     // SAFETY: by the contract above.
     let mut patched = unsafe { std::ptr::read_unaligned(desc) };
+    let sanitized = sanitize_compute_pso_desc(&mut patched);
     let original = if patched.cs.ptr.is_null() || patched.cs.len == 0 {
         &[][..]
     } else {
@@ -1941,7 +2073,9 @@ unsafe fn overridden_compute_desc(desc: *const ComputePsoDesc) -> (Option<(Compu
     };
     let (overridden, outcome) = dxil_override::lookup_for_pipeline_outcome(original, patched.root_signature as usize, 0);
     let stages = vec![crate::pso_diag::Stage { name: "CS", hash: dxil_override::content_hash(original), outcome }];
-    let Some(overridden) = overridden else { return (None, stages) };
+    let Some(overridden) = overridden else {
+        return (sanitized.then_some((patched, Vec::new())), stages);
+    };
     xs_log!(
         "DXIL override hit, hash={:016x}, size {}->{} (DECANT_D3D12X_DXIL_OVERRIDE)",
         dxil_override::content_hash(original),
@@ -2172,20 +2306,40 @@ extern "system" fn dev_evict(this: *mut Proxy, n: u32, objects: *const Object) -
     unsafe { dev_residency(this, 35, n, objects) }
 }
 
-/// The legacy `D3D12_RESOURCE_STATES` bitmask of each newer `D3D12_BARRIER_LAYOUT` value that a
-/// resource can be created in, indexed by the layout value.
-const LAYOUT_STATES: [u32; 11] = [
-    0,      // 0 undefined, common
-    0xAC3,  // 1 generic read
-    0x4,    // 2 render target
-    0x8,    // 3 unordered access
-    0x10,   // 4 depth write
-    0x20,   // 5 depth read
-    0xC0,   // 6 shader resource, all stages
-    0x800,  // 7 copy source
-    0x400,  // 8 copy dest
-    0x2000, // 9 resolve source
-    0x1000, // 10 resolve dest
+/// The legacy `D3D12_RESOURCE_STATES` bitmask of each newer `D3D12_BARRIER_LAYOUT` value
+/// (`0..=30`) that a resource can be created in, indexed by the layout value.
+const LAYOUT_STATES: [u32; 31] = [
+    0,           // 0 COMMON / PRESENT
+    0xAC3,       // 1 GENERIC_READ
+    0x4,         // 2 RENDER_TARGET
+    0x8,         // 3 UNORDERED_ACCESS
+    0x10,        // 4 DEPTH_STENCIL_WRITE
+    0x20,        // 5 DEPTH_STENCIL_READ
+    0xC0,        // 6 SHADER_RESOURCE (all stages)
+    0x800,       // 7 COPY_SOURCE
+    0x400,       // 8 COPY_DEST
+    0x2000,      // 9 RESOLVE_SOURCE
+    0x1000,      // 10 RESOLVE_DEST
+    0x100_0000,  // 11 SHADING_RATE_SOURCE
+    0x1_0000,    // 12 VIDEO_DECODE_READ
+    0x2_0000,    // 13 VIDEO_DECODE_WRITE
+    0x4_0000,    // 14 VIDEO_PROCESS_READ
+    0x8_0000,    // 15 VIDEO_PROCESS_WRITE
+    0x20_0000,   // 16 VIDEO_ENCODE_READ
+    0x80_0000,   // 17 VIDEO_ENCODE_WRITE
+    0,           // 18 DIRECT_QUEUE_COMMON
+    0xAC3,       // 19 DIRECT_QUEUE_GENERIC_READ
+    0x8,         // 20 DIRECT_QUEUE_UNORDERED_ACCESS
+    0xC0,        // 21 DIRECT_QUEUE_SHADER_RESOURCE
+    0x800,       // 22 DIRECT_QUEUE_COPY_SOURCE
+    0x400,       // 23 DIRECT_QUEUE_COPY_DEST
+    0,           // 24 COMPUTE_QUEUE_COMMON
+    0xAC3,       // 25 COMPUTE_QUEUE_GENERIC_READ
+    0x8,         // 26 COMPUTE_QUEUE_UNORDERED_ACCESS
+    0x40,        // 27 COMPUTE_QUEUE_SHADER_RESOURCE (NON_PIXEL_SHADER_RESOURCE)
+    0x800,       // 28 COMPUTE_QUEUE_COPY_SOURCE
+    0x400,       // 29 COMPUTE_QUEUE_COPY_DEST
+    0,           // 30 VIDEO_QUEUE_COMMON
 ];
 
 /// Maps a newer layout `D3D12_BARRIER_LAYOUT` value to the legacy `D3D12_RESOURCE_STATES` bitmask
@@ -2269,7 +2423,7 @@ unsafe fn dev_placed_at_va_inner(
             // The title gets the resource as a console proxy; the PC object stays behind it, and
             // every relayed call that takes a resource unwraps it (see `resource_args`).
             // SAFETY: `res` is the PC object whose reference `dev_create_committed_resource` gave.
-            hr = unsafe { give_placed(hr, res, va, charge, out) };
+            hr = unsafe { give_placed(hr, res, va, placed.is_some(), charge, out) };
             if hr >= 0 {
                 let segment = if placed.is_some() { mem_owners::Segment::System } else { mem_owners::Segment::Local };
                 let bytes = if placed.is_some() { width } else { allocation_bytes };
@@ -2292,8 +2446,8 @@ unsafe fn dev_placed_at_va_inner(
     if hr < 0 {
         // SAFETY: `desc` was checked non-null above and is 56 readable bytes by the console contract.
         let raw = unsafe { std::ptr::read_unaligned(desc.cast::<[u8; 0x38]>()) };
-        // SAFETY: `clear` is null or 24 readable bytes by the console contract.
-        let clear: Option<[u8; 24]> = (!clear.is_null()).then(|| unsafe { std::ptr::read_unaligned(clear.cast()) });
+        // SAFETY: `clear` is null or 20 readable bytes (`D3D12_CLEAR_VALUE`) by the console contract.
+        let clear: Option<[u8; CLEAR_VALUE_BYTES]> = (!clear.is_null()).then(|| unsafe { std::ptr::read_unaligned(clear.cast()) });
         xs_log!("console device slot {slot}: CreatePlacedResourceX VA {va:016X} failed with hr=0x{:08X}, state 0x{state:X}, desc {raw:02x?}, clear {clear:02x?}", hr as u32);
     }
     hr
@@ -2491,7 +2645,7 @@ extern "system" fn dev_create_queue_x(this: *mut Proxy, desc: *const c_void, rii
 /// (0x10) is a copy queue (3), priorities other than normal, high and global realtime become high,
 /// the flags keep only the PC ones, and the node mask is 0 or 1.
 fn host_queue_desc_with(d: [u32; 4], force_timeout: bool) -> [u32; 4] {
-    let kind = if d[0] == 0x10 { 3 } else { d[0] };
+    let kind = host_list_type(d[0]);
     let priority = if matches!(d[1], 0 | 100 | 10000) { d[1] } else { 100 };
     [kind, priority, host_queue_flags_with(d[2], force_timeout), d[3].min(1)]
 }
@@ -2534,11 +2688,11 @@ unsafe fn dev_pso(this: *mut Proxy, (console_slot, pc_slot): (u32, usize), desc:
     } else {
         (None, Vec::new())
     };
-    // Graphics (slot 60): a copy with the state enums PC D3D12 knows (`stream_pso::valid_states`).
+    // Graphics (slot 60 and slot 10): sanitize console formats, topology, CachedPSO, flags, and state enums.
     let graphics = if console_slot == 60 && !desc.is_null() {
         // SAFETY: slot 60's description has the PC `D3D12_GRAPHICS_PIPELINE_STATE_DESC` layout.
         let mut g: Box<[u8; crate::stream_pso::GRAPHICS_DESC_SIZE]> = Box::new(unsafe { std::ptr::read_unaligned(desc.cast()) });
-        crate::stream_pso::valid_states(&mut g);
+        sanitize_graphics_pso_desc(&mut g);
         Some(g)
     } else {
         None
@@ -3264,13 +3418,13 @@ extern "system" fn dev_create_list_x(this: *mut Proxy, params: *const c_void, al
 /// (`abi::pc_clear_value`): `None` for no clear value.
 ///
 /// # Safety
-/// `clear` is null or 24 readable bytes, by the console calling convention.
-unsafe fn pc_clear(desc: &[u8; 0x38], clear: *const c_void) -> Option<[u8; 24]> {
+/// `clear` is null or 20 readable bytes (`D3D12_CLEAR_VALUE`), by the console calling convention.
+unsafe fn pc_clear(desc: &[u8; 0x38], clear: *const c_void) -> Option<[u8; CLEAR_VALUE_BYTES]> {
     if clear.is_null() {
         return None;
     }
     // SAFETY: by the contract above.
-    let raw: [u8; 24] = unsafe { std::ptr::read_unaligned(clear.cast()) };
+    let raw: [u8; CLEAR_VALUE_BYTES] = unsafe { std::ptr::read_unaligned(clear.cast()) };
     crate::abi::pc_clear_value(desc, &raw)
 }
 
@@ -3512,13 +3666,17 @@ extern "system" fn dev_create_sampler_x(this: *mut Proxy, desc: *const u8, dest:
     const FILTER_ANISOTROPIC: u32 = 0x55;
     const ADDRESS_WRAP: u32 = 1;
     const COMPARISON_NEVER: u32 = 1;
-    // SAFETY: `this` is a live proxy; `desc` is at least 8 bytes (MaxAnisotropy, BorderColor
-    // index) by the console calling convention.
+    if desc.is_null() {
+        return E_INVALIDARG;
+    }
+    let cpu = dest as usize;
+    // The destination is a CPU handle in title memory, like the other view slots (native
+    // D3D12 removes the device on the untranslated handle).
+    let Some(host_cpu) = crate::title_heap::translate_cpu(cpu) else { return S_OK };
+    // SAFETY: `this` is a live proxy, `desc` is non-null and at least 8 bytes (MaxAnisotropy,
+    // BorderColor index) by the console calling convention.
     unsafe {
         let pc = (*this).pc;
-        // The destination is a CPU handle in title memory, like the other view slots (native
-        // D3D12 removes the device on the untranslated handle).
-        let Some(dest) = crate::title_heap::translate_cpu(dest as usize) else { return S_OK };
         let max_anisotropy: u32 = std::ptr::read_unaligned(desc.cast());
         // D3D12_SAMPLER_DESC, 0x34 bytes: Filter 0, AddressU/V/W 4/8/0xC, MipLODBias 0x10,
         // MaxAnisotropy 0x14, ComparisonFunc 0x18, BorderColor 0x1C..0x2C, MinLOD 0x2C, MaxLOD 0x30.
@@ -3532,7 +3690,8 @@ extern "system" fn dev_create_sampler_x(this: *mut Proxy, desc: *const u8, dest:
         put(0x14, max_anisotropy.clamp(1, 16).to_le_bytes());
         put(0x18, COMPARISON_NEVER.to_le_bytes());
         put(0x30, f32::MAX.to_le_bytes());
-        method::<CreateSampler>(pc, 22)(pc, pc_desc.as_ptr().cast(), dest);
+        method::<CreateSampler>(pc, 22)(pc, pc_desc.as_ptr().cast(), host_cpu);
+        crate::title_heap::tag_slot(cpu, host_cpu);
         S_OK
     }
 }
@@ -4261,6 +4420,11 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
 /// Console list slot 10 (older layout): `Reset(allocator, pso)`, the allocator may be a proxy.
 extern "system" fn list_reset(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
     reset_list(this, allocator, pso)
+}
+
+/// Console DMA command list slot 10: `Reset(allocator)` takes no pipeline state argument.
+extern "system" fn dma_list_reset(this: *mut Proxy, allocator: Object) -> HRESULT {
+    reset_list(this, allocator, std::ptr::null_mut())
 }
 
 /// Console list slot 139 (newer layout, D-2026-11-23-2): `Reset` with one extra argument that the
@@ -5286,6 +5450,98 @@ extern "system" fn res_gpu_virtual_address(this: *mut Proxy) -> u64 {
     }
 }
 
+/// Console resource slot 14 (GetHeapProperties, PC 14). Placed `title_mem` buffers are PC
+/// `CreateReservedResource` objects whose `GetHeapProperties` fails with `E_INVALIDARG`. When PC
+/// returns an error on a placed resource, answer `S_OK` with `D3D12_HEAP_TYPE_DEFAULT`.
+extern "system" fn res_get_heap_properties(this: *mut Proxy, props: *mut u32, flags: *mut u32) -> HRESULT {
+    type GetHeapProperties = unsafe extern "system" fn(Object, *mut u32, *mut u32) -> HRESULT;
+    // SAFETY: `this` is a live resource proxy (`ResProxy`) and its PC resource is live.
+    unsafe {
+        let res = &*this.cast::<ResProxy>();
+        let hr = method::<GetHeapProperties>(res.base.pc, 14)(res.base.pc, props, flags);
+        if hr < 0 && res.placed_va != 0 {
+            if !props.is_null() {
+                // D3D12_HEAP_PROPERTIES { Type = DEFAULT (1), CPUPageProperty = 0,
+                // MemoryPoolPreference = 0, CreationNodeMask = 1, VisibleNodeMask = 1 }.
+                let default_props: [u32; 5] = [1, 0, 0, 1, 1];
+                std::ptr::write_unaligned(props.cast::<[u32; 5]>(), default_props);
+            }
+            if !flags.is_null() {
+                std::ptr::write_unaligned(flags, 0);
+            }
+            return S_OK;
+        }
+        hr
+    }
+}
+
+/// True when `object` is a `Kind::Resource` proxy backed by a reserved `title_mem` buffer.
+///
+/// # Safety
+/// `object` is null or points to a live COM object.
+unsafe fn is_title_mem_resource(object: Object) -> bool {
+    if object.is_null() {
+        return false;
+    }
+    let Some(tables) = TABLES.get().and_then(|t| t.as_ref()) else {
+        return false;
+    };
+    // SAFETY: `object` is non-null and starts with a vtable pointer.
+    let vtbl = unsafe { *(object as *const *const usize) };
+    if !std::ptr::eq(tables.vtbls[Kind::Resource as usize].as_ptr(), vtbl) {
+        return false;
+    }
+    // SAFETY: `Kind::Resource` proxies are allocated as `ResProxy`.
+    unsafe { (*(object as *const ResProxy)).title_mem_backed }
+}
+
+/// Unwraps resource pointers in `barriers` and promotes non-null `UAV` barriers targeting
+/// `title_mem`-backed resources to global `UAV(NULL)` so writes across aliased `title_mem`
+/// window buffers are flushed. Returns `(touched_title_mem, has_title_mem_transition)`.
+fn prepare_resource_barriers(
+    barriers: &mut [[u8; BARRIER_BYTES]],
+    is_title_mem: impl Fn(u64) -> bool,
+    unwrap_ptr: impl Fn(u64) -> u64,
+) -> (bool, bool) {
+    const BARRIER_TYPE_TRANSITION: u32 = 0;
+    const BARRIER_TYPE_ALIASING: u32 = 1;
+    const BARRIER_TYPE_UAV: u32 = 2;
+
+    let mut touched_title_mem = false;
+    let mut has_title_mem_transition = false;
+    for barrier in barriers.iter_mut() {
+        let ty = u32::from_le_bytes([barrier[0], barrier[1], barrier[2], barrier[3]]);
+        let first = u64::from_le_bytes(barrier[8..16].try_into().unwrap_or([0; 8]));
+        match ty {
+            BARRIER_TYPE_UAV if first != 0 && is_title_mem(first) => {
+                // Promote UAV(R_placed) -> UAV(NULL) to cover writes through aliased title_mem windows.
+                barrier[8..16].fill(0);
+                touched_title_mem = true;
+            }
+            BARRIER_TYPE_TRANSITION if first != 0 && is_title_mem(first) => {
+                touched_title_mem = true;
+                has_title_mem_transition = true;
+            }
+            BARRIER_TYPE_ALIASING => {
+                let second = u64::from_le_bytes(barrier[16..24].try_into().unwrap_or([0; 8]));
+                if (first != 0 && is_title_mem(first)) || (second != 0 && is_title_mem(second)) {
+                    touched_title_mem = true;
+                }
+            }
+            _ => {}
+        }
+        resource_args::unwrap_barrier(barrier, &unwrap_ptr);
+    }
+    (touched_title_mem, has_title_mem_transition)
+}
+
+/// Global aliasing barrier `D3D12_RESOURCE_BARRIER_TYPE_ALIASING { NULL, NULL }`.
+fn global_aliasing_barrier() -> [u8; BARRIER_BYTES] {
+    let mut barrier = [0u8; BARRIER_BYTES];
+    barrier[0..4].copy_from_slice(&1u32.to_le_bytes());
+    barrier
+}
+
 /// The PC object behind a pointer stored in a structure (the pointer itself when it is not a proxy).
 ///
 /// # Safety
@@ -5377,10 +5633,15 @@ extern "system" fn list_resolve_subresource(this: *mut Proxy, dst: Object, dst_s
 }
 
 /// Console list slot 26 (ResourceBarrier, PC 26): the barriers go to PC as a copy with their
-/// resources unwrapped.
+/// resources unwrapped. Barriers touching `title_mem`-backed reserved resources promote non-null
+/// `UAV` barriers to `UAV(NULL)` and add `ALIASING(NULL, NULL)` on `DIRECT` and `COMPUTE` lists so
+/// writes across aliased `title_mem` window buffers stay coherent.
 extern "system" fn list_resource_barrier(this: *mut Proxy, n: u32, barriers: *const c_void) {
     const STACK_BARRIERS: usize = 8;
-    // SAFETY: `this` is a live command list proxy; `barriers` is null or `n` readable barriers.
+    const D3D12_COMMAND_LIST_TYPE_DIRECT: u32 = 0;
+    const D3D12_COMMAND_LIST_TYPE_COMPUTE: u32 = 2;
+    type GetListType = unsafe extern "system" fn(Object) -> u32;
+    // SAFETY: `this` is a live command list proxy, `barriers` is null or `n` readable barriers.
     unsafe {
         let pc = (*this).pc;
         crate::capture::flush(this as usize, pc);
@@ -5402,11 +5663,12 @@ extern "system" fn list_resource_barrier(this: *mut Proxy, n: u32, barriers: *co
                 .collect::<Vec<_>>();
             &mut copy_heap
         };
+        let (touched_title_mem, has_title_mem_transition) =
+            prepare_resource_barriers(copy, |p| is_title_mem_resource(p as usize as Object), |p| pc_pointer(p));
         let mut noted_stack = [(0usize, 0u32, 0u32); STACK_BARRIERS];
         let mut noted_heap = Vec::new();
         let mut noted_len = 0usize;
-        for barrier in copy.iter_mut() {
-            resource_args::unwrap_barrier(barrier, |p| pc_pointer(p));
+        for barrier in copy.iter() {
             if u32::from_le_bytes([barrier[0], barrier[1], barrier[2], barrier[3]]) == 0 {
                 let entry = (
                     u64::from_le_bytes(barrier[8..16].try_into().unwrap_or([0; 8])) as usize,
@@ -5424,7 +5686,17 @@ extern "system" fn list_resource_barrier(this: *mut Proxy, n: u32, barriers: *co
         let noted = if count <= STACK_BARRIERS { &noted_stack[..noted_len] } else { &noted_heap };
         crate::detile::note_transitions(pc as usize, noted);
         crate::present::note_list_transitions(pc as usize, noted);
+        let emit_alias = touched_title_mem
+            && matches!(method::<GetListType>(pc, 8)(pc), D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE);
+        if emit_alias && has_title_mem_transition {
+            let sync = [crate::list_sync::global_uav_barrier(), global_aliasing_barrier()];
+            method::<Barriers>(pc, 26)(pc, sync.len() as u32, sync.as_ptr().cast());
+        }
         method::<Barriers>(pc, 26)(pc, n, copy.as_ptr().cast());
+        if emit_alias && !has_title_mem_transition {
+            let alias = global_aliasing_barrier();
+            method::<Barriers>(pc, 26)(pc, 1, alias.as_ptr().cast());
+        }
     }
 }
 
@@ -6088,7 +6360,7 @@ fn custom(kind: Kind, slot: u32) -> Option<usize> {
         (Kind::List, 85) => list_copy_texture_region_x as *const () as usize,
         (Kind::List, 86) => list_copy_resource_x as *const () as usize,
         (Kind::List, 139) => list_reset_late as *const () as usize,
-        (Kind::DmaList, 10) => list_reset as *const () as usize,
+        (Kind::DmaList, 10) => dma_list_reset as *const () as usize,
         (Kind::DmaList, 11) => list_copy_buffer_region as *const () as usize,
         (Kind::DmaList, 12) => list_copy_texture_region as *const () as usize,
         (Kind::DmaList, 13) => list_copy_resource as *const () as usize,
@@ -6118,6 +6390,7 @@ fn custom(kind: Kind, slot: u32) -> Option<usize> {
         (Kind::Resource, 8) => res_map as *const () as usize,
         (Kind::Resource, 9) => res_unmap as *const () as usize,
         (Kind::Resource, 11) => res_gpu_virtual_address as *const () as usize,
+        (Kind::Resource, 14) => res_get_heap_properties as *const () as usize,
         (Kind::Queue, 8) => queue_update_tile_mappings as *const () as usize,
         (Kind::Queue, 9) => queue_copy_tile_mappings as *const () as usize,
         (Kind::Queue, 10) => queue_execute as *const () as usize,
@@ -6156,7 +6429,7 @@ fn build() -> Option<Tables> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    let total = (usize::from(DEVICE_SLOTS) + usize::from(LIST_SLOTS) + usize::from(QUEUE_SLOTS) + usize::from(HEAP_SLOTS) + usize::from(ALLOCATOR_SLOTS) + usize::from(RESOURCE_SLOTS) + usize::from(crate::abi::DMA_LIST_SLOTS)) * STUB;
+    let total = Kind::ALL.iter().map(|kind| usize::from(kind.slots())).sum::<usize>() * STUB;
     // SAFETY: a fresh anonymous allocation, written below and then made executable.
     let code = unsafe { VirtualAlloc(std::ptr::null(), total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) }.cast::<u8>();
     if code.is_null() {
@@ -6985,5 +7258,218 @@ mod tests {
         let c = std::sync::atomic::AtomicI32::new(0);
         let due: Vec<usize> = (1..=5000).filter(|_| super::log_due(&c)).collect();
         assert_eq!(due, vec![1, 2, 3, 1024, 2048, 4096]);
+    }
+
+    #[test]
+    fn preclamp_view_heap_applies_only_to_native_shader_visible_view_heaps_over_limit() {
+        let limit = crate::title_heap::PC_MAX_SHADER_VISIBLE_VIEW_DESCRIPTORS;
+        assert!(super::should_preclamp_view_heap(0, true, limit + 1, false));
+        assert!(!super::should_preclamp_view_heap(0, true, limit, false));
+        assert!(!super::should_preclamp_view_heap(0, false, limit + 1, false));
+        assert!(!super::should_preclamp_view_heap(1, true, limit + 1, false));
+        assert!(!super::should_preclamp_view_heap(0, true, limit + 1, true));
+    }
+
+    #[test]
+    fn host_list_type_maps_console_dma_and_dma_reset_uses_single_arg_handler() {
+        assert_eq!(super::host_list_type(0x10), 3);
+        for ty in [0u32, 1, 2, 3] {
+            assert_eq!(super::host_list_type(ty), ty);
+        }
+        assert_eq!(super::custom(super::Kind::DmaList, 10), Some(super::dma_list_reset as *const () as usize));
+        assert_ne!(super::custom(super::Kind::DmaList, 10), super::custom(super::Kind::List, 10));
+    }
+
+    #[test]
+    fn aligned_cbv_range_expands_size_for_unaligned_start() {
+        assert_eq!(super::aligned_cbv_range(0x1000, 128), (0x1000, 256));
+        assert_eq!(super::aligned_cbv_range(0x1000, 256), (0x1000, 256));
+        // Unaligned +128 with 256-byte range spans [0x1080, 0x1180), requiring 512 bytes from 0x1000.
+        assert_eq!(super::aligned_cbv_range(0x1080, 256), (0x1000, 512));
+        // Unaligned +128 with 128-byte range fits in [0x1000, 0x1100) = 256 bytes.
+        assert_eq!(super::aligned_cbv_range(0x1080, 128), (0x1000, 256));
+        // Unaligned +240 with 128-byte range spans [0x10F0, 0x1170), requiring 512 bytes from 0x1000.
+        assert_eq!(super::aligned_cbv_range(0x10F0, 128), (0x1000, 512));
+        // Saturating overflow does not panic.
+        assert_eq!(super::aligned_cbv_range(0x10FF, u32::MAX), (0x1000, !255u32));
+    }
+
+    #[test]
+    fn dev_create_sampler_x_rejects_null_desc() {
+        assert_eq!(super::dev_create_sampler_x(std::ptr::null_mut(), std::ptr::null(), 0), super::E_INVALIDARG);
+    }
+
+    #[test]
+    fn pso_sanitizers_clear_cached_pso_remap_formats_topology_and_flags() {
+        let mut g = [0u8; crate::stream_pso::GRAPHICS_DESC_SIZE];
+        // Console RECT_LIST topology (13) without HS -> TRIANGLE (3).
+        g[0x23C..0x240].copy_from_slice(&13u32.to_le_bytes());
+        // Console extended depth/stencil formats 117..=120 -> 44..=47.
+        g[0x244..0x248].copy_from_slice(&117u32.to_le_bytes());
+        g[0x248..0x24C].copy_from_slice(&28u32.to_le_bytes());
+        g[0x264..0x268].copy_from_slice(&118u32.to_le_bytes());
+        // Non-null CachedPSO blob.
+        g[0x278..0x280].copy_from_slice(&0x1234_5678u64.to_le_bytes());
+        g[0x280..0x288].copy_from_slice(&64u64.to_le_bytes());
+        // WARP-only bit 1 + valid bit 4 + console bit 0x1000 -> keep only 4.
+        g[0x288..0x28C].copy_from_slice(&0x1005u32.to_le_bytes());
+
+        super::sanitize_graphics_pso_desc(&mut g);
+        assert_eq!(u32::from_le_bytes(g[0x23C..0x240].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(g[0x244..0x248].try_into().unwrap()), 44);
+        assert_eq!(u32::from_le_bytes(g[0x248..0x24C].try_into().unwrap()), 28);
+        assert_eq!(u32::from_le_bytes(g[0x264..0x268].try_into().unwrap()), 45);
+        assert_eq!(&g[0x278..0x288], &[0u8; 16]);
+        assert_eq!(u32::from_le_bytes(g[0x288..0x28C].try_into().unwrap()), 4);
+
+        // With HS present, invalid topology maps to PATCH (4).
+        g[0x038..0x040].copy_from_slice(&0x1000u64.to_le_bytes());
+        g[0x040..0x048].copy_from_slice(&16u64.to_le_bytes());
+        g[0x23C..0x240].copy_from_slice(&0u32.to_le_bytes());
+        super::sanitize_graphics_pso_desc(&mut g);
+        assert_eq!(u32::from_le_bytes(g[0x23C..0x240].try_into().unwrap()), 4);
+
+        let mut c = super::ComputePsoDesc {
+            root_signature: std::ptr::null_mut(),
+            cs: super::ShaderBytecode { ptr: std::ptr::null(), len: 0 },
+            node_mask: 1,
+            _pad0: 0,
+            cached_pso: super::ShaderBytecode { ptr: 0xDEADusize as *const u8, len: 128 },
+            flags: 0x1001,
+            _pad1: 0,
+        };
+        assert!(super::sanitize_compute_pso_desc(&mut c));
+        assert!(c.cached_pso.ptr.is_null());
+        assert_eq!(c.cached_pso.len, 0);
+        assert_eq!(c.flags, 0);
+        assert!(!super::sanitize_compute_pso_desc(&mut c));
+    }
+
+    #[test]
+    fn barrier_layout_to_state_covers_shading_rate_video_and_queue_layouts() {
+        assert_eq!(super::barrier_layout_to_state(11), 0x100_0000);
+        assert_eq!(super::barrier_layout_to_state(12), 0x1_0000);
+        assert_eq!(super::barrier_layout_to_state(13), 0x2_0000);
+        assert_eq!(super::barrier_layout_to_state(14), 0x4_0000);
+        assert_eq!(super::barrier_layout_to_state(15), 0x8_0000);
+        assert_eq!(super::barrier_layout_to_state(16), 0x20_0000);
+        assert_eq!(super::barrier_layout_to_state(17), 0x80_0000);
+        assert_eq!(super::barrier_layout_to_state(18), 0);
+        assert_eq!(super::barrier_layout_to_state(19), 0xAC3);
+        assert_eq!(super::barrier_layout_to_state(20), 0x8);
+        assert_eq!(super::barrier_layout_to_state(21), 0xC0);
+        assert_eq!(super::barrier_layout_to_state(22), 0x800);
+        assert_eq!(super::barrier_layout_to_state(23), 0x400);
+        assert_eq!(super::barrier_layout_to_state(24), 0);
+        assert_eq!(super::barrier_layout_to_state(25), 0xAC3);
+        assert_eq!(super::barrier_layout_to_state(26), 0x8);
+        assert_eq!(super::barrier_layout_to_state(27), 0x40);
+        assert_eq!(super::barrier_layout_to_state(28), 0x800);
+        assert_eq!(super::barrier_layout_to_state(29), 0x400);
+        assert_eq!(super::barrier_layout_to_state(30), 0);
+        assert_eq!(super::barrier_layout_to_state(u32::MAX), 0);
+    }
+
+    #[test]
+    fn prepare_resource_barriers_promotes_title_mem_uav_and_flags_transitions() {
+        use super::BARRIER_BYTES;
+        let u64_at = |b: &[u8; BARRIER_BYTES], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let make = |ty: u32, p0: u64, p1: u64| {
+            let mut b = [0u8; BARRIER_BYTES];
+            b[0..4].copy_from_slice(&ty.to_le_bytes());
+            b[8..16].copy_from_slice(&p0.to_le_bytes());
+            b[16..24].copy_from_slice(&p1.to_le_bytes());
+            b
+        };
+
+        // UAV(title_mem proxy 0x1000) -> UAV(NULL), touched_title_mem = true, no transition.
+        let mut uav_only = [make(2, 0x1000, 0)];
+        let (touched, has_trans) = super::prepare_resource_barriers(&mut uav_only, |p| p == 0x1000, |p| if p == 0x1000 { 0x9000 } else { p });
+        assert!(touched);
+        assert!(!has_trans);
+        assert_eq!(u64_at(&uav_only[0], 8), 0);
+
+        // TRANSITION(title_mem proxy 0x1000) -> unwrapped to 0x9000, flagged for pre-sync.
+        let mut trans = [make(0, 0x1000, 0)];
+        let (touched, has_trans) = super::prepare_resource_barriers(&mut trans, |p| p == 0x1000, |p| if p == 0x1000 { 0x9000 } else { p });
+        assert!(touched);
+        assert!(has_trans);
+        assert_eq!(u64_at(&trans[0], 8), 0x9000);
+
+        // Plain non-title_mem UAV stays targeted and unwraps cleanly.
+        let mut plain = [make(2, 0x2000, 0)];
+        let (touched, has_trans) = super::prepare_resource_barriers(&mut plain, |p| p == 0x1000, |p| if p == 0x2000 { 0xA000 } else { p });
+        assert!(!touched);
+        assert!(!has_trans);
+        assert_eq!(u64_at(&plain[0], 8), 0xA000);
+    }
+
+    #[test]
+    fn resource_get_heap_properties_answers_default_on_reserved_e_invalidarg() {
+        extern "system" fn fake_get_heap_err(_this: super::Object, _props: *mut u32, _flags: *mut u32) -> super::HRESULT {
+            super::E_INVALIDARG
+        }
+        extern "system" fn fake_get_heap_ok(_this: super::Object, props: *mut u32, flags: *mut u32) -> super::HRESULT {
+            // SAFETY: test passes valid aligned pointers.
+            unsafe {
+                if !props.is_null() {
+                    std::ptr::write_unaligned(props.cast::<[u32; 5]>(), [2, 0, 0, 1, 1]);
+                }
+                if !flags.is_null() {
+                    *flags = 0x10;
+                }
+            }
+            super::S_OK
+        }
+
+        assert_eq!(super::custom(super::Kind::Resource, 14), Some(super::res_get_heap_properties as *const () as usize));
+
+        let mut vtbl_err = [0usize; 16];
+        vtbl_err[14] = fake_get_heap_err as *const () as usize;
+        let mut fake_pc_err = vtbl_err.as_ptr();
+        let mut res_proxy = super::ResProxy {
+            base: super::Proxy {
+                vtbl: std::ptr::null(),
+                pc: (&raw mut fake_pc_err).cast(),
+                refs: std::sync::atomic::AtomicI32::new(1),
+                kind: super::Kind::Resource as i32,
+            },
+            placed_va: 0x8000_0000,
+            map_fallback: std::sync::atomic::AtomicBool::new(false),
+            title_mem_backed: true,
+        };
+        let mut props = [0u32; 5];
+        let mut flags = 99u32;
+        assert_eq!(super::res_get_heap_properties((&raw mut res_proxy).cast(), props.as_mut_ptr(), &mut flags), super::S_OK);
+        assert_eq!(props, [1, 0, 0, 1, 1]);
+        assert_eq!(flags, 0);
+        // Null out pointers are handled without crashing.
+        assert_eq!(super::res_get_heap_properties((&raw mut res_proxy).cast(), std::ptr::null_mut(), std::ptr::null_mut()), super::S_OK);
+
+        // When PC succeeds, its properties and flags pass through untouched.
+        let mut vtbl_ok = [0usize; 16];
+        vtbl_ok[14] = fake_get_heap_ok as *const () as usize;
+        let mut fake_pc_ok = vtbl_ok.as_ptr();
+        res_proxy.base.pc = (&raw mut fake_pc_ok).cast();
+        assert_eq!(super::res_get_heap_properties((&raw mut res_proxy).cast(), props.as_mut_ptr(), &mut flags), super::S_OK);
+        assert_eq!(props, [2, 0, 0, 1, 1]);
+        assert_eq!(flags, 0x10);
+    }
+
+    #[test]
+    fn stub_allocation_sum_includes_fence_slots() {
+        let sum: usize = super::Kind::ALL.iter().map(|k| usize::from(k.slots())).sum();
+        assert!(sum >= usize::from(crate::abi::FENCE_SLOTS));
+        assert_eq!(
+            sum,
+            usize::from(crate::abi::DEVICE_SLOTS)
+                + usize::from(crate::abi::LIST_SLOTS)
+                + usize::from(crate::abi::QUEUE_SLOTS)
+                + usize::from(crate::abi::HEAP_SLOTS)
+                + usize::from(crate::abi::ALLOCATOR_SLOTS)
+                + usize::from(crate::abi::RESOURCE_SLOTS)
+                + usize::from(crate::abi::FENCE_SLOTS)
+                + usize::from(crate::abi::DMA_LIST_SLOTS)
+        );
     }
 }
