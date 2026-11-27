@@ -56,6 +56,7 @@ use crate::resource_args::{self, BARRIER_BYTES, COPY_LOCATION_BYTES};
 use crate::rts0;
 use crate::views_at::MapAnswer;
 
+mod enhanced_barriers;
 mod heap_pages;
 mod immediate_samplers;
 mod list_draws;
@@ -549,6 +550,7 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
                     let _ = take_unclosed(pc);
                     crate::detile::list_reset(pc_addr);
                     crate::present::list_reset(pc_addr);
+                    enhanced_barriers::list_reset(pc_addr);
                     crate::title_heap::list_reset(pc_addr);
                     // SAFETY: the proxy transferred its sole remaining PC list reference here, and
                     // all queued submissions holding this PC list have already released theirs.
@@ -556,6 +558,7 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
                 });
             } else {
                 crate::present::list_reset(pc_addr);
+                enhanced_barriers::list_reset(pc_addr);
                 crate::title_heap::list_reset(pc_addr);
             }
         }
@@ -564,6 +567,7 @@ extern "system" fn release(this: *mut Proxy) -> u32 {
             crate::detile::forget(proxy.pc as usize);
             crate::rt_diag::forget(proxy.pc as usize);
             crate::present::forget_resource(proxy.pc as usize);
+            enhanced_barriers::forget_resource(proxy.pc as usize);
         }
         if proxy.kind == Kind::Queue as i32 {
             // its queued work holds the PC queue and still runs
@@ -2407,6 +2411,9 @@ unsafe fn dev_placed_at_va_inner(
                 bytes: allocation_bytes,
             });
             crate::views_at::record_resource(va, width, res as usize, dim == 1);
+            if placed.is_some() {
+                enhanced_barriers::note_resource_created(res as usize, state, Some(&sanitized), true);
+            }
             if dim == 3 {
                 // a texture in the console tiling: the PC texture is filled from title memory (detile)
                 crate::detile::register(res as usize, va, &raw, state, allocation_bytes);
@@ -3439,18 +3446,23 @@ extern "system" fn dev_create_committed_resource(this: *mut Proxy, props: *const
     unsafe {
         let pc = (*this).pc;
         let mut r: Object = std::ptr::null_mut();
-        let (hr, actual_state) = if desc.is_null() {
-            (method::<CreateCommittedResource>(pc, 27)(pc, props, flags, desc, state, clear, riid, &mut r), state)
+        let (hr, actual_state, desc_copy) = if desc.is_null() {
+            (method::<CreateCommittedResource>(pc, 27)(pc, props, flags, desc, state, clear, riid, &mut r), state, None)
         } else {
             let mut d: [u8; 0x38] = std::ptr::read_unaligned(desc.cast());
             pc_resource_desc(&mut d);
             let state = crate::abi::pc_initial_state(&d, state);
             let clear = pc_clear(&d, clear);
-            (method::<CreateCommittedResource>(pc, 27)(pc, props, flags, d.as_ptr().cast(), state, clear.as_ref().map_or(std::ptr::null(), |c| c.as_ptr().cast()), riid, &mut r), state)
+            (
+                method::<CreateCommittedResource>(pc, 27)(pc, props, flags, d.as_ptr().cast(), state, clear.as_ref().map_or(std::ptr::null(), |c| c.as_ptr().cast()), riid, &mut r),
+                state,
+                Some(d),
+            )
         };
         if hr >= 0 {
             if !r.is_null() {
                 crate::present::note_resource_created(r as usize, actual_state);
+                enhanced_barriers::note_resource_created(r as usize, actual_state, desc_copy.as_ref(), false);
             }
             *out = r;
         } else {
@@ -3471,18 +3483,23 @@ extern "system" fn dev_create_placed_resource(this: *mut Proxy, heap: Object, of
         let pc = (*this).pc;
         let heap = unwrap(heap);
         let mut r: Object = std::ptr::null_mut();
-        let (hr, actual_state) = if desc.is_null() {
-            (method::<CreatePlacedResource>(pc, 29)(pc, heap, offset, desc, state, clear, riid, &mut r), state)
+        let (hr, actual_state, desc_copy) = if desc.is_null() {
+            (method::<CreatePlacedResource>(pc, 29)(pc, heap, offset, desc, state, clear, riid, &mut r), state, None)
         } else {
             let mut d: [u8; 0x38] = std::ptr::read_unaligned(desc.cast());
             pc_resource_desc(&mut d);
             let state = crate::abi::pc_initial_state(&d, state);
             let clear = pc_clear(&d, clear);
-            (method::<CreatePlacedResource>(pc, 29)(pc, heap, offset, d.as_ptr().cast(), state, clear.as_ref().map_or(std::ptr::null(), |c| c.as_ptr().cast()), riid, &mut r), state)
+            (
+                method::<CreatePlacedResource>(pc, 29)(pc, heap, offset, d.as_ptr().cast(), state, clear.as_ref().map_or(std::ptr::null(), |c| c.as_ptr().cast()), riid, &mut r),
+                state,
+                Some(d),
+            )
         };
         if hr >= 0 {
             if !r.is_null() {
                 crate::present::note_resource_created(r as usize, actual_state);
+                enhanced_barriers::note_resource_created(r as usize, actual_state, desc_copy.as_ref(), true);
             }
             *out = r;
         } else {
@@ -4062,27 +4079,6 @@ extern "system" fn list_wait64(this: *mut Proxy, va: u64, comparison: u32, value
     }
 }
 
-/// Console list slot 146 (newer layout): `uav_barrier_x(this, n, barriers)`. A console BVH builder
-/// library calls it between its build passes so that the writes of one pass are visible to the
-/// next. One global UAV barrier is recorded on the PC list. In the measured calls `n` is 1 and
-/// the second argument a pointer, and the barrier array itself is not read.
-extern "system" fn list_uav_barrier(this: *mut Proxy, n: u32, barriers: *const c_void) {
-    type ResourceBarrier = unsafe extern "system" fn(Object, u32, *const c_void);
-    static N: AtomicI32 = AtomicI32::new(0);
-    if !crate::abi::newer_layout() {
-        return unknown_slot(this.cast(), Kind::List, 146);
-    }
-    let global = crate::list_sync::global_uav_barrier();
-    // SAFETY: `this` is a live proxy; PC slot 26 of ID3D12GraphicsCommandList is ResourceBarrier.
-    unsafe {
-        let pc = (*this).pc;
-        method::<ResourceBarrier>(pc, 26)(pc, 1, global.as_ptr().cast());
-    }
-    if log_due(&N) {
-        xs_log!("console list slot 146 (UAV barrier, n {n}, barriers {barriers:?}): one global UAV barrier recorded on the PC list");
-    }
-}
-
 /// Why a memory wait of `width` bytes at `va` is not recorded on a list, if it is not. A wait that
 /// never comes true is refused, because the list would never run.
 fn wait_refusal(va: u64, width: u8, comparison: u32) -> Option<&'static str> {
@@ -4356,6 +4352,7 @@ fn recycle_detached_list(pc_addr: usize, device_id: usize, spec: ListSpec) {
     let was_unclosed = take_unclosed(pc);
     crate::detile::list_reset(pc_addr);
     crate::present::list_reset(pc_addr);
+    enhanced_barriers::list_reset(pc_addr);
     crate::title_heap::list_reset(pc_addr);
     crate::pso_diag::reset_pc_list(pc_addr);
     if !was_unclosed && with_list_pool(|pool| pool.push(device_id, spec, pc_addr)) {
@@ -4409,6 +4406,7 @@ fn reset_list(this: *mut Proxy, allocator: Object, pso: Object) -> HRESULT {
         forget_unclosed(old_pc);
         crate::detile::list_reset(old_addr);
         crate::present::list_reset(old_addr);
+        enhanced_barriers::list_reset(old_addr);
         crate::title_heap::list_reset(old_addr);
         crate::pso_diag::reset_pc_list(old_addr);
         let pso = bound_at_reset(this, pso);
@@ -4722,6 +4720,7 @@ unsafe fn submit_lists(pc: Object, mapped: &[Object], records: ListRecords<'_>, 
         };
         crate::detile::submitted(mapped_keys);
         crate::present::list_submitted(mapped_keys);
+        enhanced_barriers::list_submitted(mapped_keys);
         crate::rt_diag::executed(keys);
         if !keys.is_empty() {
             static N: AtomicI32 = AtomicI32::new(0);
@@ -5686,6 +5685,7 @@ extern "system" fn list_resource_barrier(this: *mut Proxy, n: u32, barriers: *co
         let noted = if count <= STACK_BARRIERS { &noted_stack[..noted_len] } else { &noted_heap };
         crate::detile::note_transitions(pc as usize, noted);
         crate::present::note_list_transitions(pc as usize, noted);
+        enhanced_barriers::note_list_transitions(pc as usize, noted);
         let emit_alias = touched_title_mem
             && matches!(method::<GetListType>(pc, 8)(pc), D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE);
         if emit_alias && has_title_mem_transition {
@@ -6333,6 +6333,7 @@ fn custom(kind: Kind, slot: u32) -> Option<usize> {
         (Kind::List, 92) => list_misc::list_write32_bottom_of_shader as *const () as usize,
         (Kind::List, 95) => list_misc::list_kickoff_x as *const () as usize,
         (Kind::List, 96) => list_misc::list_set_depth_bias_x as *const () as usize,
+        (Kind::List, 101) => list_misc::list_clear_hint_x as *const () as usize,
         (Kind::List, 126) => list_misc::list_shading_rate_x as *const () as usize,
         (Kind::List, 131) => list_misc::list_sync_top as *const () as usize,
         (Kind::List, 132) => list_misc::list_sync_bottom as *const () as usize,
@@ -6355,7 +6356,7 @@ fn custom(kind: Kind, slot: u32) -> Option<usize> {
         (Kind::List, 72) => list_write64_bottom as *const () as usize,
         (Kind::List, 73) => list_wait32 as *const () as usize,
         (Kind::List, 74) => list_wait64 as *const () as usize,
-        (Kind::List, 146) => list_uav_barrier as *const () as usize,
+        (Kind::List, 146) => enhanced_barriers::list_barrier_x as *const () as usize,
         (Kind::List, 83) => list_draws::list_slot83 as *const () as usize,
         (Kind::List, 85) => list_copy_texture_region_x as *const () as usize,
         (Kind::List, 86) => list_copy_resource_x as *const () as usize,

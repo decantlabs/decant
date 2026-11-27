@@ -462,7 +462,8 @@ pub const LIST_RULES: &[SlotRule] = &[
     custom(96, 96, "RSSetDepthBiasX(bias, clamp, slope), newer layout (older 94): ID3D12GraphicsCommandList9::RSSetDepthBias (PC 82) when the PC list has it; older layout: logged"),
     unknown(97, 99, "console-only"),
     custom(100, 100, "DispatchMeshX(x, flags, indirect arguments, payload), newer layout (older 98): PC DispatchMesh(x, 1, 1), an indirect count is logged and left out"),
-    unknown(101, 103, "console-only"),
+    custom(101, 101, "multi-clear mode toggle (u32 mode, BOOL enable), newer layout (older 99): brackets three or more consecutive RTV/DSV clears on console, no PC equivalent, ignored"),
+    unknown(102, 103, "console-only"),
     unknown(104, 109, "PC 60..65 per another runtime, which contradicts the OMSetDepthBounds measured at 68: not relayed"),
     unknown(110, 123, "console-only"),
     unknown(124, 125, "RSSetShadingRate, RSSetShadingRateImage (PC 77, 78) per other runtimes: not relayed"),
@@ -478,7 +479,7 @@ pub const LIST_RULES: &[SlotRule] = &[
     unknown(141, 141, "console-only (another runtime: binds a compute scratch buffer)"),
     custom(142, 142, "state call with one u64 argument, result unused, newer layout (purpose not measured): ignored"),
     unknown(143, 145, "console-only"),
-    custom(146, 146, "UAV barrier used between BVH build passes, newer layout (one global UAV barrier)"),
+    custom(146, 146, "Barrier(NumBarrierGroups, pBarrierGroups) (ID3D12GraphicsCommandList7::Barrier, newer layout): Enhanced Barriers lowered to legacy PC ResourceBarrier calls"),
     unknown(147, 147, "console-only"),
     custom(148, 148, "AllocateUploadMemory(size, alignment): CPU memory the title writes, whose address the proxy also accepts as a GPU address in root descriptors and index and vertex buffers; freed when the command allocator is reset"),
     unknown(149, LIST_SLOTS - 1, "console-only"),
@@ -755,9 +756,11 @@ mod tests {
             assert_eq!(l.rule(s).unwrap().kind, RuleKind::Custom, "list slot {s}");
             assert!(l.rule(s).unwrap().what.contains("DispatchMesh"), "list slot {s}");
         }
-        for s in [99u32, 101, 128, 130] {
+        for s in [99u32, 102, 128, 130] {
             assert_eq!(l.rule(s).unwrap().kind, RuleKind::Unknown, "list slot {s}");
         }
+        assert_eq!(l.rule(101).unwrap().kind, RuleKind::Custom, "list slot 101 multi-clear toggle");
+        assert!(l.rule(101).unwrap().what.contains("newer layout"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
-//! Predication, top of pipe writes, KickoffX, dynamic depth bias and the ignored state calls of the
-//! newer console list layout (slots 75, 87, 90 to 92, 95, 96, 126, 131, 132 and 142).
+//! Predication, top of pipe writes, KickoffX, dynamic depth bias, clear-batch hints and the
+//! ignored state calls of the newer console list layout (slots 75, 87, 90 to 92, 95, 96, 101, 126,
+//! 131, 132 and 142).
 
 use super::list_draws::newer_or_unknown;
 use super::*;
@@ -202,6 +203,14 @@ pub(super) extern "system" fn list_set_depth_bias_x(this: *mut Proxy, bias: f32,
     }
 }
 
+/// Console list slot 101 (newer layout, older 99): a two-argument toggle `(mode: u32, enable: u32)`
+/// bracketing three or more consecutive `ClearRenderTargetView` / `ClearDepthStencilView` calls as
+/// a console-only clear-overlap optimization hint. PC D3D12 has no command-list toggle around clears
+/// and runs every clear unconditionally, so this is a silent no-op on the newer layout.
+pub(super) extern "system" fn list_clear_hint_x(this: *mut Proxy, _mode: u32, _enable: u32) {
+    let _ = newer_or_unknown(this, 101);
+}
+
 /// Console list slot 126 (newer layout, older 124): `RSSetShadingRate` in the console form. The
 /// PC list gets no variable rate, the proxy reads no argument, and the call is only logged the
 /// first times.
@@ -386,6 +395,24 @@ mod tests {
             };
             assert_eq!(fake.events, want, "list_type {list_type}");
         }
+    }
+
+    #[test]
+    fn slot_101_and_146_are_dispatched_and_clear_hint_is_a_silent_noop() {
+        assert_eq!(custom(Kind::List, 101), Some(list_clear_hint_x as *const () as usize));
+        assert_eq!(custom(Kind::List, 146), Some(enhanced_barriers::list_barrier_x as *const () as usize));
+        let vtbl = fake_list_vtable();
+        let mut fake = FakeList { vtbl: vtbl.as_ptr(), list_type: 0, events: Vec::new() };
+        let mut proxy = Proxy {
+            vtbl: std::ptr::null(),
+            pc: std::ptr::from_mut(&mut fake).cast(),
+            refs: AtomicI32::new(1),
+            kind: Kind::List as i32,
+        };
+        // Both `(2, 1)` enable and `(2, 0)` disable leave the PC command list untouched.
+        list_clear_hint_x(&mut proxy, 2, 1);
+        list_clear_hint_x(&mut proxy, 2, 0);
+        assert!(fake.events.is_empty());
     }
 
     #[cfg(windows)]
