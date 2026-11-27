@@ -61,7 +61,7 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress
 use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
 
 use crate::log::xs_log;
-use crate::title_mirror::{Change, HEAP_PAGES, Mirror, PAGE, TileCall, heap_of};
+use crate::title_mirror::{Change, HEAP_PAGES, Mirror, PAGE, TileCall, checked_page_span, heap_of};
 
 /// A span within this many bytes of the end of its reservation is logged: a root view has no bounds
 /// check, so a shader that reads past its data would read past the slot in the window.
@@ -3690,15 +3690,27 @@ fn runs_by_heap(pages: &[u32]) -> Vec<HeapRuns> {
     by_heap
 }
 
-/// The description of the reserved buffer that stands in for a placed buffer. A reserved buffer takes
-/// no flag but `ALLOW_UNORDERED_ACCESS`, which it also gets when the initial state needs it.
-fn reserved_desc(desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_DESC {
+/// A PC reserved buffer placed over the mirror pool tiles of title span `[va, va + width)`.
+///
+/// When `va` is not 64 KiB aligned, `resource` starts at `va & !(PAGE - 1)` and the placed buffer's
+/// byte 0 sits at byte offset `base_offset` (`va & (PAGE - 1)`) inside `resource`.
+pub struct PlacedBuffer {
+    pub resource: ID3D12Resource,
+    /// Byte offset inside `resource` corresponding to title address `va` (`0..PAGE`).
+    pub base_offset: u64,
+}
+
+/// The description of the reserved buffer that stands in for a placed buffer starting at
+/// `base_offset` inside its first 64 KiB title page. A reserved buffer takes no flag but
+/// `ALLOW_UNORDERED_ACCESS`, which it also gets when the initial state needs it.
+fn reserved_desc(desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES, base_offset: u64) -> Option<D3D12_RESOURCE_DESC> {
+    let width = base_offset.checked_add(desc.Width)?;
     let needs_uav = state.0 & (D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE.0) != 0;
     let mut flags = desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if needs_uav {
         flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     }
-    D3D12_RESOURCE_DESC { Alignment: 0, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: flags, ..*desc }
+    Some(D3D12_RESOURCE_DESC { Alignment: 0, Width: width, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: flags, ..*desc })
 }
 
 /// Maps `buffer` onto `pages` outside `STATE`, ensuring any missing pool heaps exist first.
@@ -3709,7 +3721,10 @@ fn map_buffer_to_pool_outside_state(
     fence_value: &AtomicU64,
     buffer: &ID3D12Resource,
     pages: &[u32],
+    span: (u64, u64),
 ) -> Option<()> {
+    static MISSING_HEAP: AtomicI32 = AtomicI32::new(0);
+    let (va, width) = span;
     let heap_runs = runs_by_heap(pages);
     let missing_indices: Vec<u32> = heap_runs.iter().map(|&(h, _)| h).collect();
     ensure_heaps_outside_state(state_id, &missing_indices);
@@ -3718,7 +3733,14 @@ fn map_buffer_to_pool_outside_state(
         let st = guard.as_ref().filter(|st| st.id == state_id)?;
         let mut out = Vec::with_capacity(heap_runs.len());
         for &(heap, _) in &heap_runs {
-            let pool = st.heaps.get(heap as usize)?.as_ref()?;
+            let Some(pool) = st.heaps.get(heap as usize).and_then(Option::as_ref) else {
+                if MISSING_HEAP.fetch_add(1, Ordering::Relaxed) < 8 {
+                    xs_log!(
+                        "title memory: the buffer placed at {va:#x} ({width} bytes) cannot map pool heap {heap} (deferred or unavailable)"
+                    );
+                }
+                return None;
+            };
             out.push(pool._heap.clone());
         }
         out
@@ -3737,55 +3759,104 @@ fn map_buffer_to_pool_outside_state(
     Some(())
 }
 
-/// A PC buffer for a buffer the title places at title address `va` (`CreatePlacedResourceX`): a reserved
-/// buffer whose tiles are mapped to the pool tiles of the title pages there, the same tiles the window
-/// shows at `va`. What the GPU writes into it is then at the title address for every later GPU read, and
-/// what the title writes at `va` (copied into the pool at each sync) is in it. On the console a placed
-/// buffer is that memory, and console code reads root views and V#s from the memory, not from a resource.
+/// A PC reserved buffer for a buffer the title places at arbitrary title address `va`
+/// (`CreatePlacedResourceX`): a reserved buffer spanning the 64 KiB pages covering
+/// `[va, va + desc.Width)`, whose tiles are mapped to the pool tiles of those title pages — the
+/// same tiles the window shows at `va`. When `va` is not 64 KiB aligned, byte 0 of the title's
+/// buffer lies at `PlacedBuffer::base_offset` (`va & (PAGE - 1)`) inside `PlacedBuffer::resource`.
 ///
-/// `desc` is the PC description (sanitized), `state` the PC initial state. `None` when the module is off,
-/// `va` is not on a page, a page is not mapped or a call fails: the caller keeps its own way. The tile
-/// mappings are made once: a later remap of those title pages does not follow (not seen in a retail title).
-pub fn place_buffer(va: u64, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES) -> Option<ID3D12Resource> {
+/// `desc` is the PC description (sanitized), `state` the PC initial state. Returns `None` when the
+/// module is off, `desc` is not a non-empty buffer, any page covering `[va, va + desc.Width)` is
+/// unmapped or outside a single reservation, a backing pool heap is unavailable, or D3D12 rejects
+/// the reserved resource. The tile mappings are made once: a later remap of those title pages does
+/// not follow.
+pub fn place_buffer_at(va: u64, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES) -> Option<PlacedBuffer> {
     static FAILED: AtomicI32 = AtomicI32::new(0);
     static PLACED: AtomicI32 = AtomicI32::new(0);
     if desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || desc.Width == 0 {
         return None;
     }
-    let tiles = u32::try_from(desc.Width.div_ceil(PAGE)).ok()?;
-    let reserved = reserved_desc(desc, state);
-    let span_len = u64::from(tiles) * PAGE;
-    if with_state_read(|st| Some(st.mirror.wants_use(va, span_len))) == Some(true)
-        && let Some(api) = api()
-    {
-        give_outside_state(api, &[(va, span_len)]);
-    }
-    let (state_id, device, map_queue, map_fence, fence_value, pages) = with_state(|st, api| {
-        st.give(api, va, span_len);
-        let prev_tiles = st.mirror.tiles_given();
-        let pages = st.mirror.mirror_tiles(va, tiles)?;
-        if st.mirror.tiles_given() != prev_tiles {
-            MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
+    let (aligned_va, base_offset, tiles) = checked_page_span(va, desc.Width)?;
+    let reserved = reserved_desc(desc, state, base_offset)?;
+    let span_len = u64::from(tiles).checked_mul(PAGE)?;
+    let fast = with_state_read(|st| {
+        let placed = st.mirror.mirror_tiles_span_read(va, desc.Width)?;
+        Some((st.id, st.device.clone(), st.map_queue.clone(), st.map_fence.clone(), st.fence_value.clone(), placed))
+    });
+    let (state_id, device, map_queue, map_fence, fence_value, placed_tiles) = match fast {
+        Some(hit) => hit,
+        None => {
+            if with_state_read(|st| Some(st.mirror.wants_use(aligned_va, span_len))) == Some(true)
+                && let Some(api) = api()
+            {
+                give_outside_state(api, &[(aligned_va, span_len)]);
+            }
+            with_state(|st, api| {
+                st.give(api, aligned_va, span_len);
+                let prev_tiles = st.mirror.tiles_given();
+                let placed = st.mirror.mirror_tiles_span(va, desc.Width)?;
+                if st.mirror.tiles_given() != prev_tiles {
+                    bump_tile_gen();
+                    MIRROR_MAY_HAVE_PENDING.store(true, Ordering::Release);
+                }
+                Some((st.id, st.device.clone(), st.map_queue.clone(), st.map_fence.clone(), st.fence_value.clone(), placed))
+            })??
         }
-        Some((st.id, st.device.clone(), st.map_queue.clone(), st.map_fence.clone(), st.fence_value.clone(), pages))
-    })??;
+    };
+    debug_assert_eq!(placed_tiles.aligned_va, aligned_va);
+    debug_assert_eq!(placed_tiles.base_offset, base_offset);
+    debug_assert_eq!(placed_tiles.tiles.len(), tiles as usize);
     let mut buffer: Option<ID3D12Resource> = None;
     // SAFETY: plain D3D12 call on a live device with a description of plain data.
     let created = unsafe { device.CreateReservedResource(&reserved, state, None, &mut buffer) };
     if let Err(e) = created {
         if FAILED.fetch_add(1, Ordering::Relaxed) < 4 {
-            xs_log!("title memory: the buffer placed at {va:#x} ({} bytes) cannot be a reserved buffer ({e})", desc.Width);
+            xs_log!(
+                "title memory: the buffer placed at {va:#x} ({} bytes, base offset {base_offset:#x}) cannot be a reserved buffer ({e})",
+                desc.Width
+            );
         }
         return None;
     }
     let made = buffer?;
-    map_buffer_to_pool_outside_state(state_id, &map_queue, &map_fence, &fence_value, &made, &pages)?;
+    map_buffer_to_pool_outside_state(
+        state_id,
+        &map_queue,
+        &map_fence,
+        &fence_value,
+        &made,
+        &placed_tiles.tiles,
+        (va, desc.Width),
+    )?;
     if PLACED.fetch_add(1, Ordering::Relaxed) < 8 {
         // SAFETY: a live resource.
         let gpu = unsafe { made.GetGPUVirtualAddress() };
-        xs_log!("title memory: the buffer placed at {va:#x} ({} bytes) is a reserved buffer over its title pages, GPU address {gpu:#x}", desc.Width);
+        if base_offset == 0 {
+            xs_log!(
+                "title memory: the buffer placed at {va:#x} ({} bytes) is a reserved buffer over its title pages, GPU address {gpu:#x}",
+                desc.Width
+            );
+        } else {
+            xs_log!(
+                "title memory: the buffer placed at {va:#x} ({} bytes, base offset {base_offset:#x}) is a reserved buffer over its title pages, GPU address {:#x} (resource {gpu:#x})",
+                desc.Width,
+                gpu.wrapping_add(base_offset)
+            );
+        }
     }
-    Some(made)
+    Some(PlacedBuffer { resource: made, base_offset })
+}
+
+/// Page-aligned wrapper around [`place_buffer_at`] for callers that require a zero base offset
+/// (`va` must be a multiple of 64 KiB).
+pub fn place_buffer(va: u64, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES) -> Option<ID3D12Resource> {
+    if !va.is_multiple_of(PAGE) {
+        return None;
+    }
+    place_buffer_at(va, desc, state).map(|placed| {
+        debug_assert_eq!(placed.base_offset, 0);
+        placed.resource
+    })
 }
 
 /// Whether `[va, va + len)` lies in memory the title may write, even where `xmem.dll` made the page read
@@ -5539,6 +5610,213 @@ mod tests {
             let rb_words = std::slice::from_raw_parts(rb_ptr.cast::<u32>(), (PAGE as usize) / 4);
             assert_eq!(rb_words[0], pattern);
             assert_eq!(rb_words[rb_words.len() - 1], pattern);
+            readback.Unmap(0, None);
+        }
+    }
+
+    #[test]
+    fn reserved_desc_adds_base_offset_preserves_uav_and_checks_overflow() {
+        let base = buffer_desc(0x3000, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+        let aligned = reserved_desc(&base, D3D12_RESOURCE_STATE_COMMON, 0).expect("aligned");
+        assert_eq!(aligned.Width, 0x3000);
+        assert_eq!(aligned.Alignment, 0);
+        assert_eq!(aligned.Layout, D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+        assert_eq!(aligned.Flags, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        let sub = reserved_desc(&buffer_desc(0x3000, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COMMON, 0xF900).expect("sub-page");
+        assert_eq!(sub.Width, 0x12900);
+        assert_eq!(sub.Width.div_ceil(PAGE), 2);
+        assert_eq!(sub.Flags, D3D12_RESOURCE_FLAG_NONE);
+
+        let uav = reserved_desc(&buffer_desc(0x400, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 0x1800).expect("uav");
+        assert_eq!(uav.Width, 0x1C00);
+        assert_eq!(uav.Flags, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        let rtas = reserved_desc(
+            &buffer_desc(0x400, D3D12_RESOURCE_FLAG_NONE),
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+            0xB1B0,
+        )
+        .expect("rtas");
+        assert_eq!(rtas.Width, 0xB5B0);
+        assert_eq!(rtas.Flags, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        let overflow = buffer_desc(u64::MAX - 0x100, D3D12_RESOURCE_FLAG_NONE);
+        assert!(reserved_desc(&overflow, D3D12_RESOURCE_STATE_COMMON, 0x1800).is_none());
+    }
+
+    #[test]
+    fn sub_page_placed_reserved_buffer_shares_pool_tiles_across_page_boundary() {
+        use std::mem::ManuallyDrop;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+
+        type CreateDeviceFn = unsafe extern "system" fn(*mut c_void, i32, *const windows::core::GUID, *mut *mut c_void) -> i32;
+
+        // SAFETY: load system `d3d12.dll` dynamically so unit tests do not collide with this
+        // crate's own exported `D3D12CreateDevice` symbol.
+        let dev: ID3D12Device = unsafe {
+            let module = LoadLibraryW(windows_sys::w!("d3d12.dll"));
+            if module.is_null() {
+                return;
+            }
+            let Some(proc) = GetProcAddress(module, c"D3D12CreateDevice".as_ptr().cast()) else {
+                return;
+            };
+            let create: CreateDeviceFn = std::mem::transmute(proc);
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            let hr = create(std::ptr::null_mut(), D3D_FEATURE_LEVEL_12_0.0, &ID3D12Device::IID, &mut raw);
+            if hr < 0 || raw.is_null() {
+                return;
+            }
+            ID3D12Device::from_raw(raw)
+        };
+
+        // SAFETY: plain D3D12 resources, queues, and fences on the live test device above.
+        unsafe {
+            let Ok((map_q, map_q_type)) = create_map_queue(&dev) else { return };
+            let Ok(map_fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+            let Ok(mut ring) = StagingRing::new(&dev, (PAGE as usize) * 4, map_q_type) else { return };
+            let Ok(pool_heap) = make_heap(&dev, 0, MirrorPool::L1) else { return };
+            let Ok(window) = make_window(&dev, PAGE * 2, 0) else { return };
+
+            // Sub-64KiB placed buffer starting at +0xF900 with logical width 0x3000, straddling
+            // tile 0 [0xF900..0x10000) and tile 1 [0x0..0x2900).
+            let base_offset = 0xF900u64;
+            let logical_width = 0x3000u64;
+            let (aligned_va, computed_off, tiles) = checked_page_span(0x1_0000_0000 + base_offset, logical_width).expect("span");
+            assert_eq!(aligned_va, 0x1_0000_0000);
+            assert_eq!(computed_off, base_offset);
+            assert_eq!(tiles, 2);
+
+            let logical_desc = buffer_desc(logical_width, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            let placed_desc = reserved_desc(&logical_desc, D3D12_RESOURCE_STATE_COMMON, base_offset).expect("reserved desc");
+            assert_eq!(placed_desc.Width, base_offset + logical_width);
+            let mut placed_opt: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&placed_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut placed_opt)
+                .expect("CreateReservedResource for sub-64KiB placed buffer");
+            let placed = placed_opt.expect("placed handle");
+
+            // Map both the window buffer and the sub-64KiB placed buffer onto pool tiles 0..2.
+            let fence_value = Arc::new(AtomicU64::new(0));
+            let call = TileCall { buffer: 0, heap: Some(0), ranges: vec![(0, 2)], heap_tiles: vec![0] };
+            {
+                let mut scratch = MAP_QUEUE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+                update_call(&map_q, &window.resource, &call, Some(&pool_heap._heap), &mut scratch);
+                update_call(&map_q, &placed, &call, Some(&pool_heap._heap), &mut scratch);
+                let _ = signal_map_queue_locked(&map_q, &map_fence, &fence_value, &mut scratch, "sub-page test map");
+            }
+
+            // Upload distinct patterns into pool tile 0 and pool tile 1 via StagingRing.
+            let pat_tile0 = 0xA1B2_C3D4u32;
+            let pat_tile1 = 0xE5F6_0718u32;
+            let stg_base = ring.reserve((PAGE as usize) * 2, &map_fence, &fence_value).expect("staging reserve");
+            let stg_words = std::slice::from_raw_parts_mut((ring.ptr + stg_base) as *mut u32, ((PAGE as usize) * 2) / 4);
+            let page_words = (PAGE as usize) / 4;
+            stg_words[..page_words].fill(pat_tile0);
+            stg_words[page_words..].fill(pat_tile1);
+            let heaps = [Some(pool_heap.buffer.clone())];
+            let runs = [UploadRun { source: 0, heap: 0, heap_offset: 0, staging_offset: 0, bytes: PAGE * 2 }];
+            assert!(ring.copy_to_heaps(&map_q, &map_fence, &heaps, (stg_base, (PAGE as usize) * 2), &runs, &fence_value));
+
+            // Create upload (for GPU write test) and readback buffers on a DIRECT queue.
+            let up_props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+            let mut upload_opt: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &up_props,
+                D3D12_HEAP_FLAG_NONE,
+                &buffer_desc(0x400, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut upload_opt,
+            )
+            .expect("upload buffer");
+            let upload = upload_opt.expect("upload handle");
+            let pat_gpu_write = 0x1357_9BDFu32;
+            let mut up_ptr = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut up_ptr)).expect("map upload");
+            std::slice::from_raw_parts_mut(up_ptr.cast::<u32>(), 0x400 / 4).fill(pat_gpu_write);
+            upload.Unmap(0, None);
+
+            let rb_props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let mut rb_opt: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &rb_props,
+                D3D12_HEAP_FLAG_NONE,
+                &buffer_desc(logical_width + 0x400, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut rb_opt,
+            )
+            .expect("readback buffer");
+            let readback = rb_opt.expect("readback handle");
+
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+
+            // 1. Read the full logical span from `placed` at `base_offset` across tile 0 -> tile 1.
+            list.CopyBufferRegion(&readback, 0, &placed, base_offset, logical_width);
+
+            // 2. Transition `placed` from implicitly-promoted COPY_SOURCE to COPY_DEST, write
+            //    `pat_gpu_write` at `base_offset + 0x800` (inside tile 1), emit a global aliasing
+            //    barrier, and read it back through the shared `window` buffer.
+            let mut to_copy_dest = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: ManuallyDrop::new(Some(placed.clone())),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        StateAfter: D3D12_RESOURCE_STATE_COPY_DEST,
+                    }),
+                },
+            };
+            list.ResourceBarrier(std::slice::from_ref(&to_copy_dest));
+            ManuallyDrop::drop(&mut (*to_copy_dest.Anonymous.Transition).pResource);
+            let write_off = 0x800u64;
+            list.CopyBufferRegion(&placed, base_offset + write_off, &upload, 0, 0x400);
+            let alias = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Aliasing: ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                        pResourceBefore: ManuallyDrop::new(None),
+                        pResourceAfter: ManuallyDrop::new(None),
+                    }),
+                },
+            };
+            list.ResourceBarrier(&[alias]);
+            list.CopyBufferRegion(&readback, logical_width, &window.resource, base_offset + write_off, 0x400);
+            list.Close().expect("close list");
+
+            let direct_q: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("direct queue");
+            let direct_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("direct fence");
+            let mut waited = HashMap::new();
+            wait_queue_for_map_fence(&direct_q, direct_q.as_raw() as usize, &map_fence, &fence_value, &mut waited);
+            let cmd: ID3D12CommandList = list.cast().expect("cast cmd");
+            direct_q.ExecuteCommandLists(&[Some(cmd)]);
+            direct_q.Signal(&direct_fence, 1).expect("signal direct");
+            assert_eq!(wait_fence(&direct_fence, ring.event, 1, &fence_value, "sub-page drain"), FenceWaitResult::Reached(1));
+
+            let mut rb_ptr = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut rb_ptr)).expect("map readback");
+            let rb = std::slice::from_raw_parts(rb_ptr.cast::<u32>(), (logical_width as usize + 0x400) / 4);
+            // Tile 0 part: 0x10000 - 0xF900 = 0x700 bytes = 448 dwords.
+            let tile0_dwords = ((PAGE - base_offset) as usize) / 4;
+            let logical_dwords = (logical_width as usize) / 4;
+            assert_eq!(rb[0], pat_tile0, "first dword in tile 0 at +0xF900");
+            assert_eq!(rb[tile0_dwords - 1], pat_tile0, "last dword before 64 KiB boundary");
+            assert_eq!(rb[tile0_dwords], pat_tile1, "first dword across 64 KiB boundary in tile 1");
+            assert_eq!(rb[logical_dwords - 1], pat_tile1, "last dword of logical buffer in tile 1");
+            // GPU write through `placed` must be visible through `window` at the exact same offset.
+            assert_eq!(rb[logical_dwords], pat_gpu_write, "first dword written via placed buffer seen in window");
+            assert_eq!(rb[logical_dwords + 0x400 / 4 - 1], pat_gpu_write, "last dword written via placed buffer seen in window");
             readback.Unmap(0, None);
         }
     }

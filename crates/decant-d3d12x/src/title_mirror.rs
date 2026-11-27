@@ -36,6 +36,19 @@ pub fn page_span(va: u64, len: u64) -> (u64, u32) {
     (first, (end - first).div_ceil(PAGE).min(u64::from(u32::MAX)) as u32)
 }
 
+/// The page-aligned base, lead offset (`0..PAGE`), and page count covering `[va, va + bytes)`.
+/// Returns `None` for a zero-byte span or when the end address or page count overflows.
+pub fn checked_page_span(va: u64, bytes: u64) -> Option<(u64, u64, u32)> {
+    if bytes == 0 {
+        return None;
+    }
+    let aligned_va = va & !(PAGE - 1);
+    let base_offset = va - aligned_va;
+    let end = va.checked_add(bytes)?;
+    let pages = u32::try_from((end - aligned_va).div_ceil(PAGE)).ok()?;
+    (pages != 0).then_some((aligned_va, base_offset, pages))
+}
+
 /// One change of the address space, as the journal of `xmem.dll` says it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Change {
@@ -75,6 +88,18 @@ pub struct Placed {
     pub offset: u64,
     /// The bytes from the end of the span to the end of its slot.
     pub left: u64,
+}
+
+/// Mirror tiles covering a title byte span `[va, va + bytes)` inside one reservation, together with
+/// the page-aligned start address and byte offset of `va` inside tile 0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacedTiles {
+    /// Page-aligned title address of tile 0 (`va & !(PAGE - 1)`).
+    pub aligned_va: u64,
+    /// Byte offset of `va` inside tile 0 (`0..PAGE`).
+    pub base_offset: u64,
+    /// Mirror tile index for each 64 KiB page covering `[va, va + bytes)`.
+    pub tiles: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -766,6 +791,24 @@ impl Mirror {
         Some(pool_pages?.into_iter().map(|page| self.give_tile(page)).collect())
     }
 
+    /// Read-only version of [`mirror_tiles_span`](Self::mirror_tiles_span): returns `Some` only
+    /// when every 64 KiB page covering `[va, va + bytes)` is mapped in one reservation and already
+    /// has a mirror tile.
+    pub fn mirror_tiles_span_read(&self, va: u64, bytes: u64) -> Option<PlacedTiles> {
+        let (aligned_va, base_offset, pages) = checked_page_span(va, bytes)?;
+        let tiles = self.mirror_tiles_read(aligned_va, pages)?;
+        Some(PlacedTiles { aligned_va, base_offset, tiles })
+    }
+
+    /// Mirror tiles covering `[va, va + bytes)` at arbitrary byte alignment inside one reservation,
+    /// giving mirror tiles to mapped pages that have none. When `va` is not page-aligned, the
+    /// returned `base_offset` (`0..PAGE`) locates `va` inside tile 0.
+    pub fn mirror_tiles_span(&mut self, va: u64, bytes: u64) -> Option<PlacedTiles> {
+        let (aligned_va, base_offset, pages) = checked_page_span(va, bytes)?;
+        let tiles = self.mirror_tiles(aligned_va, pages)?;
+        Some(PlacedTiles { aligned_va, base_offset, tiles })
+    }
+
     /// Whether one of the `pages` title pages from `va` (on a page) shows a mirror tile of `written`:
     /// `None` when they do not all lie mapped in one reservation, as `mirror_tiles` answers. Gives no
     /// tile and allocates nothing: a page without a tile was not copied, so it is not in `written`.
@@ -1225,5 +1268,53 @@ mod tests {
                 heap_tiles: vec![1, 1, 4],
             }]
         );
+    }
+
+    #[test]
+    fn checked_page_span_computes_sub_page_offsets_crossings_and_rejects_overflow() {
+        assert_eq!(checked_page_span(0x1000_0000, 0), None);
+        assert_eq!(checked_page_span(0x1000_0000, PAGE), Some((0x1000_0000, 0, 1)));
+        assert_eq!(checked_page_span(0x1000_1800, 0x4000), Some((0x1000_0000, 0x1800, 1)));
+        assert_eq!(checked_page_span(0x1000_1800, 0x20_0000), Some((0x1000_0000, 0x1800, 33)));
+        assert_eq!(checked_page_span(0x1000_F900, 0x2000), Some((0x1000_0000, 0xF900, 2)));
+        assert_eq!(checked_page_span(0x1000_B1B0, 16), Some((0x1000_0000, 0xB1B0, 1)));
+        assert_eq!(checked_page_span(0x1000_FFFF, 1), Some((0x1000_0000, 0xFFFF, 1)));
+        assert_eq!(checked_page_span(0x1000_FFFF, 2), Some((0x1000_0000, 0xFFFF, 2)));
+        assert_eq!(checked_page_span(u64::MAX - 15, 32), None);
+        assert_eq!(checked_page_span(0x1000_0000, (u64::from(u32::MAX) + 1) * PAGE), None);
+    }
+
+    #[test]
+    fn mirror_tiles_span_handles_sub_page_alignments_and_straddling_spans() {
+        let mut m = Mirror::new(GIB);
+        reserve(&mut m, 0x1000_0000, 4);
+        assert_eq!(m.apply(Change::Map { va: 0x1000_0000, pages: 3, first_page: 20 }), None);
+        let _ = m.drain_updates();
+
+        // Read-only lookup misses before tiles are assigned.
+        assert_eq!(m.mirror_tiles_span_read(0x1000_1800, 0x4000), None);
+
+        // Single-page sub-64KiB placement allocates tile 0 and queues the window update.
+        let single = m.mirror_tiles_span(0x1000_1800, 0x4000).expect("single sub-page span");
+        assert_eq!(single, PlacedTiles { aligned_va: 0x1000_0000, base_offset: 0x1800, tiles: vec![0] });
+        assert_eq!(m.mirror_tiles_span_read(0x1000_1800, 0x4000), Some(single));
+        assert_eq!(m.drain_updates(), [TileCall { buffer: 0, heap: Some(0), ranges: vec![(0, 1)], heap_tiles: vec![0] }]);
+
+        // Straddling sub-64KiB placement across pages 0..2 reuses tile 0 and allocates tiles 1 and 2.
+        let straddle = m.mirror_tiles_span(0x1000_F900, PAGE + 0x2000).expect("straddling span");
+        assert_eq!(straddle, PlacedTiles { aligned_va: 0x1000_0000, base_offset: 0xF900, tiles: vec![0, 1, 2] });
+        assert_eq!(m.mirror_tiles_span_read(0x1000_F900, PAGE + 0x2000), Some(straddle));
+        assert_eq!(m.drain_updates(), [TileCall { buffer: 0, heap: Some(0), ranges: vec![(1, 2)], heap_tiles: vec![1] }]);
+
+        // 16-byte aligned span on page 2 succeeds with exact base_offset.
+        let small = m.mirror_tiles_span(0x1002_B1B0, 0x400).expect("16B aligned span");
+        assert_eq!(small, PlacedTiles { aligned_va: 0x1002_0000, base_offset: 0xB1B0, tiles: vec![2] });
+
+        // Straddling into the unmapped 4th page, overflowing past the reservation, zero length,
+        // or addressing an unreserved region all return None.
+        assert_eq!(m.mirror_tiles_span(0x1002_F000, 0x2000), None, "reaches unmapped page 3");
+        assert_eq!(m.mirror_tiles_span(0x1000_1800, 4 * PAGE), None, "crosses reservation end");
+        assert_eq!(m.mirror_tiles_span(0x1000_1800, 0), None, "zero length");
+        assert_eq!(m.mirror_tiles_span(0x2000_1800, 64), None, "unreserved");
     }
 }
