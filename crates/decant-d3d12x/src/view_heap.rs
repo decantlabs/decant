@@ -27,6 +27,8 @@ const SMALL_TEXTURE_LIMIT: u64 = 256 << 10;
 const WARM_FREE_HEAPS_PER_CLASS: usize = 1;
 /// The small resource placement alignment of the PC runtime.
 const SMALL: u64 = 4096;
+/// The default resource placement alignment ceiling for probing [`SMALL`] alignment.
+const DEFAULT_ALIGN: u64 = 65_536;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SizeClass {
@@ -109,22 +111,46 @@ fn cache_alloc_info(key: AllocKey, size: u64, align: u64) {
     }
 }
 
+/// Whether a resource whose default-aligned (`Alignment = 0`) allocation is `default_size` bytes
+/// qualifies to probe `D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT` (4 KiB) without triggering
+/// `CREATERESOURCE_INVALIDALIGNMENT_SMALLRESOURCE`.
+fn small_alignment_eligible(desc: &D3D12_RESOURCE_DESC, default_size: u64) -> bool {
+    let is_texture = matches!(
+        desc.Dimension,
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D
+            | D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            | D3D12_RESOURCE_DIMENSION_TEXTURE3D
+    );
+    let disallowed_flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+        | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0
+        | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS.0;
+    is_texture
+        && desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN
+        && desc.SampleDesc.Count == 1
+        && (desc.Flags.0 & disallowed_flags) == 0
+        && default_size > 0
+        && default_size <= DEFAULT_ALIGN
+}
+
 fn allocation_info(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> Option<(u64, u64)> {
     let key = AllocKey::from_desc(desc);
     if let Some(hit) = cached_alloc_info(key) {
         return Some(hit);
     }
     let mut d = *desc;
-    d.Alignment = SMALL;
+    d.Alignment = 0;
     // SAFETY: one valid description.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
-    if info.Alignment != SMALL {
-        d.Alignment = 0;
-        // SAFETY: as above.
-        info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
-    }
     if info.SizeInBytes == u64::MAX {
         return None;
+    }
+    if small_alignment_eligible(&d, info.SizeInBytes) {
+        d.Alignment = SMALL;
+        // SAFETY: as above; `d` satisfies D3D12 small-alignment prerequisites.
+        let small = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
+        if small.SizeInBytes != u64::MAX && small.Alignment == SMALL {
+            info = small;
+        }
     }
     cache_alloc_info(key, info.SizeInBytes, info.Alignment);
     Some((info.SizeInBytes, info.Alignment))
@@ -698,5 +724,49 @@ mod tests {
         ];
         assert_eq!(dense_candidate_order(&entries), vec![3, 4, 1, 2]);
         let _ = SizeClass::Small;
+    }
+
+    #[test]
+    fn small_alignment_eligibility_filters_out_oversized_msaa_and_rt_ds_textures() {
+        use super::{DEFAULT_ALIGN, small_alignment_eligible};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        let base = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        assert!(small_alignment_eligible(&base, DEFAULT_ALIGN));
+        assert!(small_alignment_eligible(&base, 4096));
+        assert!(!small_alignment_eligible(&base, 0));
+        assert!(!small_alignment_eligible(&base, DEFAULT_ALIGN + 1));
+
+        let uav = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..base };
+        assert!(small_alignment_eligible(&uav, DEFAULT_ALIGN));
+
+        let rt = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..base };
+        assert!(!small_alignment_eligible(&rt, DEFAULT_ALIGN));
+
+        let ds = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ..base };
+        assert!(!small_alignment_eligible(&ds, DEFAULT_ALIGN));
+
+        let simultaneous = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS, ..base };
+        assert!(!small_alignment_eligible(&simultaneous, DEFAULT_ALIGN));
+
+        let msaa = D3D12_RESOURCE_DESC { SampleDesc: DXGI_SAMPLE_DESC { Count: 4, Quality: 0 }, ..base };
+        assert!(!small_alignment_eligible(&msaa, DEFAULT_ALIGN));
+
+        let buffer = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, ..base };
+        assert!(!small_alignment_eligible(&buffer, DEFAULT_ALIGN));
+
+        let row_major = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..base };
+        assert!(!small_alignment_eligible(&row_major, DEFAULT_ALIGN));
     }
 }

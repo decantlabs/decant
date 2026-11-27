@@ -27,15 +27,41 @@ pub(super) fn index_stride(format: u32) -> Option<u32> {
     }
 }
 
-/// A `D3D12_INDEX_BUFFER_VIEW` of `count` indices of `format` at `va`, `None` for a format that is not
-/// an index format or a size that does not fit.
-pub(super) fn index_view_bytes(va: u64, format: u32, count: u32) -> Option<[u8; 16]> {
-    let size = count.checked_mul(index_stride(format)?)?;
+/// Packs a `D3D12_INDEX_BUFFER_VIEW` (`{BufferLocation, SizeInBytes, Format}`).
+fn pack_index_view(va: u64, size: u32, format: u32) -> [u8; 16] {
     let mut v = [0u8; 16];
     v[0..8].copy_from_slice(&va.to_le_bytes());
     v[8..12].copy_from_slice(&size.to_le_bytes());
     v[12..16].copy_from_slice(&format.to_le_bytes());
-    Some(v)
+    v
+}
+
+/// A `D3D12_INDEX_BUFFER_VIEW` of `count` indices of `format` at `va`, `None` for a format that is not
+/// an index format or a size that does not fit.
+#[cfg(test)]
+fn index_view_bytes(va: u64, format: u32, count: u32) -> Option<[u8; 16]> {
+    let size = count.checked_mul(index_stride(format)?)?;
+    Some(pack_index_view(va, size, format))
+}
+
+/// Builds the PC `D3D12_INDEX_BUFFER_VIEW` bytes for `DrawIndexedX`: translates `va` to a PC GPU
+/// address, or binds the zeroed fallback buffer (capping `SizeInBytes` to [`crate::fallback::BYTES`])
+/// when no PC resource holds `va`. Returns `(view, used_fallback)`, or `None` when `format` is not
+/// an index format or the byte size overflows `u32`.
+fn resolve_index_view(
+    va: u64,
+    format: u32,
+    count: u32,
+    translate: impl FnOnce(u64, u64) -> Option<u64>,
+    fallback: impl FnOnce() -> u64,
+) -> Option<([u8; 16], bool)> {
+    let stride = index_stride(format)?;
+    let size = count.checked_mul(stride)?;
+    let (gpu_va, view_size, used_fallback) = match translate(va, u64::from(size).max(1)) {
+        Some(pc_va) => (pc_va, size, false),
+        None => (fallback(), size.min(crate::fallback::BYTES as u32), true),
+    };
+    Some((pack_index_view(gpu_va, view_size, format), used_fallback))
 }
 
 /// Console list slot 83: `DrawIndexedX(index address, format, count, flags)` in the newer layout,
@@ -53,22 +79,34 @@ pub(super) extern "system" fn list_slot83(this: *mut Proxy, a1: u64, a2: u32, a3
 fn draw_indexed_x(this: *mut Proxy, va: u64, format: u32, count: u32, flags: u32) {
     static N: AtomicI32 = AtomicI32::new(0);
     static REFUSED: AtomicI32 = AtomicI32::new(0);
+    static FALLBACK: AtomicI32 = AtomicI32::new(0);
     if count == 0 || crate::pso_diag::skip(this as usize) {
         return;
     }
-    let bytes = index_stride(format).map_or(1, |stride| u64::from(stride) * u64::from(count));
-    let Some(view) = index_view_bytes(super::pc_gpu_address(va, bytes).unwrap_or(va), format, count) else {
+    // SAFETY: `this` is a live list proxy.
+    let pc = unsafe { (*this).pc };
+    let Some((view, used_fallback)) = resolve_index_view(va, format, count, super::pc_gpu_address, || {
+        // SAFETY: `pc` is a live PC command list.
+        unsafe { crate::fallback::address(pc) }
+    }) else {
         if log_due(&REFUSED) {
             xs_log!("console list slot 83 (DrawIndexedX {va:#x}, format {format}, count {count}): not an index format, skipped");
         }
         return;
     };
+    if used_fallback {
+        if log_due(&FALLBACK) {
+            xs_log!("console list slot 83 (DrawIndexedX {va:#x}, format {format}, count {count}): title address is in no PC resource, the zeroed fallback buffer is bound");
+        }
+        if view[0..8] == [0; 8] {
+            return;
+        }
+    }
     if log_due(&N) {
         xs_log!("console list slot 83 (DrawIndexedX, newer layout): {count} indices of format {format} at {va:#x}, flags {flags:#x}");
     }
     // SAFETY: `this` is a live list proxy; PC 43 is IASetIndexBuffer and 13 is DrawIndexedInstanced.
     unsafe {
-        let pc = (*this).pc;
         super::list_mirror::prepare(this, crate::user_mirror::Bind::Graphics);
         let _ = crate::rt_diag::draw(this as usize, "DrawIndexedX", count);
         crate::flicker_probe::draw(this as usize, crate::flicker_probe::Draw::IndexedAt { va, format, count });
@@ -144,5 +182,58 @@ mod tests {
         assert_eq!(index_view_bytes(0x1000, 28, 3), None);
         assert_eq!(index_view_bytes(0x1000, 0, 3), None);
         assert_eq!(index_view_bytes(0x1000, DXGI_FORMAT_R32_UINT, u32::MAX), None, "the size does not fit");
+    }
+
+    #[test]
+    fn resolve_index_view_uses_translated_pc_va_without_touching_fallback() {
+        let (v, used_fallback) = resolve_index_view(
+            0x2000_0000,
+            DXGI_FORMAT_R32_UINT,
+            1024,
+            |va, bytes| {
+                assert_eq!((va, bytes), (0x2000_0000, 4096));
+                Some(0xABCD_0000)
+            },
+            || panic!("fallback must not be called when VA translates"),
+        )
+        .unwrap();
+        assert!(!used_fallback);
+        assert_eq!(u64::from_le_bytes(v[0..8].try_into().unwrap()), 0xABCD_0000);
+        assert_eq!(u32::from_le_bytes(v[8..12].try_into().unwrap()), 4096);
+        assert_eq!(u32::from_le_bytes(v[12..16].try_into().unwrap()), DXGI_FORMAT_R32_UINT);
+    }
+
+    #[test]
+    fn resolve_index_view_falls_back_and_caps_size_on_unmapped_va() {
+        let fallback_va = 0xF000_1000;
+        let small = resolve_index_view(0xDEAD_0000, DXGI_FORMAT_R16_UINT, 30, |_, _| None, || fallback_va).unwrap();
+        assert!(small.1);
+        assert_eq!(u64::from_le_bytes(small.0[0..8].try_into().unwrap()), fallback_va);
+        assert_eq!(u32::from_le_bytes(small.0[8..12].try_into().unwrap()), 60);
+
+        let huge_count = (crate::fallback::BYTES as u32 / 4) + 512;
+        let capped = resolve_index_view(0xDEAD_0000, DXGI_FORMAT_R32_UINT, huge_count, |_, _| None, || fallback_va).unwrap();
+        assert!(capped.1);
+        assert_eq!(u64::from_le_bytes(capped.0[0..8].try_into().unwrap()), fallback_va);
+        assert_eq!(u32::from_le_bytes(capped.0[8..12].try_into().unwrap()), crate::fallback::BYTES as u32);
+        assert_eq!(u32::from_le_bytes(capped.0[12..16].try_into().unwrap()), DXGI_FORMAT_R32_UINT);
+    }
+
+    #[test]
+    fn resolve_index_view_rejects_invalid_format_or_overflow_before_translating() {
+        assert!(
+            resolve_index_view(0x1000, 28, 3, |_, _| panic!("must not translate"), || panic!("must not fallback"))
+                .is_none()
+        );
+        assert!(
+            resolve_index_view(
+                0x1000,
+                DXGI_FORMAT_R32_UINT,
+                u32::MAX,
+                |_, _| panic!("must not translate"),
+                || panic!("must not fallback"),
+            )
+            .is_none()
+        );
     }
 }

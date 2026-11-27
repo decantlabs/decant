@@ -56,16 +56,24 @@ pub(super) unsafe fn backing(pc: Object, count: u32, node_mask: u32, riid: *cons
     Some((h, cpu as usize, charge))
 }
 
+/// Descriptor count spanned by a table's root signature ranges, honoring explicit descriptor
+/// offsets (`u32::MAX` falls back to `OFFSET_APPEND`). `None` when any range is unbounded.
+fn ranges_extent(ranges: &[rts0::RootRange]) -> Option<u32> {
+    title_heap::table_extent(
+        ranges.iter().map(|r| (r.count, (r.offset != u32::MAX).then_some(r.offset))),
+    )
+}
+
 /// The descriptors the table at root parameter `index` of the root signature `bind` of `list`
 /// has, [`title_heap::UNBOUNDED_EXTENT`] when unbounded or unknown.
 fn extent(list: usize, bind: crate::user_mirror::Bind, index: u32) -> u32 {
     static UNBOUNDED: AtomicI32 = AtomicI32::new(0);
     let sig = if crate::user_mirror::active() { crate::user_mirror::with_shadow(list, |s| s.signature(bind)) } else { 0 };
-    let ranges = crate::dxil_override::root_layout(sig).and_then(|l| match l.params.get(index as usize).map(|p| &p.kind) {
-        Some(rts0::RootParamKind::Table(r)) => Some(r.iter().map(|r| (r.count, None)).collect::<Vec<_>>()),
+    let known = crate::dxil_override::root_layout(sig).and_then(|l| match l.params.get(index as usize).map(|p| &p.kind) {
+        Some(rts0::RootParamKind::Table(r)) => Some(ranges_extent(r)),
         _ => None,
     });
-    match ranges.map(title_heap::table_extent) {
+    match known {
         Some(Some(n)) => n,
         known => {
             if log_due(&UNBOUNDED) {
@@ -185,5 +193,29 @@ pub(super) fn present() {
         if s.refused > 0 && s.in_use == s.host_pages {
             xs_log!("descriptor pages: the shader visible heap is full ({} index pages kept for good, {} table pages): the title has more live descriptors than the PC heap holds", s.index_pages, s.table_pages);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ranges_extent;
+    use crate::rts0::{RegisterClass, RootRange};
+
+    fn range(count: u32, offset: u32) -> RootRange {
+        RootRange { class: RegisterClass::Srv, count, base: 0, space: 0, flags: 0, offset }
+    }
+
+    #[test]
+    fn ranges_extent_honors_explicit_and_gapped_offsets() {
+        assert_eq!(ranges_extent(&[range(4, 10)]), Some(14));
+        assert_eq!(ranges_extent(&[range(2, 0), range(4, 10)]), Some(14));
+        assert_eq!(ranges_extent(&[range(4, 10), range(2, 0)]), Some(14));
+    }
+
+    #[test]
+    fn ranges_extent_handles_unbounded_and_append_sentinel() {
+        assert_eq!(ranges_extent(&[range(4, 0), range(u32::MAX, 4)]), None);
+        assert_eq!(ranges_extent(&[range(u32::MAX, 0), range(2, u32::MAX)]), None);
+        assert_eq!(ranges_extent(&[range(3, 0), range(5, u32::MAX)]), Some(8));
     }
 }

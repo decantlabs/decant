@@ -124,15 +124,27 @@ extern "system" fn vo_release(this: *mut VOutput) -> u32 {
     }
 }
 
+/// Size and `AttachedToDesktop` byte offset of x86_64 `DXGI_OUTPUT_DESC`.
+const DXGI_OUTPUT_DESC_SIZE: usize = 0x60;
+const DXGI_OUTPUT_ATTACHED_OFFSET: usize = 0x50;
+
+#[cfg(windows)]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    use windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC;
+    assert!(size_of::<DXGI_OUTPUT_DESC>() == DXGI_OUTPUT_DESC_SIZE);
+    assert!(offset_of!(DXGI_OUTPUT_DESC, AttachedToDesktop) == DXGI_OUTPUT_ATTACHED_OFFSET);
+};
+
 extern "system" fn vo_get_desc(_this: *mut VOutput, desc: *mut c_void) -> HRESULT {
     if desc.is_null() {
         return E_POINTER;
     }
-    // SAFETY: `desc` is a writable `DXGI_OUTPUT_DESC` (bytes only, the layout is not needed here
-    // beyond the one field a console boot reads: `AttachedToDesktop` at byte offset 0x80).
+    // SAFETY: `desc` is a writable `DXGI_OUTPUT_DESC` (0x60 bytes on x64; `AttachedToDesktop`
+    // sits at byte offset 0x50, verified against the Windows SDK layout above).
     unsafe {
-        std::ptr::write_bytes(desc.cast::<u8>(), 0, 0x84);
-        desc.cast::<u8>().add(0x80).cast::<i32>().write(1);
+        std::ptr::write_bytes(desc.cast::<u8>(), 0, DXGI_OUTPUT_DESC_SIZE);
+        desc.cast::<u8>().add(DXGI_OUTPUT_ATTACHED_OFFSET).cast::<i32>().write_unaligned(1);
     }
     S_OK
 }
@@ -288,9 +300,9 @@ fn shadow_vtbl() -> &'static [usize; 10] {
             as_qi as *const () as usize,
             as_add_ref as *const () as usize,
             as_release as *const () as usize,
-            as_fwd3 as *const () as usize, // 3 SetPrivateData
-            as_fwd2 as *const () as usize, // 4 SetPrivateDataInterface
-            as_fwd3 as *const () as usize, // 5 GetPrivateData
+            as_set_private_data as *const () as usize, // 3 SetPrivateData
+            as_fwd2 as *const () as usize,             // 4 SetPrivateDataInterface
+            as_get_private_data as *const () as usize, // 5 GetPrivateData
             as_get_parent as *const () as usize,
             as_enum_outputs as *const () as usize,
             as_get_desc as *const () as usize,
@@ -333,30 +345,46 @@ extern "system" fn as_release(this: *mut AdapterShadow) -> u32 {
     }
 }
 
-/// `SetPrivateData`/`GetPrivateData` shape (riid, size, data).
-extern "system" fn as_fwd3(
+/// `IDXGIObject::SetPrivateData` (slot 3): `(riid, data_size, data)`.
+extern "system" fn as_set_private_data(
     this: *mut AdapterShadow,
-    a: *const GUID,
-    b: usize,
-    c: *mut c_void,
+    riid: *const GUID,
+    size: u32,
+    data: *const c_void,
 ) -> HRESULT {
-    // SAFETY: `this` is live, forwarded to the real adapter at the same slot.
+    // SAFETY: `this` is live, forwarded to the real adapter's SetPrivateData (slot 3).
     unsafe {
-        method::<unsafe extern "system" fn(Object, *const GUID, usize, *mut c_void) -> HRESULT>(
+        method::<unsafe extern "system" fn(Object, *const GUID, u32, *const c_void) -> HRESULT>(
             (*this).real,
             3,
-        )((*this).real, a, b, c)
+        )((*this).real, riid, size, data)
     }
 }
 
-/// `SetPrivateDataInterface` shape (riid, data).
+/// `IDXGIObject::SetPrivateDataInterface` (slot 4): `(riid, unknown)`.
 extern "system" fn as_fwd2(this: *mut AdapterShadow, a: *const GUID, b: *const c_void) -> HRESULT {
-    // SAFETY: as in `as_fwd3`, forwarded to slot 4.
+    // SAFETY: `this` is live, forwarded to the real adapter's SetPrivateDataInterface (slot 4).
     unsafe {
         method::<unsafe extern "system" fn(Object, *const GUID, *const c_void) -> HRESULT>(
             (*this).real,
             4,
         )((*this).real, a, b)
+    }
+}
+
+/// `IDXGIObject::GetPrivateData` (slot 5): `(riid, data_size*, data)`.
+extern "system" fn as_get_private_data(
+    this: *mut AdapterShadow,
+    riid: *const GUID,
+    size: *mut u32,
+    data: *mut c_void,
+) -> HRESULT {
+    // SAFETY: `this` is live, forwarded to the real adapter's GetPrivateData (slot 5).
+    unsafe {
+        method::<unsafe extern "system" fn(Object, *const GUID, *mut u32, *mut c_void) -> HRESULT>(
+            (*this).real,
+            5,
+        )((*this).real, riid, size, data)
     }
 }
 
@@ -468,6 +496,8 @@ mod tests {
         refs: AtomicI32,
     }
     static FAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FAKE_SET_PRIVATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FAKE_GET_PRIVATE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     extern "system" fn fake_qi(_t: *mut FakeAdapter, _r: *const GUID, _o: *mut Object) -> HRESULT {
         windows_sys::Win32::Foundation::E_NOINTERFACE
@@ -484,12 +514,13 @@ mod tests {
             n as u32
         }
     }
-    extern "system" fn fake_fwd3(
+    extern "system" fn fake_set_private(
         _t: *mut FakeAdapter,
         _a: *const GUID,
-        _b: usize,
-        _c: *mut c_void,
+        _b: u32,
+        _c: *const c_void,
     ) -> HRESULT {
+        FAKE_SET_PRIVATE_CALLS.fetch_add(1, Ordering::SeqCst);
         S_OK
     }
     extern "system" fn fake_fwd2(
@@ -497,6 +528,18 @@ mod tests {
         _a: *const GUID,
         _b: *const c_void,
     ) -> HRESULT {
+        S_OK
+    }
+    extern "system" fn fake_get_private(
+        _t: *mut FakeAdapter,
+        _a: *const GUID,
+        size: *mut u32,
+        _c: *mut c_void,
+    ) -> HRESULT {
+        FAKE_GET_PRIVATE_CALLS.fetch_add(1, Ordering::SeqCst);
+        if !size.is_null() {
+            unsafe { *size = 42 };
+        }
         S_OK
     }
     extern "system" fn fake_get_parent(
@@ -539,9 +582,9 @@ mod tests {
                 fake_qi as *const () as usize,
                 fake_add_ref as *const () as usize,
                 fake_release as *const () as usize,
-                fake_fwd3 as *const () as usize,
+                fake_set_private as *const () as usize,
                 fake_fwd2 as *const () as usize,
-                fake_fwd3 as *const () as usize,
+                fake_get_private as *const () as usize,
                 fake_get_parent as *const () as usize,
                 fake_enum_outputs as *const () as usize,
                 fake_get_desc as *const () as usize,
@@ -610,5 +653,71 @@ mod tests {
             assert_eq!(method::<Release>(output, 2)(output), 0);
             assert_eq!(method::<Release>(shadow, 2)(shadow), 0);
         }
+    }
+
+    #[test]
+    fn vo_get_desc_zeros_struct_sets_attached_and_does_not_overrun() {
+        #[repr(C)]
+        struct Guarded {
+            desc: [u8; DXGI_OUTPUT_DESC_SIZE],
+            canary: [u8; 0x40],
+        }
+        let mut buf = Guarded {
+            desc: [0x5A; DXGI_OUTPUT_DESC_SIZE],
+            canary: [0xA5; 0x40],
+        };
+        assert_eq!(vo_get_desc(std::ptr::null_mut(), std::ptr::null_mut()), E_POINTER);
+        let hr = vo_get_desc(std::ptr::null_mut(), buf.desc.as_mut_ptr().cast());
+        assert_eq!(hr, S_OK);
+        assert!(buf.desc[..DXGI_OUTPUT_ATTACHED_OFFSET].iter().all(|&b| b == 0));
+        let attached = i32::from_le_bytes(
+            buf.desc[DXGI_OUTPUT_ATTACHED_OFFSET..DXGI_OUTPUT_ATTACHED_OFFSET + 4].try_into().unwrap(),
+        );
+        assert_eq!(attached, 1);
+        assert!(buf.desc[DXGI_OUTPUT_ATTACHED_OFFSET + 4..].iter().all(|&b| b == 0));
+        assert_eq!(buf.canary, [0xA5; 0x40], "vo_get_desc must not write past DXGI_OUTPUT_DESC");
+
+        #[cfg(windows)]
+        {
+            use windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC;
+            let mut sdk_desc = DXGI_OUTPUT_DESC::default();
+            assert_eq!(vo_get_desc(std::ptr::null_mut(), (&raw mut sdk_desc).cast()), S_OK);
+            assert!(sdk_desc.AttachedToDesktop.as_bool());
+            assert_eq!(sdk_desc.Rotation.0, 0);
+            assert!(sdk_desc.Monitor.is_invalid());
+        }
+    }
+
+    #[test]
+    fn adapter_shadow_forwards_set_and_get_private_data_to_their_own_slots() {
+        let real = Box::into_raw(Box::new(FakeAdapter {
+            vtbl: fake_vtbl().as_ptr(),
+            refs: AtomicI32::new(1),
+        }))
+        .cast::<c_void>();
+        let shadow = wrap_adapter(real);
+        let before_set = FAKE_SET_PRIVATE_CALLS.load(Ordering::SeqCst);
+        let before_get = FAKE_GET_PRIVATE_CALLS.load(Ordering::SeqCst);
+        let mut size = 0u32;
+        let payload = [0u8; 4];
+        // SAFETY: `shadow` is a live `AdapterShadow` wrapping `FakeAdapter`.
+        unsafe {
+            assert_eq!(
+                method::<unsafe extern "system" fn(Object, *const GUID, u32, *const c_void) -> HRESULT>(
+                    shadow, 3,
+                )(shadow, &IID_UNKNOWN, payload.len() as u32, payload.as_ptr().cast()),
+                S_OK
+            );
+            assert_eq!(
+                method::<unsafe extern "system" fn(Object, *const GUID, *mut u32, *mut c_void) -> HRESULT>(
+                    shadow, 5,
+                )(shadow, &IID_UNKNOWN, &mut size, std::ptr::null_mut()),
+                S_OK
+            );
+            assert_eq!(method::<Release>(shadow, 2)(shadow), 0);
+        }
+        assert_eq!(FAKE_SET_PRIVATE_CALLS.load(Ordering::SeqCst), before_set + 1);
+        assert_eq!(FAKE_GET_PRIVATE_CALLS.load(Ordering::SeqCst), before_get + 1);
+        assert_eq!(size, 42);
     }
 }

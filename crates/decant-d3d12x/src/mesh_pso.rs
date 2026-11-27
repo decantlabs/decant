@@ -10,7 +10,7 @@
 //! The PC runtime takes a mesh pipeline only as a stream (`ID3D12Device2::CreatePipelineState`):
 //! [`pc_stream`] writes one from the description.
 
-use crate::stream_pso::GRAPHICS_DESC_SIZE;
+use crate::stream_pso::{GRAPHICS_DESC_SIZE, PC_GRAPHICS_PIPELINE_FLAGS};
 
 /// Offset of the amplification shader's `D3D12_SHADER_BYTECODE`.
 pub const AS_AT: usize = GRAPHICS_DESC_SIZE;
@@ -27,7 +27,7 @@ const PS: u32 = 2;
 const BLEND: u32 = 8;
 const SAMPLE_MASK: u32 = 9;
 const RASTERIZER: u32 = 10;
-const DEPTH_STENCIL: u32 = 11;
+const DEPTH_STENCIL1: u32 = 21;
 const PRIMITIVE_TOPOLOGY: u32 = 14;
 const RENDER_TARGET_FORMATS: u32 = 15;
 const DEPTH_STENCIL_FORMAT: u32 = 16;
@@ -47,7 +47,7 @@ pub fn has_shader(desc: &[u8], at: usize) -> bool {
     read_u64(desc, at) != 0 && read_u64(desc, at + 8) != 0
 }
 
-const MAX_PC_STREAM_BYTES: usize = 624;
+const MAX_PC_STREAM_BYTES: usize = 632;
 
 /// Appends one subobject: its type, padding up to the payload's alignment, the payload, padding up
 /// to the next pointer boundary (each subobject of a stream is pointer aligned).
@@ -79,7 +79,11 @@ pub fn pc_stream(desc: &[u8; MESH_DESC_SIZE]) -> Vec<u8> {
     push(&mut s, BLEND, 4, &desc[0x078..0x1C0]);
     push(&mut s, SAMPLE_MASK, 4, &desc[0x1C0..0x1C4]);
     push(&mut s, RASTERIZER, 4, &desc[0x1C4..0x1F0]);
-    push(&mut s, DEPTH_STENCIL, 4, &desc[0x1F0..0x224]);
+    let mut ds1 = [0u8; 56];
+    ds1[..52].copy_from_slice(&desc[0x1F0..0x224]);
+    let bounds_enabled = u32::from(u32::from_le_bytes(desc[0x224..0x228].try_into().unwrap_or_default()) != 0);
+    ds1[52..56].copy_from_slice(&bounds_enabled.to_le_bytes());
+    push(&mut s, DEPTH_STENCIL1, 4, &ds1);
     push(&mut s, PRIMITIVE_TOPOLOGY, 4, &desc[0x23C..0x240]);
     // D3D12_RT_FORMAT_ARRAY: the eight formats, then the count.
     let mut targets = [0u8; 36];
@@ -89,7 +93,8 @@ pub fn pc_stream(desc: &[u8; MESH_DESC_SIZE]) -> Vec<u8> {
     push(&mut s, DEPTH_STENCIL_FORMAT, 4, &desc[0x264..0x268]);
     push(&mut s, SAMPLE_DESC, 4, &desc[0x268..0x270]);
     push(&mut s, NODE_MASK, 4, &desc[0x270..0x274]);
-    push(&mut s, FLAGS, 4, &desc[0x288..0x28C]);
+    let flags = u32::from_le_bytes(desc[0x288..0x28C].try_into().unwrap_or_default()) & PC_GRAPHICS_PIPELINE_FLAGS;
+    push(&mut s, FLAGS, 4, &flags.to_le_bytes());
     s
 }
 
@@ -162,7 +167,50 @@ mod tests {
             types.push(ty);
             pos = (at + size).next_multiple_of(8);
         }
-        assert_eq!(types, [ROOT_SIGNATURE, AS, MS, PS, BLEND, SAMPLE_MASK, RASTERIZER, DEPTH_STENCIL, PRIMITIVE_TOPOLOGY, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT, SAMPLE_DESC, NODE_MASK, FLAGS]);
+        assert_eq!(types, [ROOT_SIGNATURE, AS, MS, PS, BLEND, SAMPLE_MASK, RASTERIZER, DEPTH_STENCIL1, PRIMITIVE_TOPOLOGY, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT, SAMPLE_DESC, NODE_MASK, FLAGS]);
+    }
+
+    #[test]
+    fn pc_stream_preserves_depth_bounds_and_masks_pipeline_flags() {
+        let mut s = mesh_stream(false);
+        let mut ds1 = [0u8; 56];
+        ds1[0..4].copy_from_slice(&1u32.to_le_bytes());
+        ds1[4..8].copy_from_slice(&1u32.to_le_bytes());
+        ds1[8..12].copy_from_slice(&2u32.to_le_bytes());
+        ds1[52..56].copy_from_slice(&1u32.to_le_bytes());
+        push(&mut s, DEPTH_STENCIL1, 4, &ds1);
+        push(&mut s, 19, 8, &[0xDEADu64.to_le_bytes(), 512u64.to_le_bytes()].concat());
+        push(&mut s, FLAGS, 4, &0xFFFF_000Fu32.to_le_bytes());
+
+        let Ok(Some(UnpackedStream::Mesh(m))) = unpack_stream(&s) else {
+            panic!("expected a mesh pipeline");
+        };
+        assert_eq!((read_u64(&m[..], 0x278), read_u64(&m[..], 0x280)), (0, 0), "console cached blob cleared");
+        let pc = pc_stream(&m);
+
+        let mut pos = 0;
+        let mut saw_ds1 = None;
+        let mut saw_flags = None;
+        while pos < pc.len() {
+            let ty = u32::from_le_bytes(pc[pos..pos + 4].try_into().unwrap());
+            let (align, size) = if ty == AS || ty == MS { (8, 16) } else { subobject_layout(ty).unwrap() };
+            let at = pos + align.max(4);
+            if ty == DEPTH_STENCIL1 {
+                saw_ds1 = Some(u32::from_le_bytes(pc[at + 52..at + 56].try_into().unwrap()));
+            } else if ty == FLAGS {
+                saw_flags = Some(u32::from_le_bytes(pc[at..at + 4].try_into().unwrap()));
+            }
+            pos = (at + size).next_multiple_of(8);
+        }
+        assert_eq!(saw_ds1, Some(1), "DepthBoundsTestEnable survives into PC stream");
+        assert_eq!(saw_flags, Some(PC_GRAPHICS_PIPELINE_FLAGS), "flags masked to PC hardware bits");
+
+        // Defense in depth: even if raw flags bits are set directly on the mesh desc, pc_stream masks them.
+        let mut raw = *m;
+        raw[0x288..0x28C].copy_from_slice(&0x0000_0007u32.to_le_bytes());
+        let pc_raw = pc_stream(&raw);
+        let tail_flags = u32::from_le_bytes(pc_raw[pc_raw.len() - 4..].try_into().unwrap());
+        assert_eq!(tail_flags, 4);
     }
 
     #[test]

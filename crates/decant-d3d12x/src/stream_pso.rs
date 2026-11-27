@@ -67,6 +67,14 @@ pub struct PlainComputeDesc {
 /// Size of a x86_64 `D3D12_GRAPHICS_PIPELINE_STATE_DESC` in the Windows SDK layout.
 pub const GRAPHICS_DESC_SIZE: usize = 656;
 
+/// PC hardware `D3D12_PIPELINE_STATE_FLAGS` bits valid on graphics/mesh pipelines:
+/// `DYNAMIC_DEPTH_BIAS` (`0x4`) and `DYNAMIC_INDEX_BUFFER_STRIP_CUT` (`0x8`).
+/// `TOOL_DEBUG` (`0x1`, WARP-only) and console-specific flag bits are stripped.
+pub const PC_GRAPHICS_PIPELINE_FLAGS: u32 = 0x4 | 0x8;
+
+/// PC hardware `D3D12_PIPELINE_STATE_FLAGS` bits valid on compute pipelines (`NONE`).
+const PC_COMPUTE_PIPELINE_FLAGS: u32 = 0;
+
 /// What a stream unpacks to.
 #[derive(Clone, Debug)]
 pub enum UnpackedStream {
@@ -92,6 +100,9 @@ mod at {
     pub const SAMPLE_MASK: usize = 0x1C0;
     pub const RASTERIZER: usize = 0x1C4;
     pub const DEPTH_STENCIL: usize = 0x1F0;
+    /// 4-byte alignment padding immediately after `DepthStencilState` (`0x1F0..0x224`, before
+    /// `InputLayout` at `0x228`), used to carry `D3D12_DEPTH_STENCIL_DESC1::DepthBoundsTestEnable`.
+    pub const DEPTH_BOUNDS_ENABLE: usize = DEPTH_STENCIL + 52;
     pub const INPUT_LAYOUT: usize = 0x228;
     pub const STRIP_CUT: usize = 0x238;
     pub const TOPOLOGY: usize = 0x23C;
@@ -110,10 +121,9 @@ mod at {
 }
 
 /// Where a subobject payload is copied to in the graphics description: type, offset, byte count.
-/// The payload of a subobject can be longer than the field (depth stencil with the bounds flag),
-/// then the first bytes are taken. Types 15, 16, 23 and 24 are not plain copies and are handled
-/// in `unpack_graphics`.
-const COPIES: [(u32, usize, usize); 19] = [
+/// Types 11, 15, 16, 21, 23 and 24 need extra handling in `unpack_graphics`; type 19
+/// (`CachedPSO`) holds a console driver blob and is intentionally omitted so it stays zeroed.
+const COPIES: [(u32, usize, usize); 16] = [
     (0, at::ROOT_SIGNATURE, 8),
     (1, at::VS, 16),
     (2, at::PS, 16),
@@ -124,14 +134,11 @@ const COPIES: [(u32, usize, usize); 19] = [
     (8, at::BLEND, 328),
     (9, at::SAMPLE_MASK, 4),
     (10, at::RASTERIZER, 44),
-    (11, at::DEPTH_STENCIL, 52),
-    (21, at::DEPTH_STENCIL, 52),
     (12, at::INPUT_LAYOUT, 16),
     (13, at::STRIP_CUT, 4),
     (14, at::TOPOLOGY, 4),
     (17, at::SAMPLE_DESC, 8),
     (18, at::NODE_MASK, 4),
-    (19, at::CACHED, 16),
     (20, at::FLAGS, 4),
 ];
 
@@ -251,8 +258,9 @@ fn unpack_compute(stream: &[u8], subs: &[(u32, usize, usize)]) -> PlainComputeDe
             0 => c.root_sig = rd_usize(stream, at),
             6 => (c.cs_ptr, c.cs_len) = (rd_usize(stream, at), rd_usize(stream, at + 8)),
             18 => c.node_mask = rd_u32(stream, at),
-            19 => (c.cached_ptr, c.cached_len) = (rd_usize(stream, at), rd_usize(stream, at + 8)),
-            20 => c.flags = rd_u32(stream, at),
+            // Console driver cached PSO blobs are incompatible with PC runtimes; leave zeroed.
+            19 => {}
+            20 => c.flags = rd_u32(stream, at) & PC_COMPUTE_PIPELINE_FLAGS,
             _ => {}
         }
     }
@@ -271,6 +279,10 @@ fn unpack_graphics(stream: &[u8], subs: &[(u32, usize, usize)]) -> ([u8; GRAPHIC
             continue;
         }
         match ty {
+            11 => {
+                g[at::DEPTH_STENCIL..at::DEPTH_STENCIL + 52].copy_from_slice(&payload[..52]);
+                wr_u32(&mut g, at::DEPTH_BOUNDS_ENABLE, 0);
+            }
             // Eight formats come first and the count after them. Read the other way round, a
             // pipeline with one target had UNKNOWN in slot 0 and wrote nothing, so every frame
             // was black.
@@ -281,6 +293,10 @@ fn unpack_graphics(stream: &[u8], subs: &[(u32, usize, usize)]) -> ([u8; GRAPHIC
                 }
             }
             16 => wr_u32(&mut g, at::DEPTH_FORMAT, pc_dxgi_format(rd_u32(payload, 0))),
+            21 => {
+                g[at::DEPTH_STENCIL..at::DEPTH_STENCIL + 52].copy_from_slice(&payload[..52]);
+                wr_u32(&mut g, at::DEPTH_BOUNDS_ENABLE, u32::from(rd_u32(payload, 52) != 0));
+            }
             23 => mesh_shaders[..16].copy_from_slice(payload),
             24 => mesh_shaders[16..].copy_from_slice(payload),
             _ => {}
@@ -352,6 +368,9 @@ pub fn valid_states(g: &mut [u8; GRAPHICS_DESC_SIZE]) {
             fix(face + field, 1..=8, default);
         }
     }
+    g[at::CACHED..at::CACHED + 16].fill(0);
+    let flags = rd_u32(g, at::FLAGS) & PC_GRAPHICS_PIPELINE_FLAGS;
+    wr_u32(g, at::FLAGS, flags);
     sanitize_integer_rt_blend(g);
 }
 
@@ -414,6 +433,11 @@ fn sanitize_integer_rt_blend(g: &mut [u8; GRAPHICS_DESC_SIZE]) {
     } else {
         switch_off(g, 0);
     }
+}
+
+/// Whether `D3D12_DEPTH_STENCIL_DESC1::DepthBoundsTestEnable` was set on an unpacked stream.
+pub fn depth_bounds_test(g: &[u8; GRAPHICS_DESC_SIZE]) -> bool {
+    rd_u32(g, at::DEPTH_BOUNDS_ENABLE) != 0
 }
 
 /// Reads `pRootSignature` of a plain graphics description.
@@ -493,6 +517,14 @@ mod tests {
         assert_eq!(size_of::<D3D12_STREAM_OUTPUT_DESC>(), 32);
         assert_eq!(size_of::<D3D12_RASTERIZER_DESC>(), 44);
         assert_eq!(size_of::<D3D12_BLEND_DESC>(), 328);
+        assert_eq!(size_of::<D3D12_DEPTH_STENCIL_DESC1>(), 56);
+        assert_eq!(offset_of!(D3D12_DEPTH_STENCIL_DESC1, DepthBoundsTestEnable), 52);
+        assert_eq!(at::DEPTH_BOUNDS_ENABLE + 4, at::INPUT_LAYOUT);
+        assert_eq!(
+            PC_GRAPHICS_PIPELINE_FLAGS,
+            (D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS.0
+                | D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT.0) as u32
+        );
     }
 
     #[cfg(windows)]
@@ -525,16 +557,17 @@ mod tests {
     }
 
     #[test]
-    fn a_compute_stream_keeps_its_pointers_flags_and_cache() {
+    fn a_compute_stream_clears_console_cache_and_unsupported_flags() {
         let mut s = Vec::new();
         push_sub(&mut s, 0, &0xAB00u64.to_le_bytes());
         push_sub(&mut s, 6, &bytecode(0xC000, 123));
         push_sub(&mut s, 18, &5u32.to_le_bytes());
         push_sub(&mut s, 19, &bytecode(0xD000, 77));
-        push_sub(&mut s, 20, &2u32.to_le_bytes());
+        push_sub(&mut s, 20, &0xFFFF_FFFFu32.to_le_bytes());
         let Ok(Some(UnpackedStream::Compute(c))) = unpack_stream(&s) else { panic!("expected compute") };
-        assert_eq!((c.root_sig, c.cs_ptr, c.cs_len), (0xAB00, 0xC000, 123));
-        assert_eq!((c.node_mask, c.cached_ptr, c.cached_len, c.flags), (5, 0xD000, 77, 2));
+        assert_eq!((c.root_sig, c.cs_ptr, c.cs_len, c.node_mask), (0xAB00, 0xC000, 123, 5));
+        assert_eq!((c.cached_ptr, c.cached_len), (0, 0), "console CachedPSO blob is discarded");
+        assert_eq!(c.flags, 0, "compute flags clear TOOL_DEBUG and graphics/console bits");
         assert_eq!(std::mem::size_of::<PlainComputeDesc>(), 56);
     }
 
@@ -583,15 +616,46 @@ mod tests {
     }
 
     #[test]
-    fn the_depth_stencil_with_bounds_flag_copies_only_the_common_part() {
+    fn the_depth_stencil_with_bounds_flag_preserves_depth_bounds_test() {
         let mut payload = vec![0u8; 56];
         payload[4] = 1;
         payload[52] = 0xEE;
         let mut s = vs_only();
+        push_sub(&mut s, 12, &bytecode(0xCAFE_0000, 3));
         push_sub(&mut s, 21, &payload);
         let g = graphics(&s);
         assert_eq!(g[at::DEPTH_STENCIL + 4], 1);
-        assert_eq!(rd_u32(&g[..], at::DEPTH_STENCIL + 52), 0, "the bounds flag is not in the plain description");
+        assert_eq!(rd_u32(&g[..], at::DEPTH_BOUNDS_ENABLE), 1, "DepthBoundsTestEnable is preserved as BOOL");
+        assert!(depth_bounds_test(&g));
+        assert_eq!(rd_usize(&g[..], at::INPUT_LAYOUT), 0xCAFE_0000, "InputLayout stays untouched");
+
+        // A plain DEPTH_STENCIL subobject clears DepthBoundsTestEnable.
+        push_sub(&mut s, 11, &[0u8; 52]);
+        let cleared = graphics(&s);
+        assert_eq!(rd_u32(&cleared[..], at::DEPTH_BOUNDS_ENABLE), 0);
+        assert!(!depth_bounds_test(&cleared));
+    }
+
+    #[test]
+    fn graphics_streams_and_valid_states_clear_cached_pso_and_mask_flags() {
+        let mut s = vs_only();
+        push_sub(&mut s, 19, &bytecode(0xBEEF_0000, 4096));
+        // Set TOOL_DEBUG (1), console bit (2), DYNAMIC_DEPTH_BIAS (4), DYNAMIC_INDEX_BUFFER_STRIP_CUT (8), and high bits.
+        push_sub(&mut s, 20, &0x8000_000Fu32.to_le_bytes());
+        let g = graphics(&s);
+        assert_eq!((rd_usize(&g[..], at::CACHED), rd_usize(&g[..], at::CACHED + 8)), (0, 0));
+        assert_eq!(rd_u32(&g[..], at::FLAGS), PC_GRAPHICS_PIPELINE_FLAGS);
+
+        let mut s_tool_only = vs_only();
+        push_sub(&mut s_tool_only, 20, &3u32.to_le_bytes());
+        assert_eq!(rd_u32(&graphics(&s_tool_only)[..], at::FLAGS), 0);
+
+        let mut plain = default_graphics_desc();
+        plain[at::CACHED..at::CACHED + 16].copy_from_slice(&bytecode(0x1234, 99));
+        wr_u32(&mut plain, at::FLAGS, 0xFFFF_FFF5);
+        valid_states(&mut plain);
+        assert_eq!((rd_usize(&plain, at::CACHED), rd_usize(&plain, at::CACHED + 8)), (0, 0));
+        assert_eq!(rd_u32(&plain, at::FLAGS), 4);
     }
 
     #[test]
