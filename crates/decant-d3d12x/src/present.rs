@@ -638,6 +638,7 @@ fn make(queue: &ID3D12CommandQueue, w: u32, h: u32, fmt: DXGI_FORMAT) -> windows
         let buffers = [swap.GetBuffer(0)?, swap.GetBuffer(1)?];
         let allocators = [dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?, dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?];
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocators[0], None)?;
+        let _ = list.SetName(windows::core::w!("decant present list"));
         list.Close()?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let wait_event = CreateEventW(None, false, false, None).ok();
@@ -827,7 +828,8 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
             let back = &p.buffers[i];
             // A console title usually presents its back buffer in RENDER_TARGET, but it may also
             // leave it in COMMON or PRESENT. The tracked state avoids a mismatch with the barrier.
-            let src_state = source_state(source.as_raw() as usize);
+            let allow_rt = (d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0) != 0;
+            let src_state = present_source_state(source.as_raw() as usize, allow_rt);
             let mut before_len = 0usize;
             let mut before = [D3D12_RESOURCE_BARRIER::default(), D3D12_RESOURCE_BARRIER::default()];
             if src_state != D3D12_RESOURCE_STATE_COPY_SOURCE {
@@ -940,6 +942,7 @@ pub unsafe fn show(queue: *mut c_void, resource: *mut c_void) -> bool {
             let list: ID3D12CommandList = p.list.cast()?;
             let tracked = crate::retire::begin(p.queue.as_raw());
             p.queue.ExecuteCommandLists(&[Some(list)]);
+            note_presented_state(source.as_raw() as usize, src_state);
             if tracked {
                 crate::retire::submitted(p.queue.as_raw());
             }
@@ -1085,9 +1088,17 @@ impl Hasher for FastUsizeHasher {
 
 type FastMap<V> = HashMap<usize, V, BuildHasherDefault<FastUsizeHasher>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrackedState {
+    state: u32,
+    /// `true` once at least one submitted `ResourceBarrier` has transitioned this resource.
+    /// `false` while only the creation-time initial state (or a prior present promotion) is known.
+    explicit: bool,
+}
+
 #[derive(Default)]
 struct StateTracker {
-    resources: FastMap<u32>,
+    resources: FastMap<TrackedState>,
     list_notes: FastMap<Vec<(usize, u32)>>,
 }
 
@@ -1102,7 +1113,7 @@ fn with_states<R>(f: impl FnOnce(&mut StateTracker) -> R) -> R {
 pub(crate) fn note_resource_created(res: usize, state: u32) {
     if res != 0 {
         with_states(|s| {
-            s.resources.insert(res, state);
+            s.resources.insert(res, TrackedState { state, explicit: false });
         });
     }
 }
@@ -1142,7 +1153,7 @@ pub(crate) fn list_submitted(lists: &[usize]) {
         for &list in lists {
             if let Some(notes) = list_notes.get(&list) {
                 for &(res, after) in notes {
-                    resources.insert(res, after);
+                    resources.insert(res, TrackedState { state: after, explicit: true });
                 }
             }
         }
@@ -1158,12 +1169,45 @@ pub(crate) fn forget_resource(res: usize) {
     }
 }
 
-/// The tracked state of `res`, `RENDER_TARGET` when nothing is tracked. A title that created the
-/// resource in or moved it to `COMMON` (0, the same value as `PRESENT`) before `PresentX` is
-/// reported as such.
+/// The raw tracked state of `res`, `RENDER_TARGET` when nothing is tracked.
+#[cfg(test)]
 fn source_state(res: usize) -> D3D12_RESOURCE_STATES {
     with_states(|s| s.resources.get(&res).copied())
-        .map_or(D3D12_RESOURCE_STATE_RENDER_TARGET, |v| D3D12_RESOURCE_STATES(v as i32))
+        .map_or(D3D12_RESOURCE_STATE_RENDER_TARGET, |t| D3D12_RESOURCE_STATES(t.state as i32))
+}
+
+/// The state `present::show` transitions `res` from and back to around its swap-chain copy.
+///
+/// Newer console layouts create display targets with an initial `UNORDERED_ACCESS` layout and
+/// synchronize rendering via pipeline syncs rather than legacy `ResourceBarrier` transitions.
+/// Once the title renders to such a target as a render target, transitioning it from/to
+/// `UNORDERED_ACCESS` mismatches PC D3D12's tracked `RENDER_TARGET` state and forces the next
+/// frame's render-target clear/draw back into an invalid-state error. When a render-target-capable
+/// resource has only its creation-time `UNORDERED_ACCESS` state (no explicit `ResourceBarrier`
+/// submitted), treat it as `RENDER_TARGET`. Any state set by a submitted `ResourceBarrier`
+/// (including an explicit transition to `UNORDERED_ACCESS`) is preserved verbatim.
+fn present_source_state(res: usize, allow_render_target: bool) -> D3D12_RESOURCE_STATES {
+    const UAV: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+    match with_states(|s| s.resources.get(&res).copied()) {
+        None => D3D12_RESOURCE_STATE_RENDER_TARGET,
+        Some(TrackedState { state: UAV, explicit: false }) if allow_render_target => D3D12_RESOURCE_STATE_RENDER_TARGET,
+        Some(TrackedState { state, .. }) => D3D12_RESOURCE_STATES(state as i32),
+    }
+}
+
+/// Remembers the state `present::show` left `res` in after submitting its copy command list,
+/// unless an explicit `ResourceBarrier` has taken ownership of `res`.
+fn note_presented_state(res: usize, state: D3D12_RESOURCE_STATES) {
+    if res == 0 {
+        return;
+    }
+    with_states(|s| {
+        if let Some(entry) = s.resources.get_mut(&res)
+            && !entry.explicit
+        {
+            entry.state = state.0 as u32;
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1351,6 +1395,79 @@ mod tests {
 
         forget_resource(res);
         list_reset(list);
+    }
+
+    #[test]
+    fn initial_uav_render_target_presents_as_render_target_and_stays_promoted() {
+        let res = 0xCAFE_0031usize;
+        forget_resource(res);
+
+        // Display target created with initial UNORDERED_ACCESS layout and no explicit barriers.
+        note_resource_created(res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
+        assert_eq!(source_state(res), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // Without ALLOW_RENDER_TARGET, keep UNORDERED_ACCESS intact.
+        assert_eq!(present_source_state(res, false), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // With ALLOW_RENDER_TARGET, transition from and back to RENDER_TARGET instead of UAV.
+        assert_eq!(present_source_state(res, true), D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        // Submitting the present copy remembers the promoted RENDER_TARGET state.
+        note_presented_state(res, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        assert_eq!(source_state(res), D3D12_RESOURCE_STATE_RENDER_TARGET);
+        assert_eq!(present_source_state(res, true), D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        forget_resource(res);
+    }
+
+    #[test]
+    fn explicit_uav_transition_is_preserved_across_presents() {
+        let res = 0xCAFE_0032usize;
+        let list = 0xCAFE_0033usize;
+        forget_resource(res);
+        list_reset(list);
+
+        // Even after an initial UAV creation and first-frame promotion to RENDER_TARGET,
+        // an explicit ResourceBarrier transitioning to UNORDERED_ACCESS takes precedence.
+        note_resource_created(res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
+        assert_eq!(present_source_state(res, true), D3D12_RESOURCE_STATE_RENDER_TARGET);
+        note_presented_state(res, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        note_list_transitions(list, &[(res, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32)]);
+        list_submitted(&[list]);
+        assert_eq!(present_source_state(res, true), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        // A present completion note must not overwrite an explicit ResourceBarrier state.
+        note_presented_state(res, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        assert_eq!(source_state(res), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        assert_eq!(present_source_state(res, true), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        // Re-creating a resource at the same address clears the prior explicit flag.
+        note_resource_created(res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
+        assert_eq!(present_source_state(res, true), D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        forget_resource(res);
+        list_reset(list);
+    }
+
+    #[test]
+    fn non_uav_initial_states_and_untracked_resources_keep_existing_behavior() {
+        let res_common = 0xCAFE_0034usize;
+        let res_copy = 0xCAFE_0035usize;
+        let res_untracked = 0xCAFE_0036usize;
+        forget_resource(res_common);
+        forget_resource(res_copy);
+        forget_resource(res_untracked);
+
+        assert_eq!(present_source_state(res_untracked, true), D3D12_RESOURCE_STATE_RENDER_TARGET);
+        assert_eq!(present_source_state(res_untracked, false), D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        note_resource_created(res_common, D3D12_RESOURCE_STATE_COMMON.0 as u32);
+        assert_eq!(present_source_state(res_common, true), D3D12_RESOURCE_STATE_COMMON);
+
+        note_resource_created(res_copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        assert_eq!(present_source_state(res_copy, true), D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+        forget_resource(res_common);
+        forget_resource(res_copy);
     }
 
     #[test]
